@@ -17,8 +17,8 @@ export default function HitRatioCalc() {
   const p99 = 1 - hit > 0.01 ? missMs : cacheMs;
 
   const W = 360;
-  const H = 170;
-  const P = { l: 44, r: 10, t: 10, b: 30 };
+  const H = 200;
+  const P = { l: 62, r: 10, t: 12, b: 38 };
   const yMax = Math.max(noCache, missMs) * 1.05;
   const x = (h: number) => P.l + h * (W - P.l - P.r);
   const y = (ms: number) => H - P.b - (ms / yMax) * (H - P.t - P.b);
@@ -44,21 +44,21 @@ export default function HitRatioCalc() {
           {[0, 0.5, 1].map((f) => (
             <g key={f}>
               <line x1={P.l} x2={W - P.r} y1={y(f * yMax)} y2={y(f * yMax)} stroke="var(--border)" />
-              <text x={P.l - 5} y={y(f * yMax) + 4} textAnchor="end" fontSize={10} fill="var(--muted)">
+              <text x={P.l - 5} y={y(f * yMax) + 4} textAnchor="end" fontSize={14} fill="var(--muted)">
                 {(f * yMax).toFixed(yMax > 20 ? 0 : 1)} ms
               </text>
             </g>
           ))}
           {[0, 0.25, 0.5, 0.75, 1].map((h) => (
-            <text key={h} x={x(h)} y={H - P.b + 14} textAnchor="middle" fontSize={10} fill="var(--muted)">
+            <text key={h} x={x(h)} y={H - P.b + 14} textAnchor="middle" fontSize={14} fill="var(--muted)">
               {h * 100}%
             </text>
           ))}
-          <text x={(P.l + W - P.r) / 2} y={H - 3} textAnchor="middle" fontSize={10} fill="var(--muted)">
+          <text x={(P.l + W - P.r) / 2} y={H - 3} textAnchor="middle" fontSize={14} fill="var(--muted)">
             hit ratio
           </text>
           <line x1={P.l} x2={W - P.r} y1={y(noCache)} y2={y(noCache)} stroke="var(--bad)" strokeDasharray="4 3" />
-          <text x={P.l + 4} y={y(noCache) - 4} textAnchor="start" fontSize={10} fill="var(--bad)">
+          <text x={P.l + 4} y={y(noCache) - 4} textAnchor="start" fontSize={14} fill="var(--bad)">
             no cache: {noCache} ms
           </text>
           <polyline points={curve} fill="none" stroke="var(--accent)" strokeWidth={2} />
@@ -114,7 +114,7 @@ function Out({ label, value, sub, tone }: { label: string; value: string; sub: s
     <div className="rounded-lg border border-line px-2 py-2">
       <div className={`text-xl font-semibold tabular-nums ${tone === 'ok' ? 'text-ok' : tone === 'bad' ? 'text-bad' : ''}`}>{value}</div>
       <div className="text-xs">{label}</div>
-      <div className="text-[0.7rem] text-muted">{sub}</div>
+      <div className="text-[0.8125rem] text-muted">{sub}</div>
     </div>
   );
 }

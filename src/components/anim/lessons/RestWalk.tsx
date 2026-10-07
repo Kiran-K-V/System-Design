@@ -79,86 +79,84 @@ const steps: WalkStep[] = [
   },
 ];
 
-const TX = 745;
-const ROW_H = 34;
+const TX = 530;
+const ROW_H = 38;
 
 export default function RestWalk() {
   return (
     <AnimFrame title="REST verbs on a tweets resource" steps={steps}>
       {(i, s) => (
-        <SketchSvg width={900} height={370} label="A client sends REST requests and the server tweets table changes">
-          <SketchBox cx={70} cy={185} w={100} h={60} seed={seedOf('client')} />
-          <HandText x={70} y={185} size={18}>
+        <SketchSvg width={640} height={330} label="A client sends REST requests and the server tweets table changes">
+          <SketchBox cx={44} cy={165} w={78} h={52} seed={seedOf('client')} />
+          <HandText x={44} y={165} size={15}>
             Client
           </HandText>
 
-          <HandText x={330} y={22} size={13} color="var(--muted)">
+          <HandText x={236} y={16} size={13} color="var(--muted)">
             request
           </HandText>
-          <SketchBox cx={330} cy={92} w={350} h={96} seed={seedOf('req')} stroke={s.req ? 'var(--accent)' : 'var(--muted)'} fill="var(--surface)" fillStyle="solid" />
-          <HandText x={330} y={s.req?.body ? 80 : 92} size={17} mono color="var(--accent)">
+          <SketchBox cx={236} cy={74} w={270} h={92} seed={seedOf('req')} stroke={s.req ? 'var(--accent)' : 'var(--muted)'} fill="var(--surface)" fillStyle="solid" />
+          <HandText x={236} y={s.req?.body ? 62 : 74} size={14} mono color="var(--accent)">
             {s.req?.line ?? '(nothing sent yet)'}
           </HandText>
           {s.req?.body && (
-            <HandText x={330} y={108} size={15} mono>
+            <HandText x={236} y={90} size={14} mono>
               {s.req.body}
             </HandText>
           )}
 
-          <HandText x={330} y={198} size={13} color="var(--muted)">
+          <HandText x={236} y={168} size={13} color="var(--muted)">
             response
           </HandText>
           <SketchBox
-            cx={330}
-            cy={268}
-            w={350}
-            h={96}
+            cx={236}
+            cy={246}
+            w={270}
+            h={92}
             seed={seedOf('res')}
             stroke={s.res ? (s.res.ok ? 'var(--ok)' : 'var(--bad)') : 'var(--muted)'}
             fill="var(--surface)"
             fillStyle="solid"
           />
-          <HandText x={330} y={s.res?.extra ? 256 : 268} size={17} mono color={s.res ? (s.res.ok ? 'var(--ok)' : 'var(--bad)') : 'var(--muted)'}>
+          <HandText x={236} y={s.res?.extra ? 234 : 246} size={14} mono color={s.res ? (s.res.ok ? 'var(--ok)' : 'var(--bad)') : 'var(--muted)'}>
             {s.res?.line ?? '(nothing yet)'}
           </HandText>
           {s.res?.extra && (
-            <HandText x={330} y={284} size={14} mono>
+            <HandText x={236} y={262} size={13} mono>
               {s.res.extra}
             </HandText>
           )}
 
-          <SketchArrow points={[[122, 168], [150, 100]]} seed={seedOf('a1')} stroke="var(--accent)" />
-          <SketchArrow points={[[150, 272], [122, 202]]} seed={seedOf('a2')} stroke={s.res && !s.res.ok ? 'var(--bad)' : 'var(--ok)'} />
-          <SketchArrow points={[[510, 92], [TX - 134, 112]]} seed={seedOf('a3')} dashed stroke="var(--muted)" />
-          <HandText x={570} y={84} size={13} color="var(--muted)">
+          <SketchArrow points={[[70, 150], [96, 92]]} seed={seedOf('a1')} stroke="var(--accent)" />
+          <SketchArrow points={[[96, 232], [70, 182]]} seed={seedOf('a2')} stroke={s.res && !s.res.ok ? 'var(--bad)' : 'var(--ok)'} />
+          <SketchArrow points={[[378, 74], [TX - 112, 96]]} seed={seedOf('a3')} dashed stroke="var(--muted)" />
+          <HandText x={411} y={62} size={13} color="var(--muted)">
             changes
           </HandText>
 
-          <SketchBox cx={TX} cy={190} w={250} h={290} seed={seedOf('table')} />
-          <HandText x={TX} y={66} size={16} weight={700}>
+          <SketchBox cx={TX} cy={165} w={218} h={300} seed={seedOf('table')} />
+          <HandText x={TX} y={34} size={15} weight={700}>
             tweets table
           </HandText>
-          <HandText x={TX - 105} y={92} size={12} anchor="start" color="var(--muted)">
+          <HandText x={TX - 96} y={62} size={13} anchor="start" color="var(--muted)">
             id
           </HandText>
-          <HandText x={TX - 60} y={92} size={12} anchor="start" color="var(--muted)">
+          <HandText x={TX - 44} y={62} size={13} anchor="start" color="var(--muted)">
             text
           </HandText>
           {s.rows.map((r, k) => (
             <motion.g key={`${i}-${r.id}-${k}`} initial={s.hl === r.id ? { opacity: 0 } : false} animate={{ opacity: 1 }} transition={{ duration: 0.5 }}>
-              {s.hl === r.id && (
-                <rect x={TX - 118} y={104 + k * ROW_H} width={236} height={ROW_H - 4} rx={6} fill="var(--accent-soft)" />
-              )}
-              <HandText x={TX - 105} y={121 + k * ROW_H} size={15} anchor="start" mono>
+              {s.hl === r.id && <rect x={TX - 104} y={74 + k * ROW_H} width={208} height={ROW_H - 6} rx={6} fill="var(--accent-soft)" />}
+              <HandText x={TX - 96} y={91 + k * ROW_H} size={14} anchor="start" mono>
                 {String(r.id)}
               </HandText>
-              <HandText x={TX - 60} y={121 + k * ROW_H} size={15} anchor="start">
+              <HandText x={TX - 44} y={91 + k * ROW_H} size={14} anchor="start">
                 {r.text}
               </HandText>
             </motion.g>
           ))}
           {s.gone && (
-            <HandText x={TX} y={121 + s.rows.length * ROW_H} size={14} color="var(--bad)">
+            <HandText x={TX} y={91 + s.rows.length * ROW_H} size={13} color="var(--bad)">
               {`row ${s.gone} deleted`}
             </HandText>
           )}

@@ -76,17 +76,17 @@ export default function SlowStartCalc() {
           <p className="mb-1 text-xs text-muted">Segments sent in each round trip (the window doubles)</p>
           <div className="flex h-32 items-end gap-2 border-b border-line">
             <div className="flex w-10 flex-col items-center justify-end">
-              <span className="mb-1 text-[10px] text-muted">SYN</span>
+              <span className="mb-1 text-xs text-muted">SYN</span>
               <div className="h-2 w-full rounded-t bg-muted/50" />
             </div>
             {out.map((r, i) => (
               <div key={i} className="flex flex-1 flex-col items-center justify-end">
-                <span className="mb-1 text-[10px] tabular-nums text-muted">{r.cwnd}</span>
+                <span className="mb-1 text-xs tabular-nums text-muted">{r.cwnd}</span>
                 <div className="w-full rounded-t bg-accent" style={{ height: `${Math.max(4, (r.cwnd / max) * 96)}px` }} />
               </div>
             ))}
           </div>
-          <div className="mt-1 flex gap-2 text-[10px] text-muted">
+          <div className="mt-1 flex gap-2 text-xs text-muted">
             <span className="w-10 text-center">RTT 1</span>
             {out.map((_, i) => (
               <span key={i} className="flex-1 text-center">

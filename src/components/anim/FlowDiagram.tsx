@@ -9,6 +9,7 @@ import {
   SketchEllipse,
   SketchSvg,
   seedOf,
+  textBoost,
   type Pt,
 } from './sketch';
 
@@ -263,7 +264,7 @@ export default function FlowDiagram({
           >
             <circle r={7} fill={color} />
             {pk.label && (
-              <text y={-13} textAnchor="middle" fontSize={13} fontWeight={700} fill={color} style={{ fontFamily: 'var(--font-hand)' }}>
+              <text y={-13} textAnchor="middle" fontSize={14 * textBoost(width)} fontWeight={700} fill={color} style={{ fontFamily: 'var(--font-hand)' }}>
                 {pk.label}
               </text>
             )}

@@ -78,7 +78,7 @@ export default function HandshakeCost() {
                   {s.parts.map((p) => (
                     <div
                       key={p.label}
-                      className="flex items-center justify-center overflow-hidden whitespace-nowrap border-r border-bg text-[11px] font-medium text-white last:border-r-0"
+                      className="flex items-center justify-center overflow-hidden whitespace-nowrap border-r border-bg text-xs font-medium text-white last:border-r-0"
                       style={{ flex: p.rtts, background: p.color }}
                     >
                       {p.label}

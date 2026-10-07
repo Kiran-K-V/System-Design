@@ -1,6 +1,6 @@
 import { motion } from 'motion/react';
 import AnimFrame from '../AnimFrame';
-import { HandText, SketchBox, SketchSvg, seedOf } from '../sketch';
+import { HandText, SketchBox, SketchSvg, seedOf, textBoost } from '../sketch';
 
 type Kind = 'setup' | 'run' | 'stall';
 interface Seg {
@@ -102,10 +102,10 @@ const steps = [
   { caption: 'HTTP/3 runs over QUIC on UDP. QUIC tracks loss per stream. The lost packet belonged to app.js, so only app.js waits. The small files finish at 110 ms. QUIC also sets up in 1 round trip instead of 2.' },
 ];
 
-const X0 = 130;
-const SCALE = 700 / 520;
+const X0 = 112;
+const SCALE = 470 / 520;
 const px = (ms: number) => X0 + ms * SCALE;
-const ROW_Y = [78, 128, 178];
+const ROW_Y = [72, 120, 168];
 const COLOR: Record<Kind, string> = { setup: 'var(--muted)', run: 'var(--accent)', stall: 'var(--bad)' };
 
 function Bar({ seg, rowY }: { seg: Seg; rowY: number }) {
@@ -136,22 +136,22 @@ export default function HttpMultiplex() {
         const sc = i === 0 ? null : SC[i - 1];
         return (
           <>
-            <SketchSvg width={900} height={250} label="Timeline bars showing when each of three files loads">
+            <SketchSvg width={720} height={236} label="Timeline bars showing when each of three files loads">
               {RES.map((r, k) => (
                 <g key={r.key}>
-                  <HandText x={X0 - 12} y={ROW_Y[k] - 5} size={15} anchor="end">
+                  <HandText x={X0 - 10} y={ROW_Y[k] - 6} size={14} anchor="end">
                     {r.name}
                   </HandText>
-                  <HandText x={X0 - 12} y={ROW_Y[k] + 12} size={12} anchor="end" color="var(--muted)">
-                    {`${r.ms} ms of work`}
+                  <HandText x={X0 - 10} y={ROW_Y[k] + 11} size={13} anchor="end" color="var(--muted)">
+                    {`${r.ms} ms work`}
                   </HandText>
                 </g>
               ))}
-              <line x1={X0} x2={X0 + 700} y1={218} y2={218} stroke="var(--border)" />
+              <line x1={X0} x2={X0 + 470} y1={208} y2={208} stroke="var(--border)" />
               {[0, 100, 200, 300, 400, 500].map((t) => (
                 <g key={t}>
-                  <line x1={px(t)} x2={px(t)} y1={214} y2={222} stroke="var(--muted)" />
-                  <text x={px(t)} y={238} textAnchor="middle" fontSize={12} fill="var(--muted)">
+                  <line x1={px(t)} x2={px(t)} y1={204} y2={212} stroke="var(--muted)" />
+                  <text x={px(t)} y={238} textAnchor="middle" fontSize={14 * textBoost(900)} fill="var(--muted)">
                     {t} ms
                   </text>
                 </g>
@@ -166,13 +166,13 @@ export default function HttpMultiplex() {
                       {`done ${e} ms`}
                     </HandText>
                   ))}
-                  <HandText x={px(0) + 4} y={22} size={16} anchor="start">
-                    {`${sc.name}  (${sc.conns})`}
+                  <HandText x={px(0)} y={20} size={16} anchor="start">
+                    {`${sc.name} (${sc.conns})`}
                   </HandText>
                 </motion.g>
               )}
               {!sc && (
-                <HandText x={X0 + 350} y={125} size={18} color="var(--muted)">
+                <HandText x={X0 + 235} y={120} size={16} color="var(--muted)">
                   gray = connection setup, blue = transfer, red = stalled
                 </HandText>
               )}

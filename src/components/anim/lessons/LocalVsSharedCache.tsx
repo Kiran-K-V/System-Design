@@ -1,19 +1,19 @@
 import AnimFrame from '../AnimFrame';
 import FlowDiagram, { type FlowEdge, type FlowNode, type FlowNote, type FlowPacket } from '../FlowDiagram';
 
-const lb: FlowNode = { id: 'lb', x: 70, y: 170, w: 110, h: 64, label: 'Load\nbalancer' };
-const db: FlowNode = { id: 'db', x: 710, y: 250, w: 110, h: 100, shape: 'db', label: 'Database' };
+const lb: FlowNode = { id: 'lb', x: 55, y: 170, w: 96, h: 64, label: 'Load\nbalancer' };
+const db: FlowNode = { id: 'db', x: 590, y: 250, w: 100, h: 100, shape: 'db', label: 'Database' };
 const app = (n: 1 | 2 | 3, tone?: FlowNode['tone'], sub?: string): FlowNode => ({
   id: `a${n}`,
-  x: 300,
+  x: 245,
   y: 60 + (n - 1) * 110,
-  w: 170,
+  w: 160,
   h: 66,
   label: `App ${n}`,
   sub,
   tone,
 });
-const redis: FlowNode = { id: 'redis', x: 560, y: 70, w: 130, h: 70, label: 'Redis', sub: 'one shared copy' };
+const redis: FlowNode = { id: 'redis', x: 440, y: 70, w: 110, h: 70, label: 'Redis' };
 
 const lbEdges: FlowEdge[] = [1, 2, 3].map((n) => ({ from: 'lb', to: `a${n}` }));
 const dbEdges: FlowEdge[] = [1, 2, 3].map((n) => ({ from: `a${n}`, to: 'db', dashed: true }));
@@ -75,7 +75,7 @@ const SCENES: Scene[] = [
       { from: 'a2', to: 'redis', label: 'SET "Bea"', delay: 1 },
     ],
     active: ['a2', 'redis'],
-    sharedNote: { text: 'user:7 = Bea', tone: 'ok' },
+    sharedNote: { text: 'user:7 = Bea\n(one copy)', tone: 'ok' },
   },
   {
     caption: 'Now any server returns "Bea". There is one copy, so there is nothing to disagree with. The price: every read pays a ~0.5 ms network hop instead of a ~1 µs memory read, and Redis is one more thing that can fail.',
@@ -87,7 +87,7 @@ const SCENES: Scene[] = [
       { from: 'a1', to: 'redis', label: 'get', delay: 1 },
     ],
     active: ['a1', 'redis'],
-    sharedNote: { text: 'user:7 = Bea', tone: 'ok' },
+    sharedNote: { text: 'user:7 = Bea\n(one copy)', tone: 'ok' },
   },
 ];
 
@@ -98,13 +98,13 @@ export default function LocalVsSharedCache() {
         const s = SCENES[i];
         const sub = (k: number) => (s.shared ? undefined : `local copy: ${s.copies[k]}`);
         const nodes: FlowNode[] = [lb, app(1, s.tones[0], sub(0)), app(2, s.tones[1], sub(1)), app(3, s.tones[2], sub(2)), db, ...(s.shared ? [redis] : [])];
-        const edges: FlowEdge[] = [...lbEdges, ...(s.shared ? redisEdges : []), ...dbEdges];
+        const edges: FlowEdge[] = [...lbEdges, ...(s.shared ? [...redisEdges, { from: 'a2', to: 'db', dashed: true }] : dbEdges)];
         const dbText = s.shared ? 'DB: Bea' : i >= 2 ? 'DB: Bea' : i === 1 ? 'DB: Bea (just now)' : 'DB: Ana';
-        const notes: FlowNote[] = [{ x: 710, y: 318, text: dbText, anchor: 'middle', size: 17, tone: dbText.includes('Bea') ? 'ok' : undefined }];
-        if (s.shared) notes.push({ x: 640, y: 72, text: s.sharedNote?.text ?? '', size: 17, tone: s.sharedNote?.tone });
+        const notes: FlowNote[] = [{ x: 590, y: 318, text: dbText, anchor: 'middle', size: 17, tone: dbText.includes('Bea') ? 'ok' : undefined }];
+        if (s.shared) notes.push({ x: 505, y: 72, text: s.sharedNote?.text ?? '', size: 17, tone: s.sharedNote?.tone });
         return (
           <FlowDiagram
-            width={800}
+            width={660}
             height={340}
             nodes={nodes}
             edges={edges}

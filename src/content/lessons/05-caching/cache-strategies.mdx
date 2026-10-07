@@ -1,0 +1,155 @@
+---
+summary: "Five patterns decide who talks to the cache and in what order reads and writes happen. Each has a failure mode: stale reads, lost writes, or extra latency."
+requires: ['05-caching/why-cache', '05-caching/cache-placement']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import CacheStrategies from '../../../components/anim/lessons/CacheStrategies.tsx';
+import CacheAsideRace from '../../../components/anim/lessons/CacheAsideRace.tsx';
+
+## The problem
+
+You have a cache and a database. A read is easy to think about: look in the cache, else ask the database. A write is the hard part. A write changes the truth in the database. The cache still holds the old value.
+
+Now you have **two systems that must agree**, and no transaction spans both. A transaction (lesson 4.4) lets several changes succeed or fail as one unit. Your cache cannot join the database's transaction. So any write must touch two places, one after the other, and something can go wrong between the two steps.
+
+## Naive solution: write both, and hope
+
+The obvious code is:
+
+1. Update the database.
+2. Update the cache.
+
+It looks fine. It breaks in four ways:
+
+- **Crash between 1 and 2.** The database is new, the cache is old.
+- **Step 2 fails** (timeout, cache down). Same result.
+- **Two writers race.** Writer A and writer B update the same key. Their database writes land in order A, B. Their cache writes land in order B, A. The cache holds A's value while the database holds B's. Nothing crashed, and the two disagree forever.
+- **Wrong order.** Update the cache first, then the database fails. The cache now holds a value that never existed in the truth.
+
+Each caching pattern is a different answer to "who does these steps, and in which order?" Pick by what you can afford to get wrong.
+
+## Five patterns
+
+Pick a tab. Step through the reads and writes. At the end of each tab you will see what breaks.
+
+<CacheStrategies client:visible />
+
+### How to remember them
+
+| Pattern | Who talks to the database? | Read path | Write path | Main risk |
+|---|---|---|---|---|
+| **Cache-aside** | The app | App checks cache, loads on miss, fills cache | Write DB, then delete the cache key | Stale reads, races |
+| **Read-through** | The cache | Cache loads on a miss | (separate choice) | Stampede on misses, the loader is a dependency |
+| **Write-through** | The cache, in the write call | Always warm for written keys | Cache writes DB, then answers | Slower writes, cache full of unread data |
+| **Write-back** | The cache, later, in batches | Reads hit fresh data | Cache answers, flushes to DB later | **Lost writes** if the cache dies |
+| **Write-around** | The app, skipping the cache | Cache filled by reads only | Write to DB only | First read after write is a miss, stale if cached |
+
+Real systems mix them. A common pair is read-through plus write-through: the cache is the only door for the app. Another common pair is cache-aside for reads plus write-around for writes (delete on write, fill on read).
+
+## Why "delete" beats "update" on a write
+
+In cache-aside, the write path deletes the cached key. It does not set the new value. Facebook's memcache paper gives the reason in one line: they delete instead of update because **deletes are idempotent**. Running a delete twice is the same as running it once. An update done twice, in a different order from the database writes, leaves the wrong value (the race from the naive solution).
+
+Deleting also wastes no work. If nobody reads the key again soon, you never rebuild it.
+
+Even delete is not perfect. Step through this race. No server fails. Nothing is wrong with any single step.
+
+<CacheAsideRace client:visible />
+
+The reader's *set* arrives after the writer's *delete*. The cache ends up with v1 forever (until the TTL). Three common defenses:
+
+- **Always set a TTL.** It turns "wrong forever" into "wrong for at most N seconds". Redis and Memcached both support it, and the AWS ElastiCache guide recommends adding a TTL to either strategy to limit staleness.
+- **Leases.** Facebook's memcache gives a reader a 64-bit token when it misses. The reader must present the token when it fills the cache. A delete from a writer invalidates the token, so the late `SET` is refused. This works like load-link/store-conditional in CPUs.
+- **Versioned values.** Store a version number with the data. The cache only accepts a set with a higher version than what it holds.
+
+<Callout type="deep" title="Why not make the cache part of the transaction?">
+You can approximate it. In the **transactional outbox** pattern, the write also records "invalidate key k" in a table inside the same database transaction. A separate process reads that table and deletes the cache key, retrying until it succeeds. Facebook does a version of this: a daemon on each database watches committed SQL and broadcasts cache deletes. Change data capture (lesson 6.5) is the general form. The cost is delay: the cache is stale until the daemon runs.
+</Callout>
+
+## Write-back in more depth
+
+Write-back is the only pattern that makes writes *faster* than the database. It also takes on the most risk.
+
+- **Why it is fast.** The app gets "ok" after a ~0.5 ms memory write. The database write moves off the critical path.
+- **Why it can lower database load.** Many writes to one key collapse into one flush (see the animation). A hot counter updated 10,000 times a second can become one write per second.
+- **What it costs.** Until a flush, the cache holds the **only** copy of those writes. If the node dies, they are gone, and the user was told they succeeded.
+
+If you need write-back, reduce the risk: keep dirty data on replicated cache nodes, flush on a short interval, and write to a durable log first. At that point you are building a database, and you should ask if you wanted one. Use write-back for data you can lose or recompute: view counts, "last seen" times, metrics.
+
+## The numbers
+
+| Operation | Typical cost |
+|---|---|
+| Cache GET or SET, same data center | ~0.5 ms |
+| Database indexed read | ~1–5 ms (lesson 1.5) |
+| Database write, durable | ~5–10 ms (a flush to disk, replication) |
+| **Cache-aside miss** | cache check + DB read + cache set, about 6–8 ms: three trips |
+| **Write-through write** | cache + DB: ~6–11 ms |
+| **Write-back write** | cache only: ~0.5 ms |
+
+A cache-aside **miss is three network trips** (check, query, fill). That is a common surprise.
+
+## Trade-offs
+
+| Pattern | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Cache-aside | Simple, only hot data is cached, cache loss is survivable | Stale reads, a cold start, the logic lives in every caller | Default for read-heavy data |
+| Read-through | Less app code, one place for loading logic | A smarter cache, and a loader that can fail | Many services read the same data |
+| Write-through | Reads never stale for written keys | Slow writes, unread data fills the cache | Reads right after writes must be fresh |
+| Write-back | Fast writes, fewer DB writes | **Data loss on a crash**, harder to reason about | Counters, metrics, anything you can rebuild |
+| Write-around | Cache stays clean of write-once data | First read after a write is a miss | Logs, uploads, history |
+
+## Interview lens
+
+<Callout type="tip">
+Say the pattern and its failure mode together. "I will use cache-aside with a 5-minute TTL. On a write I update Postgres, then delete the key. If the delete fails, users see stale data for at most 5 minutes. For view counts I use write-back to Redis and flush every few seconds, and I accept losing a few seconds of counts in a crash."
+</Callout>
+
+<Callout type="mistake">
+Do not say "write-through is always consistent". It keeps the cache in line with the database *for successful writes*. It says nothing about a failed write, a second cache node, or a reader that started before the write. Also do not choose write-back for money, orders, or anything the user was told is saved.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A page-view counter takes 50,000 increments per second on a few hot keys. The database cannot take that many writes. Losing the last few seconds of counts after a crash is acceptable. Which pattern fits?',
+      options: ['Write-through', 'Write-around', 'Write-back, flushing totals every few seconds', 'Cache-aside with delete on write'],
+      answer: 2,
+      explain: 'Write-back collapses many increments into one flush and answers from memory. Write-through would send all 50,000 writes per second to the database. The only cost, losing a few seconds on a crash, is acceptable here.',
+    },
+    {
+      q: 'Cache-aside, TTL 10 minutes. A writer updates the database and crashes before it deletes the cache key. What is the longest a reader can see the old value?',
+      options: ['Zero. The database triggers an invalidation.', 'About 10 minutes, counted from when the old value was cached', 'Forever', 'Until the next write to any key'],
+      answer: 1,
+      explain: 'Nothing else invalidates the key, so the TTL is the only safety net. The old copy expires at most 10 minutes after it was stored. Without a TTL, the answer would be forever.',
+    },
+    {
+      q: 'Which sequence leaves the cache holding stale data in cache-aside, with no crash?',
+      options: [
+        'Reader checks cache (miss), reads DB (v1), writer updates DB (v2), writer deletes key, reader sets v1',
+        'Writer updates DB (v2), writer deletes key, reader checks cache (miss), reads DB (v2), reader sets v2',
+        'Reader checks cache (hit)',
+        'Writer updates DB (v2), writer deletes key',
+      ],
+      answer: 0,
+      explain: 'The reader read the old value before the write but filled the cache after the delete. Its late set overwrites the empty slot with v1. Leases or versioned values prevent this.',
+    },
+    {
+      q: 'A cache write takes 0.5 ms. A durable database write takes 8 ms. What is the write latency under write-through and under write-back?',
+      options: ['8.5 ms and 0.5 ms', '0.5 ms and 8.5 ms', '8 ms and 8 ms', '8.5 ms and 8.5 ms'],
+      answer: 0,
+      explain: 'Write-through waits for cache and database in turn: 0.5 + 8 = 8.5 ms. Write-back answers after the cache write only (0.5 ms) and flushes later.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Scaling Memcache at Facebook (NSDI 2013)](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala). Look-aside cache, delete on write, leases, and invalidation daemons.
+- [AWS ElastiCache: caching strategies](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Strategies.html). Lazy loading, write-through, and adding a TTL, with pros and cons.
+- [Redis: client-side caching](https://redis.io/docs/latest/develop/clients/client-side-caching/). Server-sent invalidation as an alternative to TTLs.

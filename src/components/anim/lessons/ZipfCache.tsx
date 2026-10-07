@@ -42,8 +42,8 @@ export default function ZipfCache() {
 
   // Right panel: cumulative curve on a log x axis.
   const W = 340;
-  const H = 190;
-  const P = { l: 40, r: 12, t: 12, b: 34 };
+  const H = 200;
+  const P = { l: 46, r: 12, t: 14, b: 38 };
   const xOf = (keys: number) => P.l + (Math.log10(keys) / 6) * (W - P.l - P.r);
   const yOf = (share: number) => H - P.b - share * (H - P.t - P.b);
   const curve: string[] = [];
@@ -67,9 +67,9 @@ export default function ZipfCache() {
         <Seg value={s} options={SKEWS} onChange={setS} label="Skew of the key popularity" />
       </div>
       <div className="grid gap-4 sm:grid-cols-2">
-        <svg viewBox="0 0 340 190" className="h-auto w-full" role="img" aria-label="Bar chart: share of requests for each of the 48 most popular keys">
-          <text x={P.l} y={10} fontSize={11} fill="var(--muted)">
-            requests per key (most popular 48 shown)
+        <svg viewBox="0 0 340 200" className="h-auto w-full" role="img" aria-label="Bar chart: share of requests for each of the 48 most popular keys">
+          <text x={P.l} y={12} fontSize={14} fill="var(--muted)">
+            requests per key (top 48)
           </text>
           {bars.map((b, i) => {
             const bw = (W - P.l - P.r) / BARS;
@@ -88,13 +88,13 @@ export default function ZipfCache() {
             );
           })}
           <line x1={P.l} x2={W - P.r} y1={H - P.b} y2={H - P.b} stroke="var(--muted)" />
-          <text x={P.l} y={H - P.b + 14} fontSize={10} fill="var(--muted)">
+          <text x={P.l} y={H - P.b + 14} fontSize={14} fill="var(--muted)">
             key rank 1
           </text>
-          <text x={W - P.r} y={H - P.b + 14} fontSize={10} fill="var(--muted)" textAnchor="end">
+          <text x={W - P.r} y={H - P.b + 14} fontSize={14} fill="var(--muted)" textAnchor="end">
             48
           </text>
-          <text x={(P.l + W - P.r) / 2} y={H - 4} textAnchor="middle" fontSize={10} fill="var(--muted)">
+          <text x={(P.l + W - P.r) / 2} y={H - 3} textAnchor="middle" fontSize={14} fill="var(--muted)">
             green = in cache, grey = not cached
           </text>
         </svg>
@@ -103,23 +103,23 @@ export default function ZipfCache() {
           {[0, 0.25, 0.5, 0.75, 1].map((v) => (
             <g key={v}>
               <line x1={P.l} x2={W - P.r} y1={yOf(v)} y2={yOf(v)} stroke="var(--border)" />
-              <text x={P.l - 5} y={yOf(v) + 4} textAnchor="end" fontSize={10} fill="var(--muted)">
+              <text x={P.l - 5} y={yOf(v) + 4} textAnchor="end" fontSize={14} fill="var(--muted)">
                 {v * 100}%
               </text>
             </g>
           ))}
           {[1, 2, 3, 4, 5, 6].map((e) => (
-            <text key={e} x={xOf(Math.pow(10, e))} y={H - P.b + 14} textAnchor="middle" fontSize={10} fill="var(--muted)">
+            <text key={e} x={xOf(Math.pow(10, e))} y={H - P.b + 14} textAnchor="middle" fontSize={14} fill="var(--muted)">
               {e === 6 ? '1M' : e === 3 ? '1K' : `10^${e}`}
             </text>
           ))}
-          <text x={(P.l + W - P.r) / 2} y={H - 4} textAnchor="middle" fontSize={10} fill="var(--muted)">
+          <text x={(P.l + W - P.r) / 2} y={H - 3} textAnchor="middle" fontSize={14} fill="var(--muted)">
             keys in cache (log scale)
           </text>
           <polyline points={curve.join(' ')} fill="none" stroke="var(--accent)" strokeWidth={2} />
           <line x1={xOf(size)} x2={xOf(size)} y1={P.t} y2={H - P.b} stroke="var(--muted)" strokeDasharray="3 3" />
           <circle cx={xOf(size)} cy={yOf(hit)} r={5} fill="var(--ok)" />
-          <text x={P.l + 6} y={P.t + 8} textAnchor="start" fontSize={11} fill="var(--muted)">
+          <text x={P.l + 6} y={P.t + 8} textAnchor="start" fontSize={14} fill="var(--muted)">
             hit ratio
           </text>
         </svg>

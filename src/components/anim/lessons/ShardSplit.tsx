@@ -66,41 +66,42 @@ export default function ShardSplit() {
       {(_, s) => {
         const one = s.stage === 'one';
         const text = s.stage === 'hash' ? hashText : s.stage === 'directory' ? dirText : rangeText;
-        const nodes: FlowNode[] = [{ id: 'client', x: 70, y: 175, w: 100, h: 56, label: 'App', sub: 'servers' }];
+        const nodes: FlowNode[] = [{ id: 'client', x: 50, y: 165, w: 84, h: 56, label: 'App', sub: 'servers' }];
         const edges: FlowEdge[] = [];
         const notes: FlowNote[] = [];
         const groups: FlowGroup[] = [];
 
         if (one) {
-          nodes.push({ id: 'db', x: 400, y: 175, w: 150, h: 120, shape: 'db', label: 'users', sub: '30 TB', tone: 'bad' });
+          nodes.push({ id: 'db', x: 320, y: 165, w: 150, h: 120, shape: 'db', label: 'users', sub: '30 TB', tone: 'bad' });
           edges.push({ from: 'client', to: 'db', label: '40K writes/s', tone: 'bad', labelAt: [0, -18] });
-          notes.push({ x: 540, y: 120, text: 'too big for\none disk', tone: 'bad' }, { x: 540, y: 230, text: 'too many writes\nfor one primary', tone: 'bad' });
+          notes.push({ x: 425, y: 110, text: 'too big for\none disk', tone: 'bad', size: 15 }, { x: 425, y: 225, text: 'too many writes\nfor one primary', tone: 'bad', size: 15 });
         } else {
-          nodes.push({ id: 'router', x: 250, y: 175, w: 120, h: 60, label: 'Router', sub: 'knows the map' });
+          nodes.push({ id: 'router', x: 190, y: 165, w: 120, h: 60, label: 'Router', sub: 'knows the map' });
           edges.push({ from: 'client', to: 'router' });
-          const ys: Record<string, number> = { s1: 60, s2: 175, s3: 290 };
+          const ys: Record<string, number> = { s1: 58, s2: 165, s3: 272 };
           for (const id of ['s1', 's2', 's3']) {
-            nodes.push({ id, x: 560, y: ys[id], w: 130, h: 82, shape: 'db', label: `Shard ${id[1]}`, sub: text[id].replace('\n', ' ') });
+            nodes.push({ id, x: 470, y: ys[id], w: 130, h: 90, shape: 'db', label: `Shard ${id[1]}`, sub: text[id].replace('\n', ' ') });
             edges.push({ from: 'router', to: id });
           }
           if (s.stage === 'directory') {
-            nodes.push({ id: 'dir', x: 250, y: 50, w: 140, h: 56, shape: 'dashed', label: 'Directory', sub: 'key → shard' });
+            nodes.push({ id: 'dir', x: 190, y: 45, w: 130, h: 56, shape: 'dashed', label: 'Directory', sub: 'key → shard' });
             edges.push({ from: 'router', to: 'dir', head: 'both' });
-            notes.push({ x: 330, y: 20, text: 'one more thing to run', anchor: 'start' });
+            notes.push({ x: 270, y: 30, text: 'one more thing\nto run', anchor: 'start', size: 14 });
           }
           if (s.stage === 'replicas') {
             for (const [i, id] of ['s1', 's2', 's3'].entries()) {
               const y = ys[id];
-              nodes.push({ id: `r${i + 1}`, x: 790, y, w: 110, h: 70, shape: 'db', label: 'follower', sub: `copy of ${i + 1}`, tone: 'ok' });
-              edges.push({ from: id, to: `r${i + 1}`, dashed: true, tone: 'ok', label: 'replicate', labelAt: [0, -14] });
-              groups.push({ x: 425, y: y - 52, w: 435, h: 104, label: `group ${i + 1}` });
+              nodes.push({ id: `r${i + 1}`, x: 650, y, w: 100, h: 74, shape: 'db', label: 'follower', sub: `copy of ${i + 1}`, tone: 'ok' });
+              edges.push({ from: id, to: `r${i + 1}`, dashed: true, tone: 'ok', label: 'replicate', labelAt: [0, -16] });
+              if (i === 0) notes.push({ x: 715, y: 338, text: 'dashed box = one shard group (leader + follower)', anchor: 'end', size: 14 });
+              groups.push({ x: 335, y: y - 50, w: 380, h: 100, label: ' '.repeat(i + 1) });
             }
           }
         }
         return (
           <FlowDiagram
-            width={900}
-            height={350}
+            width={720}
+            height={348}
             nodes={nodes}
             edges={edges}
             notes={notes}

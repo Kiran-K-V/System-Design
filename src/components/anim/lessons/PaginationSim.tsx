@@ -97,7 +97,8 @@ export default function PaginationSim() {
   const [s, setS] = useState<State>(() => initial(4));
   const [last, setLast] = useState<string>('');
 
-  const fetchNext = () =>
+  const fetchNext = () => {
+    setLast('Both clients fetched their next page. Compare the two lists below.');
     setS((cur) => {
       const off = cur.offsetPages.length * cur.limit;
       const offsetPage = cur.list.slice(off, off + cur.limit);
@@ -110,6 +111,7 @@ export default function PaginationSim() {
         cursorPages: cursorPage.length ? [...cur.cursorPages, cursorPage] : cur.cursorPages,
       };
     });
+  };
 
   const addPost = () => {
     setS((cur) => ({ ...cur, list: [cur.nextId, ...cur.list], nextId: cur.nextId + 1 }));

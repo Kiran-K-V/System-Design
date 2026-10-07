@@ -17,27 +17,27 @@ const steps: Step[] = [
   { caption: 'A common fix: build a second, sharded copy keyed by amount (a global secondary index). The query now asks one index shard, then fetches from the 2 data shards that match. The price: every write updates two places.', stage: 'index' },
 ];
 
-const SY = [50, 135, 220, 305];
+const SY = [45, 125, 205, 285];
 
 function diagram(stage: Exclude<Stage, 'tail'>) {
   const nodes: FlowNode[] = [
-    { id: 'client', x: 65, y: 178, w: 96, h: 56, label: 'App' },
-    { id: 'router', x: 245, y: 178, w: 120, h: 60, label: 'Router' },
+    { id: 'client', x: 50, y: 165, w: 84, h: 56, label: 'App' },
+    { id: 'router', x: 185, y: 165, w: 110, h: 60, label: 'Router' },
   ];
   const edges: FlowEdge[] = [{ from: 'client', to: 'router' }];
   const notes: FlowNote[] = [];
   let packets: FlowPacket[] = [];
   let active: string[] = ['router'];
   const times = ['4 ms', '5 ms', '6 ms', '38 ms'];
-  const shardX = stage === 'index' ? 640 : 600;
+  const shardX = 455;
   SY.forEach((y, i) => {
     const id = `s${i + 1}`;
     nodes.push({
       id,
       x: shardX,
       y,
-      w: 130,
-      h: 64,
+      w: 120,
+      h: 74,
       shape: 'db',
       label: `Shard ${i + 1}`,
       sub: stage === 'slow' ? times[i] : undefined,
@@ -52,7 +52,7 @@ function diagram(stage: Exclude<Stage, 'tail'>) {
       { from: 'router', to: 's2', delay: 0.9 },
     ];
     active = ['router', 's2'];
-    notes.push({ x: 700, y: 135, text: 'only shard 2\nis asked', anchor: 'start' });
+    notes.push({ x: 540, y: 125, text: 'only shard 2\nis asked', anchor: 'start', size: 15 });
   } else if (stage === 'all') {
     for (let i = 1; i <= 4; i++) edges.push({ from: 'router', to: `s${i}` });
     packets = [
@@ -60,25 +60,25 @@ function diagram(stage: Exclude<Stage, 'tail'>) {
       ...[1, 2, 3, 4].map((i) => ({ from: 'router', to: `s${i}`, delay: 0.9 })),
     ];
     active = ['router', 's1', 's2', 's3', 's4'];
-    notes.push({ x: 700, y: 178, text: 'every shard\nis asked', anchor: 'start' });
+    notes.push({ x: 540, y: 165, text: 'every shard\nis asked', anchor: 'start', size: 15 });
   } else if (stage === 'slow') {
     for (let i = 1; i <= 4; i++) edges.push({ from: 'router', to: `s${i}`, head: 'both' });
     packets = [1, 2, 3, 4].map((i) => ({ from: `s${i}`, to: 'router', tone: i === 4 ? 'bad' : 'ok' }) as FlowPacket);
     active = ['router'];
-    notes.push({ x: 700, y: 178, text: 'router waits\nfor the slowest', anchor: 'start', tone: 'bad' });
+    notes.push({ x: 540, y: 165, text: 'router waits\nfor the slowest', anchor: 'start', tone: 'bad', size: 15 });
   } else {
-    nodes.push({ id: 'idx', x: 245, y: 60, w: 150, h: 60, shape: 'dashed', label: 'Index', sub: 'amount → shard' });
+    nodes.push({ id: 'idx', x: 185, y: 48, w: 140, h: 62, shape: 'dashed', label: 'Index', sub: 'amount → shard' });
     edges.push({ from: 'router', to: 'idx', head: 'both' }, { from: 'router', to: 's1' }, { from: 'router', to: 's3' });
     nodes.forEach((n) => {
       if (n.id === 's2' || n.id === 's4') n.tone = 'muted';
     });
     packets = [
-      { from: 'router', to: 'idx', label: 'amount>500' },
+      { from: 'router', to: 'idx' },
       { from: 'router', to: 's1', delay: 1 },
       { from: 'router', to: 's3', delay: 1 },
     ];
     active = ['router', 'idx', 's1', 's3'];
-    notes.push({ x: 705, y: 178, text: 'only the shards\nwith matches', anchor: 'start' });
+    notes.push({ x: 540, y: 165, text: 'only the shards\nwith matches', anchor: 'start', size: 15 });
   }
   return { nodes, edges, notes, packets, active };
 }
@@ -90,23 +90,23 @@ function TailBars() {
     { n: 100, p: (1 - 0.99 ** 100) * 100 },
   ];
   return (
-    <SketchSvg width={900} height={350} label="Chance that a fan-out query hits at least one slow shard">
-      <HandText x={450} y={30} size={17}>
-        Chance a query waits on at least one slow shard (each shard slow 1% of the time)
+    <SketchSvg width={720} height={330} label="Chance that a fan-out query hits at least one slow shard">
+      <HandText x={360} y={28} size={16}>
+        {'Chance a query waits on a slow shard\n(each shard is slow 1% of the time)'}
       </HandText>
       {rows.map((r, i) => {
-        const y = 80 + i * 84;
-        const w = (r.p / 100) * 560;
+        const y = 85 + i * 78;
+        const w = (r.p / 100) * 400;
         return (
           <g key={r.n}>
-            <HandText x={150} y={y + 22} size={17} anchor="end">{`${r.n} shard${r.n > 1 ? 's' : ''}`}</HandText>
-            <rect x={170} y={y} width={560} height={44} rx={6} fill="var(--surface)" />
-            <rect x={170} y={y} width={Math.max(4, w)} height={44} rx={6} fill="var(--bad)" opacity={0.75} />
-            <HandText x={180 + Math.max(4, w)} y={y + 22} size={18} weight={700} anchor="start">{`${r.p.toFixed(1)}%`}</HandText>
+            <HandText x={120} y={y + 22} size={17} anchor="end">{`${r.n} shard${r.n > 1 ? 's' : ''}`}</HandText>
+            <rect x={135} y={y} width={400} height={44} rx={6} fill="var(--surface)" />
+            <rect x={135} y={y} width={Math.max(4, w)} height={44} rx={6} fill="var(--bad)" opacity={0.75} />
+            <HandText x={545} y={y + 22} size={18} weight={700} anchor="start">{`${r.p.toFixed(1)}%`}</HandText>
           </g>
         );
       })}
-      <HandText x={450} y={336} size={14} color="var(--muted)">
+      <HandText x={360} y={312} size={15} color="var(--muted)">
         formula: 1 − 0.99ⁿ
       </HandText>
     </SketchSvg>
@@ -119,7 +119,7 @@ export default function ScatterGather() {
       {(_, s) => {
         if (s.stage === 'tail') return <TailBars />;
         const d = diagram(s.stage);
-        return <FlowDiagram width={900} height={350} nodes={d.nodes} edges={d.edges} notes={d.notes} packets={d.packets} active={d.active} stepKey={s.stage} label="Router sending a query to shards" />;
+        return <FlowDiagram width={720} height={330} nodes={d.nodes} edges={d.edges} notes={d.notes} packets={d.packets} active={d.active} stepKey={s.stage} label="Router sending a query to shards" />;
       }}
     </AnimFrame>
   );

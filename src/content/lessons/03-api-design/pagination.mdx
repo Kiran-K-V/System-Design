@@ -1,0 +1,190 @@
+---
+summary: Offset pagination skips N rows and breaks when the list changes. Cursor pagination remembers the last item seen, stays correct under writes and stays fast at any depth.
+requires: ['03-api-design/rest']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import PaginationShift from '../../../components/anim/lessons/PaginationShift.tsx';
+import PaginationSim from '../../../components/anim/lessons/PaginationSim.tsx';
+
+## The problem
+
+Your tweets table has 10 million rows. A client calls `GET /tweets`. If the server answers with everything, that is 10 million x ~300 bytes = ~3 GB in one response. The server runs out of memory and the phone never finishes the download.
+
+So every list endpoint must return a bounded slice, and let the client ask for the next slice. This is **pagination**. The default page is small: 20 tweets is ~6 KB, one fast round trip.
+
+The design question is how the client says "the next slice".
+
+## Naive solution: offset and limit
+
+The first idea is the one SQL gives you.
+
+```sql
+SELECT * FROM tweets ORDER BY created_at DESC LIMIT 20 OFFSET 40;
+```
+
+The API shape is `GET /tweets?offset=40&limit=20`. The client asks for page 3 by skipping 40 rows. It is simple, and it lets the user jump straight to page 7. GitHub's REST API uses this style (`page` and `per_page`, default 30, max 100 on most endpoints).
+
+It has two flaws.
+
+### Flaw 1: it is wrong when the list changes
+
+A feed changes all the time. Offset is a **position**: "the 5th row from the top". Positions move when rows are added or removed. Watch what that does.
+
+<PaginationShift client:visible />
+
+An insert above the reader pushes items down, so the next page repeats one. A delete above the reader pulls items up, so the next page skips one. The reader sees a duplicate or a gap, and the server returns `200` both times. Nothing signals the error.
+
+### Flaw 2: it gets slower the deeper you go
+
+The database cannot jump to row 1,000,000. PostgreSQL's documentation says it plainly: "The rows skipped by an OFFSET clause still have to be computed inside the server; therefore a large OFFSET might be inefficient."
+
+So `OFFSET 1000000 LIMIT 20` reads and drops 1,000,000 rows to return 20. The cost grows in a straight line with the offset. If skipping a row costs ~1 µs (an assumption), page 1 costs ~20 µs and offset 1,000,000 costs ~1 s. A crawler that walks every page makes the total quadratic.
+
+One more rule from the same docs: always use `ORDER BY` with a unique ordering. Without it, the database may return rows in a different order for each query.
+
+## The mechanism: a cursor
+
+A **cursor** marks where the last page ended. Instead of "skip 40", the client says "give me items after this one".
+
+```sql
+SELECT * FROM tweets
+WHERE (created_at, id) < (:last_created_at, :last_id)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+This is also called **keyset pagination**: you page by the values of the sort key.
+
+Why it fixes both flaws:
+
+- **Correct under writes.** The cursor is a value, not a position. Rows inserted above it or deleted above it do not change what "older than this item" means.
+- **Fast at any depth.** With an index on `(created_at, id)`, the database seeks directly to the cursor in about log(n) steps, then reads 20 rows. An **index** is a sorted copy of some columns that the database uses to find rows without scanning (lesson 4.3). Page 1 and page 50,000 cost the same.
+
+The response carries the next cursor:
+
+```json
+{
+  "data": [ { "id": 981, "text": "..." } ],
+  "next_cursor": "eyJ0IjoxNzAwMDAwMDAwLCJpZCI6OTgxfQ",
+  "has_more": true
+}
+```
+
+Rules for a good cursor:
+
+1. **Make it opaque.** Encode the sort key (for example in base64) and tell clients not to parse it. Then you can change the internals later without breaking anyone. The GraphQL documentation recommends the same.
+2. **Break ties.** Many tweets share one `created_at`. Sort by `(created_at, id)`. A non-unique key makes items vanish or repeat at page borders.
+3. **Say when it ends.** Return `has_more` or an empty `next_cursor`. Slack warns against guessing the end by comparing the result size with the limit: the last full page would look like "more".
+4. **Cap the limit.** Stripe takes 1 to 100 items per page, default 10. Slack recommends 100 to 200 and allows up to 1,000.
+
+Try it. Change the list between pages and compare.
+
+<PaginationSim client:visible />
+
+### What real APIs do
+
+| API | Style | How the client continues |
+|---|---|---|
+| Stripe | Cursor on object ids | `starting_after=<id>` or `ending_before=<id>`, plus `has_more` |
+| Slack | Opaque cursor | `cursor=<next_cursor>`; an empty `next_cursor` ends the list; cursors expire |
+| GitHub REST | Page number | `page` and `per_page`, and a `Link` header with `next`, `prev`, `first`, `last` |
+| GraphQL (Relay style) | Cursor connection | `first: 10, after: $cursor`; `pageInfo { endCursor hasNextPage }` |
+
+## What a cursor cannot do
+
+Cursors give up two things.
+
+- **Jumping to page N.** A cursor only moves forward or back from a known item. A UI with page numbers ("1 2 3 ... 40") needs offset.
+- **A cheap total count.** `COUNT(*)` on a big table is itself a scan. Return `has_more` instead of "page 3 of 500,000". If you need a number, an approximate count is usually enough.
+
+Cursors also do not freeze the list. New rows above the cursor never show up in the current walk. That is usually what you want. If you need a consistent snapshot, such as for an export, fix a maximum id or timestamp at the start and add it to every query.
+
+## Numbers
+
+- **Response size.** 20 items x ~300 B = ~6 KB. 100 items = ~30 KB. Choose the page size to fit one fast round trip.
+- **Offset cost.** Reads `offset + limit` rows. Page 50,000 at 20 per page is offset 1,000,000: ~1,000,020 rows read for 20 returned.
+- **Cursor cost.** About log(n) index steps plus `limit` rows. For 10 million rows, a balanced tree with a few hundred keys per node is only 3 to 4 levels deep (assumption, see lesson 4.3).
+- **Total cost of a full walk.** Offset sums to roughly n^2 / (2 x limit) row reads. Cursor reads n rows. For n = 1,000,000 and limit 20, that is ~25 billion against 1 million (derived).
+
+## Trade-offs
+
+| Choice | Gain | Pay | Choose it when |
+|---|---|---|---|
+| Offset | Simple, can jump to any page, easy total count | Duplicates and gaps under writes, slow when deep | Small, mostly static data; admin tables; search with page numbers |
+| Cursor (keyset) | Stable, constant cost, scales | No page jump, needs a unique sort key and an index | Feeds, infinite scroll, exports, anything large or live |
+| Cursor over many shards | Same client contract | Server must merge streams from each shard | Sharded stores (lesson 4.7) |
+
+## Interview lens
+
+<Callout type="tip">
+Say it in one breath: "A list endpoint takes a `limit` and a `cursor`, and returns `next_cursor`. I use cursors because the feed changes while users read it, and offset would repeat or skip posts." Then add the tie-breaker: sort by `(created_at, id)`.
+</Callout>
+
+<Callout type="mistake">
+Do not offer offset pagination for a large, live feed and then move on. Interviewers will ask "what happens if a new post arrives between page 1 and page 2?" Also do not forget the unique tie-breaker in the sort key.
+</Callout>
+
+<Callout type="deep" title="Offset over many shards is worse">
+Say the data lives on S shards, and a client asks for offset 10,000 and limit 20 in the global order. No shard knows how many rows to skip. Each shard must return its top 10,020 rows. The coordinator merges S x 10,020 rows and throws almost all of them away. Cursors avoid this: each shard returns only the next 20 rows after the cursor, and the coordinator merges S x 20.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A client reads page 1 of a feed (offset 0, limit 10). Three new posts arrive at the top. The client then reads page 2 (offset 10, limit 10). What does it see?',
+      options: [
+        'Posts 11 to 20 of the old list, exactly',
+        'The last 3 posts of page 1 again, then 7 posts it has not seen',
+        'An error, because the offset moved',
+        'Nothing, because page 2 is empty'
+      ],
+      answer: 1,
+      explain: 'The 3 new posts push everything down by 3. The old posts 8, 9 and 10 now sit at positions 10 to 12, so page 2 starts with them: three duplicates.',
+    },
+    {
+      q: 'An endpoint sorts by score, and many items share the same score. You build a cursor from the last score only: WHERE score < :cursor. What goes wrong?',
+      options: [
+        'Nothing. Scores are enough',
+        'Items that tie with the last item of a page get skipped',
+        'The query becomes slower',
+        'The cursor becomes too long',
+      ],
+      answer: 1,
+      explain: 'WHERE score < :cursor drops every item whose score equals the cursor, including ones not yet shown. Use a unique key: (score, id), and compare both.',
+    },
+    {
+      q: 'An admin screen shows a table of 5,000 rows with page numbers 1 to 50 and a "jump to page 37" box. Which pagination fits best?',
+      options: [
+        'Cursor, because it is always better',
+        'Offset, because the data is small, rarely changes, and users jump to pages',
+        'No pagination, return all 5,000 rows',
+        'Cursor with a very large limit',
+      ],
+      answer: 1,
+      explain: 'Offset is the only style that jumps to page 37. At 5,000 rows, the cost and the drift are small. Cursors are better for large, live lists, not for every list.',
+    },
+    {
+      q: 'A job exports all 2 million rows of a table using OFFSET with LIMIT 1000. About how many row reads does the database do in total, and what is the better design?',
+      options: [
+        '2 million. Offset is fine',
+        '~2 billion. Use a cursor so each page seeks directly',
+        '~2 trillion. Use a bigger limit',
+        '~4 million. Add an index',
+      ],
+      answer: 1,
+      explain: 'There are 2,000 pages. Page k reads about k x 1,000 rows, so the total is about 1,000 x (2,000 x 2,001 / 2) = ~2 billion. With a cursor, each page seeks to its start and reads 1,000 rows: 2 million in total.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [PostgreSQL: LIMIT and OFFSET](https://www.postgresql.org/docs/current/queries-limit.html): why large offsets are slow and why ORDER BY matters.
+- [Stripe API: Pagination](https://docs.stripe.com/api/pagination): cursor pagination with `starting_after`, `ending_before` and `has_more`.
+- [Slack: Pagination](https://docs.slack.dev/apis/web-api/pagination): opaque cursors, `next_cursor` and the advice not to infer the end from result size.
+- [GraphQL: Pagination](https://graphql.org/learn/pagination/): cursor connections with `edges`, `pageInfo` and `first/after`.

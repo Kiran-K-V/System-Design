@@ -4,8 +4,8 @@ import { NODE_COLORS } from '../HashRing';
 
 const H = Array.from({ length: 20 }, (_, i) => i);
 const LETTERS = ['A', 'B', 'C', 'D', 'E'];
-const CELL = 40;
-const X0 = 60;
+const CELL = 32;
+const X0 = 48;
 
 interface Step {
   caption: string;
@@ -36,8 +36,8 @@ function Row({ y, mod, label, moved }: { y: number; mod: number; label: string; 
         const changed = moved && h % 4 !== h % 5;
         return (
           <g key={h}>
-            <rect x={X0 + h * CELL + 2} y={y - 17} width={CELL - 4} height={34} rx={6} fill={NODE_COLORS[owner]} opacity={0.5} stroke={changed ? 'var(--bad)' : 'none'} strokeWidth={changed ? 2.4 : 0} />
-            <HandText x={X0 + h * CELL + CELL / 2} y={y} size={15} weight={700}>
+            <rect x={X0 + h * CELL + 2} y={y - 16} width={CELL - 4} height={32} rx={6} fill={NODE_COLORS[owner]} opacity={0.5} stroke={changed ? 'var(--bad)' : 'none'} strokeWidth={changed ? 2.4 : 0} />
+            <HandText x={X0 + h * CELL + CELL / 2} y={y} size={16} weight={700}>
               {LETTERS[owner]}
             </HandText>
           </g>
@@ -52,49 +52,49 @@ export default function ModNFail() {
     <AnimFrame title="Why hash % N breaks when N changes" steps={steps}>
       {(_, s) =>
         s.stage === 'scale' ? (
-          <SketchSvg width={900} height={300} label="Share of keys moved: mod N versus a ring, for three cluster sizes">
-            <HandText x={450} y={22} size={16}>
+          <SketchSvg width={720} height={290} label="Share of keys moved: mod N versus a ring, for three cluster sizes">
+            <HandText x={360} y={22} size={17}>
               Share of keys that move when one server is added
             </HandText>
             {SCALE.map((r, i) => {
-              const y = 70 + i * 78;
-              const bar = (v: number) => (v / 100) * 480;
+              const y = 60 + i * 74;
+              const bar = (v: number) => (v / 100) * 360;
               return (
                 <g key={r.n}>
-                  <HandText x={190} y={y + 26} size={18} anchor="end">
+                  <HandText x={170} y={y + 26} size={16} anchor="end">
                     {`${r.n} → ${r.n + 1} servers`}
                   </HandText>
-                  <rect x={210} y={y} width={bar(r.mod)} height={24} rx={4} fill="var(--bad)" opacity={0.75} />
-                  <HandText x={218 + bar(r.mod)} y={y + 12} size={16} anchor="start">{`hash % N: ${r.mod}%`}</HandText>
-                  <rect x={210} y={y + 28} width={Math.max(3, bar(r.ring))} height={24} rx={4} fill="var(--ok)" opacity={0.8} />
-                  <HandText x={218 + Math.max(3, bar(r.ring))} y={y + 40} size={16} anchor="start">{`ring: ${r.ring}%`}</HandText>
+                  <rect x={185} y={y} width={bar(r.mod)} height={24} rx={4} fill="var(--bad)" opacity={0.75} />
+                  <HandText x={193 + bar(r.mod)} y={y + 12} size={15} anchor="start">{`hash % N: ${r.mod}%`}</HandText>
+                  <rect x={185} y={y + 28} width={Math.max(3, bar(r.ring))} height={24} rx={4} fill="var(--ok)" opacity={0.8} />
+                  <HandText x={193 + Math.max(3, bar(r.ring))} y={y + 40} size={15} anchor="start">{`ring: ${r.ring}%`}</HandText>
                 </g>
               );
             })}
           </SketchSvg>
         ) : (
-          <SketchSvg width={900} height={250} label="Twenty keys and the server each one maps to, before and after adding a server">
-            <Badge cx={26} cy={50} n={1} seed={seedOf('mn1')} />
-            <Row y={50} mod={4} label="" />
-            <HandText x={X0} y={92} size={16} anchor="start" color="var(--muted)">
-              hash % 4: hash 0 → A, 1 → B, 2 → C, 3 → D, 4 → A, 5 → B ...
+          <SketchSvg width={720} height={270} label="Twenty keys and the server each one maps to, before and after adding a server">
+            <Badge cx={20} cy={60} n={1} seed={seedOf('mn1')} />
+            <Row y={60} mod={4} label="" />
+            <HandText x={X0} y={96} size={15} anchor="start" color="var(--muted)">
+              hash % 4: 0 → A, 1 → B, 2 → C, 3 → D, 4 → A, 5 → B ...
             </HandText>
             {s.stage !== 'before' && (
               <>
-                <Badge cx={26} cy={150} n={2} seed={seedOf('mn2')} />
-                <Row y={150} mod={5} label="" moved={s.stage === 'moved'} />
-                <HandText x={X0} y={192} size={16} anchor="start" color="var(--muted)">
-                  hash % 5: hash 0 → A, 1 → B, 2 → C, 3 → D, 4 → E, 5 → A ...
+                <Badge cx={20} cy={160} n={2} seed={seedOf('mn2')} />
+                <Row y={160} mod={5} label="" moved={s.stage === 'moved'} />
+                <HandText x={X0} y={196} size={15} anchor="start" color="var(--muted)">
+                  hash % 5: 0 → A, 1 → B, 2 → C, 3 → D, 4 → E, 5 → A ...
                 </HandText>
               </>
             )}
             {s.stage === 'moved' && (
-              <HandText x={X0 + 10 * CELL} y={228} size={18} color="var(--bad)" weight={700}>
+              <HandText x={X0 + 10 * CELL} y={240} size={19} color="var(--bad)" weight={700}>
                 16 of 20 keys changed server (80%)
               </HandText>
             )}
             {[0, 5, 10, 15].map((h) => (
-              <HandText key={h} x={X0 + h * CELL + CELL / 2} y={12} size={12} color="var(--muted)">
+              <HandText key={h} x={X0 + h * CELL + CELL / 2} y={16} size={14} color="var(--muted)">
                 {`h=${h}`}
               </HandText>
             ))}

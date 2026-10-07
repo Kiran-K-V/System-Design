@@ -8,9 +8,10 @@ import { HandText, SketchArrow, SketchBox, SketchSvg, seedOf } from '../sketch';
  */
 
 const RTT = 80; // ms, assumed phone-to-server round trip
-const X0 = 176;
-const PX = 2.2; // pixels per ms
+const X0 = 100;
+const PX = 1.85; // viewBox units per ms. 640 wide, text >= 13px.
 const x = (ms: number) => X0 + ms * PX;
+const BAR_W = RTT * PX;
 
 interface Bar {
   lane: 0 | 1 | 2;
@@ -23,14 +24,15 @@ interface Bar {
   appearsAt: number;
 }
 
-const LANE_Y = [80, 205, 330];
+const LANE_Y = [72, 210, 348];
+const SEP = [0, 150, 302];
 
 const BARS: Bar[] = [
-  { lane: 0, from: 0, label: 'GET /users/7', note: 'sends ~2 KB, we use 2 fields', noteTone: 'var(--bad)', appearsAt: 1 },
-  { lane: 0, from: RTT, label: 'GET /users/7/posts', note: 'only author ids, no names', noteTone: 'var(--bad)', appearsAt: 2 },
-  { lane: 0, from: 2 * RTT, count: 3, label: 'GET /users/{id} ×3', note: 'one call per author', noteTone: 'var(--bad)', appearsAt: 3 },
+  { lane: 0, from: 0, label: 'GET /users/7', note: '~2 KB back,\nwe use 2 fields', noteTone: 'var(--bad)', appearsAt: 1 },
+  { lane: 0, from: RTT, label: 'GET …/posts', note: 'only author ids,\nno names', noteTone: 'var(--bad)', appearsAt: 2 },
+  { lane: 0, from: 2 * RTT, count: 3, label: 'GET /users/{id} ×3', note: 'one call\nper author', noteTone: 'var(--bad)', appearsAt: 3 },
   { lane: 1, from: 0, label: 'POST /graphql', appearsAt: 4 },
-  { lane: 2, from: 0, label: 'GetProfileScreen(7)', note: 'fixed shape built for this screen', noteTone: 'var(--muted)', appearsAt: 5 },
+  { lane: 2, from: 0, label: 'GetProfileScreen', note: 'fixed shape for this screen', noteTone: 'var(--muted)', appearsAt: 5 },
 ];
 
 const STATS = [
@@ -83,16 +85,17 @@ function Lane({ i, step }: { i: 0 | 1 | 2; step: number }) {
   const active = BARS.filter((b) => b.lane === i).some((b) => b.appearsAt === step);
   return (
     <g>
-      <HandText x={14} y={y - 10} size={20} anchor="start" weight={700} color={active ? 'var(--accent)' : 'var(--fg)'}>
+      <HandText x={6} y={y - 12} size={18} anchor="start" weight={700} color={active ? 'var(--accent)' : 'var(--fg)'}>
         {LANES[i].name}
       </HandText>
-      <HandText x={14} y={y + 20} size={12} anchor="start" color="var(--muted)">
+      <HandText x={6} y={y + 20} size={13} anchor="start" color="var(--muted)">
         {LANES[i].sub}
       </HandText>
       {bars.map((b) => {
         const n = b.count ?? 1;
         const h = n > 1 ? 15 : 30;
         const isNew = b.appearsAt === step;
+        const cx = x(b.from) + BAR_W / 2;
         return (
           <motion.g
             key={b.label}
@@ -101,19 +104,19 @@ function Lane({ i, step }: { i: 0 | 1 | 2; step: number }) {
             transition={{ duration: 0.5 }}
           >
             {Array.from({ length: n }, (_, k) => {
-              const cy = y + (k - (n - 1) / 2) * (h + 3) - (n > 1 ? 0 : 0);
+              const cy = y + (k - (n - 1) / 2) * (h + 3);
               return (
                 <g key={k}>
-                  <rect x={x(b.from)} y={cy - h / 2} width={RTT * PX} height={h} rx={6} fill="var(--accent-soft)" />
-                  <SketchBox cx={x(b.from) + (RTT * PX) / 2} cy={cy} w={RTT * PX} h={h} r={6} seed={seedOf(b.label + k)} stroke={n > 1 ? 'var(--warn)' : 'var(--accent)'} />
+                  <rect x={x(b.from)} y={cy - h / 2} width={BAR_W} height={h} rx={6} fill="var(--accent-soft)" />
+                  <SketchBox cx={cx} cy={cy} w={BAR_W} h={h} r={6} seed={seedOf(b.label + k)} stroke={n > 1 ? 'var(--warn)' : 'var(--accent)'} />
                 </g>
               );
             })}
-            <HandText x={x(b.from) + (RTT * PX) / 2} y={y - (n > 1 ? 32 : 28)} size={13} mono>
+            <HandText x={cx} y={y - (n > 1 ? 34 : 28)} size={13}>
               {b.label}
             </HandText>
             {b.note && (
-              <HandText x={x(b.from) + (RTT * PX) / 2} y={y + (n > 1 ? 44 : 32)} size={13} color={b.noteTone}>
+              <HandText x={cx} y={y + (n > 1 ? 50 : 42)} size={13} color={b.noteTone}>
                 {b.note}
               </HandText>
             )}
@@ -122,14 +125,14 @@ function Lane({ i, step }: { i: 0 | 1 | 2; step: number }) {
       })}
       {i === 1 && step >= 4 && (
         <motion.g initial={step === 4 ? { opacity: 0 } : false} animate={{ opacity: 1 }} transition={{ delay: 0.3, duration: 0.5 }}>
-          <HandText x={X0} y={y + 46} size={13} anchor="start" mono color="var(--muted)">
-            {'{ user(id:7) { name avatar posts(first:3) { text author { name avatar } } } }'}
+          <HandText x={X0} y={y + 50} size={13} anchor="start" mono color="var(--muted)">
+            {'{ user(id:7) { name avatar\n\u00a0\u00a0posts(first:3) { text\n\u00a0\u00a0\u00a0\u00a0author { name avatar } } } }'}
           </HandText>
         </motion.g>
       )}
       {stat && (
         <motion.g initial={stat.at === step ? { opacity: 0 } : false} animate={{ opacity: 1 }} transition={{ delay: 0.4, duration: 0.5 }}>
-          <HandText x={768} y={y} size={15} color={stat.color} weight={700}>
+          <HandText x={594} y={y} size={14} color={stat.color} weight={700}>
             {stat.lines}
           </HandText>
         </motion.g>
@@ -142,27 +145,27 @@ export default function FetchRace() {
   return (
     <AnimFrame title="One screen, three API styles" steps={steps} interval={3000}>
       {(i) => (
-        <SketchSvg width={900} height={420} label="Timeline of round trips for REST, GraphQL and RPC fetching the same profile screen">
+        <SketchSvg width={640} height={450} label="Timeline of round trips for REST, GraphQL and RPC fetching the same profile screen">
           {[1, 2].map((k) => (
-            <SketchArrow key={k} points={[[10, [0, 150, 268][k]], [890, [0, 150, 268][k]]]} head="none" dashed stroke="var(--border)" strokeWidth={1} seed={seedOf('sep' + k)} />
+            <SketchArrow key={k} points={[[6, SEP[k]], [634, SEP[k]]]} head="none" dashed stroke="var(--border)" strokeWidth={1} seed={seedOf('sep' + k)} />
           ))}
           {i === 0 && (
             <g>
-              <SketchBox cx={x(0) + 88} cy={205} w={176} h={30} r={6} seed={seedOf('legend')} stroke="var(--muted)" dashed />
-              <HandText x={x(0) + 88} y={205} size={13} color="var(--muted)">
+              <SketchBox cx={x(0) + BAR_W / 2} cy={LANE_Y[1]} w={BAR_W} h={30} r={6} seed={seedOf('legend')} stroke="var(--muted)" dashed />
+              <HandText x={x(0) + BAR_W / 2} y={LANE_Y[1]} size={13} color="var(--muted)">
                 one bar = 80 ms
               </HandText>
-              <HandText x={x(0) + 196} y={205} size={14} anchor="start" color="var(--muted)">
-                {'= one round trip. A longer chain of bars = a slower screen.'}
+              <HandText x={x(0) + BAR_W + 12} y={LANE_Y[1]} size={14} anchor="start" color="var(--muted)">
+                {'= one round trip\nlonger chain = slower screen'}
               </HandText>
             </g>
           )}
           <Lane i={0} step={i} />
           <Lane i={1} step={i} />
           <Lane i={2} step={i} />
-          <SketchArrow points={[[X0, 392], [x(320), 392]]} head="end" stroke="var(--muted)" strokeWidth={1} seed={seedOf('axis')} />
+          <SketchArrow points={[[X0, 412], [x(250), 412]]} head="end" stroke="var(--muted)" strokeWidth={1} seed={seedOf('axis')} />
           {[0, 80, 160, 240].map((t) => (
-            <HandText key={t} x={x(t)} y={408} size={12} color="var(--muted)">
+            <HandText key={t} x={x(t) + (t === 0 ? 8 : 0)} y={434} size={13} color="var(--muted)">
               {`${t} ms`}
             </HandText>
           ))}

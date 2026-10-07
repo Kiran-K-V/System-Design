@@ -1,0 +1,172 @@
+---
+summary: When the network splits, a replicated system must either reject requests or return possibly stale data. Even without a split, it trades latency for consistency.
+requires: ['04-data/replication', '01-one-machine/latency-numbers']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import CapPartition from '../../../components/anim/lessons/CapPartition.tsx';
+import LatencyConsistency from '../../../components/anim/lessons/LatencyConsistency.tsx';
+import PacelcTree from '../../../components/anim/lessons/PacelcTree.tsx';
+
+## The problem
+
+You replicated your database to two regions. Alice writes to the replica near her. Bob reads from the replica near him.
+
+Now a cable is cut. The two regions cannot talk. Both replicas are alive. Alice writes `x = 5`. Bob reads `x`.
+
+What should Bob's replica do? It has two choices, and both hurt:
+
+- Answer with the value it has. The answer may be old.
+- Refuse to answer. Bob gets an error.
+
+There is no third choice that is always right. That is the CAP theorem.
+
+## The three words, defined exactly
+
+Eric Brewer proposed the idea in a 2000 talk. Seth Gilbert and Nancy Lynch proved a precise version in 2002. The words have narrow meanings.
+
+- **Consistency (C)** means linearizability: every read returns the latest completed write, as if there were one copy of the data. This is **not** the "C" in ACID. Lesson 4.10 defines linearizability in full.
+- **Availability (A)** means every request to a working node gets a real response, not an error and not a hang.
+- **Partition tolerance (P)** means the system keeps running when the network drops or delays messages between nodes.
+
+The theorem: **if the network can partition, a system cannot be both consistent and available.** While a partition lasts, you pick one.
+
+Notice that P is not a choice. Networks do fail. A cable is cut, a switch reboots, a data center is slow. If your system spans more than one machine, you will have partitions. So the real choice is C or A **during a partition**. A "CA" system that survives partitions does not exist. A single node is "CA" only because it has no network between its replicas.
+
+## Watch it happen
+
+Step through the same story twice. First with the CP choice, then flip the toggle to AP. Stay on the same step when you flip, and compare.
+
+<CapPartition client:visible />
+
+Here is what you saw.
+
+| | **CP** (consistent, rejects) | **AP** (available, may diverge) |
+|---|---|---|
+| Write on the cut-off side | Refused, error | Accepted |
+| Read on the cut-off side | Refused, error | Returns a possibly stale value |
+| After the partition heals | Resume, nothing to merge | Replicas hold different values and must reconcile |
+| Who pays | The user who sees an error | The app, which must handle stale reads and conflicts |
+
+### CP in practice
+
+A CP system does not shut down everything. It uses **majority quorums**. With 5 replicas, a partition might split them 3 and 2. The side with 3 keeps serving. The side with 2 rejects requests. Only the minority side is unavailable. Systems like etcd and ZooKeeper work this way (lesson 4.11 shows how).
+
+### AP in practice
+
+An AP system keeps taking writes on both sides. When the partition heals it must merge them. Amazon's Dynamo used version vectors to detect that two writes were concurrent, then handed both versions to the application to reconcile. Simpler stores use "last write wins", which drops one write without warning.
+
+## Common mistakes about CAP
+
+**"Pick two of three" is misleading.** You do not give up a property all the time. Brewer himself wrote in 2012 that you only give up consistency or availability **while a partition lasts**. Most of the time there is no partition, and you can have both.
+
+**The choice is per operation, not per system.** A payment needs C: a double spend is worse than an error. A "like" counter needs A: a stale count is fine. Good designs mix both in one product.
+
+**CAP says nothing about latency.** A system can be slow and still be "available" by the formal definition. This is a real gap, and it is why Abadi added PACELC.
+
+## PACELC: the rest of the time
+
+Most of the time, nothing is partitioned. Yet replication still forces a trade-off. Daniel Abadi described it in 2010 (and in a 2012 paper): a system that copies data must either wait for the copies, which is slow, or not wait, which risks stale reads.
+
+His rule reads like a sentence: **if there is a Partition, choose Availability or Consistency; Else, choose Latency or Consistency.**
+
+<PacelcTree />
+
+The "else" side is the one you live with every day. Try it. Move the slider to change the distance between regions. Then compare the three ways a leader can reply to a write.
+
+<LatencyConsistency client:visible />
+
+Notice what the numbers say. Waiting for a replica 70 ms away adds about 70 ms to **every write**. Not waiting keeps writes fast but leaves a window where a far replica is stale. The speed of light sets the floor: you cannot make this trade-off disappear with better software.
+
+### How real systems classify
+
+| System | During partition | Else | Label |
+|---|---|---|---|
+| Dynamo, Cassandra, Riak (defaults) | Availability | Latency | PA/EL |
+| Bigtable, HBase | Consistency | Consistency | PC/EC |
+| MongoDB (default settings) | Availability | Consistency | PA/EC |
+| PNUTS (Yahoo) | Consistency | Latency | PC/EL |
+
+Treat the table as defaults. Many stores let you tune the setting per request. In Cassandra you pick a consistency level on each read and write (lesson 4.11 shows the math). A label is a starting point for a conversation, not a final answer.
+
+## Numbers
+
+| Fact | Value |
+|---|---|
+| Round trip inside one data center | ~0.5 ms (lesson 1.2) |
+| Round trip across a continent | ~50–150 ms (lesson 1.2) |
+| Sync write to a replica 70 ms away | +~70 ms on every write |
+| Quorum of 5 replicas | 3 needed. Survives 2 failures. |
+
+## Trade-offs
+
+| Choice | You gain | You pay | When to choose |
+|---|---|---|---|
+| CP | Correct answers, no conflicts | Errors during partitions, higher write latency | Money, inventory, locks, leader election |
+| AP | Always answers, low latency | Stale reads, conflicts to merge | Feeds, counters, carts, sessions, caches |
+| EL (low latency) | Fast reads and writes | Window of stale data | Read-heavy, global users |
+| EC (consistency) | Fresh data always | Latency of waiting on replicas | Correctness matters more than speed |
+
+## Interview lens
+
+<Callout type="tip">
+Do not say "I choose CP" for the whole system. Say it per feature: "Checkout and inventory are CP. If we cannot confirm, we reject and ask the user to retry. The product feed is AP. A stale feed for a few seconds is fine." Then name the PACELC "else" cost: "Even without a partition, synchronous replication to another region adds one round trip to every write."
+</Callout>
+
+<Callout type="mistake">
+Do not say "we get all three because we use replication", and do not call a database "CA". If the system spans machines, partitions will happen. Another slip: treating "consistent" as "ACID". CAP's C is linearizability, a claim about single-object reads and writes. ACID's C is about keeping app invariants.
+</Callout>
+
+<Callout type="deep" title="A fair critique of CAP">
+Martin Kleppmann argued that CAP's definitions are too narrow to describe real systems. Its "availability" counts a reply after a very long delay as available. Its "consistency" is only linearizability. And "partition tolerance" is not something you choose. He suggests describing systems by how latency changes as faults happen. PACELC points the same way. Know CAP well enough to give the one-line answer, and know its limits well enough to say what it leaves out.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A 3-node cluster splits into groups of 2 and 1. It is a CP system with majority quorums. What happens to a write sent to the group of 1?',
+      options: [
+        'It succeeds and is merged later',
+        'It is rejected, because the group of 1 has no majority',
+        'It succeeds on the group of 2 only',
+        'It is accepted but marked stale',
+      ],
+      answer: 1,
+      explain: 'A majority of 3 is 2. The group of 2 keeps serving. The group of 1 cannot confirm a write with a majority, so it refuses. That refusal is the cost of consistency.',
+    },
+    {
+      q: 'Your shopping cart service must always accept "add item", even if two data centers cannot talk. After they reconnect, a user sees both of their added items. Which choice is this?',
+      options: ['CP', 'AP', 'CA', 'PC/EC'],
+      answer: 1,
+      explain: 'The service kept taking writes on both sides, then merged them. That is the AP choice. (Dynamo’s shopping cart is the classic example.)',
+    },
+    {
+      q: 'There is no partition. A leader replicates each write synchronously to a replica 100 ms away before it replies. What is the best estimate of write latency?',
+      options: ['~1 ms', '~50 ms', '~100 ms or more', '~0 ms, because there is no partition'],
+      answer: 2,
+      explain: 'The leader must wait one round trip to that replica, about 100 ms. CAP says nothing about this cost. PACELC does: in the "else" case, consistency is paid for with latency.',
+    },
+    {
+      q: 'Which statement about "CA" systems is correct?',
+      options: [
+        'They give consistency and availability and tolerate partitions',
+        'They exist only if nothing can partition, such as a single node',
+        'They are the best choice for most web apps',
+        'They are PC/EC systems',
+      ],
+      answer: 1,
+      explain: 'A system with replicas across a network cannot rule out partitions. Only a single node has no network between replicas, and then the C-versus-A choice never comes up.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Gilbert and Lynch, "Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services"](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf), the proof.
+- [Kleppmann, "A Critique of the CAP Theorem"](https://arxiv.org/pdf/1509.05393), why the definitions are narrow.
+- [Marc Brooker on PACELC](https://brooker.co.za/blog/2014/07/16/pacelc/), what PACELC adds and where it is still vague.
+- [Jepsen: consistency models](https://jepsen.io/consistency), which models stay available under partition.

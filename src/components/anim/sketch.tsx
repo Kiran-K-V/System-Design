@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from 'react';
+import { createContext, useContext, useMemo, type ReactNode } from 'react';
 import rough from 'roughjs';
 import type { Options } from 'roughjs/bin/core';
 
@@ -13,6 +13,15 @@ export type Pt = [number, number];
 
 export const INK = 'var(--fg)';
 export const HAND_FONT = 'var(--font-hand)';
+
+/**
+ * The article column is ~720px wide, so a viewBox wider than that shrinks every glyph.
+ * SketchSvg publishes a text boost so a size written for a 720-wide canvas still renders at the same pixel size.
+ */
+const TextBoost = createContext(1);
+const COLUMN_PX = 720;
+const MIN_BOOST_PX = 14;
+export const textBoost = (viewBoxWidth: number) => Math.max(1, viewBoxWidth / COLUMN_PX);
 
 /** Stable small integer from any string, for rough.js seeds. */
 export function seedOf(key: string): number {
@@ -161,6 +170,8 @@ export function HandText({
   /** Draw a background-colored outline so text stays readable over hatching. */
   halo?: boolean;
 }) {
+  const boost = useContext(TextBoost);
+  size = Math.max(size * boost, MIN_BOOST_PX * boost);
   const lines = children.split('\n');
   const first = y - ((lines.length - 1) * size * lineHeight) / 2;
   return (
@@ -199,8 +210,10 @@ export function Badge({ cx, cy, n, seed, color = 'var(--badge)' }: { cx: number;
 /** SVG wrapper for sketch diagrams. */
 export function SketchSvg({ width, height, label, children }: { width: number; height: number; label?: string; children: ReactNode }) {
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} className="h-auto w-full" role="img" aria-label={label}>
-      {children}
-    </svg>
+    <TextBoost.Provider value={textBoost(width)}>
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-auto w-full" role="img" aria-label={label}>
+        {children}
+      </svg>
+    </TextBoost.Provider>
   );
 }

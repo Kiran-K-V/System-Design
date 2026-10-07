@@ -86,10 +86,10 @@ export function HashRingView({ points, colors, letters = {}, keys = [], arcs = t
         })}
       {arcs && ring.length === 1 && <circle cx={C} cy={C} r={R} stroke={colors[ring[0].node]} strokeWidth={11} fill="none" opacity={0.42} />}
 
-      <HandText x={C} y={C - 12} size={16} color="var(--muted)">
+      <HandText x={C} y={C - 14} size={19} color="var(--muted)">
         hash ring
       </HandText>
-      <HandText x={C} y={C + 10} size={13} color="var(--muted)">
+      <HandText x={C} y={C + 10} size={16} color="var(--muted)">
         positions 0 to 2³²−1, clockwise
       </HandText>
 
@@ -100,7 +100,7 @@ export function HashRingView({ points, colors, letters = {}, keys = [], arcs = t
             return (
               <g key={`lg-${n}`}>
                 <circle cx={x - 9} cy={C + 40} r={6} fill={colors[n]} />
-                <HandText x={x + 3} y={C + 40} size={15} weight={700} anchor="start">
+                <HandText x={x + 3} y={C + 42} size={19} weight={700} anchor="start">
                   {letters[n] ?? n}
                 </HandText>
               </g>
@@ -139,7 +139,7 @@ export function HashRingView({ points, colors, letters = {}, keys = [], arcs = t
           <g key={`key-${i}`}>
             <circle cx={x} cy={y} r={big ? 6.5 : 3.6} fill={colors[owner]} stroke={big ? 'var(--fg)' : 'var(--bg)'} strokeWidth={big ? 2 : 1} />
             {k.label && (
-              <HandText x={at(k.pos, R - 44)[0]} y={at(k.pos, R - 44)[1]} size={13} halo>
+              <HandText x={at(k.pos, R - 44)[0]} y={at(k.pos, R - 44)[1]} size={16} halo>
                 {k.label}
               </HandText>
             )}
@@ -155,7 +155,7 @@ export function HashRingView({ points, colors, letters = {}, keys = [], arcs = t
           <g key={`pt-${i}`} opacity={isDead ? 0.4 : 1}>
             <circle cx={x} cy={y} r={pointLabels ? 9 : 4.5} fill={colors[p.node]} stroke="var(--bg)" strokeWidth={2} />
             {pointLabels && (
-              <HandText x={lx} y={ly} size={17} weight={700} color={isDead ? 'var(--bad)' : 'var(--fg)'}>
+              <HandText x={lx} y={ly} size={20} weight={700} color={isDead ? 'var(--bad)' : 'var(--fg)'}>
                 {(letters[p.node] ?? p.node) + (isDead ? ' ✕' : '')}
               </HandText>
             )}

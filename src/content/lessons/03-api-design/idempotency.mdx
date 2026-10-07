@@ -1,0 +1,178 @@
+---
+summary: Networks lose responses, so clients must retry. An idempotency key lets the server recognize a retry and return the saved result instead of doing the work twice.
+requires: ['03-api-design/rest']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import RetryReplay from '../../../components/anim/lessons/RetryReplay.tsx';
+import KeyLifecycle from '../../../components/anim/lessons/KeyLifecycle.tsx';
+
+## The problem
+
+A customer taps "Pay $50". The app sends `POST /charges`. The server charges the card. Then the connection drops before the response arrives.
+
+The app sees a timeout. Did the payment happen? It cannot know. The server did the work, and the network ate the answer.
+
+The client has two bad choices.
+
+- **Give up.** If the charge never ran, you lose the sale.
+- **Retry.** If the charge did run, you charge the customer twice.
+
+This is not rare. Say you process 1 million payments a day, and 0.1% end in an ambiguous timeout (assumption). That is ~1,000 uncertain payments a day. If clients retry blindly, up to ~1,000 customers per day get double charged: ~$50,000 of refunds and angry support tickets.
+
+Retries also come from places you do not control: a mobile network that flaps, a gateway that retries on `502`, a message queue that redelivers (lesson 6.3). Your server must expect the same request twice.
+
+## Naive solutions and where they fail
+
+**"Check first."** Before retrying, the client does `GET /charges?customer=42&amount=50` to see if the charge exists. This fails. The client never got the charge id, so it must search by guess. A customer may really buy two $50 items in one minute. And between the check and the retry, the first request may still be running.
+
+**"Make the server detect duplicates by content."** Reject a second $50 charge for the same customer within 5 minutes. This blocks real purchases and still lets slow retries through.
+
+What is missing is a name for the operation. Both attempts must carry the same identifier, so the server can tell "retry" from "new purchase".
+
+## What idempotent means
+
+A quick recap from lesson 3.1. An operation is **idempotent** if doing it many times has the same effect as doing it once. `PUT /users/42` with a full body is idempotent. `DELETE /tweets/981` is idempotent. `POST /charges` is not, because each call creates a new charge.
+
+The goal of this lesson: make `POST` safe to retry, without changing what it means.
+
+First, see the failure.
+
+<RetryReplay mode="naive" client:visible />
+
+## The mechanism: an idempotency key
+
+An **idempotency key** is a unique value the client makes for one logical operation. The client sends it with every attempt of that operation. The server uses it to remember the result.
+
+Stripe's API works this way. The client sends an `Idempotency-Key` header. The server saves the status code and body of the first request for that key, "regardless of whether it succeeds or fails". Later requests with the same key get the same result back, even a `500`. Now the same failure with a key.
+
+<RetryReplay mode="key" client:visible />
+
+### The server side
+
+The key store is where the guarantee lives. Look at each case it must handle.
+
+<KeyLifecycle client:visible />
+
+The rules that make it correct:
+
+1. **Claim atomically.** "If the key is absent, insert it" must be one atomic step: a unique constraint, or `SET key value NX` in Redis (NX means "only if not exists"). A check followed by an insert has a race: two requests both see "absent" and both run.
+2. **Store the fingerprint.** Save a hash of the request body. If the same key arrives with a different body, that is a client bug. Stripe's idempotency layer compares parameters and errors if they differ. The IETF draft for an `Idempotency-Key` header uses `422` for a mismatch.
+3. **Handle in progress.** If the key exists but has no result yet, a second request must not run the work. Return `409 Conflict` (the draft's choice) or wait for the first to finish.
+4. **Save the response.** Replay the saved status and body. The client cannot tell it was a replay, which is the point.
+5. **Expire keys.** Stripe may remove keys at least 24 hours old. A key store that grows forever is a leak.
+6. **Scope keys.** Combine the key with the caller (customer or API key). Two customers must never collide on `abc123`.
+
+### The client side
+
+- Generate the key **once per operation**, before the first try. A random UUID v4 works. Stripe suggests it and allows up to 255 characters.
+- **Reuse** the same key for every retry of that operation. A new key per retry would break the whole scheme.
+- Retry with **exponential backoff and jitter**: wait 1 s, 2 s, 4 s and so on, plus a random amount, so thousands of clients do not retry in the same instant (lesson 7.2).
+
+### Make the write and the key one transaction
+
+There is a gap in the design. What if the server charges the card and crashes before it saves the result under the key? On retry the key says "in progress" forever.
+
+Two ways to close it:
+
+- **Same transaction.** Put the key row and the charge row in the same database, and write them in one transaction. They both commit or both roll back. Then "key done" and "charge exists" cannot disagree.
+- **Pass the key downstream.** When your service calls an outside payment processor, forward an idempotency key to it too. Stripe's engineering post describes this style of safe retry with recovery points: if a request was rolled back, retrying it wholesale is safe, otherwise the server resumes from where it stopped.
+
+A key stuck "in progress" also needs a **lease**: a timeout after which another worker may take it over.
+
+### Other ways to get idempotency
+
+You do not always need a key store.
+
+- **Client-chosen id with `PUT`.** `PUT /orders/{client_generated_id}`. The second `PUT` hits the same resource.
+- **Unique business key.** A `UNIQUE (order_id)` constraint on the payments table makes the second insert fail. The server then returns the existing row.
+- **Conditional writes.** "Update where version = 7" fails on a replay, because the version already moved to 8.
+
+## Numbers
+
+- **Storage.** 1 million keys a day x ~1 KB (key, hash, saved response) = ~1 GB per day. With a 24-hour lifetime, the store holds about 1 GB (derived).
+- **Cost per request.** One extra read or write on the key store. In a data center a round trip is ~0.5 ms (lesson 1.2), so the overhead is about 1 ms. It runs only on `POST`s, not on reads.
+- **Retry window.** A typical client retries over seconds to minutes. The key lifetime (24 hours here) only needs to be longer than the longest retry plus any queue delay.
+
+## Trade-offs
+
+| Approach | Gain | Pay | Choose it when |
+|---|---|---|---|
+| Idempotency key + key store | Works for any `POST`, replays the exact response | An extra store, expiry, in-progress handling | Payments, orders, any create with side effects |
+| Unique business key in the database | No extra store, strong guarantee | Only fits when a natural unique key exists | The operation has a real id, such as `order_id` |
+| `PUT` with client-chosen id | Standard HTTP, no new header | The client must create ids | Creating resources the client names |
+| No protection | Simple | Duplicates under retry | Pure reads, or operations where a duplicate is harmless |
+
+## Interview lens
+
+<Callout type="tip">
+For any money or inventory write, say: "The client sends an idempotency key. The server does an atomic insert-if-absent on the key, runs the work, saves the response, and replays it for retries. Keys expire after 24 hours." Then name the two edge cases: same key with a different body, and a request that is still in progress.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the server checks if the charge already exists" with no key. There is nothing stable to check against. Also do not say idempotency keys give "exactly-once delivery". The network still delivers the request twice. The key makes the effect happen once.
+</Callout>
+
+<Callout type="deep" title="The same idea in queues">
+A message queue that guarantees "at least once" delivery will deliver some messages twice. The consumer fixes this the same way: it records the message id in a dedupe table inside the same transaction as its work. Lesson 6.3 builds on this. Idempotency is the tool that turns at-least-once delivery into effectively-once processing.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A client sends POST /charges with key K1 and the connection drops. It retries with a new random key K2 for the retry. What happens?',
+      options: [
+        'The server notices it is a retry and returns the saved response',
+        'The server treats it as a new operation and may charge twice',
+        'The server returns 409 because K1 is in use',
+        'The server returns 422 because the body matches an earlier request'
+      ],
+      answer: 1,
+      explain: 'The key is the only link between attempts. A fresh key says "this is a new purchase". The client must reuse K1 for every retry of the same operation.',
+    },
+    {
+      q: 'Two requests with the same key arrive at the same moment. Both check the key store and both see "absent". Both run the charge. What design mistake caused this?',
+      options: [
+        'The key was too short',
+        'The check and the insert were two steps, not one atomic step',
+        'The key store had no expiry',
+        'The client did not use backoff',
+      ],
+      answer: 1,
+      explain: 'A read followed by a write has a race. Use one atomic claim: a unique constraint or insert-if-absent. Then exactly one request wins and the other sees "in progress".',
+    },
+    {
+      q: 'Which of these operations needs an idempotency key the most?',
+      options: [
+        'GET /users/42',
+        'PUT /users/42 with a full body',
+        'POST /transfers that moves $100 between accounts',
+        'DELETE /sessions/abc',
+      ],
+      answer: 2,
+      explain: 'GET, PUT and DELETE are already idempotent by their definition. POST that moves money is not, and a duplicate does real harm.',
+    },
+    {
+      q: 'The server saves a charge, then crashes before it writes the response under the key. The key stays "in progress". Which design avoids this gap?',
+      options: [
+        'Write the charge row and the key row in one database transaction',
+        'Use a longer key',
+        'Return 200 before doing the work',
+        'Retry the request three times on the server',
+      ],
+      answer: 0,
+      explain: 'One transaction means both rows commit together or neither does. The state "charge exists but key says in progress" cannot happen. A lease on in-progress keys is the fallback when the work spans systems.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Stripe API: Idempotent requests](https://docs.stripe.com/api/idempotent_requests): header, key length, saved results, 24-hour pruning and parameter checks.
+- [Stripe blog: Designing robust and predictable APIs with idempotency](https://stripe.com/blog/idempotency): recovery points and backoff with jitter.
+- [IETF draft: The Idempotency-Key HTTP Header Field](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/): a proposed standard header. The draft has expired, so treat it as a reference design.
+- [RFC 9110, section 9.2.2: Idempotent Methods](https://www.rfc-editor.org/rfc/rfc9110.html#name-idempotent-methods): the HTTP definition.

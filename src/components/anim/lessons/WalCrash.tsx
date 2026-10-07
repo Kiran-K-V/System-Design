@@ -12,15 +12,15 @@ interface WalStep {
 }
 
 const edges: FlowEdge[] = [
-  { from: 'client', to: 'wbuf', label: 'COMMIT', head: 'both', labelAt: [0, -16] },
-  { from: 'wbuf', to: 'wal', label: 'append + fsync', labelAt: [0, -16] },
+  { from: 'client', to: 'wbuf', head: 'both' },
+  { from: 'wbuf', to: 'wal', label: 'append, fsync', labelAt: [0, -16] },
   { from: 'pool', to: 'data', label: 'checkpoint', dashed: true, labelAt: [0, -16] },
-  { from: 'wal', to: 'pool', label: 'replay', dashed: true, bend: -30, labelAt: [-40, 6] },
+  { from: 'wal', to: 'pool', label: 'replay', dashed: true, bend: -26, labelAt: [-6, 0] },
 ];
 
 const groups: FlowGroup[] = [
-  { x: 190, y: 10, w: 270, h: 330, label: 'RAM: lost on crash' },
-  { x: 560, y: 10, w: 330, h: 330, label: 'Disk: survives a crash' },
+  { x: 92, y: 10, w: 230, h: 330, label: 'RAM: lost on crash' },
+  { x: 420, y: 10, w: 296, h: 330, label: 'Disk: survives a crash' },
 ];
 
 const steps: WalStep[] = [
@@ -80,7 +80,7 @@ const steps: WalStep[] = [
   {
     caption: 'Later, a checkpoint writes dirty pages to the data file. Then the log before that point is no longer needed and can be recycled. In PostgreSQL, checkpoints run at least every 5 minutes by default. A longer gap means more log to replay after a crash.',
     ram: { wbuf: 'empty', pool: 'A=70  B=80' },
-    disk: { wal: 'checkpoint ● (old log recycled)', data: 'A=70  B=80' },
+    disk: { wal: 'checkpoint ● old log recycled', data: 'A=70  B=80' },
     active: ['data'],
     packets: [{ from: 'pool', to: 'data', label: 'flush', tone: 'ok' }],
   },
@@ -91,15 +91,15 @@ export default function WalCrash() {
     <AnimFrame title="Write-ahead log: commit, crash, recover" steps={steps} interval={3400}>
       {(i, s) => {
         const nodes: FlowNode[] = [
-          { id: 'client', x: 85, y: 175, w: 110, label: 'Client' },
-          { id: 'wbuf', x: 325, y: 100, w: 210, h: 74, label: 'Log buffer', sub: s.ram.wbuf, tone: s.ram.tone },
-          { id: 'pool', x: 325, y: 250, w: 210, h: 74, label: 'Page in RAM', sub: s.ram.pool, tone: s.ram.tone },
-          { id: 'wal', x: 725, y: 100, w: 270, h: 74, shape: 'db', label: 'Log file (WAL)', sub: s.disk.wal },
-          { id: 'data', x: 725, y: 250, w: 270, h: 74, shape: 'db', label: 'Data file', sub: s.disk.data, tone: s.disk.dataTone },
+          { id: 'client', x: 44, y: 175, w: 78, label: 'Client' },
+          { id: 'wbuf', x: 207, y: 100, w: 200, h: 74, label: 'Log buffer', sub: s.ram.wbuf, tone: s.ram.tone },
+          { id: 'pool', x: 207, y: 250, w: 200, h: 74, label: 'Page in RAM', sub: s.ram.pool, tone: s.ram.tone },
+          { id: 'wal', x: 568, y: 100, w: 270, h: 92, shape: 'db', label: 'Log file (WAL)', sub: s.disk.wal },
+          { id: 'data', x: 568, y: 250, w: 270, h: 92, shape: 'db', label: 'Data file', sub: s.disk.data, tone: s.disk.dataTone },
         ];
-        const notes: FlowNote[] = s.note ? [{ x: 460, y: 178, text: s.note, anchor: 'middle', tone: s.noteTone }] : [];
+        const notes: FlowNote[] = s.note ? [{ x: 207, y: 322, text: s.note, anchor: 'middle', tone: s.noteTone, size: 16 }] : [];
         return (
-          <FlowDiagram width={900} height={350} nodes={nodes} edges={edges} groups={groups} notes={notes} active={s.active} packets={s.packets} stepKey={i} label="Write-ahead log timeline" />
+          <FlowDiagram width={720} height={350} nodes={nodes} edges={edges} groups={groups} notes={notes} active={s.active} packets={s.packets} stepKey={i} label="Write-ahead log timeline" />
         );
       }}
     </AnimFrame>
@@ -171,12 +171,12 @@ export function NaiveWrite() {
     <AnimFrame title="Without a log: a crash between two page writes" steps={naiveSteps} interval={3000}>
       {(i, s) => {
         const nodes: FlowNode[] = [
-          { id: 'db', x: 150, y: 120, w: 190, h: 74, label: 'Database', sub: 'transfer 30 from A to B' },
-          { id: 'p7', x: 600, y: 55, w: 230, h: 70, shape: 'db', label: 'Disk page 7', sub: s.p7, tone: s.p7tone },
-          { id: 'p9', x: 600, y: 190, w: 230, h: 70, shape: 'db', label: 'Disk page 9', sub: s.p9, tone: s.p9tone },
+          { id: 'db', x: 110, y: 130, w: 190, h: 80, label: 'Database', sub: 'move 30 from A to B' },
+          { id: 'p7', x: 560, y: 60, w: 230, h: 90, shape: 'db', label: 'Disk page 7', sub: s.p7, tone: s.p7tone },
+          { id: 'p9', x: 560, y: 200, w: 230, h: 90, shape: 'db', label: 'Disk page 9', sub: s.p9, tone: s.p9tone },
         ];
-        const notes: FlowNote[] = s.note ? [{ x: 450, y: 262, text: s.note, anchor: 'middle', tone: s.noteTone, size: 17 }] : [];
-        return <FlowDiagram width={900} height={290} nodes={nodes} edges={naiveEdges} notes={notes} active={s.active} packets={s.packets} stepKey={i} label="Crash between two page writes" />;
+        const notes: FlowNote[] = s.note ? [{ x: 360, y: 285, text: s.note, anchor: 'middle', tone: s.noteTone, size: 18 }] : [];
+        return <FlowDiagram width={720} height={310} nodes={nodes} edges={naiveEdges} notes={notes} active={s.active} packets={s.packets} stepKey={i} label="Crash between two page writes" />;
       }}
     </AnimFrame>
   );

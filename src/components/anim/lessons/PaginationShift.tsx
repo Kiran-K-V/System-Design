@@ -73,8 +73,8 @@ function simulate(upTo: number): State {
   return { list, offsetPages, cursorPages, inserted, deleted };
 }
 
-const CELL = 36;
-const X0 = 176;
+const CELL = 31;
+const X0 = 8;
 
 function Cell({ cx, cy, id, tone, seed, ghost }: { cx: number; cy: number; id: number; tone?: 'ok' | 'bad' | 'hl'; seed: string; ghost?: boolean }) {
   const stroke = tone === 'bad' ? 'var(--bad)' : tone === 'ok' ? 'var(--ok)' : ghost ? 'var(--bad)' : 'var(--fg)';
@@ -82,7 +82,7 @@ function Cell({ cx, cy, id, tone, seed, ghost }: { cx: number; cy: number; id: n
     <g>
       {tone === 'hl' && <rect x={cx - CELL / 2 + 2} y={cy - CELL / 2 + 2} width={CELL - 4} height={CELL - 4} rx={5} fill="var(--accent-soft)" />}
       <SketchBox cx={cx} cy={cy} w={CELL - 4} h={CELL - 4} r={5} seed={seedOf(seed)} stroke={stroke} dashed={ghost} strokeWidth={tone === 'bad' ? 2.2 : 1.4} />
-      <HandText x={cx} y={cy + 1} size={15} color={ghost ? 'var(--bad)' : undefined} weight={tone === 'bad' ? 700 : 400}>
+      <HandText x={cx} y={cy + 1} size={14} color={ghost ? 'var(--bad)' : undefined} weight={tone === 'bad' ? 700 : 400}>
         {String(id)}
       </HandText>
     </g>
@@ -124,63 +124,55 @@ function Panel({
   const missed = final ? START.filter((id) => id < maxSeen && id > minSeen && !seen.has(id) && list.includes(id)) : [];
   const flat: { id: number; page: number; dup: boolean }[] = [];
   pages.forEach((p, pi) => p.forEach((id) => flat.push({ id, page: pi, dup: dupes.has(id * 100 + pi) })));
+  const rx = (k: number, page: number) => X0 + (k + page * 0.35) * CELL + CELL / 2;
 
   return (
     <g>
-      <HandText x={12} y={top + 36} size={20} anchor="start" weight={700}>
+      <HandText x={X0} y={top + 16} size={19} anchor="start" weight={700}>
         {title}
       </HandText>
-      <HandText x={12} y={top + 60} size={13} anchor="start" mono color="var(--muted)">
+      <HandText x={X0 + 78} y={top + 17} size={13} anchor="start" mono color="var(--muted)">
         {query}
       </HandText>
-      <HandText x={12} y={top + 90} size={13} anchor="start" color="var(--muted)">
-        server list
+      <HandText x={X0} y={top + 46} size={13} anchor="start" color="var(--muted)">
+        server list, newest first
       </HandText>
       {list.map((id, k) => (
         <Cell
           key={id}
           cx={X0 + k * CELL + CELL / 2}
-          cy={top + 90}
+          cy={top + 74}
           id={id}
           seed={`${title}s${id}`}
           tone={id === inserted ? 'ok' : last.includes(id) && step % 2 === 1 ? 'hl' : undefined}
         />
       ))}
       {deleted !== null && (
-        <g>
-          <HandText x={X0 + 6 * CELL} y={top + 128} size={13} color="var(--bad)">
-            {`post ${deleted} deleted`}
-          </HandText>
-        </g>
+        <HandText x={X0 + 3 * CELL} y={top + 102} size={13} anchor="start" color="var(--bad)">
+          {`↑ post ${deleted} was deleted here`}
+        </HandText>
       )}
-      <HandText x={12} y={top + 150} size={13} anchor="start" color="var(--muted)">
-        client received
+      <HandText x={X0} y={top + 126} size={13} anchor="start" color="var(--muted)">
+        client received, page by page
       </HandText>
       {flat.map((c, k) => (
-        <Cell
-          key={`${c.page}-${c.id}`}
-          cx={X0 + (k + c.page * 0.4) * CELL + CELL / 2}
-          cy={top + 150}
-          id={c.id}
-          seed={`${title}r${c.page}${c.id}`}
-          tone={c.dup ? 'bad' : undefined}
-        />
+        <Cell key={`${c.page}-${c.id}`} cx={rx(k, c.page)} cy={top + 152} id={c.id} seed={`${title}r${c.page}${c.id}`} tone={c.dup ? 'bad' : undefined} />
       ))}
       {flat.map(
         (c, k) =>
           c.dup && (
-            <HandText key={`d${k}`} x={X0 + (k + c.page * 0.4) * CELL + CELL / 2} y={top + 178} size={13} color="var(--bad)">
+            <HandText key={`d${k}`} x={rx(k, c.page)} y={top + 180} size={13} color="var(--bad)">
               duplicate
             </HandText>
           ),
       )}
       {missed.map((id) => (
-        <HandText key={id} x={X0 + (flat.length + 2.4) * CELL} y={top + 150} size={14} anchor="start" color="var(--bad)">
+        <HandText key={id} x={rx(flat.length, 2) + 8} y={top + 152} size={14} anchor="start" color="var(--bad)">
           {`never saw post ${id}`}
         </HandText>
       ))}
       {final && missed.length === 0 && dupes.size === 0 && (
-        <HandText x={X0 + (flat.length + 1.6) * CELL} y={top + 150} size={14} anchor="start" color="var(--ok)">
+        <HandText x={rx(flat.length, 2) + 8} y={top + 152} size={14} anchor="start" color="var(--ok)">
           each post once
         </HandText>
       )}
@@ -198,7 +190,7 @@ export default function PaginationShift() {
         const nextOffset = s.offsetPages.length * PAGE;
         const lastCursor = s.cursorPages.length ? s.cursorPages[s.cursorPages.length - 1].slice(-1)[0] : null;
         return (
-          <SketchSvg width={900} height={420} label="Two clients page through a changing feed, one by offset and one by cursor">
+          <SketchSvg width={640} height={420} label="Two clients page through a changing feed, one by offset and one by cursor">
             <Panel
               top={0}
               title="Offset"

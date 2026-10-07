@@ -1,0 +1,155 @@
+---
+summary: HTTP sends requests over TCP. Each version of HTTP and TLS exists to remove round trips or waiting. Learn what each one removed.
+requires: ['02-networking/ip-tcp-udp', '02-networking/dns']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import HttpMultiplex from '../../../components/anim/lessons/HttpMultiplex.tsx';
+import TlsHandshake from '../../../components/anim/lessons/TlsHandshake.tsx';
+import HandshakeCost from '../../../components/anim/lessons/HandshakeCost.tsx';
+
+## The problem
+
+You now know the cost of a new connection from lesson 2.1: DNS, then a TCP handshake, then more. A web page is not one request. It is an HTML file plus scripts, styles, images, and API calls.
+
+If every request paid for a new connection, a page on a 100 ms link would spend most of its life in handshakes. Every version of HTTP, and every change to TLS, attacks that waste. This lesson follows the chain of fixes. Each fix leaves one new problem for the next.
+
+## HTTP in one minute
+
+**HTTP** (Hypertext Transfer Protocol) is request and response, text on top of a stream. The client sends a request. The server sends one response. The server remembers nothing between requests. That is **stateless**.
+
+```http
+GET /profile/42 HTTP/1.1
+Host: api.example.com
+Accept: application/json
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 58
+
+{"id":42,"name":"Ada"}
+```
+
+A request has a **method** (GET, POST, ...), a path, **headers** (key-value metadata), and an optional body. A response has a **status code** (200 OK, 404 Not Found, 503 Service Unavailable) and the same parts. Module 3 covers how to design these. Here, only the transport matters.
+
+## Version 1: one request, one connection
+
+The first HTTP versions opened a new TCP connection for every request, then closed it. Each request paid the handshake. HTTP/1.1 made the connection **persistent** (keep-alive) by default. The client reuses it for the next request. That saves the handshake, but leaves a rule: on one connection, the next request waits for the previous response.
+
+So one slow response blocks everything behind it. That is **head-of-line blocking** (HOL). The first fix was to open more connections. Browsers open up to 6 per host (MDN). Each extra connection pays its own TCP and TLS setup, and takes memory on the server. HTTP pipelining, which sends requests without waiting, still returns responses in order, so it keeps the blocking. Browsers do not enable it by default.
+
+## Version 2: many streams, one connection
+
+**HTTP/2** (RFC 9113) keeps the same meaning (methods, headers, status codes) but changes how bytes move. It splits messages into small binary **frames**. Each frame belongs to a **stream**, which is one request and its response. One connection carries many streams at once. The server interleaves frames from different responses.
+
+It adds **header compression** (HPACK). Headers repeat on every request (cookie, user agent), so compressing them with a shared table saves bytes. RFC 9113 recommends allowing at least 100 concurrent streams per connection.
+
+But RFC 9113 states a limit in section 1: TCP head-of-line blocking is not addressed. TCP delivers a single ordered byte stream and knows nothing about streams. If one packet is lost, TCP holds back all bytes that arrive after it, until the resend lands. Every stream stalls, including those whose data was fine.
+
+Step through the same page loaded five ways.
+
+<HttpMultiplex client:visible />
+
+## Version 3: streams that do not block each other
+
+**HTTP/3** (RFC 9114) removes TCP. It runs over **QUIC** (RFC 9000), a transport built on UDP. QUIC does what TCP and TLS did, but per stream. Loss on one stream stalls only that stream. HTTP/3 also replaces HPACK with **QPACK**, because HPACK needs ordered delivery and QUIC does not give it across streams.
+
+QUIC also merges the transport and TLS handshakes. One round trip sets up both. And a QUIC connection is identified by a connection ID, not by the IP and port pair. So when a phone moves from Wi-Fi to cellular, the connection can survive.
+
+Why UDP? Routers and firewalls already pass UDP and block unknown protocols. TCP lives in the operating system kernel and is hard to change. QUIC lives in user space, so it can improve fast.
+
+## TLS: what the handshake buys
+
+**TLS** (Transport Layer Security) wraps the byte stream in three guarantees: nobody can read it (confidentiality), nobody can change it unseen (integrity), and you are talking to the real server (authentication). HTTPS is HTTP over TLS.
+
+The server proves its identity with a **certificate**. A certificate says "this public key belongs to example.com" and carries a signature from a **certificate authority** (CA) that your device already trusts. The two sides use a key exchange to derive a shared secret, then encrypt with fast symmetric keys.
+
+Round trips are the cost. TLS 1.2 needed 2 round trips on top of TCP. TLS 1.3 (RFC 8446) needs 1.
+
+<TlsHandshake client:visible />
+
+TLS 1.3 also has a **0-RTT** mode for a returning client: it sends the request in the first flight. The price is that RFC 8446 section 2.3 warns that 0-RTT data has no replay protection. An attacker can capture that first flight and send it again. So only safe, repeatable requests (like a GET of a public page) should use it. Never a payment.
+
+## Numbers
+
+The slider uses the round counts above. Move it to see which setups hurt most when the user is far away.
+
+<HandshakeCost client:visible />
+
+| Setup | Round trips to first byte |
+|---|---|
+| HTTPS, TLS 1.2, new connection | 4 |
+| HTTPS, TLS 1.3, new connection | 3 |
+| HTTP/3, new connection | 2 |
+| Warm connection, any version | 1 |
+| HTTP/3 with 0-RTT resumption | 1 |
+
+Between your own services in one data center, the round trip is ~0.5 ms, so even 3 round trips cost ~1.5 ms. The same count across an ocean costs ~300 ms. The lesson: reuse connections everywhere, and move the server near the user when the user is far.
+
+## Trade-offs
+
+| Version | You gain | You pay | Use it when |
+|---|---|---|---|
+| HTTP/1.1 | Simple, works everywhere, easy to debug as text | One request at a time per connection, many connections | Legacy clients, simple tools |
+| HTTP/2 | One connection, many streams, compressed headers | TCP-level blocking on loss, harder to debug | Default for browsers and service-to-service calls |
+| HTTP/3 | No cross-stream blocking, 1-RTT setup, survives network changes | UDP may be blocked on some networks, more CPU in user space | Mobile and lossy networks, global users |
+
+## Interview lens
+
+<Callout type="tip">
+Count round trips out loud. "A cold HTTPS request is DNS plus 3 round trips. With keep-alive and HTTP/2 the next request is 1. With a CDN near the user, that round trip is 20 ms, not 200 ms." This links DNS, TCP, TLS and CDN in one sentence.
+</Callout>
+
+<Callout type="mistake">
+Do not say "HTTP/2 removes head-of-line blocking". It removes it at the HTTP layer. TCP still blocks all streams on one lost packet. Only HTTP/3 over QUIC removes both. Also do not call 0-RTT free: it trades replay safety for speed.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A user is 60 ms (round trip) from your server. Your site uses TLS 1.3 over TCP. About how long until the first byte of the response on a brand-new connection, ignoring DNS?',
+      options: ['60 ms', '120 ms', '180 ms', '240 ms'],
+      answer: 2,
+      explain: 'TCP is 1 RTT, TLS 1.3 is 1 RTT, and the request and response is 1 RTT. Three round trips of 60 ms is 180 ms. With a warm connection it is 60 ms.',
+    },
+    {
+      q: 'Your mobile users have lossy networks. A page loads 30 small files over HTTP/2. One packet is lost. What happens?',
+      options: [
+        'Only the stream that owned the packet waits',
+        'All 30 streams stall until TCP resends the packet',
+        'The connection closes and all 30 restart',
+        'HTTP/2 skips the lost data',
+      ],
+      answer: 1,
+      explain: 'HTTP/2 multiplexes streams over one TCP connection. TCP delivers bytes in order and does not know about streams, so everything behind the missing packet waits. HTTP/3 over QUIC fixes this.',
+    },
+    {
+      q: 'Why do browsers open 6 connections per host for HTTP/1.1 but only 1 for HTTP/2?',
+      options: [
+        'HTTP/2 forbids more than one connection',
+        'HTTP/1.1 can run one request at a time per connection, so parallel connections are the only way to get parallelism. HTTP/2 multiplexes streams in one.',
+        'HTTP/2 connections are slower so they need fewer',
+        'HTTP/1.1 connections cannot be reused',
+      ],
+      answer: 1,
+      explain: 'More connections are a workaround for the one-at-a-time rule. HTTP/2 makes the workaround unnecessary and saves the extra setup cost and server memory.',
+    },
+    {
+      q: 'You want to use TLS 1.3 0-RTT early data. Which request is safest to send that way?',
+      options: ['POST /payments to charge a card', 'GET /static/logo.png', 'POST /orders to place an order', 'DELETE /account'],
+      answer: 1,
+      explain: '0-RTT data can be replayed by an attacker. A replayed GET of a public file does no harm. A replayed payment, order or delete could repeat the action.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RFC 9113: HTTP/2](https://www.rfc-editor.org/rfc/rfc9113.html) (section 1 states the TCP head-of-line limit)
+- [RFC 9114: HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) and [RFC 9000: QUIC](https://www.rfc-editor.org/rfc/rfc9000.html)
+- [RFC 8446: TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html) (section 2.3 on 0-RTT replay)
+- [MDN: Connection management in HTTP/1.x](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Connection_management_in_HTTP_1.x)

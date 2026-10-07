@@ -20,9 +20,9 @@ export default function DnsTtlSim() {
   const [i, setI] = useState(1);
   const ttl = OPTIONS[i].sec;
   const qps = RESOLVERS / ttl;
-  const W = 340;
-  const H = 130;
-  const P = { l: 40, r: 10, t: 10, b: 28 };
+  const W = 300;
+  const H = 150;
+  const P = { l: 46, r: 8, t: 10, b: 34 };
   const x = (f: number) => P.l + f * (W - P.l - P.r);
   const y = (v: number) => P.t + (1 - v) * (H - P.t - P.b);
 
@@ -60,11 +60,11 @@ export default function DnsTtlSim() {
           <line x1={P.l} x2={W - P.r} y1={y(0)} y2={y(0)} stroke="var(--border)" />
           <line x1={P.l} x2={W - P.r} y1={y(1)} y2={y(1)} stroke="var(--border)" />
           <line x1={x(0)} y1={y(1)} x2={x(1)} y2={y(0)} stroke="var(--bad)" strokeWidth={2.5} />
-          <text x={P.l - 6} y={y(1) + 4} textAnchor="end" fontSize={10} fill="var(--muted)">100%</text>
-          <text x={P.l - 6} y={y(0) + 4} textAnchor="end" fontSize={10} fill="var(--muted)">0%</text>
-          <text x={x(0)} y={H - 12} textAnchor="middle" fontSize={10} fill="var(--muted)">IP changed</text>
-          <text x={x(1)} y={H - 12} textAnchor="end" fontSize={10} fill="var(--muted)">{fmt(ttl)} later</text>
-          <text x={W - P.r} y={P.t + 26} textAnchor="end" fontSize={11} fill="var(--muted)">share of resolvers</text><text x={W - P.r} y={P.t + 40} textAnchor="end" fontSize={11} fill="var(--muted)">still on the old IP</text>
+          <text x={P.l - 6} y={y(1) + 4} textAnchor="end" fontSize={13} fill="var(--muted)">100%</text>
+          <text x={P.l - 6} y={y(0) + 4} textAnchor="end" fontSize={13} fill="var(--muted)">0%</text>
+          <text x={x(0) - 6} y={H - 12} textAnchor="start" fontSize={13} fill="var(--muted)">IP changed</text>
+          <text x={x(1)} y={H - 12} textAnchor="end" fontSize={13} fill="var(--muted)">{fmt(ttl)} later</text>
+          <text x={W - P.r} y={P.t + 28} textAnchor="end" fontSize={13} fill="var(--muted)">share of resolvers</text><text x={W - P.r} y={P.t + 44} textAnchor="end" fontSize={13} fill="var(--muted)">still on the old IP</text>
         </svg>
       </div>
       <p className="border-t border-line px-4 py-3 text-[0.95rem] leading-relaxed">

@@ -15,28 +15,27 @@ interface Entity {
   y: number;
   w: number;
   attrs: Attr[];
-  tone?: 'accent';
 }
 
-const ROW = 22;
-const heightOf = (e: Entity) => 34 + e.attrs.length * ROW + 8;
+const ROW = 24;
+const heightOf = (e: Entity) => 36 + e.attrs.length * ROW + 8;
 
 function EntityBox({ e, step, born }: { e: Entity; step: number; born: number }) {
   const h = heightOf(e);
   return (
     <Fade step={step} born={born}>
-      <SketchBox cx={e.x + e.w / 2} cy={e.y + h / 2} w={e.w} h={h} r={8} seed={seedOf(e.id)} stroke={e.tone ? 'var(--accent)' : 'var(--fg)'} fill="var(--surface)" fillStyle="solid" />
-      <HandText x={e.x + e.w / 2} y={e.y + 17} size={17} weight={700}>
+      <SketchBox cx={e.x + e.w / 2} cy={e.y + h / 2} w={e.w} h={h} r={8} seed={seedOf(e.id)} fill="var(--surface)" fillStyle="solid" />
+      <HandText x={e.x + e.w / 2} y={e.y + 18} size={18} weight={700}>
         {e.title}
       </HandText>
-      <line x1={e.x + 8} x2={e.x + e.w - 8} y1={e.y + 32} y2={e.y + 32} stroke="var(--border)" />
+      <line x1={e.x + 8} x2={e.x + e.w - 8} y1={e.y + 34} y2={e.y + 34} stroke="var(--border)" />
       {e.attrs.map((a, i) => (
         <g key={a.name}>
-          <HandText x={e.x + 14} y={e.y + 32 + 14 + i * ROW} size={14} anchor="start" color={a.tone ? `var(--${a.tone === 'accent' ? 'accent' : 'warn'})` : 'var(--fg)'}>
+          <HandText x={e.x + 12} y={e.y + 34 + 15 + i * ROW} size={15} anchor="start" color={a.tone === 'accent' ? 'var(--accent)' : a.tone === 'warn' ? 'var(--warn)' : 'var(--fg)'}>
             {a.name}
           </HandText>
           {a.tag && (
-            <HandText x={e.x + e.w - 12} y={e.y + 32 + 14 + i * ROW} size={12} anchor="end" color="var(--muted)">
+            <HandText x={e.x + e.w - 10} y={e.y + 34 + 15 + i * ROW} size={14} anchor="end" color="var(--muted)">
               {a.tag}
             </HandText>
           )}
@@ -47,11 +46,11 @@ function EntityBox({ e, step, born }: { e: Entity; step: number; born: number })
 }
 
 const FEATURES = [
-  'Users post short messages',
-  'Users follow other users',
+  'Users post',
+  'Users follow users',
   'Users like posts',
-  'Home timeline: newest posts\nfrom people I follow',
-  'Every post shows its\nlike count',
+  'Home timeline',
+  'Like counts',
 ];
 
 const steps = [
@@ -70,8 +69,8 @@ export default function ErBuilder() {
         const user: Entity = {
           id: 'User',
           title: 'User',
-          x: 300,
-          y: 30,
+          x: 4,
+          y: 10,
           w: 200,
           attrs: [{ name: 'id', tag: 'PK' }, { name: 'name' }, { name: 'handle' }],
         };
@@ -81,102 +80,95 @@ export default function ErBuilder() {
           { name: 'body' },
           { name: 'created_at' },
         ];
-        if (i >= 4) postAttrs.push({ name: 'INDEX (user_id, created_at)', tone: 'accent' });
+        if (i >= 4) postAttrs.push({ name: 'idx: user_id, created_at', tone: 'accent' });
         if (i >= 5) postAttrs.push({ name: 'like_count (copy)', tone: 'warn' });
-        const post: Entity = { id: 'Post', title: 'Post', x: 640, y: 30, w: 220, attrs: postAttrs };
+        const post: Entity = { id: 'Post', title: 'Post', x: 300, y: 10, w: 220, attrs: postAttrs };
         const follow: Entity = {
           id: 'Follow',
           title: 'Follow',
-          x: 300,
-          y: 270,
+          x: 4,
+          y: 310,
           w: 200,
-          attrs: [{ name: 'follower_id', tag: 'FK → User' }, { name: 'followee_id', tag: 'FK → User' }],
+          attrs: [{ name: 'follower_id', tag: 'FK' }, { name: 'followee_id', tag: 'FK' }],
         };
         const like: Entity = {
           id: 'Like',
           title: 'Like',
-          x: 640,
-          y: 270,
+          x: 300,
+          y: 310,
           w: 220,
           attrs: [{ name: 'user_id', tag: 'FK → User' }, { name: 'post_id', tag: 'FK → Post' }],
         };
         const hot = i === 4;
-        const edge = (hot ? 'var(--accent)' : 'var(--fg)');
+        const accentIf = hot ? 'var(--accent)' : undefined;
         return (
-          <SketchSvg width={900} height={420} label="Entity relationship sketch that grows as features are added">
-            {/* feature list */}
-            <HandText x={14} y={22} size={16} weight={700} anchor="start">
-              Feature list
-            </HandText>
-            {FEATURES.map((f, k) => {
-              const y = 62 + k * 62;
-              const done = i >= k + 1;
-              const current = i === k + 1;
-              return (
-                <g key={f}>
-                  <SketchBox cx={22} cy={y - 4} w={20} h={20} r={4} seed={seedOf('chk' + k)} stroke={done ? 'var(--ok)' : 'var(--muted)'} />
-                  {done && (
-                    <HandText x={22} y={y - 3} size={16} weight={700} color="var(--ok)">
-                      ✓
-                    </HandText>
-                  )}
-                  <HandText x={42} y={y + (f.includes('\n') ? 2 : -4)} size={14.5} anchor="start" color={current ? 'var(--accent)' : done ? 'var(--fg)' : 'var(--muted)'} weight={current ? 700 : 400}>
+          <div>
+            <ul className="flex flex-wrap gap-x-4 gap-y-1.5 px-2 text-[0.9rem] leading-snug">
+              <li className="font-semibold">Features:</li>
+              {FEATURES.map((f, k) => {
+                const done = i >= k + 1;
+                const current = i === k + 1;
+                return (
+                  <li key={f} className={`flex items-start gap-1.5 ${current ? 'font-semibold text-accent' : done ? '' : 'text-muted'}`}>
+                    <span aria-hidden className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border text-[11px] ${done ? 'border-ok text-ok' : 'border-line'}`}>
+                      {done ? '✓' : ''}
+                    </span>
                     {f}
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="mx-auto mt-2 max-w-[560px]">
+              <SketchSvg width={524} height={420} label="Entity relationship sketch that grows as features are added">
+                {i >= 1 && (
+                  <Fade step={i} born={1}>
+                    <SketchArrow points={[[208, 60], [296, 60]]} head="none" seed={seedOf('rel-up')} />
+                    <HandText x={218} y={44} size={15} weight={700}>1</HandText>
+                    <HandText x={286} y={44} size={15} weight={700}>N</HandText>
+                    <HandText x={252} y={82} size={14} color="var(--muted)">writes</HandText>
+                  </Fade>
+                )}
+                {i >= 2 && (
+                  <Fade step={i} born={2}>
+                    <SketchArrow points={[[50, 122], [50, 306]]} head="none" stroke={accentIf} seed={seedOf('rel-fu1')} />
+                    <SketchArrow points={[[150, 122], [150, 306]]} head="none" stroke={accentIf} seed={seedOf('rel-fu2')} />
+                    <HandText x={38} y={136} size={15} weight={700}>1</HandText>
+                    <HandText x={38} y={292} size={15} weight={700}>N</HandText>
+                    <HandText x={138} y={136} size={15} weight={700}>1</HandText>
+                    <HandText x={138} y={292} size={15} weight={700}>N</HandText>
+                    <HandText x={50} y={214} size={14} color="var(--muted)" halo>follower</HandText>
+                    <HandText x={150} y={214} size={14} color="var(--muted)" halo>followee</HandText>
+                  </Fade>
+                )}
+                {i >= 3 && (
+                  <Fade step={i} born={3}>
+                    <SketchArrow points={[[410, 306], [410, 205]]} head="none" seed={seedOf('rel-lp')} />
+                    <HandText x={396} y={292} size={15} weight={700}>N</HandText>
+                    <HandText x={396} y={222} size={15} weight={700}>1</HandText>
+                    <SketchArrow points={[[296, 345], [210, 135]]} head="none" seed={seedOf('rel-lu')} />
+                    <HandText x={226} y={150} size={15} weight={700}>1</HandText>
+                    <HandText x={282} y={326} size={15} weight={700}>N</HandText>
+                  </Fade>
+                )}
+                {hot && <SketchArrow points={[[208, 360], [262, 300], [304, 196]]} stroke="var(--accent)" seed={seedOf('hot-path')} />}
+
+                {i >= 1 && <EntityBox e={user} step={i} born={1} />}
+                {i >= 1 && <EntityBox e={post} step={i} born={1} />}
+                {i >= 2 && <EntityBox e={follow} step={i} born={2} />}
+                {i >= 3 && <EntityBox e={like} step={i} born={3} />}
+                {i === 0 && (
+                  <HandText x={262} y={200} size={19} color="var(--muted)">
+                    {'nothing designed yet\nread the nouns and verbs'}
                   </HandText>
-                </g>
-              );
-            })}
-
-            {/* relationships */}
-            {i >= 1 && (
-              <Fade step={i} born={1}>
-                <SketchArrow points={[[504, 70], [636, 70]]} head="none" seed={seedOf('rel-up')} />
-                <HandText x={520} y={54} size={14} weight={700}>1</HandText>
-                <HandText x={622} y={54} size={14} weight={700}>N</HandText>
-                <HandText x={570} y={90} size={13} color="var(--muted)">writes</HandText>
-              </Fade>
-            )}
-            {i >= 2 && (
-              <Fade step={i} born={2}>
-                <SketchArrow points={[[360, 138], [360, 266]]} head="none" stroke={hot ? edge : undefined} seed={seedOf('rel-fu1')} />
-                <HandText x={346} y={150} size={14} weight={700}>1</HandText>
-                <HandText x={346} y={254} size={14} weight={700}>N</HandText>
-                <HandText x={316} y={204} size={13} color="var(--muted)" anchor="end">follower</HandText>
-                <SketchArrow points={[[440, 138], [440, 266]]} head="none" stroke={hot ? edge : undefined} seed={seedOf('rel-fu2')} />
-                <HandText x={426} y={150} size={14} weight={700}>1</HandText>
-                <HandText x={426} y={254} size={14} weight={700}>N</HandText>
-                <HandText x={456} y={204} size={13} color="var(--muted)" anchor="start">followee</HandText>
-              </Fade>
-            )}
-            {i >= 3 && (
-              <Fade step={i} born={3}>
-                <SketchArrow points={[[750, 266], [750, 200]]} head="none" seed={seedOf('rel-lp')} />
-                <HandText x={736} y={254} size={14} weight={700}>N</HandText>
-                <HandText x={736} y={212} size={14} weight={700}>1</HandText>
-                <SketchArrow points={[[636, 312], [480, 150]]} head="none" seed={seedOf('rel-lu')} />
-                <HandText x={500} y={170} size={14} weight={700}>1</HandText>
-                <HandText x={616} y={296} size={14} weight={700}>N</HandText>
-              </Fade>
-            )}
-            {hot && (
-              <>
-                <SketchArrow points={[[500, 330], [560, 330], [640, 190]]} stroke="var(--accent)" seed={seedOf('hot-path')} />
-                <HandText x={456} y={392} size={12.5} mono color="var(--accent)">
-                  {'SELECT p.* FROM Follow f JOIN Post p ON p.user_id = f.followee_id\nWHERE f.follower_id = ? ORDER BY p.created_at DESC LIMIT 20'}
-                </HandText>
-              </>
-            )}
-
-            {i >= 1 && <EntityBox e={user} step={i} born={1} />}
-            {i >= 1 && <EntityBox e={post} step={i} born={1} />}
-            {i >= 2 && <EntityBox e={follow} step={i} born={2} />}
-            {i >= 3 && <EntityBox e={like} step={i} born={3} />}
-            {i === 0 && (
-              <HandText x={580} y={200} size={20} color="var(--muted)">
-                {'nothing designed yet\nread the nouns and the verbs'}
-              </HandText>
-            )}
-          </SketchSvg>
+                )}
+              </SketchSvg>
+              {hot && (
+                <pre className="mx-2 mt-1 overflow-x-auto rounded-md border border-line bg-surface px-3 py-2 font-mono text-[12.5px] leading-snug text-accent">
+                  {'SELECT p.* FROM Follow f JOIN Post p ON p.user_id = f.followee_id\nWHERE f.follower_id = ? ORDER BY p.created_at DESC LIMIT 20;'}
+                </pre>
+              )}
+            </div>
+          </div>
         );
       }}
     </AnimFrame>
