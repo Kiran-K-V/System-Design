@@ -30,7 +30,7 @@ function sizeLabel(keys: number) {
 
 export default function ZipfCache() {
   const [s, setS] = useState(1);
-  const [pos, setPos] = useState(0.67); // slider position 0..1 maps to 10^(6*pos) keys
+  const [pos, setPos] = useState(2 / 3); // slider position 0..1 maps to 10^(6*pos) keys
   const cum = useMemo(() => cumulative(s), [s]);
   const size = Math.max(1, Math.min(N, Math.round(Math.pow(10, 6 * pos))));
   const hit = cum[size];
@@ -119,7 +119,7 @@ export default function ZipfCache() {
           <polyline points={curve.join(' ')} fill="none" stroke="var(--accent)" strokeWidth={2} />
           <line x1={xOf(size)} x2={xOf(size)} y1={P.t} y2={H - P.b} stroke="var(--muted)" strokeDasharray="3 3" />
           <circle cx={xOf(size)} cy={yOf(hit)} r={5} fill="var(--ok)" />
-          <text x={W - P.r} y={P.t + 8} textAnchor="end" fontSize={11} fill="var(--muted)">
+          <text x={P.l + 6} y={P.t + 8} textAnchor="start" fontSize={11} fill="var(--muted)">
             hit ratio
           </text>
         </svg>

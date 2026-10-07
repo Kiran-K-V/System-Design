@@ -23,7 +23,7 @@ interface Bar {
   appearsAt: number;
 }
 
-const LANE_Y = [88, 236, 330];
+const LANE_Y = [80, 205, 330];
 
 const BARS: Bar[] = [
   { lane: 0, from: 0, label: 'GET /users/7', note: 'sends ~2 KB, we use 2 fields', noteTone: 'var(--bad)', appearsAt: 1 },
@@ -35,8 +35,8 @@ const BARS: Bar[] = [
 
 const STATS = [
   { lane: 0, at: 3, lines: '5 requests\n3 round trips\n~240 ms\n~11 KB', color: 'var(--bad)' },
-  { lane: 1, at: 4, lines: '1 request\n1 round trip\n~85 ms\n~0.6 KB', color: 'var(--ok)' },
-  { lane: 2, at: 5, lines: '1 request\n1 round trip\n~85 ms\n~0.8 KB', color: 'var(--ok)' },
+  { lane: 1, at: 4, lines: '1 request\n1 round trip\n~85 ms\n~1.3 KB', color: 'var(--ok)' },
+  { lane: 2, at: 5, lines: '1 request\n1 round trip\n~85 ms\n~1.5 KB', color: 'var(--ok)' },
 ];
 
 const LANES = [
@@ -64,7 +64,7 @@ const steps = [
   },
   {
     caption:
-      'GraphQL: one request to /graphql. The query names the exact fields, nested: user, posts, and each post author. The server walks the graph and returns exactly that shape. One round trip, ~0.6 KB.',
+      'GraphQL: one request to /graphql. The query names the exact fields, nested: user, posts, and each post author. The server walks the graph and returns exactly that shape. One round trip, ~1.3 KB.',
   },
   {
     caption:
@@ -113,7 +113,7 @@ function Lane({ i, step }: { i: 0 | 1 | 2; step: number }) {
               {b.label}
             </HandText>
             {b.note && (
-              <HandText x={x(b.from) + (RTT * PX) / 2} y={y + (n > 1 ? 40 : 30)} size={12} color={b.noteTone}>
+              <HandText x={x(b.from) + (RTT * PX) / 2} y={y + (n > 1 ? 44 : 32)} size={13} color={b.noteTone}>
                 {b.note}
               </HandText>
             )}
@@ -122,8 +122,8 @@ function Lane({ i, step }: { i: 0 | 1 | 2; step: number }) {
       })}
       {i === 1 && step >= 4 && (
         <motion.g initial={step === 4 ? { opacity: 0 } : false} animate={{ opacity: 1 }} transition={{ delay: 0.3, duration: 0.5 }}>
-          <HandText x={X0} y={y + 52} size={12} anchor="start" mono color="var(--muted)">
-            {'{ user(id: 7) { name avatar posts(first: 3) { text author { name avatar } } } }'}
+          <HandText x={X0} y={y + 46} size={13} anchor="start" mono color="var(--muted)">
+            {'{ user(id:7) { name avatar posts(first:3) { text author { name avatar } } } }'}
           </HandText>
         </motion.g>
       )}
@@ -144,8 +144,19 @@ export default function FetchRace() {
       {(i) => (
         <SketchSvg width={900} height={420} label="Timeline of round trips for REST, GraphQL and RPC fetching the same profile screen">
           {[1, 2].map((k) => (
-            <SketchArrow key={k} points={[[10, [0, 164, 290][k]], [890, [0, 164, 290][k]]]} head="none" dashed stroke="var(--border)" strokeWidth={1} seed={seedOf('sep' + k)} />
+            <SketchArrow key={k} points={[[10, [0, 150, 268][k]], [890, [0, 150, 268][k]]]} head="none" dashed stroke="var(--border)" strokeWidth={1} seed={seedOf('sep' + k)} />
           ))}
+          {i === 0 && (
+            <g>
+              <SketchBox cx={x(0) + 88} cy={205} w={176} h={30} r={6} seed={seedOf('legend')} stroke="var(--muted)" dashed />
+              <HandText x={x(0) + 88} y={205} size={13} color="var(--muted)">
+                one bar = 80 ms
+              </HandText>
+              <HandText x={x(0) + 196} y={205} size={14} anchor="start" color="var(--muted)">
+                {'= one round trip. A longer chain of bars = a slower screen.'}
+              </HandText>
+            </g>
+          )}
           <Lane i={0} step={i} />
           <Lane i={1} step={i} />
           <Lane i={2} step={i} />

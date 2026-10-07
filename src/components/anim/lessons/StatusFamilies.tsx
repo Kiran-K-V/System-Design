@@ -30,7 +30,7 @@ const FAMILIES: Family[] = [
     codes: [
       ['301', 'moved for good'],
       ['302', 'moved for now'],
-      ['304', 'use your cached copy'],
+      ['304', 'use cached copy'],
     ],
   },
   {
@@ -62,7 +62,7 @@ const FAMILIES: Family[] = [
   },
 ];
 
-const W = 216;
+const W = 210;
 const GAP = 12;
 
 export default function StatusFamilies() {
@@ -72,7 +72,7 @@ export default function StatusFamilies() {
       <div className="px-2 py-4 sm:px-4">
         <SketchSvg width={900} height={330} label="HTTP status code families 2xx, 3xx, 4xx and 5xx with the common codes in each">
           {FAMILIES.map((f, i) => {
-            const cx = 6 + W / 2 + i * (W + GAP);
+            const cx = 12 + W / 2 + i * (W + GAP);
             const x0 = cx - W / 2;
             return (
               <g key={f.range}>

@@ -30,7 +30,7 @@ export default function SlowStartCalc() {
   const [size, setSize] = useState(2);
   const { segs, out } = rounds(SIZES[size].bytes);
   const total = (1 + out.length) * rtt;
-  const max = out[out.length - 1].cwnd;
+  const max = Math.max(...out.map((r) => r.cwnd));
 
   return (
     <figure className="not-prose my-8 overflow-hidden rounded-xl border border-line bg-bg shadow-[0_1px_2px_rgb(0_0_0/0.04)]">
@@ -74,7 +74,7 @@ export default function SlowStartCalc() {
         </div>
         <div>
           <p className="mb-1 text-xs text-muted">Segments sent in each round trip (the window doubles)</p>
-          <div className="flex h-36 items-end gap-2 border-b border-line">
+          <div className="flex h-32 items-end gap-2 border-b border-line">
             <div className="flex w-10 flex-col items-center justify-end">
               <span className="mb-1 text-[10px] text-muted">SYN</span>
               <div className="h-2 w-full rounded-t bg-muted/50" />
@@ -82,7 +82,7 @@ export default function SlowStartCalc() {
             {out.map((r, i) => (
               <div key={i} className="flex flex-1 flex-col items-center justify-end">
                 <span className="mb-1 text-[10px] tabular-nums text-muted">{r.cwnd}</span>
-                <div className="w-full rounded-t bg-accent" style={{ height: `${Math.max(4, (r.cwnd / max) * 100)}px` }} />
+                <div className="w-full rounded-t bg-accent" style={{ height: `${Math.max(4, (r.cwnd / max) * 96)}px` }} />
               </div>
             ))}
           </div>

@@ -63,7 +63,7 @@ export default function NormalizeCost() {
       title="Normalize or copy? One author, one year"
       caption={
         <>
-          Task: show each post with its author’s name. Raise <b>views per post</b> and the copy wins. Raise <b>renames</b> or <b>posts</b> and the single copy wins. The access pattern decides, not taste.
+          Task: show each post with its author’s name. Raise <b>views per post</b> and the copy wins. Raise <b>renames</b> or the <b>write cost</b> and the single copy wins. Posts scale both sides, so they do not change the winner. The access pattern decides, not taste.
         </>
       }
     >

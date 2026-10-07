@@ -58,16 +58,16 @@ export default function ModNFail() {
             </HandText>
             {SCALE.map((r, i) => {
               const y = 70 + i * 78;
-              const bar = (v: number) => (v / 100) * 520;
+              const bar = (v: number) => (v / 100) * 480;
               return (
                 <g key={r.n}>
-                  <HandText x={90} y={y + 16} size={16} anchor="end">
+                  <HandText x={190} y={y + 26} size={18} anchor="end">
                     {`${r.n} → ${r.n + 1} servers`}
                   </HandText>
-                  <rect x={110} y={y} width={bar(r.mod)} height={24} rx={4} fill="var(--bad)" opacity={0.75} />
-                  <HandText x={118 + bar(r.mod)} y={y + 12} size={14} anchor="start">{`hash % N: ${r.mod}%`}</HandText>
-                  <rect x={110} y={y + 28} width={Math.max(3, bar(r.ring))} height={24} rx={4} fill="var(--ok)" opacity={0.8} />
-                  <HandText x={118 + Math.max(3, bar(r.ring))} y={y + 40} size={14} anchor="start">{`ring: ${r.ring}%`}</HandText>
+                  <rect x={210} y={y} width={bar(r.mod)} height={24} rx={4} fill="var(--bad)" opacity={0.75} />
+                  <HandText x={218 + bar(r.mod)} y={y + 12} size={16} anchor="start">{`hash % N: ${r.mod}%`}</HandText>
+                  <rect x={210} y={y + 28} width={Math.max(3, bar(r.ring))} height={24} rx={4} fill="var(--ok)" opacity={0.8} />
+                  <HandText x={218 + Math.max(3, bar(r.ring))} y={y + 40} size={16} anchor="start">{`ring: ${r.ring}%`}</HandText>
                 </g>
               );
             })}
@@ -76,14 +76,14 @@ export default function ModNFail() {
           <SketchSvg width={900} height={250} label="Twenty keys and the server each one maps to, before and after adding a server">
             <Badge cx={26} cy={50} n={1} seed={seedOf('mn1')} />
             <Row y={50} mod={4} label="" />
-            <HandText x={X0} y={92} size={14} anchor="start" color="var(--muted)">
+            <HandText x={X0} y={92} size={16} anchor="start" color="var(--muted)">
               hash % 4: hash 0 → A, 1 → B, 2 → C, 3 → D, 4 → A, 5 → B ...
             </HandText>
             {s.stage !== 'before' && (
               <>
                 <Badge cx={26} cy={150} n={2} seed={seedOf('mn2')} />
                 <Row y={150} mod={5} label="" moved={s.stage === 'moved'} />
-                <HandText x={X0} y={192} size={14} anchor="start" color="var(--muted)">
+                <HandText x={X0} y={192} size={16} anchor="start" color="var(--muted)">
                   hash % 5: hash 0 → A, 1 → B, 2 → C, 3 → D, 4 → E, 5 → A ...
                 </HandText>
               </>

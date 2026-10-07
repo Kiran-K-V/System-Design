@@ -1,0 +1,162 @@
+---
+summary: A cache can sit in the browser, at a CDN edge, in a gateway, inside the app, in a shared store, or in the database. Each place trades distance, size, and control.
+requires: ['05-caching/why-cache', '02-networking/cdn-proxies']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import CacheLayers from '../../../components/anim/lessons/CacheLayers.tsx';
+import LocalVsSharedCache from '../../../components/anim/lessons/LocalVsSharedCache.tsx';
+
+## The problem
+
+Lesson 5.1 said: put a copy of hot data close to the reader. It did not say *where*. A cache can live in seven places between the user and the disk. Pick the wrong one and you get one of two bad results. You cache too far from the user and still pay a long trip. Or you cache too close and lose control: you cannot update or remove the copy when the data changes.
+
+Think of each place as a trade between three things:
+
+- **Distance.** How many network hops and how much latency lie between the reader and the copy.
+- **Reach.** How many readers share the copy. A copy in one browser helps one user. A copy at a CDN edge helps every user in a city.
+- **Control.** How easily you can remove or change the copy when the truth changes.
+
+Closer copies are faster, but they serve fewer readers and are harder to control. This one trade explains the whole stack.
+
+## The request walks down a stack
+
+Step through seven requests. Each one stops at a different layer. Watch what changes: the user's wait, and how much of your system is spared.
+
+<CacheLayers client:visible />
+
+The layers, top to bottom:
+
+1. **Browser cache.** The user's own device. It follows HTTP rules (`Cache-Control`, RFC 9111). You do not control it after you send the response. You can only set how long it may keep the copy.
+2. **CDN edge.** A content delivery network keeps copies in servers near users (lesson 2.7). Cloudflare, for instance, caches static files by extension by default and does not cache HTML or JSON unless you tell it to. It is a *shared cache*: one copy serves many users.
+3. **Gateway or reverse proxy.** A server in front of your app (Nginx, an API gateway) can cache whole responses by URL. It is in your data center, so it is fast to reach but far from the user.
+4. **In-process cache.** A hash map inside the app, such as a Caffeine cache in Java or `lru_cache` in Python. A lookup is a memory read. No network.
+5. **Distributed cache.** A separate cluster such as Redis or Memcached, shared by all app servers.
+6. **Database buffer pool.** The database keeps hot disk pages in its own RAM. PostgreSQL calls this `shared_buffers` (128 MB default) and also leans on the operating system's page cache. You get this layer for free.
+7. **Disk.** The source of truth.
+
+### Two numbers, two jobs
+
+Look again at the totals in the animation. They rest on two assumptions: 20 ms from the user to the edge, 80 ms from the user to your region.
+
+- The **edge and browser layers** change the user's latency a lot: from ~80 ms to ~20 ms or ~0 ms. They remove the long network trip.
+- The **backend layers** (in-process, Redis, buffer pool) change latency by a few ms. Their job is different: each one **removes load** from the layer behind it. The database only sees what every layer above it missed.
+
+When an interviewer asks "where would you cache?", ask yourself which job you need. Slow for faraway users? Cache at the edge. Overloaded database? Cache in the backend.
+
+## In-process or shared? The consistency trap
+
+The in-process cache is the fastest backend layer: ~1 µs, no network. So why does everyone reach for Redis?
+
+Because of what happens when you run more than one app server. Each server has its own private copy. A write that goes through one server updates only that server's copy. Step through it.
+
+<LocalVsSharedCache client:visible />
+
+With N servers you have N copies that can disagree. Users see their data flip between old and new on refresh. It lasts until each copy expires.
+
+There are ways to live with this:
+
+- **Short TTLs** (time to live: how long a copy may stay before it must be refreshed). A 5-second TTL bounds the lie to 5 seconds.
+- **Broadcast invalidation.** On write, tell all servers to drop the key (over pub/sub). It works, but it is a new system you must make reliable.
+- **Cache only data that rarely changes**: config, feature flags, reference tables.
+- **Sticky routing.** The load balancer sends the same user to the same server. It hides the problem, then breaks when a server is replaced.
+
+A shared cache removes the problem by keeping one copy. You pay ~0.5 ms per read instead of ~1 µs, and you run another cluster.
+
+<Callout type="deep" title="Both at once: two-level caches">
+Large systems often use both. A small in-process cache (a few seconds TTL, a few thousand hot keys) sits in front of Redis. Hot keys never reach Redis, which also fixes the "hot key" problem where one Redis node takes all the traffic for a viral key. Redis even helps with the consistency side: with client-side caching, the server tracks which keys each client holds and sends an invalidation message when a key changes, so the local copy is dropped. If the connection to the server drops, the client flushes the whole local cache, because it can no longer trust it.
+</Callout>
+
+## What each layer is good for
+
+| Layer | Best for | Not for | Who controls freshness |
+|---|---|---|---|
+| Browser | Static files, user-private responses | Anything you must change at once | Only `Cache-Control` headers you sent earlier |
+| CDN | Public, popular content: images, JS, video, public pages | Per-user data (unless keyed carefully) | Headers, plus purge APIs |
+| Gateway cache | Identical responses for many users | Personalized responses | Headers, TTL, purge |
+| In-process | Tiny, hot, rarely changing data | Data that must agree across servers | Your code only |
+| Redis / Memcached | Objects and query results shared by all servers | Data larger than RAM budget | Your code (lesson 5.3) |
+| DB buffer pool | Hot rows and index pages | Nothing. It is automatic. | The database |
+
+## The numbers
+
+| Layer | Typical cost to reach |
+|---|---|
+| Browser cache | ~0 ms (local memory or disk) |
+| CDN edge | One round trip to the nearest edge, often 10–50 ms |
+| Gateway in your data center | ~1 ms from the app side |
+| In-process | ~100 ns to ~1 µs |
+| Redis in the same data center | ~0.5 ms |
+| DB query, buffer pool hit | ~1–5 ms (lesson 1.5) |
+| DB page read from SSD | ~100 µs extra (lesson 1.2) |
+
+Redis is about 500 to 5,000 times slower than an in-process lookup. It is also about 40 times faster than a ~20 ms round trip to a CDN edge.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Edge / CDN | Lowest latency for far users, shields origin | Weak control, purge delay, only cacheable content | Public or semi-public content |
+| In-process | No network, no extra system | N copies that drift, memory inside your app heap | Small, slow-changing, very hot data |
+| Redis | One shared copy, big capacity | ~0.5 ms per hit, a new cluster to run | Many app servers, data must agree |
+| Two levels | Speed and shared truth | Two TTLs to reason about | Hot keys, huge read volume |
+
+## Interview lens
+
+<Callout type="tip">
+Name the layer and the reason. "I would put static assets and public product pages on a CDN to cut latency for far users. Personalized data goes to Redis, keyed by user id. Config goes in-process with a 30-second TTL." This answers *where* and *why* in one breath.
+</Callout>
+
+<Callout type="mistake">
+Do not put per-user data in a shared CDN cache without keying on the user, and do not cache private pages with a public header. Another user may receive someone else's page. Also do not say "cache everything in Redis". Say which layer protects which resource.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Users in Asia complain that your US-hosted site is slow. Your database is idle. Which cache gives the biggest latency win?',
+      options: ['A bigger Redis cluster', 'A larger DB buffer pool', 'A CDN edge cache', 'An in-process cache in each app server'],
+      answer: 2,
+      explain: 'The delay is network distance, not backend work. Only a layer near the user (CDN edge or browser) removes the long trip. Backend caches save a few ms and database load, not 100+ ms of distance.',
+    },
+    {
+      q: 'You run 4 app servers, each with a private in-process cache, 60 s TTL. A user changes her name through server 2. What can she see in the next minute?',
+      options: [
+        'Always the new name',
+        'The old name on some refreshes, until each server\'s copy expires or is replaced',
+        'An error page',
+        'The old name for exactly 60 s on every refresh',
+      ],
+      answer: 1,
+      explain: 'Only server 2 knows the new name. The balancer sends refreshes to different servers, so she may see old or new. Each other server keeps its old copy for up to 60 s from the time it was cached.',
+    },
+    {
+      q: 'Cache lookup costs: in-process 1 µs, Redis 0.5 ms. A request does 20 lookups for related keys. How much time do the lookups cost with Redis, one after another?',
+      options: ['~20 µs', '~0.5 ms', '~10 ms', '~100 ms'],
+      answer: 2,
+      explain: '20 × 0.5 ms = 10 ms. This is why chatty code against a remote cache is slow. Batch the keys into one multi-get, or keep hot ones in-process.',
+    },
+    {
+      q: 'Which statement about the database buffer pool is right?',
+      options: [
+        'You must add it by installing Redis',
+        'It caches hot pages in DB RAM, so a query can skip the disk read but still pays the network and query cost',
+        'It removes the need for a cache in front of a database',
+        'It caches the responses of your API',
+      ],
+      answer: 1,
+      explain: 'The buffer pool saves the disk read. The request still crosses the network, is parsed, and executes. A cache in front saves all of that, but it adds staleness.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RFC 9111: HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html). Freshness, `max-age`, `s-maxage`, `no-cache`, `no-store`.
+- [Cloudflare: default cache behavior](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/). What an edge caches without configuration.
+- [Redis: client-side caching](https://redis.io/docs/latest/develop/clients/client-side-caching/). Server-assisted invalidation for in-process caches.
+- [PostgreSQL docs: resource consumption](https://www.postgresql.org/docs/current/runtime-config-resource.html). `shared_buffers` and the OS cache.

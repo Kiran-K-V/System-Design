@@ -46,7 +46,7 @@ const steps: Step[] = [
     caption: 'Directory sharding: a lookup table maps each key (or key group) to a shard. Any placement is possible. You can move one hot key to its own shard. The price: the directory is a new service, on the path of every request, and it must never be wrong.',
     stage: 'directory',
     active: ['router', 'dir'],
-    packets: [{ from: 'router', to: 'dir', label: 'where is 42?' }],
+    packets: [{ from: 'router', to: 'dir' }],
   },
   {
     caption: 'Sharding and replication work together. Each shard is itself a small replicated group: one leader and followers. Sharding spreads writes and data. Replication keeps each shard alive when a machine fails.',
@@ -93,7 +93,7 @@ export default function ShardSplit() {
               const y = ys[id];
               nodes.push({ id: `r${i + 1}`, x: 790, y, w: 110, h: 70, shape: 'db', label: 'follower', sub: `copy of ${i + 1}`, tone: 'ok' });
               edges.push({ from: id, to: `r${i + 1}`, dashed: true, tone: 'ok', label: 'replicate', labelAt: [0, -14] });
-              groups.push({ x: 480, y: y - 52, w: 380, h: 104, label: `shard ${i + 1} group` });
+              groups.push({ x: 425, y: y - 52, w: 435, h: 104, label: `group ${i + 1}` });
             }
           }
         }

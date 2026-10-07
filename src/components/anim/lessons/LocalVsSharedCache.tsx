@@ -1,18 +1,19 @@
 import AnimFrame from '../AnimFrame';
 import FlowDiagram, { type FlowEdge, type FlowNode, type FlowNote, type FlowPacket } from '../FlowDiagram';
 
-const lb: FlowNode = { id: 'lb', x: 80, y: 190, w: 110, h: 60, label: 'Load\nbalancer' };
-const db: FlowNode = { id: 'db', x: 810, y: 190, w: 110, h: 100, shape: 'db', label: 'Database' };
-const app = (n: 1 | 2 | 3, tone?: FlowNode['tone']): FlowNode => ({
+const lb: FlowNode = { id: 'lb', x: 70, y: 170, w: 110, h: 64, label: 'Load\nbalancer' };
+const db: FlowNode = { id: 'db', x: 710, y: 250, w: 110, h: 100, shape: 'db', label: 'Database' };
+const app = (n: 1 | 2 | 3, tone?: FlowNode['tone'], sub?: string): FlowNode => ({
   id: `a${n}`,
-  x: 330,
-  y: 60 + (n - 1) * 130,
-  w: 150,
-  h: 56,
+  x: 300,
+  y: 60 + (n - 1) * 110,
+  w: 170,
+  h: 66,
   label: `App ${n}`,
+  sub,
   tone,
 });
-const redis: FlowNode = { id: 'redis', x: 580, y: 190, w: 130, h: 70, label: 'Redis', sub: 'one shared copy' };
+const redis: FlowNode = { id: 'redis', x: 560, y: 70, w: 130, h: 70, label: 'Redis', sub: 'one shared copy' };
 
 const lbEdges: FlowEdge[] = [1, 2, 3].map((n) => ({ from: 'lb', to: `a${n}` }));
 const dbEdges: FlowEdge[] = [1, 2, 3].map((n) => ({ from: `a${n}`, to: 'db', dashed: true }));
@@ -95,29 +96,16 @@ export default function LocalVsSharedCache() {
     <AnimFrame title="In-process caches disagree. A shared cache does not." steps={SCENES.map((s) => ({ caption: s.caption }))} interval={3200}>
       {(i) => {
         const s = SCENES[i];
-        const nodes: FlowNode[] = [lb, app(1, s.tones[0]), app(2, s.tones[1]), app(3, s.tones[2]), db, ...(s.shared ? [redis] : [])];
+        const sub = (k: number) => (s.shared ? undefined : `local copy: ${s.copies[k]}`);
+        const nodes: FlowNode[] = [lb, app(1, s.tones[0], sub(0)), app(2, s.tones[1], sub(1)), app(3, s.tones[2], sub(2)), db, ...(s.shared ? [redis] : [])];
         const edges: FlowEdge[] = [...lbEdges, ...(s.shared ? redisEdges : []), ...dbEdges];
-        const notes: FlowNote[] = [];
-        if (!s.shared) {
-          s.copies.forEach((c, k) => {
-            const stale = s.tones[k] === 'bad';
-            notes.push({
-              x: 420,
-              y: 60 + k * 130 + 4,
-              text: `local: ${c}`,
-              size: 16,
-              tone: stale ? 'bad' : s.tones[k] === 'ok' ? 'ok' : undefined,
-            });
-          });
-          notes.push({ x: 810, y: 262, text: 'DB: ' + (i >= 2 ? 'Bea' : i === 1 ? 'Bea (just now)' : 'Ana'), anchor: 'middle', size: 16, tone: i >= 1 ? 'ok' : undefined });
-        } else {
-          notes.push({ x: 580, y: 240, text: s.sharedNote?.text ?? '', anchor: 'middle', size: 16, tone: s.sharedNote?.tone });
-          notes.push({ x: 810, y: 262, text: 'DB: Bea', anchor: 'middle', size: 16, tone: 'ok' });
-        }
+        const dbText = s.shared ? 'DB: Bea' : i >= 2 ? 'DB: Bea' : i === 1 ? 'DB: Bea (just now)' : 'DB: Ana';
+        const notes: FlowNote[] = [{ x: 710, y: 318, text: dbText, anchor: 'middle', size: 17, tone: dbText.includes('Bea') ? 'ok' : undefined }];
+        if (s.shared) notes.push({ x: 640, y: 72, text: s.sharedNote?.text ?? '', size: 17, tone: s.sharedNote?.tone });
         return (
           <FlowDiagram
-            width={900}
-            height={320}
+            width={800}
+            height={340}
             nodes={nodes}
             edges={edges}
             notes={notes}

@@ -64,7 +64,7 @@ export default function DnsTtlSim() {
           <text x={P.l - 6} y={y(0) + 4} textAnchor="end" fontSize={10} fill="var(--muted)">0%</text>
           <text x={x(0)} y={H - 12} textAnchor="middle" fontSize={10} fill="var(--muted)">IP changed</text>
           <text x={x(1)} y={H - 12} textAnchor="end" fontSize={10} fill="var(--muted)">{fmt(ttl)} later</text>
-          <text x={(W + P.l) / 2} y={P.t + 24} textAnchor="middle" fontSize={11} fill="var(--muted)">resolvers still on the old IP</text>
+          <text x={W - P.r} y={P.t + 26} textAnchor="end" fontSize={11} fill="var(--muted)">share of resolvers</text><text x={W - P.r} y={P.t + 40} textAnchor="end" fontSize={11} fill="var(--muted)">still on the old IP</text>
         </svg>
       </div>
       <p className="border-t border-line px-4 py-3 text-[0.95rem] leading-relaxed">

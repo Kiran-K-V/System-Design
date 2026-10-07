@@ -12,11 +12,11 @@ interface DnsStep {
 const IP = '203.0.113.7';
 
 const baseNodes: FlowNode[] = [
-  { id: 'client', x: 95, y: 175, w: 130, label: 'Browser', sub: 'stub resolver' },
-  { id: 'resolver', x: 380, y: 175, w: 150, h: 76, label: 'Recursive\nresolver', sub: 'ISP, 1.1.1.1, 8.8.8.8' },
-  { id: 'root', x: 745, y: 50, w: 190, label: 'Root server', sub: 'knows who runs .com' },
-  { id: 'tld', x: 745, y: 175, w: 190, label: '.com TLD server', sub: 'knows who runs example.com' },
-  { id: 'auth', x: 745, y: 300, w: 190, label: 'Authoritative', sub: 'owns example.com records' },
+  { id: 'client', x: 85, y: 175, w: 130, label: 'Browser', sub: 'stub resolver' },
+  { id: 'resolver', x: 330, y: 175, w: 150, h: 80, label: 'Resolver', sub: 'recursive' },
+  { id: 'root', x: 765, y: 50, w: 210, label: 'Root server', sub: 'knows who runs .com' },
+  { id: 'tld', x: 765, y: 175, w: 210, label: '.com TLD server', sub: 'knows who runs example.com' },
+  { id: 'auth', x: 765, y: 300, w: 210, label: 'Authoritative', sub: 'holds example.com records' },
 ];
 
 const edges: FlowEdge[] = [
@@ -37,7 +37,7 @@ const steps: DnsStep[] = [
   {
     caption: 'Query 1: "What is the A record (IPv4 address) for www.example.com?" This is a recursive query. It means "do whatever it takes and bring me the answer". The resolver checks its cache. Nothing there.',
     active: ['client', 'resolver'],
-    packets: [{ from: 'client', to: 'resolver', label: 'www.example.com?' }],
+    packets: [{ from: 'client', to: 'resolver' }],
     cache: 'cache: empty (miss)',
     badge: 1,
   },
@@ -45,7 +45,7 @@ const steps: DnsStep[] = [
     caption: 'The resolver starts at the top. It asks a root server. The root does not know the IP. It knows who runs .com, and answers with a referral: "ask these .com servers". Resolvers ship with the root server list built in.',
     active: ['resolver', 'root'],
     packets: [
-      { from: 'resolver', to: 'root', label: 'www.example.com?' },
+      { from: 'resolver', to: 'root' },
       { from: 'root', to: 'resolver', label: 'ask .com', tone: 'warn', delay: 1 },
     ],
     cache: 'cache: empty',
@@ -55,8 +55,8 @@ const steps: DnsStep[] = [
     caption: 'The resolver asks a .com TLD (top-level domain) server. It also lacks the IP. It knows which name servers own example.com, and refers the resolver there.',
     active: ['resolver', 'tld'],
     packets: [
-      { from: 'resolver', to: 'tld', label: 'www.example.com?' },
-      { from: 'tld', to: 'resolver', label: 'ask ns1.example.com', tone: 'warn', delay: 1 },
+      { from: 'resolver', to: 'tld' },
+      { from: 'tld', to: 'resolver', label: 'ask ns1', tone: 'warn', delay: 1 },
     ],
     cache: 'cache: NS for .com',
     badge: 3,
@@ -65,8 +65,8 @@ const steps: DnsStep[] = [
     caption: `The resolver asks the authoritative server for example.com. This server holds the real records. It answers: www.example.com is ${IP}, with a TTL (time to live) of 300 seconds.`,
     active: ['resolver', 'auth'],
     packets: [
-      { from: 'resolver', to: 'auth', label: 'www.example.com?' },
-      { from: 'auth', to: 'resolver', label: `${IP}  TTL 300`, tone: 'ok', delay: 1 },
+      { from: 'resolver', to: 'auth' },
+      { from: 'auth', to: 'resolver', label: IP, tone: 'ok', delay: 1 },
     ],
     cache: 'cache: NS for .com, NS for example.com',
     badge: 4,
@@ -82,8 +82,8 @@ const steps: DnsStep[] = [
     caption: 'Another user on the same resolver asks 20 seconds later. The resolver finds the answer in its cache and replies at once. No upstream server is touched. Cost: one hop, ~10 ms. This is why DNS survives billions of lookups.',
     active: ['client', 'resolver'],
     packets: [
-      { from: 'client', to: 'resolver', label: 'www.example.com?' },
-      { from: 'resolver', to: 'client', label: `${IP} (cached)`, tone: 'ok', delay: 1 },
+      { from: 'client', to: 'resolver' },
+      { from: 'resolver', to: 'client', label: IP, tone: 'ok', delay: 1 },
     ],
     cache: 'cache hit, 280 s left',
     badge: 6,
@@ -92,8 +92,8 @@ const steps: DnsStep[] = [
     caption: 'After 300 seconds the entry expires. The next query must refresh it. But the resolver still remembers who runs .com and example.com (those records live much longer), so it skips the root and TLD and asks the authoritative server directly.',
     active: ['resolver', 'auth'],
     packets: [
-      { from: 'resolver', to: 'auth', label: 'www.example.com?' },
-      { from: 'auth', to: 'resolver', label: `${IP}  TTL 300`, tone: 'ok', delay: 1 },
+      { from: 'resolver', to: 'auth' },
+      { from: 'auth', to: 'resolver', label: IP, tone: 'ok', delay: 1 },
     ],
     cache: 'expired: refresh from authoritative only',
     badge: 7,
@@ -105,7 +105,7 @@ export default function DnsWalk() {
     <AnimFrame title="DNS: a cold lookup, then a cached one" steps={steps} interval={3000}>
       {(i, step) => {
         const nodes = baseNodes.map((n) => (step.active.includes(n.id) ? n : { ...n, tone: 'default' as const }));
-        const notes: FlowNote[] = [{ x: 380, y: 250, text: step.cache, anchor: 'middle', tone: step.cache.includes('hit') ? 'ok' : undefined }];
+        const notes: FlowNote[] = [{ x: 200, y: 60, text: 'Question every time:\nwhat is the A record of\nwww.example.com?', anchor: 'middle', size: 15 }, { x: 330, y: 238, text: step.cache, anchor: 'middle', tone: step.cache.includes('hit') ? 'ok' : undefined }];
         const withBadge = nodes.map((n) => (n.id === 'resolver' && step.badge ? { ...n, badge: step.badge } : n));
         return (
           <FlowDiagram

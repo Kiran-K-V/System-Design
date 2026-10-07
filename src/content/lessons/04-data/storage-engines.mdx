@@ -1,0 +1,167 @@
+---
+summary: A database stores rows in fixed-size pages and survives crashes by writing a sequential log before it touches any page. Know this and every database becomes a variation of one idea.
+requires: ['01-one-machine/latency-numbers', '04-data/data-modeling']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import WalCrash, { NaiveWrite } from '../../../components/anim/lessons/WalCrash.tsx';
+import PageLayout from '../../../components/anim/lessons/PageLayout.tsx';
+
+## The problem
+
+You designed the schema. Now a database must keep it on a disk. Two facts make this hard.
+
+1. **RAM is lost on a power cut. Disk is not.** But disk is ~1,000x slower than RAM (lesson 1.2). So data must reach disk, and you cannot afford many disk waits per request.
+2. **A disk writes in blocks, not bytes.** An SSD or HDD moves 512 bytes to 4 KB at a time. A database page is 8 KB in PostgreSQL. SQLite uses 4 KB by default (since version 3.12.0, 2016). Change one byte and you still write a whole block.
+
+And one more: a transaction often changes many places. Move money from A to B: that changes two rows, maybe on two pages. A crash can fall between them.
+
+## Naive: write the pages directly
+
+The simplest design: read the page, change it, write the page back. Watch what a crash does.
+
+<NaiveWrite client:visible />
+
+The disk cannot write two pages as one step. After the crash, A was debited and B was not. 30 units vanished. The database cannot even tell, because nothing records that a transfer was in progress.
+
+The fix is an old idea from accounting: **write down what you are about to do before you do it.**
+
+## First: what is a page?
+
+Before the fix, the thing it protects. A table is a file cut into **pages** of equal size. Each page holds many rows.
+
+<PageLayout />
+
+The page is the unit of I/O. A query for one 200-byte row reads one 8 KB page. A page holds about 8,192 / 200 = ~40 such rows. A table of 100 million rows of 200 B is 20 GB, which is ~2.4 million pages.
+
+The database keeps recently used pages in a RAM cache, the **buffer pool**. PostgreSQL's `shared_buffers` defaults to 128 MB, which is 16,384 pages. Production systems set it much higher. A page that is in the pool costs ~100 ns to read. A page that is not costs one SSD read, ~100 µs.
+
+## The mechanism: the write-ahead log
+
+The **write-ahead log** (WAL) is a file where the database appends a record for every change, before it changes any data page. The PostgreSQL manual states the rule plainly: changes to data files must be written only after the WAL records describing them have been flushed to permanent storage.
+
+Step through one commit, then a crash.
+
+<WalCrash client:visible />
+
+Three things to see:
+
+- **The commit point is the log write.** The client hears "OK" once the log record is on disk, not when the data page is. This is the whole trick.
+- **Dirty pages are written later.** Many changes to the same page merge into one page write. A **checkpoint** flushes dirty pages in a batch.
+- **Recovery is replay.** After a crash, the database re-applies log records to the pages. This is **redo**. Each page header stores the log position of its last change, so recovery knows which records a page already has.
+
+Why is this faster, not just safer? Look at the cost of one commit.
+
+| Approach | Disk work before "OK" | Pattern |
+|---|---|---|
+| Write every changed page | One 8 KB write per changed page | Random, scattered |
+| Write-ahead log | One small record, one fsync | Sequential append |
+
+The log is written in order, so an HDD does not seek, and an SSD sees the friendliest pattern it has. PostgreSQL also batches: when many small transactions commit at once, one fsync of the log may commit all of them. This is **group commit**.
+
+<Callout type="deep" title="Why the first change to a page after a checkpoint logs the whole page">
+A crash in the middle of an 8 KB page write can leave half old, half new bytes. This is a **torn page**. A log record that says "change bytes 40–48" cannot fix a torn page. So PostgreSQL's `full_page_writes` setting (on by default) writes the whole page into the log on its first change after each checkpoint. Recovery restores the page from the log, then applies the later small records. This is also why a checkpoint is followed by a burst of larger log writes.
+</Callout>
+
+## Two families of storage engines
+
+Everything above is **update in place**: the page stays at one location and is overwritten. PostgreSQL, MySQL's InnoDB, and SQLite work this way. Their indexes are **B-trees** (lesson 4.3). The WAL is a safety net.
+
+The other family makes the log the data. It never overwrites. It only appends, and merges old data later. These are **log-structured** engines, such as RocksDB, Cassandra, and LevelDB. Their indexes are **LSM trees** (lesson 4.3). The idea comes from the 1996 LSM-tree paper by O'Neil and others.
+
+To feel why this works, build the smallest database there is: two shell functions.
+
+```bash
+db_set() { echo "$1,$2" >> database; }          # write: append one line
+db_get() { grep "^$1," database | tail -n 1; }  # read: scan, take the last
+```
+
+Writes are as fast as a disk can go: one sequential append. Reads scan the whole file: slow, and slower with every write. This is the example Martin Kleppmann builds in *Designing Data-Intensive Applications* (chapter 3). Every storage engine is this log plus a way to find things without scanning. That "way to find things" is an **index**. It is the next lesson.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| PostgreSQL page size | 8 KB (compile-time option) | PostgreSQL docs |
+| SQLite default page size | 4,096 B (1,024 B before 3.12.0) | SQLite docs |
+| PostgreSQL buffer pool default | 128 MB | PostgreSQL docs |
+| PostgreSQL checkpoint interval default | 5 minutes | PostgreSQL docs |
+| PostgreSQL WAL writer flush interval | 200 ms | PostgreSQL docs |
+| Page read from RAM / SSD / HDD | ~100 ns / ~100 µs / ~10 ms | Lesson 1.2 |
+| fsync of a small log write | roughly 0.1–1 ms on an SSD; several ms on an HDD | Depends on the device and its cache |
+
+The last row decides your commit throughput. If one fsync takes 1 ms, one connection that commits one transaction at a time reaches at most ~1,000 commits per second. Group commit lifts the ceiling because many connections share one fsync.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| WAL with fsync on every commit | No acknowledged write is lost | Commit latency = fsync time | Money, orders, anything users would notice |
+| Asynchronous commit | Much lower commit latency | A crash loses the last few transactions. PostgreSQL's risk window is up to 3 × 200 ms = 600 ms | Event logs, metrics, counters |
+| Bigger buffer pool | More reads hit RAM | Memory cost; slower warm-up | Working set fits in RAM |
+| Frequent checkpoints | Fast crash recovery | More page writes, more I/O | Recovery time targets are strict |
+| Update in place (B-tree) | Fast point reads and range reads | Random writes, page splits | Read-heavy or mixed load |
+| Log-structured (LSM) | Very high write rate | Reads check several files; background compaction | Write-heavy load |
+
+Asynchronous commit is a safe trade in one specific way: PostgreSQL's manual says the risk is data **loss**, not data **corruption**. Replay still restores a consistent state, just a slightly older one.
+
+## Interview lens
+
+<Callout type="tip">
+When asked "how does the database not lose my write?", say the sentence in order: "It appends a record to a write-ahead log, fsyncs it, then acknowledges. Data pages are written later in batches. After a crash it replays the log." Then add: "That is also why replicas work. They replay the same log." That last link is lesson 4.6.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the database writes to disk when you commit" as if it meant the table. It writes a **log record**. And do not say a write is durable because it reached the OS. Until fsync returns, the bytes may sit in the OS page cache and vanish on a power cut. Durable means the device has confirmed.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A table has 100 million rows of 200 bytes each. About how many 8 KB pages does it need, ignoring overhead?',
+      options: ['~25 thousand', '~2.4 million', '~244 million', '~2.4 billion'],
+      answer: 1,
+      explain: '100 million × 200 B = 20 GB. 20 GB / 8 KB = about 2.4 million pages. Each page holds ~40 rows.',
+    },
+    {
+      q: 'A database acknowledges a commit after it writes the log record to the operating system, but before fsync. The power fails one second later. What is true?',
+      options: [
+        'Nothing is lost, because the log is sequential',
+        'The transaction may be lost, although the client was told it committed',
+        'Only the data page is lost; the log replays it',
+        'The database is corrupted',
+      ],
+      answer: 1,
+      explain: 'Without fsync the record can still sit in the OS cache, which is RAM. A power cut loses it. The client holds a false OK. The rule is: log, then fsync, then acknowledge.',
+    },
+    {
+      q: 'One transaction changes rows on 3 different data pages. How many random data-page writes must finish before the client sees OK, with a WAL?',
+      options: ['3', '1', '0', '3 per replica'],
+      answer: 2,
+      explain: 'Only the sequential log write is required. The three dirty pages stay in RAM and reach the data file at the next checkpoint. After a crash the log restores them.',
+    },
+    {
+      q: 'You set wal_writer_delay to its default of 200 ms and enable asynchronous commit. What is the worst-case outcome of a crash?',
+      options: [
+        'Up to ~600 ms of the latest committed transactions are lost, and the database stays consistent',
+        'The data file is corrupted and needs a restore',
+        'Nothing; async commit only affects replicas',
+        'All transactions since the last checkpoint are lost',
+      ],
+      answer: 0,
+      explain: 'PostgreSQL states the risk window is at most three times wal_writer_delay, here 600 ms. Replay restores a consistent older state. The risk is loss, not corruption.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [PostgreSQL docs: Write-Ahead Logging](https://www.postgresql.org/docs/current/wal-intro.html)
+- [PostgreSQL docs: Asynchronous commit](https://www.postgresql.org/docs/current/wal-async-commit.html)
+- [PostgreSQL docs: Database page layout](https://www.postgresql.org/docs/current/storage-page-layout.html)
+- [SQLite: Write-Ahead Logging](https://sqlite.org/wal.html)
+- O'Neil, Cheng, Gawlick, O'Neil. *The Log-Structured Merge-Tree (LSM-Tree)*. Acta Informatica, 1996.

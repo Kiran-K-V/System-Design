@@ -79,7 +79,7 @@ const steps: WalkStep[] = [
   },
 ];
 
-const TX = 640;
+const TX = 745;
 const ROW_H = 34;
 
 export default function RestWalk() {
@@ -129,8 +129,8 @@ export default function RestWalk() {
 
           <SketchArrow points={[[122, 168], [150, 100]]} seed={seedOf('a1')} stroke="var(--accent)" />
           <SketchArrow points={[[150, 272], [122, 202]]} seed={seedOf('a2')} stroke={s.res && !s.res.ok ? 'var(--bad)' : 'var(--ok)'} />
-          <SketchArrow points={[[510, 92], [TX - 134, 120]]} seed={seedOf('a3')} dashed stroke="var(--muted)" />
-          <HandText x={565} y={86} size={13} color="var(--muted)">
+          <SketchArrow points={[[510, 92], [TX - 134, 112]]} seed={seedOf('a3')} dashed stroke="var(--muted)" />
+          <HandText x={570} y={84} size={13} color="var(--muted)">
             changes
           </HandText>
 

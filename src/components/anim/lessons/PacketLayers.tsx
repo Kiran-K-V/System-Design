@@ -32,25 +32,25 @@ export default function PacketLayers() {
 
         <SketchBox cx={655} cy={175} w={470} h={300} stroke={layers[3].color} seed={seedOf('frame')} r={14} />
         <HandText x={430} y={42} size={15} anchor="start" color={layers[3].color}>
-          Ethernet frame: carries at most 1,500 bytes of IP packet (the MTU)
+          Ethernet frame (carries at most 1,500 B: the MTU)
         </HandText>
         <SketchBox cx={655} cy={196} w={440} h={240} stroke={layers[2].color} seed={seedOf('ip')} r={12} />
         <HandText x={450} y={94} size={15} anchor="start" color={layers[2].color}>
-          IP packet: 20 B header (source and destination address)
+          IP packet: 20 B header (addresses)
         </HandText>
         <SketchBox cx={655} cy={216} w={410} h={180} stroke={layers[1].color} seed={seedOf('tcp')} r={10} />
         <HandText x={470} y={144} size={15} anchor="start" color={layers[1].color}>
-          TCP segment: 20 B header (ports, seq, ack, flags)
+          TCP segment: 20 B header (ports, seq, ack)
         </HandText>
         <SketchBox cx={655} cy={240} w={380} h={90} stroke="var(--fg)" seed={seedOf('data')} r={8} />
         <HandText x={655} y={232} size={17}>
           your data
         </HandText>
         <HandText x={655} y={256} size={14} color="var(--muted)">
-          up to 1,460 B (the MSS = 1,500 - 20 - 20)
+          up to 1,460 B (MSS = 1,500 - 20 - 20)
         </HandText>
         <HandText x={655} y={334} size={14} color="var(--muted)">
-          With UDP, the 8 B UDP header replaces the TCP header: up to 1,472 B of data
+          With UDP the header is 8 B, so up to 1,472 B of data
         </HandText>
       </SketchSvg>
     </figure>

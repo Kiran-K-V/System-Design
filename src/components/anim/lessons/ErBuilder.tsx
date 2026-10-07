@@ -138,13 +138,14 @@ export default function ErBuilder() {
             )}
             {i >= 2 && (
               <Fade step={i} born={2}>
-                <SketchArrow points={[[400, 138], [400, 266]]} head="none" stroke={hot ? edge : undefined} seed={seedOf('rel-fu1')} />
-                <HandText x={386} y={150} size={14} weight={700}>1</HandText>
-                <HandText x={386} y={254} size={14} weight={700}>N</HandText>
-                <HandText x={452} y={204} size={13} color="var(--muted)">follower</HandText>
-                <SketchArrow points={[[298, 305], [262, 190], [298, 80]]} head="none" seed={seedOf('rel-fu2')} />
-                <HandText x={236} y={190} size={13} color="var(--muted)" anchor="end">followee</HandText>
-                <HandText x={280} y={96} size={14} weight={700}>1</HandText>
+                <SketchArrow points={[[360, 138], [360, 266]]} head="none" stroke={hot ? edge : undefined} seed={seedOf('rel-fu1')} />
+                <HandText x={346} y={150} size={14} weight={700}>1</HandText>
+                <HandText x={346} y={254} size={14} weight={700}>N</HandText>
+                <HandText x={316} y={204} size={13} color="var(--muted)" anchor="end">follower</HandText>
+                <SketchArrow points={[[440, 138], [440, 266]]} head="none" stroke={hot ? edge : undefined} seed={seedOf('rel-fu2')} />
+                <HandText x={426} y={150} size={14} weight={700}>1</HandText>
+                <HandText x={426} y={254} size={14} weight={700}>N</HandText>
+                <HandText x={456} y={204} size={13} color="var(--muted)" anchor="start">followee</HandText>
               </Fade>
             )}
             {i >= 3 && (

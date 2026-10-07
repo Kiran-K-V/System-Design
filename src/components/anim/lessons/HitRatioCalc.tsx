@@ -58,7 +58,7 @@ export default function HitRatioCalc() {
             hit ratio
           </text>
           <line x1={P.l} x2={W - P.r} y1={y(noCache)} y2={y(noCache)} stroke="var(--bad)" strokeDasharray="4 3" />
-          <text x={W - P.r - 2} y={y(noCache) - 4} textAnchor="end" fontSize={10} fill="var(--bad)">
+          <text x={P.l + 4} y={y(noCache) - 4} textAnchor="start" fontSize={10} fill="var(--bad)">
             no cache: {noCache} ms
           </text>
           <polyline points={curve} fill="none" stroke="var(--accent)" strokeWidth={2} />

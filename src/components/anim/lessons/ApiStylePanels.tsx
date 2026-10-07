@@ -65,7 +65,7 @@ export default function ApiStylePanels() {
                 </HandText>
                 <SketchBox cx={cx} cy={140} w={W - 28} h={106} r={8} seed={seedOf(p.name + 'c')} fill="var(--surface)" fillStyle="solid" stroke="var(--border)" />
                 <HandText x={x0 - 4} y={140} size={12.5} anchor="start" mono lineHeight={1.4}>
-                  {p.code.join('\n')}
+                  {p.code.map((l) => l.replace(/^ +/, (m) => '\u00a0'.repeat(m.length))).join('\n')}
                 </HandText>
                 <HandText x={x0} y={218} size={15} anchor="start" weight={700}>
                   {p.picks}

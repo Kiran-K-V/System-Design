@@ -2,14 +2,14 @@ import AnimFrame from '../AnimFrame';
 import FlowDiagram, { type FlowEdge, type FlowNode, type FlowNote, type FlowPacket } from '../FlowDiagram';
 
 const nodes: FlowNode[] = [
-  { id: 'app', x: 110, y: 170, w: 150, h: 70, label: 'App server' },
-  { id: 'cache', x: 450, y: 170, w: 170, h: 70, label: 'Cache', sub: 'RAM, ~0.5 ms away' },
-  { id: 'db', x: 790, y: 170, w: 130, h: 100, shape: 'db', label: 'Database', sub: '~5 ms query' },
+  { id: 'app', x: 100, y: 170, w: 150, h: 70, label: 'App server' },
+  { id: 'cache', x: 380, y: 170, w: 170, h: 70, label: 'Cache', sub: 'RAM, ~0.5 ms away' },
+  { id: 'db', x: 665, y: 175, w: 130, h: 100, shape: 'db', label: 'Database', sub: '~5 ms query' },
 ];
 
 const edges: FlowEdge[] = [
   { from: 'app', to: 'cache', head: 'both' },
-  { from: 'app', to: 'db', head: 'both', bend: 100, dashed: true },
+  { from: 'app', to: 'db', head: 'both', bend: 80, dashed: true },
 ];
 
 interface Scene {
@@ -19,12 +19,14 @@ interface Scene {
   notes: FlowNote[];
 }
 
+const slow: FlowNote = { x: 380, y: 112, text: 'dashed = slow path', anchor: 'middle', size: 14 };
+
 const total = (text: string, tone: 'bad' | 'ok' | 'warn' | 'default' = 'default'): FlowNote => ({
-  x: 450,
-  y: 300,
+  x: 380,
+  y: 280,
   text,
   anchor: 'middle',
-  size: 17,
+  size: 20,
   tone: tone === 'default' ? undefined : tone,
 });
 
@@ -33,19 +35,19 @@ const scenes: Scene[] = [
     caption: 'The setup. A read must return the user row. The cache starts empty. The database holds the truth. The dashed line is the slow path.',
     packets: [],
     active: [],
-    notes: [{ x: 450, y: 222, text: 'cache: (empty)', anchor: 'middle' }],
+    notes: [{ x: 380, y: 224, text: 'cache: (empty)', anchor: 'middle', size: 17 }],
   },
   {
     caption: 'Read 1, step 1. The app asks the cache first. Asking costs about 0.5 ms: one network round trip inside the data center.',
     packets: [{ from: 'app', to: 'cache', label: 'GET user:7' }],
     active: ['cache'],
-    notes: [{ x: 450, y: 222, text: 'cache: (empty)', anchor: 'middle' }, total('so far: ~0.5 ms')],
+    notes: [{ x: 380, y: 224, text: 'cache: (empty)', anchor: 'middle', size: 17 }, total('so far: ~0.5 ms')],
   },
   {
     caption: 'The cache has no copy. That is a miss. The app learns this after one wasted round trip.',
     packets: [{ from: 'cache', to: 'app', label: 'miss', tone: 'bad' }],
     active: ['app'],
-    notes: [{ x: 450, y: 222, text: 'cache: (empty)', anchor: 'middle' }, total('so far: ~1 ms', 'warn')],
+    notes: [{ x: 380, y: 224, text: 'cache: (empty)', anchor: 'middle', size: 17 }, total('so far: ~1 ms', 'warn')],
   },
   {
     caption: 'The app queries the database. This is the slow part: about 5 ms for an indexed read. The row comes back.',
@@ -54,13 +56,13 @@ const scenes: Scene[] = [
       { from: 'db', to: 'app', label: 'row', delay: 1.1, tone: 'ok' },
     ],
     active: ['db'],
-    notes: [{ x: 450, y: 222, text: 'cache: (empty)', anchor: 'middle' }, total('so far: ~6 ms', 'bad')],
+    notes: [{ x: 380, y: 224, text: 'cache: (empty)', anchor: 'middle', size: 17 }, total('so far: ~6 ms', 'bad')],
   },
   {
     caption: 'The app writes the row into the cache, then returns it to the user. This miss cost about 6.5 ms: cache check, database read, cache write.',
     packets: [{ from: 'app', to: 'cache', label: 'SET user:7' }],
     active: ['cache'],
-    notes: [{ x: 450, y: 222, text: 'cache: user:7 = {...}', anchor: 'middle', tone: 'ok' }, total('miss path total: ~6.5 ms', 'bad')],
+    notes: [{ x: 380, y: 224, text: 'cache: user:7 = {...}', anchor: 'middle', size: 17, tone: 'ok' }, total('miss path total: ~6.5 ms', 'bad')],
   },
   {
     caption: 'Read 2 for the same key. The app asks the cache. The cache has the row. That is a hit. The database never hears about it.',
@@ -69,14 +71,14 @@ const scenes: Scene[] = [
       { from: 'cache', to: 'app', label: 'hit', delay: 1.1, tone: 'ok' },
     ],
     active: ['cache'],
-    notes: [{ x: 450, y: 222, text: 'cache: user:7 = {...}', anchor: 'middle', tone: 'ok' }, total('hit path total: ~0.5 ms', 'ok')],
+    notes: [{ x: 380, y: 224, text: 'cache: user:7 = {...}', anchor: 'middle', size: 17, tone: 'ok' }, total('hit path total: ~0.5 ms', 'ok')],
   },
   {
     caption: 'The result. A hit is about 13 times faster than a miss here, and it uses zero database capacity. The rest of this module is about making hits common and keeping them correct.',
     packets: [],
     active: ['cache'],
     notes: [
-      { x: 450, y: 222, text: 'cache: user:7 = {...}', anchor: 'middle', tone: 'ok' },
+      { x: 380, y: 224, text: 'cache: user:7 = {...}', anchor: 'middle', size: 17, tone: 'ok' },
       total('hit ~0.5 ms   vs   miss ~6.5 ms', 'default'),
     ],
   },
@@ -87,11 +89,11 @@ export default function CacheHitMissFlow() {
     <AnimFrame title="One key: a miss, then a hit" steps={scenes.map((s) => ({ caption: s.caption }))} interval={2800}>
       {(i) => (
         <FlowDiagram
-          width={900}
-          height={330}
+          width={760}
+          height={310}
           nodes={nodes}
           edges={edges}
-          notes={scenes[i].notes}
+          notes={[...scenes[i].notes, slow]}
           packets={scenes[i].packets}
           active={scenes[i].active}
           stepKey={i}

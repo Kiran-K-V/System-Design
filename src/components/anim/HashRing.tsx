@@ -93,6 +93,22 @@ export function HashRingView({ points, colors, letters = {}, keys = [], arcs = t
         positions 0 to 2³²−1, clockwise
       </HandText>
 
+      {!pointLabels && (
+        <g>
+          {[...new Set(ring.map((p) => p.node))].map((n, i, all) => {
+            const x = C - ((all.length - 1) * 44) / 2 + i * 44;
+            return (
+              <g key={`lg-${n}`}>
+                <circle cx={x - 9} cy={C + 40} r={6} fill={colors[n]} />
+                <HandText x={x + 3} y={C + 40} size={15} weight={700} anchor="start">
+                  {letters[n] ?? n}
+                </HandText>
+              </g>
+            );
+          })}
+        </g>
+      )}
+
       {keys.map((k, i) => {
         if (!k.focus) return null;
         const owner = ownerOfPos(k.pos);

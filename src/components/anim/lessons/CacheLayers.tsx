@@ -13,9 +13,9 @@ interface Layer {
 
 const LAYERS: Layer[] = [
   { id: 'browser', label: 'Browser cache', cost: 0, costText: 'local, ~0 ms', holds: 'static files, API responses' },
-  { id: 'cdn', label: 'CDN edge', cost: 20, costText: '+20 ms round trip to the edge', holds: 'images, JS, public pages' },
-  { id: 'gateway', label: 'Gateway / proxy cache', cost: 60, costText: '+60 ms on to the region', holds: 'whole responses, by URL' },
-  { id: 'local', label: 'In-process cache', cost: 1, costText: '+1 ms to the app, ~1 µs lookup', holds: 'hot objects in app memory' },
+  { id: 'cdn', label: 'CDN edge', cost: 20, costText: '+20 ms to the edge', holds: 'images, JS, public pages' },
+  { id: 'gateway', label: 'Gateway / proxy cache', cost: 60, costText: '+60 ms on to your region', holds: 'whole responses, by URL' },
+  { id: 'local', label: 'In-process cache', cost: 1, costText: '+1 ms to app, ~1 µs lookup', holds: 'hot objects in app memory' },
   { id: 'redis', label: 'Distributed cache (Redis)', cost: 0.5, costText: '+0.5 ms network hop', holds: 'objects shared by all servers' },
   { id: 'buffer', label: 'Database buffer pool', cost: 2, costText: '+2 ms query', holds: 'hot disk pages in DB RAM' },
   { id: 'disk', label: 'Disk (source of truth)', cost: 3, costText: '+3 ms page read', holds: 'everything' },
@@ -88,11 +88,11 @@ export default function CacheLayers() {
       {(i) => {
         const hit = SCENARIOS[i].hit;
         return (
-          <SketchSvg width={900} height={450} label="Seven cache layers from browser to disk. A request goes down and stops at the first hit.">
+          <SketchSvg width={760} height={450} label="Seven cache layers from browser to disk. A request goes down and stops at the first hit.">
             {GROUPS.map((g) => (
               <g key={g.label}>
-                <SketchBox cx={340} cy={(g.y0 + g.y1) / 2} w={400} h={g.y1 - g.y0} r={14} dashed stroke="var(--muted)" seed={seedOf(g.label)} />
-                <HandText x={340} y={g.y0 - 1} size={13} color="var(--muted)" halo>
+                <SketchBox cx={275} cy={(g.y0 + g.y1) / 2} w={330} h={g.y1 - g.y0} r={14} dashed stroke="var(--muted)" seed={seedOf(g.label)} />
+                <HandText x={275} y={g.y0 - 1} size={14} color="var(--muted)" halo>
                   {g.label}
                 </HandText>
               </g>
@@ -106,54 +106,49 @@ export default function CacheLayers() {
               const y = ROW_Y[r];
               return (
                 <g key={l.id} opacity={faded ? 0.38 : 1}>
-                  {isHit && <rect x={190} y={y - 20} width={300} height={40} rx={9} fill="var(--ok)" opacity={0.16} />}
-                  {isMiss && <rect x={190} y={y - 20} width={300} height={40} rx={9} fill="var(--bad)" opacity={0.08} />}
-                  <SketchBox cx={340} cy={y} w={300} h={44} r={9} seed={seedOf(l.id)} stroke={isHit ? 'var(--ok)' : isMiss ? 'var(--bad)' : 'var(--fg)'} strokeWidth={isHit ? 2.2 : 1.4} />
-                  <HandText x={340} y={y - 5} size={16}>
+                  {isHit && <rect x={130} y={y - 20} width={290} height={40} rx={9} fill="var(--ok)" opacity={0.16} />}
+                  {isMiss && <rect x={130} y={y - 20} width={290} height={40} rx={9} fill="var(--bad)" opacity={0.08} />}
+                  <SketchBox cx={275} cy={y} w={290} h={44} r={9} seed={seedOf(l.id)} stroke={isHit ? 'var(--ok)' : isMiss ? 'var(--bad)' : 'var(--fg)'} strokeWidth={isHit ? 2.2 : 1.4} />
+                  <HandText x={275} y={y - 5} size={18}>
                     {l.label}
                   </HandText>
-                  <HandText x={340} y={y + 12} size={11} color="var(--muted)">
+                  <HandText x={275} y={y + 13} size={12} color="var(--muted)">
                     {l.holds}
                   </HandText>
                   {reached && (
-                    <HandText x={112} y={y} size={22} weight={700} color={isHit ? 'var(--ok)' : 'var(--bad)'}>
+                    <HandText x={86} y={y} size={24} weight={700} color={isHit ? 'var(--ok)' : 'var(--bad)'}>
                       {isHit ? '✓' : '✕'}
                     </HandText>
                   )}
-                  <HandText x={548} y={y} size={13} anchor="start" color={isMiss ? 'var(--warn)' : 'var(--muted)'}>
-                    {l.costText}
-                  </HandText>
+                  {isHit ? (
+                    <HandText x={440} y={y} size={17} weight={700} anchor="start" color="var(--ok)">
+                      {`hit! user waits ~${fmtMs(total(r))} ms`}
+                    </HandText>
+                  ) : (
+                    <HandText x={440} y={y} size={14} anchor="start" color={isMiss ? 'var(--warn)' : 'var(--muted)'}>
+                      {l.costText}
+                    </HandText>
+                  )}
                 </g>
               );
             })}
 
             {hit !== null && (
               <>
-                <SketchArrow points={[[70, ROW_Y[0] - 14], [70, ROW_Y[hit]]]} head="end" stroke="var(--accent)" strokeWidth={2} seed={seedOf(`req${hit}`)} />
+                <SketchArrow points={[[40, ROW_Y[0] - 14], [40, ROW_Y[hit]]]} head="end" stroke="var(--accent)" strokeWidth={2} seed={seedOf(`req${hit}`)} />
                 <motion.circle
                   key={`dot${i}`}
-                  cx={70}
+                  cx={40}
                   r={8}
                   fill="var(--accent)"
                   initial={{ cy: ROW_Y[0] - 14 }}
                   animate={{ cy: ROW_Y[hit] }}
                   transition={{ duration: 0.5 + hit * 0.18, ease: 'easeInOut' }}
                 />
-                <HandText x={70} y={ROW_Y[0] - 28} size={13} color="var(--accent)">
+                <HandText x={40} y={ROW_Y[0] - 26} size={13} color="var(--accent)">
                   request
                 </HandText>
-                <HandText x={720} y={hit < 3 ? 300 : 120} size={14} color="var(--muted)">
-                  user waits about
-                </HandText>
-                <HandText x={720} y={hit < 3 ? 332 : 152} size={34} weight={700} color="var(--ok)">
-                  {`~${fmtMs(total(hit))} ms`}
-                </HandText>
               </>
-            )}
-            {hit === null && (
-              <HandText x={720} y={225} size={16} color="var(--muted)">
-                {'assumed: 20 ms to the edge,\n80 ms to your region'}
-              </HandText>
             )}
           </SketchSvg>
         );

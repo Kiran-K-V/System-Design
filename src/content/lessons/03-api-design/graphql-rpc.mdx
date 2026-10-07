@@ -1,0 +1,174 @@
+---
+summary: REST makes the server pick each response shape. GraphQL lets the client pick the fields in one round trip, and RPC exposes procedures for service-to-service calls. Each moves cost to a different place.
+requires: ['03-api-design/rest', '02-networking/rpc-grpc']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import FetchRace from '../../../components/anim/lessons/FetchRace.tsx';
+import ApiStylePanels from '../../../components/anim/lessons/ApiStylePanels.tsx';
+
+## The problem
+
+Your mobile team builds a profile screen. It shows the user's name and avatar, plus their last 3 posts. Each post shows its author's name and avatar.
+
+With the REST design from lesson 3.1 the app needs five requests. It fetches the user, then the post list, then each author. The phone is on a mobile network with an ~80 ms round trip (assumption). Each step waits for the one before it.
+
+The screen takes ~240 ms to fill, and downloads ~11 KB to show ~1.3 KB of data. The web team has a different screen that needs different fields. The iOS team wants a third shape.
+
+One resource per URL cannot fit all three. What do you do?
+
+## Naive fixes, and where they break
+
+**Fix 1: fatter responses.** Add `?include=posts,posts.author` to `GET /users/7`. This works for one screen. Soon you have ten `include` options, nobody knows which are cheap, and each response still carries fields the client ignores.
+
+**Fix 2: one endpoint per screen.** Build `GET /screens/profile`. It is fast, but now the backend team writes and ships an endpoint every time a client team changes a layout. The API becomes a copy of the UI.
+
+Both fixes show the real tension. Who decides the shape of the response: the server, or the client?
+
+## Three answers
+
+<FetchRace client:visible />
+
+Watch the REST lane. Two words describe what went wrong.
+
+- **Over-fetching**: the response has more data than the client needs.
+- **Under-fetching**: one response does not hold enough, so the client must call again.
+
+Together they cause the real cost: **sequential round trips**. Parallel calls help only when the client already knows what to ask for.
+
+### GraphQL: the client picks the fields
+
+**GraphQL** is a query language for APIs. The server publishes a **schema**: a typed description of every object and the fields it has. The client sends a **query** that names the fields it wants.
+
+```graphql
+query {
+  user(id: 7) {
+    name
+    avatar
+    posts(first: 3) {
+      text
+      author { name avatar }
+    }
+  }
+}
+```
+
+The server returns JSON with exactly that shape. Key facts from graphql.org:
+
+- **One endpoint**, usually `/graphql`. Queries go in a `POST` body (`GET` is allowed for queries only).
+- **Three operation types**: `query` reads, `mutation` writes, `subscription` pushes live updates.
+- **Strong types and introspection**: clients can ask the server what the schema is, and tools can validate queries before they run.
+- **Evolution without versions**: you add fields freely and mark old ones deprecated.
+
+The server works through each field with a **resolver**: a small function that loads the data for that field. That design hides a trap.
+
+### The N+1 problem
+
+Say the query asks for 20 posts with their authors. A naive resolver does this:
+
+1. One query loads the 20 posts.
+2. For each post, the `author` resolver runs its own query. That is 20 more.
+
+That is **N+1 queries**: one for the list, N for the children. At ~1 ms per database query (assumption), the server spends ~21 ms in sequence. The fix is **batching**. A tool such as DataLoader collects all author ids requested in the same tick, and asks for them together: `WHERE id IN (...)`. That is 2 queries, ~2 ms.
+
+GraphQL did not remove the fan-out. It moved it from the phone to your data center, where round trips cost microseconds instead of 80 ms. That is a good trade. It still needs care.
+
+### RPC: call a procedure
+
+**RPC** (remote procedure call) makes a network call look like a function call: `GetProfileScreen(7)`. The unit of design is the **action**, not the resource. gRPC, which you met in lesson 2.6, defines services in `.proto` files with Protocol Buffers and generates client and server code in many languages. It runs on HTTP/2.
+
+RPC fits **service-to-service** calls. Both sides are your code. Types are generated, so mistakes show up at compile time. Messages are binary and small, so calls are fast. The downsides are tight coupling (change a method and every caller must update) and weaker support in browsers.
+
+<ApiStylePanels />
+
+## What GraphQL costs you
+
+GraphQL is not free. Interviewers like to ask about four costs.
+
+- **HTTP caching.** Every query goes to the same URL by `POST`. CDNs and browsers cannot cache by URL. You must cache at the field level, or use persisted queries (the client sends a stored query id).
+- **Query cost.** A client can ask for a deeply nested query that loads millions of rows. Limit query depth, score complexity, or allow only pre-approved queries.
+- **Authorization per field.** In REST, you guard a route. In GraphQL, one query reaches many types. Each resolver must check access.
+- **Errors.** A response can hold data and errors together. The GraphQL-over-HTTP rules say to answer `2xx` when `data` is present, because HTTP has no status for "partial success". Monitoring that counts only 4xx and 5xx will miss failures.
+
+## Numbers
+
+| Style | Round trips | Time at 80 ms RTT | Bytes (assumed) |
+|---|---|---|---|
+| REST, per-resource | 3 (5 requests) | ~240 ms | ~11 KB |
+| GraphQL | 1 | ~85 ms | ~1.3 KB |
+| RPC, per-screen method | 1 | ~85 ms | ~1.5 KB |
+
+At 5,000 profile loads per second, REST makes 25,000 requests per second. GraphQL or RPC makes 5,000 (derived). Each request also pays for headers, auth checks and logging.
+
+## Trade-offs
+
+| Style | Gain | Pay | Choose it when |
+|---|---|---|---|
+| REST | Simple, cacheable by URL, works everywhere | Over-fetch, many round trips | Public APIs, simple resources, CDN-friendly reads |
+| GraphQL | Client picks fields, one round trip, typed schema | N+1, hard HTTP caching, query cost, auth per field | Many clients with different data needs, nested data |
+| RPC / gRPC | Fast, small, generated typed clients | Tight coupling, browser limits | Internal service-to-service calls |
+| BFF (backend for frontend) | One tailored API per client, REST inside | Another service to build and run | A few clients, each needing very different shapes |
+
+## Interview lens
+
+<Callout type="tip">
+Default to REST for the public API. Add "RPC between internal services" when you draw the service boxes. Bring up GraphQL only when you can name the reason: several client types with different data needs, or deeply nested reads. Then name its costs: N+1 and caching.
+</Callout>
+
+<Callout type="mistake">
+Do not say "GraphQL is faster". One request is faster than five. But the query still runs. If the server does 21 database queries to answer it, the work moved, and you pay for it in latency and load. State where the fan-out happens.
+</Callout>
+
+<Callout type="deep" title="Why not GraphQL everywhere?">
+GraphQL puts a general query engine in front of your data. That gives clients power, and gives attackers power too. Most teams that adopt it also adopt a gateway, query depth limits, persisted queries and per-field auth. If you have two clients and stable screens, REST plus a few purpose-built endpoints is simpler.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A screen needs data from three REST endpoints. The second call needs an id from the first, and the third needs an id from the second. The round trip is 100 ms. About how long does the screen wait for the network?',
+      options: ['~100 ms, because calls run in parallel', '~300 ms', '~600 ms', '~30 ms'],
+      answer: 1,
+      explain: 'Each call depends on the one before it, so they cannot run in parallel. 3 round trips x 100 ms = ~300 ms. Dependencies, not request count, set the wait.',
+    },
+    {
+      q: 'A GraphQL query asks for 50 posts and each post author. The resolver for author runs one query per post. How many database queries run, and what is the usual fix?',
+      options: [
+        '1 query. No fix needed',
+        '51 queries. Batch the author lookups into one query with a loader',
+        '50 queries. Add an index on author',
+        '51 queries. Switch the API to REST',
+      ],
+      answer: 1,
+      explain: 'One query for the posts plus 50 for the authors is 51 (N+1). Batching all author ids in one WHERE id IN (...) query cuts this to 2. An index makes each query faster but does not cut the count.',
+    },
+    {
+      q: 'Which API style fits best for calls between your own order service and your payment service, where latency and typed contracts matter most?',
+      options: ['GraphQL', 'RPC with gRPC', 'REST with long query strings', 'A BFF'],
+      answer: 1,
+      explain: 'Both sides are your code, so generated typed clients and compact binary messages are a win. Browser support does not matter here. GraphQL targets varied external clients. A BFF serves a UI.',
+    },
+    {
+      q: 'Your monitoring alerts when the share of 4xx and 5xx responses passes 1%. After moving an API to GraphQL, errors go up but the alert never fires. What is the most likely cause?',
+      options: [
+        'GraphQL is more reliable, so errors fell',
+        'GraphQL often returns 200 with an errors array, so status codes hide the failures',
+        'GraphQL does not support HTTP status codes at all',
+        'The alert needs a higher threshold',
+      ],
+      answer: 1,
+      explain: 'When a response has data, GraphQL over HTTP answers 2xx even if it also lists errors. You must inspect the errors field, or emit a metric per resolver error.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [GraphQL: Introduction to GraphQL](https://graphql.org/learn/): the schema, queries, mutations and subscriptions.
+- [GraphQL: Serving over HTTP](https://graphql.org/learn/serving-over-http/): single endpoint, POST and GET, and status codes with errors.
+- [gRPC: Introduction](https://grpc.io/docs/what-is-grpc/introduction/): service definitions, Protocol Buffers and code generation.
+- [GraphQL DataLoader](https://github.com/graphql/dataloader): the batching and per-request caching tool that fixes N+1.
