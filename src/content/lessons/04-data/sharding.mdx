@@ -1,0 +1,186 @@
+---
+summary: Split one data set across many machines by a shard key. The key you choose decides your load balance, your hot spots, and which queries stay cheap.
+requires: ['04-data/replication', '01-one-machine/numbers-to-know']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import ShardSplit from '../../../components/anim/lessons/ShardSplit.tsx';
+import ShardKeyLab from '../../../components/anim/lessons/ShardKeyLab.tsx';
+import ScatterGather from '../../../components/anim/lessons/ScatterGather.tsx';
+import LogicalShardMap from '../../../components/anim/lessons/LogicalShardMap.tsx';
+
+## The problem
+
+Your users table has 30 TB of data. It takes 40,000 writes per second at peak.
+
+Lesson 1.5 gave you the limits of one database node: about 10 TB of data and 5K–20K writes per second. You are over on both.
+
+Replication does not fix this. In the last lesson you copied the whole data set to several machines. Every replica stores all 30 TB. Every replica must apply all 40,000 writes per second. Replicas add read capacity and survival. They add **no** write capacity and **no** extra storage.
+
+You must put different data on different machines. That is **sharding**: split one data set into parts (shards), and store each part on its own database. Some systems call this partitioning. Each shard holds a share of the rows, and a **shard key** decides which share a row belongs to.
+
+## Naive solutions and where they fail
+
+**Buy a bigger machine.** This is vertical scaling. It works, and it is the right first move. But it has a ceiling, and the price rises faster than the size. At some point no bigger machine exists.
+
+**Shard by an obvious field.** Say you shard orders by creation date: one shard per month. It looks natural. Every new order is written to the current month. One shard takes 100% of the writes and the other eleven are idle. You added machines and got no more write capacity.
+
+Try it. The lab below has 4 shards and 4,000 requests. Pick a traffic pattern and a strategy. Start with "Newest ids" and **Range**.
+
+<ShardKeyLab client:visible />
+
+You just saw the central rule of this lesson: **a shard key must spread load, not only data.** A key can split the data evenly and still send all the traffic to one shard.
+
+## The mechanism: shard key, router, strategy
+
+Three things make a sharded database.
+
+1. A **shard key**: the column used to place a row. Example: `user_id`.
+2. A **placement rule**: a function from key to shard.
+3. A **router**: the part that applies the rule. It can live in the client library, in a proxy in front of the database, or inside the database nodes themselves.
+
+Step through how one table splits.
+
+<ShardSplit client:visible />
+
+There are three common placement rules.
+
+| Strategy | Rule | Strength | Weakness |
+|---|---|---|---|
+| **Range** | Shard 1 holds ids 1–1M, shard 2 holds 1M–2M, and so on | Range scans stay on one or two shards. Easy to reason about. | Sequential keys (time, auto-increment ids) pile onto the newest range. |
+| **Hash** | `hash(key) mod N`, or a ring | Even spread, even for sequential keys | Range scans touch every shard. Changing N moves almost everything (see consistent hashing, next lesson). |
+| **Directory** | A lookup table maps key to shard | Any placement. You can move one key. | The table is one more service on the hot path. It must be fast and correct. |
+
+Go back to the lab. Switch to **Hash**: "Newest ids" is now even. Now pick "One celebrity" with Hash. One shard takes about half of the traffic. Then pick **Directory**. The directory puts the celebrity key alone on one shard, and the other shards share the rest.
+
+## Hot keys
+
+A hot key is one key that gets far more traffic than the others: a celebrity account, a viral post, a huge chat room. Hashing cannot fix it, because one key always hashes to one shard.
+
+Discord hit this. It stores messages in Cassandra with the partition key `(channel_id, bucket)`, where a bucket is a fixed time window. The bucket stops one channel from growing into one endless partition. But a channel in a server with hundreds of thousands of members still gets orders of magnitude more traffic than a channel among friends. Discord reported hot partitions that made reads slow. Its fix was a layer of Rust data services that **coalesce** identical concurrent reads: when many users request the same data at once, the service queries the database once and gives the answer to all of them. It routes by channel id so the same channel always lands on the same service.
+
+Your tools, from cheapest to most costly:
+
+- **Cache** the hot key in front of the shard (Module 5).
+- **Replicate reads** of the hot key to several machines.
+- **Split the key.** Write `post:42#0` to `post:42#9` and read from all ten. Writes spread, but reads now need ten lookups.
+- **Move it** to a dedicated shard with a directory.
+
+## Resharding: the cost nobody mentions
+
+One day, 4 shards are not enough. You need 8. If you used `hash(key) mod 4`, the rule becomes `mod 8` and most rows change shard. You must copy a huge share of your data while serving traffic.
+
+The standard answer is **logical shards**. Create many more small shards than you have machines, say 480. Place several on each physical database. The rule `key → logical shard` never changes. Only the small map `logical shard → machine` changes. To add capacity, you move whole logical shards between machines.
+
+<LogicalShardMap />
+
+Real systems do this:
+
+- **Notion** shards Postgres by workspace id into **480 logical shards on 32 physical databases**, 15 each. Later it grew the fleet from 32 to 96 databases, because some shards were above 90% CPU at peak. Afterwards CPU and IOPS were about 20% at peak. They copied the data with Postgres logical replication, and skipping index creation during the initial copy cut the sync from 3 days to 12 hours.
+- **Instagram** packs ids as 41 bits of time, 13 bits of **logical shard** id, and 10 bits of sequence. 13 bits allow up to 8,192 logical shards. Each id carries the shard that owns the row.
+
+Moving one logical shard has the same four steps every time: copy a snapshot, stream the changes made during the copy, pause for a moment, switch the map. Rehearse it before you need it.
+
+## Cross-shard queries
+
+Sharding turns some easy queries into hard ones. A query that includes the shard key goes to one shard. A query that does not must go to **all** shards, then merge the results. This is **scatter-gather**.
+
+<ScatterGather client:visible />
+
+The tail-latency math matters in interviews. If each shard is slow (above its own p99, the slowest 1% of requests) 1% of the time, a query over 100 shards is slow in `1 − 0.99^100 ≈ 63%` of cases. The more shards a query touches, the slower it is on average.
+
+Two more costs follow:
+
+- **Joins and transactions across shards** are hard. A transaction on two shards needs a protocol such as two-phase commit, which is slow and blocks on failure. The usual design choice is to pick a shard key so that rows used together live together. Notion chose workspace id because users work inside one workspace, so most queries stay on one shard.
+- **Secondary indexes** need a decision. A **local** index lives with each shard: writes are cheap, but a query on that field asks every shard. A **global** index is its own sharded table keyed by the indexed field: reads are cheap, but each write now updates two shards.
+
+## Numbers
+
+| Fact | Value |
+|---|---|
+| One node, comfortable | ~10 TB, ~5K–20K writes/s (lesson 1.5) |
+| Shards needed for 30 TB, 40K writes/s | at least 3 by size, 4 by writes; add headroom: 6–8 |
+| Scatter-gather over 100 shards, 1% slow each | ~63% of queries hit a slow shard |
+| Notion | 480 logical shards, 32 → 96 physical databases |
+| Instagram shard-id bits | 13 (up to 8,192 logical shards) |
+
+Estimate the shard count in the interview from storage and write rate, then add headroom. Say which of the two numbers forces the count.
+
+## Trade-offs
+
+| Choice | You gain | You pay | When to choose |
+|---|---|---|---|
+| Do not shard | Simple queries, real transactions | A hard ceiling | Data under ~10 TB and writes under ~10K/s |
+| Range | Fast scans, simple map | Hot spots on sequential keys | Time-series reads, ordered scans |
+| Hash | Even load | No range scans | Key-based access, user data |
+| Directory | Full control, hot-key fixes | Extra service, must be consistent | Uneven or fast-changing load |
+| Many logical shards | Cheap growth | Map to maintain, more small shards to operate | Any system that will grow |
+
+## Interview lens
+
+<Callout type="tip">
+Say these three things, in order. First: "I would not shard until storage or write rate passes one node's limit. Replicas and a cache handle reads." Second: "The shard key is `user_id` because the main queries are per user, so they stay on one shard." Third: "I would use many logical shards so I can add machines without rehashing." That is a complete answer.
+</Callout>
+
+<Callout type="mistake">
+Do not pick a shard key because it divides the data evenly. Pick it because it divides the **traffic** evenly **and** keeps your main queries on one shard. A timestamp, a country code, or a boolean is almost always a bad key: too few values, or all the load on the newest one.
+</Callout>
+
+<Callout type="deep" title="Why not shard everything from day one?">
+Sharding takes away features you get free on one node: joins, foreign keys, multi-row transactions, and simple global indexes. It adds a router, a map, and a resharding process to operate. Notion has said it would have sharded earlier. That shows the cost of waiting too long, not that early is free. Do the capacity math. Shard when the math says one node cannot hold the load.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'You shard a chat app’s messages table by message timestamp, one range per day. What goes wrong?',
+      options: [
+        'Old days cannot be read',
+        'All writes go to today’s shard, so one shard is overloaded and the rest are idle',
+        'Range scans become impossible',
+        'Rows are duplicated across shards',
+      ],
+      answer: 1,
+      explain: 'Time-ordered keys put all new writes in the newest range. The data is spread over many shards, but the write load is not.',
+    },
+    {
+      q: 'A product-catalog table is sharded by hash(product_id). Which query is expensive?',
+      options: [
+        'Get product 981',
+        'Get products 981, 982, and 983 by id',
+        'List all products with price under $10',
+        'Insert a new product',
+      ],
+      answer: 2,
+      explain: 'Price is not the shard key, so the router must ask every shard and merge. The by-id reads and the insert each go to the shard that owns the id.',
+    },
+    {
+      q: 'Each of 50 shards is slow on 2% of requests. A query fans out to all 50. About how often does it wait on a slow shard?',
+      options: ['2%', '~36%', '~64%', '~100%'],
+      answer: 2,
+      explain: 'P(no slow shard) = 0.98^50 ≈ 0.364. So the query is slow about 1 − 0.364 ≈ 64% of the time.',
+    },
+    {
+      q: 'You run 4 hash shards with hash(key) mod 4 and need 8. What is the cleanest way to avoid a huge reshuffle next time?',
+      options: [
+        'Use a larger hash function',
+        'Create many logical shards (say 256) and map logical shards to machines',
+        'Add a cache',
+        'Switch to range sharding on user id',
+      ],
+      answer: 1,
+      explain: 'Logical shards fix the key-to-shard rule. Growth only changes which machine holds each logical shard, so you move whole shards and no row is rehashed.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [How Discord Stores Trillions of Messages](https://discord.com/blog/how-discord-stores-trillions-of-messages), partition keys, hot partitions, and request coalescing.
+- [Herding elephants: sharding Postgres at Notion](https://www.notion.com/blog/sharding-postgres-at-notion), shard key choice and migration steps.
+- [The Great Re-shard (Notion)](https://www.notion.com/blog/the-great-re-shard), growing from 32 to 96 databases with no downtime.
+- [Sharding & IDs at Instagram](https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c), logical shards packed into the id.

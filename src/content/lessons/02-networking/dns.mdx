@@ -1,0 +1,159 @@
+---
+summary: DNS turns names into IP addresses through a hierarchy of servers and aggressive caching. The TTL on each record sets how fast you can change your mind.
+requires: ['02-networking/ip-tcp-udp']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import DnsWalk from '../../../components/anim/lessons/DnsWalk.tsx';
+import DnsTtlSim from '../../../components/anim/lessons/DnsTtlSim.tsx';
+
+## The problem
+
+TCP needs an IP address. People type `www.example.com`. Something must turn the name into an address, for every request, for every user on Earth, in a few milliseconds.
+
+The mapping also changes. You move a service to a new data center. A server dies. A CDN picks a closer machine for each user. A table that large, and that alive, cannot sit in one place.
+
+## Naive solution: one big server
+
+Put every name and address in one table on one server. All clients ask it.
+
+Three things break at once:
+
+- **Distance.** A user in Sydney would wait ~160 ms or more for each answer from a server in Virginia (lesson 1.2: the speed of light sets the floor). That delay lands before the first byte of every new site.
+- **Load.** Every page load on the Internet would start with a query to this one server.
+- **Failure.** If it fails, the whole Internet stops. You cannot reach any site by name.
+
+The fix uses two ideas from system design that you will see again and again: **split the data by a hierarchy** so no server knows everything, and **cache** so most questions never travel far.
+
+## The mechanism
+
+**DNS** (Domain Name System) is a distributed database of records. It has two parts.
+
+**A hierarchy of name servers.** A name reads from right to left. In `www.example.com`:
+
+- The root (the invisible dot at the end) knows who runs each top-level domain (TLD) such as `.com`.
+- The `.com` servers know who runs `example.com`.
+- The **authoritative** servers for `example.com` hold the real records, such as the IP of `www`.
+
+No server in this chain knows more than its own level. Each one answers with either the data or a **referral**: "I do not know, but ask these servers".
+
+**A recursive resolver that does the walking.** Your device does not walk the tree. It asks a recursive resolver (your ISP's, or a public one such as `1.1.1.1` or `8.8.8.8`) and waits. The resolver walks the tree and caches what it learns.
+
+Step through one cold lookup, then a cached one.
+
+<DnsWalk client:visible />
+
+Three details matter:
+
+1. **There are only 13 root server names (A to M), but about 2,000 machines behind them.** root-servers.org lists 2,048 instances run by 12 organizations. They use **anycast**: many machines share one IP address, and routing sends each packet to the nearest one (RFC 4786). So the root is not one server and not one place.
+2. **Every answer carries a TTL.** TTL means time to live: the number of seconds a cache may keep the record (RFC 1035). When it runs out, the cache must ask again.
+3. **DNS uses UDP on port 53.** A query and its answer are one packet each. There is no handshake (lesson 2.1). RFC 1035 limits a UDP message to 512 bytes. Larger answers need other mechanisms, such as TCP.
+
+### Record types you need
+
+| Record | Holds | Example use |
+|---|---|---|
+| **A** | IPv4 address | `api.example.com` is `203.0.113.7` |
+| **AAAA** | IPv6 address | same name, 128-bit address |
+| **CNAME** | An alias to another name | `www` is an alias for `example.cdn.net` |
+| **NS** | Which servers are authoritative | who answers for `example.com` |
+| **MX** | Mail servers | where to deliver email |
+| **TXT** | Free text | domain ownership proofs |
+
+A failed lookup is cached too. If a name does not exist, the resolver stores that fact (RFC 2308 calls it negative caching) so a typo does not hit the authoritative server again and again.
+
+## What TTL costs
+
+TTL is a dial with two bad ends. A short TTL lets you change the answer quickly, but resolvers come back often and hit your name servers hard. A long TTL cuts load, but after you change an IP, caches serve the old one until they expire.
+
+<DnsTtlSim client:visible />
+
+The model: after you change the IP, each resolver's copy expires at a random point within one TTL. So the share of users on the old address falls in a straight line over one TTL. The tail is the worst case: one TTL after the change, the last cache refreshes.
+
+<Callout type="deep" title="DNS as a load balancer, and where it stops">
+A name can return several A records. Resolvers rotate or shuffle them, so traffic spreads over several IPs. This is DNS round robin. Providers also add **geo-routing** (answer with the IP of the nearest region) and **health-checked failover** (stop returning a dead IP). Cloud load balancers use this: an AWS load balancer removes the IP of an unhealthy zone from DNS, and its DNS records carry a 60 second TTL.
+
+But DNS cannot see load. It cannot tell that one server is full. It cannot drain a connection. And some clients and resolvers cache longer than your TTL. So DNS picks the front door (a region, or a load balancer). Something faster does the fine-grained balancing behind it. That is lesson 2.4.
+</Callout>
+
+## Numbers
+
+| Event | Cost |
+|---|---|
+| Answer from the browser or OS cache | ~0 ms |
+| Answer from the resolver cache | one round trip to the resolver, often ~1 to 10 ms |
+| Cold lookup, full walk | ~4 round trips; ~100 ms is a fair order of magnitude |
+| Refresh after TTL expiry, resolver knows the name servers | ~1 upstream round trip |
+| Authoritative load, 100,000 resolvers, TTL 300 s | ~330 queries per second |
+| Authoritative load, same resolvers, TTL 60 s | ~1,700 queries per second |
+
+The cold cost is paid once per TTL per resolver, not once per user. That is why one resolver can serve millions of people.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Pick it when |
+|---|---|---|---|
+| Short TTL (30 to 60 s) | Fast failover and migration | More query load, more cold lookups for users | Failover matters, or you plan to move |
+| Long TTL (hours) | Low load, fewer cold lookups | A slow change, a bad IP lingers | The IP almost never changes |
+| DNS-based balancing | Free, global, works with anything | Coarse, cannot see load, slow to react | Choosing a region or a load balancer |
+| Load balancer in front | Fine control, instant health reaction | An extra hop, extra component | Spreading requests inside a region |
+
+## Interview lens
+
+<Callout type="tip">
+Say where DNS sits in the latency budget: "The first request pays for DNS, then TCP, then TLS. After that, the connection and the DNS answer are cached." For a global product, add geo-DNS or anycast to send users to a nearby region, and name the TTL you would use.
+</Callout>
+
+<Callout type="mistake">
+Do not build failover on DNS alone and promise "5 seconds". With a 60 second TTL, some users stay on the dead IP for a minute or more. Some resolvers also stretch TTLs. If you need fast failover, put a load balancer or anycast address in front. If you plan a migration, lower the TTL days before, not minutes before.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A resolver has an empty cache. How many servers does it ask to answer www.example.com, and in what order?',
+      options: [
+        'One: the authoritative server',
+        'Three: root, then .com TLD, then the authoritative server',
+        'Two: the .com server, then the authoritative server',
+        'Thirteen: every root server',
+      ],
+      answer: 1,
+      explain: 'The root points to .com. The .com server points to the example.com name servers. Those return the IP. Later lookups can skip the root and TLD because the resolver caches who runs them.',
+    },
+    {
+      q: 'Your A record has a TTL of 1 hour. At 12:00 you change the IP because the old server is gone. When can you be sure no resolver serves the old IP?',
+      options: ['12:00, at once', 'About 12:01', '13:00, one TTL later', 'Never; you cannot change it'],
+      answer: 2,
+      explain: 'A resolver that cached the record at 11:59 keeps it until 12:59. Rounding up, one TTL after the change every copy has expired (resolvers that stretch TTLs excepted).',
+    },
+    {
+      q: '1,000,000 busy resolvers all hold your record with TTL 300 s. Each asks again as soon as its copy expires. About how many queries per second reach your authoritative servers?',
+      options: ['~300', '~3,300', '~33,000', '1,000,000'],
+      answer: 1,
+      explain: 'Each resolver asks once per 300 s. 1,000,000 / 300 is about 3,333 per second. Dropping the TTL to 60 s would multiply that by 5.',
+    },
+    {
+      q: 'Why is DNS better served by caches and a hierarchy than by one very fast server?',
+      options: [
+        'A fast server cannot hold the whole table',
+        'Distance and the single point of failure remain, however fast the server is',
+        'DNS requires many servers by law',
+        'UDP cannot reach a single server',
+      ],
+      answer: 1,
+      explain: 'A faster CPU cannot beat the speed of light to a faraway user, and one server is one point of failure. Caches near users and many replicas fix both.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RFC 1035: Domain Names, Implementation and Specification](https://www.rfc-editor.org/rfc/rfc1035.html) (TTL, 512-byte UDP limit, port 53)
+- [RFC 2308: Negative Caching of DNS Queries](https://www.rfc-editor.org/rfc/rfc2308.html)
+- [RFC 4786: Operation of Anycast Services](https://www.rfc-editor.org/rfc/rfc4786.html)
+- [Root Server Technical Operations](https://root-servers.org/) (live count of root server instances)
