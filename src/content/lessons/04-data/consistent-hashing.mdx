@@ -1,0 +1,169 @@
+---
+summary: A way to place keys on servers so that adding or removing a server moves only about 1/N of the keys, not almost all of them.
+requires: ['04-data/sharding']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import ModNFail from '../../../components/anim/lessons/ModNFail.tsx';
+import RingWalkthrough from '../../../components/anim/lessons/RingWalkthrough.tsx';
+import HashRing from '../../../components/anim/HashRing.tsx';
+
+## The problem
+
+You run a cache with four servers. You spread keys over them with the simplest rule you know: `server = hash(key) % 4`. It works. Load is even.
+
+Then traffic grows. You add a fifth server. The rule becomes `hash(key) % 5`. What happens to your keys?
+
+Almost all of them move. Each moved key is a cache miss. Your database now gets hit by nearly every request at once. A change that should add capacity causes an outage.
+
+The same trap exists for shards of a database, not only for caches. Any time you place data by `hash % N`, a change in N is a re-shuffle of the whole data set.
+
+## Naive solution: hash % N
+
+Step through the failure. We use small hashes (0 to 19) so you can check each cell by hand.
+
+<ModNFail client:visible />
+
+The math is simple. A key keeps its server only when `h % N` equals `h % (N+1)`. Over any block of `N × (N+1)` consecutive hashes, that happens for exactly `N` of them. So the share that stays is `1/(N+1)`. The share that moves is `N/(N+1)`.
+
+| Servers | Keys moved with `hash % N` | Keys moved with a ring (ideal) |
+|---|---|---|
+| 1 → 2 | 50% | 50% |
+| 4 → 5 | 80% | ~20% |
+| 9 → 10 | 90% | ~10% |
+| 99 → 100 | 99% | ~1% |
+
+I checked these on 100,000 simulated keys. The `hash % N` numbers match the formula within 0.3 points.
+
+The goal is clear. When one server joins, it should take its fair share, about `1/(N+1)` of the keys, and no other key should move.
+
+## The mechanism: a hash ring
+
+Karger and colleagues at MIT proposed this in 1997 ("Consistent Hashing and Random Trees", STOC 1997). The idea has three parts.
+
+1. **Make the hash space a circle.** A 32-bit hash has 2³² possible values. Put them on a circle, from 0 up to 2³²−1, then wrap back to 0.
+2. **Hash servers onto the circle.** Hash each server name. That gives each server a position.
+3. **Hash keys onto the same circle.** A key belongs to the first server you reach going clockwise from the key's position.
+
+Step through it. Watch what moves when a server joins and when one leaves.
+
+<RingWalkthrough client:visible />
+
+Why does this move so few keys? A new server only takes the arc between itself and its counter-clockwise neighbor. Keys outside that arc still find the same server first. The removal case is the same in reverse: a dead server's arc goes to its clockwise neighbor, and nothing else changes.
+
+The cost of a lookup is small. Keep the server positions in a sorted array. Find the first position at or after the key's hash with a binary search. With 2,560 points, that is about 12 comparisons.
+
+## Virtual nodes
+
+One point per server has a flaw. Random points make uneven arcs. In a simulation of 10 servers with one point each, the busiest server held about **2.9× the average load** (the expected longest arc among n random arcs is about `(1 + 1/2 + … + 1/n) / n` of the ring, which for 10 is 0.29, against an average of 0.1).
+
+A second flaw: when a server dies, all its keys land on **one** neighbor. That neighbor may now hold double its share and may fail next.
+
+The fix is **virtual nodes** (vnodes). Each physical server hashes to many points: `cache-A#0`, `cache-A#1`, and so on. Each point owns a small arc. A server's total share is the sum of many small random arcs, and sums of many random numbers are close to their average.
+
+Measured on the same simulation (10 servers, busiest server vs average):
+
+| Points per server | Busiest server |
+|---|---|
+| 1 | ~2.9× |
+| 16 | ~1.4× |
+| 64 | ~1.2× |
+| 256 | ~1.1× |
+
+Dynamo uses vnodes for this reason, and adds a second benefit: a stronger server can own more points than a weaker one. Cassandra uses the same idea. Its older default was 256 tokens per node, and newer versions use a token allocator that needs far fewer.
+
+Now try it yourself. Add servers, add keys, and flip virtual nodes on. After each change, the box shows how many keys moved, and how many `hash % N` would have moved.
+
+<HashRing client:visible />
+
+Things to try: with 1 virtual node, add a server and watch how few keys move, then check the load bars. They are uneven. Switch to 32 virtual nodes. The bars level out, and the moved-key count settles near `keys / servers`.
+
+## Replication on the ring
+
+Most systems store each key on more than one server. On a ring this is cheap: store the key on the owner and on the next `R − 1` **distinct physical** servers clockwise. Cassandra works this way, and it skips virtual nodes that belong to a server it already chose. Dynamo calls this list of servers the key's preference list.
+
+## Numbers
+
+| Fact | Value |
+|---|---|
+| Keys moved when one server joins (average) | `K / N` (Karger et al.) |
+| Keys moved with `hash % N` | `K × N / (N+1)` |
+| Busiest server, 10 servers, 1 point each | ~2.9× average |
+| Busiest server, 10 servers, 256 points each | ~1.1× average |
+| Lookup | binary search over sorted points: O(log V) |
+
+## Trade-offs
+
+| Choice | You gain | You pay | When to choose |
+|---|---|---|---|
+| `hash % N` | Zero state, trivial code | Almost all keys move when N changes | N never changes |
+| Ring, 1 point per server | Few keys move | Uneven load | Demos only |
+| Ring with vnodes | Few keys move, even load, spread failure | A sorted table of points to maintain and share | Caches, Dynamo-style stores |
+| Fixed hash slots (Redis Cluster: 16,384 slots) | Simple table, move whole slots | Slot table must be kept in sync | You want explicit control of data movement |
+| Directory (lookup table) | Any placement, easy to move one key | Table is a new service to run | Large, uneven, or changing workloads |
+
+<Callout type="deep" title="Fixed slots are consistent hashing in disguise">
+Redis Cluster does not use a ring. It splits the key space into 16,384 slots. A key maps to a slot by `CRC16(key) mod 16384`, and each node owns a set of slots. Adding a node means moving some whole slots. The goal is the same as the ring: change the owner of only a small share of keys. The slot table makes the movement explicit, and you control which slots move. Notion uses the same idea for Postgres: 480 logical shards sit on 32 physical databases, 15 on each. The fixed number of logical shards is what lets the cluster grow later without rehashing every row (the next lesson covers this).
+</Callout>
+
+## Interview lens
+
+<Callout type="tip">
+Say why in one sentence: "With `hash % N`, adding a server remaps `N/(N+1)` of the keys. With a ring, only about `1/(N+1)` move." Then say "I would use virtual nodes to even out the load and to spread a failed server's keys over many peers." Stop there unless asked for more. Many managed stores (DynamoDB, Cassandra) do this for you. Name that, and do not reinvent it on the whiteboard.
+</Callout>
+
+<Callout type="mistake">
+Do not claim consistent hashing fixes hot keys. One celebrity key still hashes to one point and lands on one server. A ring spreads **many keys** evenly. It does not spread **one key's traffic**. For hot keys you need a cache in front, key splitting, or replicas that all serve reads.
+</Callout>
+
+Another common slip: saying the ring moves "no" keys. It moves about `K/N`. Data movement is cheaper, not free. A moved key still has to be copied (storage) or re-fetched (cache).
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A cache cluster uses hash % N. You go from 9 servers to 10. About what share of keys now map to a different server?',
+      options: ['10%', '50%', '90%', '100%'],
+      answer: 2,
+      explain: 'A key stays only when h % 9 equals h % 10. That holds for 9 out of every 90 hashes, so 1/10 stay and 9/10 move. The general rule is N/(N+1).',
+    },
+    {
+      q: 'You use a ring with 50 servers and add one more. About what share of keys moves, if the ring is well balanced?',
+      options: ['~2%', '~50%', '~98%', 'None'],
+      answer: 0,
+      explain: 'The new server should own 1/51 of the keys, about 2%. Only keys in the new server’s arcs move, and they all move to it.',
+    },
+    {
+      q: 'Servers on the ring have one point each. One server crashes. Which statement is true?',
+      options: [
+        'All its keys move to one neighbor, which may become overloaded',
+        'Its keys spread evenly over all servers',
+        'Every key on the ring moves',
+        'Nothing moves, because keys are replicated',
+      ],
+      answer: 0,
+      explain: 'Its single arc now belongs to the next server clockwise. With many virtual nodes the arcs would go to many different successors, which spreads the load.',
+    },
+    {
+      q: 'One key (a celebrity profile) gets 40% of all reads. Does a ring with 256 virtual nodes per server fix the overload?',
+      options: [
+        'Yes, vnodes spread each key over many servers',
+        'No, the key still maps to one point and so to one server',
+        'Yes, but only if you add more servers',
+        'No, because vnodes make lookups slower than the load saving',
+      ],
+      answer: 1,
+      explain: 'Hashing places one key at one position. Virtual nodes even out the share of key space per server. They do nothing for the traffic of a single key. Use a cache, replicas for reads, or split the key.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Karger et al., "Consistent Hashing and Random Trees" (STOC 1997)](https://cs.brown.edu/courses/csci2950-u/f09/papers/chash97stoc.pdf), the original paper.
+- [DeCandia et al., "Dynamo: Amazon's Highly Available Key-value Store" (SOSP 2007)](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf), section on partitioning and virtual nodes.
+- [Apache Cassandra docs: Dynamo-style architecture](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html), token ring, vnodes, and replica placement.
+- [Redis Cluster specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/), hash slots.

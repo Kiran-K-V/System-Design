@@ -1,0 +1,188 @@
+---
+summary: A REST API names things (nouns) and uses a small set of HTTP verbs and status codes to act on them, so clients can guess the rest of the API and machines can retry, cache and scale it.
+requires: ['02-networking/http-tls']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import RestAnatomy from '../../../components/anim/lessons/RestAnatomy.tsx';
+import RestWalk from '../../../components/anim/lessons/RestWalk.tsx';
+import StatusFamilies from '../../../components/anim/lessons/StatusFamilies.tsx';
+
+## The problem
+
+You build a Twitter-like service. A web team, an iOS team and an Android team all call it. Next year, partners will call it too.
+
+Every endpoint you ship is a **contract**. Once a phone app in a user's pocket calls it, you cannot rename it. Old app versions stay alive for years.
+
+So the first API design question is not "what can I build?". It is "what can I still change in two years?" An API with 60 endpoints, each named by whoever wrote it, is a contract nobody can guess and nobody can clean up.
+
+## The naive design: one URL per action
+
+The easy start is to name each endpoint after the function behind it.
+
+```
+POST /createTweet
+POST /deleteTweet?id=981
+GET  /getTweetsForUser?user=42
+GET  /deleteTweet?id=981      <- someone "simplified" it
+```
+
+This fails in four ways.
+
+1. **No pattern.** Is it `/removeTweet`, `/deleteTweet` or `/tweet/delete`? A new engineer must read the docs for every call.
+2. **Verbs hide meaning.** The server, the proxy and the cache only see a name. They cannot tell a read from a write.
+3. **Unsafe retries.** A network library that retries on failure cannot know if `/getTweetsForUser` is safe to repeat.
+4. **Real damage.** Browsers prefetch links. Crawlers follow them. A `GET` that deletes data will be fired by tools you do not control.
+
+HTTP already has verbs. The fix is to use them, and to put the meaning in the URL as a noun.
+
+## The mechanism: resources and a small verb set
+
+A **resource** is a thing your system stores: a user, a tweet, an order. Each resource has an address, its URL. A **collection** is a list of them.
+
+```
+/tweets          the collection of all tweets
+/tweets/981      one tweet, by id
+/users/42        one user
+/users/42/tweets the tweets of user 42
+```
+
+Rules that keep it guessable:
+
+- **Plural nouns.** `/tweets`, not `/tweet` and not `/getTweets`.
+- **Identity in the path.** `/tweets/981` points at exactly one thing.
+- **Filter, sort and page in the query string.** `/tweets?author=42&sort=-created&limit=20`.
+- **Data in the body.** Use a JSON body for the thing you create or change.
+- **Nest only one level.** `/users/42/tweets` is fine. `/users/42/tweets/981/likes/7/user` is not. Past one level, give the child its own top-level URL.
+
+Then the verb says what to do. Here is the whole call, with every part labeled.
+
+<RestAnatomy />
+
+### The verbs
+
+| Verb | Meaning | Safe? | Idempotent? |
+|---|---|---|---|
+| `GET` | Read a resource | Yes | Yes |
+| `POST` | Create, or run an action | No | **No** |
+| `PUT` | Replace a resource completely | No | Yes |
+| `PATCH` | Change part of a resource | No | Only if the patch is "set X to Y" |
+| `DELETE` | Remove a resource | No | Yes |
+
+Two words need care. RFC 9110, the HTTP specification, defines them.
+
+- **Safe**: the method only reads. It "should not change the state of the server". `GET`, `HEAD`, `OPTIONS` and `TRACE` are safe.
+- **Idempotent**: sending the same request many times leaves the server in the same state as sending it once. `GET`, `PUT` and `DELETE` are idempotent. `POST` is neither safe nor idempotent.
+
+Idempotent does not mean "same response". Delete the same tweet twice: the first call returns `204`, the second returns `404`. The server state is the same after both. That is what counts.
+
+Why does this matter? Because networks lose responses. A client that sent a request and heard nothing does not know if it worked. For an idempotent verb, the client can just send it again. For `POST`, it cannot. Lesson 3.4 solves that.
+
+Step through a full life cycle of a tweet.
+
+<RestWalk client:visible />
+
+### Status codes
+
+The status code is a three-digit summary. The first digit tells a client what to do next without reading the body.
+
+<StatusFamilies />
+
+The pairs that interviewers probe:
+
+- **401 vs 403.** `401` means "I do not know who you are": no token or a bad token. `403` means "I know who you are, and you may not do this". Despite its name, `401` is about authentication.
+- **400 vs 422.** `400` means the request is malformed (broken JSON). `422` means it parses but fails the rules (empty text). Many APIs use `400` for both. Pick one rule and keep it.
+- **409 Conflict.** The request clashes with current state: a username is taken, or an edit used a stale version.
+- **429 Too Many Requests.** The client hit a rate limit. The server may add a `Retry-After` header (RFC 6585).
+- **Never `200` with an error body.** Clients, proxies and monitoring tools all read the status code first.
+
+For the error body, use one shape everywhere. RFC 9457 defines `application/problem+json` with `type`, `title`, `status`, `detail` and `instance`.
+
+### Stateless requests
+
+REST servers are **stateless**: each request carries everything the server needs, such as the auth token and all parameters. The server keeps no memory of the previous request from this client.
+
+That one rule is what lets you put 50 identical servers behind a load balancer (lesson 2.4). Any server can answer any request. Lose one, and nothing breaks.
+
+## Numbers
+
+- **One call is one round trip.** Inside one data center it costs well under 1 ms. From a phone across a continent, assume ~100 ms. Three calls in a row cost ~300 ms. Lesson 3.2 builds on this.
+- **Unbounded lists hurt.** A tweet is about 300 bytes of JSON (assumption). A list of 20 is ~6 KB. A list of all 1 million tweets is ~300 MB. Always cap list size. Lesson 3.3 shows how to page.
+- **Never reuse a name with a new meaning.** Adding a field is safe: old clients ignore it. Renaming or removing one breaks every old client. If you must break, ship a new version, usually a URL prefix such as `/v2/tweets`, and keep `/v1` alive until its callers leave.
+
+## Trade-offs
+
+| Choice | Gain | Pay | Choose it when |
+|---|---|---|---|
+| Resource nouns + standard verbs | Guessable, cacheable, safe retries for GET/PUT/DELETE | Awkward for actions that are not CRUD | The default for public and mobile APIs |
+| Action sub-resource, `POST /tweets/981/retweet` | Models verbs that do not fit CRUD | Not idempotent by default | An action creates or triggers something |
+| `PUT` (replace) vs `PATCH` (partial) | `PUT` is idempotent and simple | `PUT` needs the full body and can overwrite others' edits | `PUT` for small objects, `PATCH` for large ones |
+| Version in the URL (`/v2/`) | Visible, easy to route and cache | Many versions to maintain | Most APIs. Prefer additive changes first |
+
+## Interview lens
+
+<Callout type="tip">
+In an interview, list the resources and the endpoints first, before you draw boxes. Write six lines: `POST /tweets`, `GET /tweets/{id}`, `GET /users/{id}/tweets?limit=&cursor=`, and so on. Name the idempotency of each. Then take the user id from the auth token, not from the URL or body.
+</Callout>
+
+<Callout type="mistake">
+Do not write `POST /createUser` or `GET /getUser`. The verb is already in the HTTP method. Also do not trust a user id in the request body: `POST /tweets` with `{ "userId": 7 }` lets anyone post as user 7.
+</Callout>
+
+<Callout type="deep" title="Is it really REST?">
+Roy Fielding's original REST also asks for hypermedia: responses carry links that tell the client what it can do next. Almost no public API does this. When people say "REST API" they mean "resource URLs, HTTP verbs and JSON". That is the meaning to use in an interview.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A client sends DELETE /tweets/981 and the connection drops before the answer arrives. It sends the same request again and gets 404. What should the client conclude?',
+      options: [
+        'The delete failed and it must try a different endpoint',
+        'The tweet is gone either way. The goal is reached',
+        'The server has a bug, because the same request gave two different answers',
+        'It must now send a POST to recreate the tweet',
+      ],
+      answer: 1,
+      explain: 'DELETE is idempotent. The server state after one or two calls is the same: the tweet does not exist. The status code can differ without breaking idempotency. 404 on the retry usually means the first call worked.',
+    },
+    {
+      q: 'A user is logged in. They call GET /orders/77 and the order belongs to someone else. Which status code fits best?',
+      options: ['401', '403', '400', '500'],
+      answer: 1,
+      explain: 'The server knows who the caller is (so not 401). The caller is not allowed to see this order, so 403. Some systems return 404 here to avoid revealing that the order exists. Both are defensible, but 401 is wrong.',
+    },
+    {
+      q: 'A mobile client sends POST /tweets. The server saves it, but the 201 response is lost. The client retries. What happens with the design from this lesson?',
+      options: [
+        'The server detects the duplicate, because POST is idempotent',
+        'The server creates a second tweet, because POST is not idempotent',
+        'The server returns 409 automatically',
+        'The retry fails, because stateless servers reject repeats',
+      ],
+      answer: 1,
+      explain: 'Nothing in a plain POST lets the server recognize a repeat. Two tweets exist. Lesson 3.4 adds an idempotency key to fix it.',
+    },
+    {
+      q: 'Which URL is the best design for "all tweets by user 42, newest first, 20 at a time"?',
+      options: [
+        'POST /getTweetsByUser with body {"user":42}',
+        'GET /users/42/tweets?sort=-created&limit=20',
+        'GET /getUser42Tweets/20',
+        'GET /tweets/user/42/newest/20',
+      ],
+      answer: 1,
+      explain: 'A noun path for the collection, GET for a safe read, and the sort and page size as query parameters. The others hide a verb in the URL, use POST for a read, or bake options into path segments.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html): safe and idempotent methods (section 9.2) and status codes (section 15).
+- [RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457.html): a standard JSON shape for errors.
+- [RFC 6585: Additional HTTP Status Codes](https://www.rfc-editor.org/rfc/rfc6585.html): defines 429 Too Many Requests and Retry-After.

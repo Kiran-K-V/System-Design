@@ -1,0 +1,126 @@
+---
+summary: A reference page of what one modern machine and each common component can do. Use it to decide when to scale, and when not to.
+requires: ['01-one-machine/latency-numbers', '01-one-machine/estimation']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+
+## Why this page exists
+
+Lesson 1.4 turned users into QPS and bytes. Those numbers mean nothing until you compare them with what a machine can do.
+
+The most common mistake in design interviews is **scaling too early**. Engineers shard a database that would fit on one laptop. Modern hardware is large. Know its limits, and you will add complexity only where it pays.
+
+All numbers are order-of-magnitude, for 2025-era cloud hardware. They change with workload. Use them to decide, not to promise.
+
+## One machine
+
+| Resource | Typical large server | Notes |
+|---|---|---|
+| CPU cores | 64–192 | Per socket counts vary; cloud sells by vCPU |
+| RAM | 256 GB – 2 TB+ | Some instances offer 24 TB |
+| Local NVMe SSD | 4–60 TB | Millions of IOPS across drives |
+| Network | 25–100 Gbps | 100 Gbps ≈ 12 GB/s |
+
+<Callout type="tip">
+Before you shard, ask: "Does it fit on one big machine?" 1 TB of RAM holds 1 billion 1 KB objects. Say this out loud. It shows you know the hardware.
+</Callout>
+
+## Components
+
+### Cache (Redis, Memcached)
+
+| Metric | Value |
+|---|---|
+| Ops per second, one node | ~100K–1M (simple GET/SET) |
+| Latency | < 1 ms in the same data center |
+| Memory per node | up to hundreds of GB |
+
+**Scale out when:** data exceeds one node's RAM, or ops exceed ~100K–200K per second sustained.
+
+### Relational database (PostgreSQL, MySQL)
+
+| Metric | Value |
+|---|---|
+| Simple indexed reads, one node | ~10K–50K+ per second |
+| Writes (transactions), one node | ~5K–20K per second |
+| Comfortable storage | up to ~10 TB per node (more is possible but slow to back up and restore) |
+| Query latency | 1–5 ms simple, 10 ms+ with joins |
+
+**Scale out when:** writes exceed ~10K per second, data exceeds ~10 TB, or reads exceed what replicas and a cache absorb.
+
+### Application server
+
+| Metric | Value |
+|---|---|
+| Requests per second | ~1K–10K+ per node, depends on work |
+| Concurrent connections | ~10K–100K (event loop servers) |
+| Persistent WebSocket connections | ~100K–1M with tuning |
+
+App servers are stateless (they keep no data between requests), so you add more behind a load balancer. That is the easiest scaling in the system.
+
+### Message queue / log (Kafka)
+
+| Metric | Value |
+|---|---|
+| Throughput per broker | ~100s of MB/s, up to ~1M small messages per second |
+| End-to-end latency | ~2–10 ms |
+| Retention | days to forever, limited by disk |
+
+### Object storage (S3 and similar)
+
+| Metric | Value |
+|---|---|
+| Capacity | effectively unlimited |
+| Requests | ~3,500 writes and ~5,500 reads per second **per key prefix**, scale with more prefixes |
+| Time to first byte | ~10–100 ms |
+| Max object size | 5 TB |
+
+### Search (Elasticsearch)
+
+| Metric | Value |
+|---|---|
+| Query latency | ~10–100 ms |
+| Indexing lag | ~1 s before new docs are searchable |
+
+## Scaling triggers at a glance
+
+| You see | Consider |
+|---|---|
+| Peak reads > ~10K/s on one DB | Read replicas, then a cache |
+| Peak reads > ~100K/s | Cache in front of everything; CDN for public content |
+| Peak writes > ~10K/s | Shard, batch, or use a write-optimized store |
+| Data > ~10 TB in a DB | Shard, archive cold data |
+| Files or blobs > ~1 MB | Object storage plus a URL in the DB |
+| Users far from your region | CDN, regional deployment |
+
+<Callout type="mistake">
+"We have 10M users, so we need Cassandra." 10M users posting twice a day is about 230 writes per second. One Postgres node handles that with room to spare. Choose a technology for its access pattern, not for the user count.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Your service needs 400 GB of hot data in a cache. What is the simplest option?',
+      options: ['Shard across 50 small cache nodes', 'One or two large cache nodes', 'Put it in the database', 'Use a CDN'],
+      answer: 1,
+      explain: 'Single nodes hold hundreds of GB. Start simple; shard when data or QPS outgrows one node.',
+    },
+    {
+      q: 'Peak writes are 3,000 per second. Data is 2 TB. What does the database need?',
+      options: ['Sharding now', 'One primary node (plus replicas for safety)', 'A NoSQL migration', 'Kafka in front'],
+      answer: 1,
+      explain: 'Both numbers are well inside one relational node. Replicas give durability and read capacity.',
+    },
+    {
+      q: 'Users upload 50 MB videos. Where should the bytes go?',
+      options: ['A BLOB column in Postgres', 'Redis', 'Object storage, with the URL in the database', 'Kafka'],
+      answer: 2,
+      explain: 'Databases are bad at large blobs. Object storage is cheap, durable, and serves bytes directly (Module 9.6).',
+    },
+  ]}
+/>

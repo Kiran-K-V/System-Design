@@ -1,0 +1,162 @@
+---
+summary: A schema is a bet on how your data will be read. Draw entities from the features, normalize so each fact lives once, then copy data on purpose where the access pattern demands it.
+requires: ['01-one-machine/numbers-to-know']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import ErBuilder from '../../../components/anim/lessons/ErBuilder.tsx';
+import NormalizeCost from '../../../components/anim/lessons/NormalizeCost.tsx';
+
+## The problem
+
+Module 1 gave you the speed of one machine. Module 3 gave you the API on top. Now the data under it.
+
+Take a micro-blog called Chirp. Users post, follow, and like. The first schema takes one afternoon. It works for 1,000 users.
+
+At 10 million users it breaks in two ways. The home timeline takes seconds. And renaming a user takes minutes, because the old name is stored in 50 places.
+
+Both bugs have the same root. The schema was drawn from the **things** in the product. Nobody asked **how the data is read and changed**. A good schema starts from the questions, not from the nouns.
+
+## Start from the features
+
+Four words you need first:
+
+- An **entity** is a kind of thing you store: User, Post. Each becomes a table (or a collection).
+- An **attribute** is one fact about an entity: a user's name.
+- A **primary key** (PK) is the attribute that identifies one row. No two rows share it.
+- A **foreign key** (FK) is an attribute that holds another row's primary key. It is a pointer.
+
+Step through the animation. A feature list becomes a schema, one feature at a time.
+
+<ErBuilder client:visible />
+
+Two rules came out of it:
+
+1. **One-to-many** (a user has many posts): put the FK on the "many" side. The post stores `user_id`.
+2. **Many-to-many** (users follow users, users like posts): you cannot store a list in one column. Make a **junction table**, one row per pair.
+
+The step with feature 4 matters most. A schema is not finished until you list the queries it must answer. These are the **access patterns**. For each one, write down three things: the query, how often it runs, and how fast it must be.
+
+| Access pattern | Frequency | Target | Shape it needs |
+|---|---|---|---|
+| Home timeline for one user | 5,000/s peak | < 50 ms | Index on `Post(user_id, created_at)` |
+| Show one post with author name | 50,000/s peak | < 10 ms | One row read, no join |
+| Like a post | 500/s | < 100 ms | One insert |
+| Rename a user | 0.1/s | seconds | Any |
+
+Look at the ratio. Reads of the author name are 500,000 times more frequent than renames. That ratio is the whole argument for the next section.
+
+## Naive: store every fact once, never look at the queries
+
+A textbook rule says: **normalize**. Store each fact in exactly one place. This is the standard defense against bugs, so it is right as a default.
+
+Here is the failure it prevents. Suppose each post stores the author's name as text. A user renames themselves. You must update every post. If one update fails, some posts show the old name. This is an **update anomaly**: the same fact now has two values. Normalized, the name lives in `User.name` only, and posts point to it.
+
+Normalization has a cost, and it shows up at read time. To show a post with its author, the database must **join**: read the post row, then read the user row. Two lookups instead of one.
+
+That is fine for one post. It hurts at scale. A home page shows 20 posts. That is 20 post rows and up to 20 user rows. At 50,000 page views per second, the join work is large.
+
+## The mechanism: copy data, on purpose
+
+**Denormalization** means storing a copy of a fact where it is read. You trade write cost and a risk of stale copies for faster reads.
+
+Do the arithmetic before you do it. Use the widget. It counts row reads and row writes for one author over one year.
+
+<NormalizeCost client:visible />
+
+The rule you can take from it:
+
+> Copy a field when it is **read often and changed rarely**. Keep one copy when it **changes often**.
+
+A user's display name: read on every post view, changed twice a year. Copy it. A user's follower count: changes every few seconds. Copying it into every post would mean thousands of writes per second. Do not.
+
+There is a third kind of copy: **derived data**. The `like_count` in the last animation step is derived. It can be rebuilt by counting Like rows. So a wrong value is repairable. A derived copy is the safest kind to add. A copy of a fact with no other source is the most dangerous.
+
+<Callout type="deep" title="When copying is required, not optional">
+An order line stores `price_at_purchase`. The product price will change later. The old order must keep the old price. This looks like denormalization but it is a different thing. It is a **historic fact**, not a copy of current state. If you "normalize" it away, last year's invoices change when a price changes. Ask of every copy: "Should this follow the source, or freeze at this moment?"
+</Callout>
+
+## Numbers
+
+Estimate before you choose a store. Use lesson 1.4.
+
+- A Post row: 8 B id + 8 B user id + 8 B timestamp + ~280 B body, plus overhead. Call it ~300 B.
+- 1 billion posts × 300 B = ~300 GB. One machine holds that on SSD (lesson 1.5).
+- A Follow row is two 8-byte ids: 16 B. A user following 500 accounts adds 8 KB. 100 million users × 500 follows = 50 billion rows, ~800 GB of raw ids before index overhead.
+- A timeline with no index: the database reads every post. 300 GB at ~3 GB/s sequential is ~100 s. With the index on `(user_id, created_at)`: one lookup per followed account, ~500 lookups. Lesson 4.3 shows why that costs milliseconds.
+
+The point: the **same data** costs 100 seconds or 50 milliseconds depending on the shape. Shape is a performance decision.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Normalize (one fact, one place) | Correctness, small writes, easy changes | Joins on read | The fact changes often, or correctness matters more than speed |
+| Denormalize (copy a fact) | One-row reads, no join | Many-row writes, risk of stale copies | Read:write ratio is high, the copy is stable |
+| Derived column (counts, sums) | Cheap reads of aggregates | Update on every write; must be repairable | A hot read shows an aggregate |
+| Junction table | Models many-to-many with plain rows | Extra table, extra join | Both sides have many partners |
+| Extra index | Fast lookups for one pattern | Slower writes, more disk | The pattern is frequent and slow without it |
+
+## Interview lens
+
+<Callout type="tip">
+Begin every data-model answer with the access patterns. Say: "Reads are X per second, writes are Y per second. The hot read is Z, so I will shape the table for Z." Then draw. Interviewers hear a staff engineer when the schema follows from the numbers.
+</Callout>
+
+<Callout type="mistake">
+Do not denormalize "for speed" before you have counted. Say what is read, how often, and what it costs to keep the copy correct. A schema full of copies with no plan to update them is a bug factory. The opposite mistake also fails: a pure third-normal-form schema for a feed that serves 50,000 reads per second.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Students enroll in many courses. A course has many students. How do you store this in a relational database?',
+      options: [
+        'A list of course ids in a column on Student',
+        'A list of student ids in a column on Course',
+        'A junction table Enrollment(student_id, course_id)',
+        'Two tables with the same data',
+      ],
+      answer: 2,
+      explain: 'A column cannot hold a set of keys and stay queryable. A junction table has one row per pair, with two FKs. It is also the right place to add facts about the pair, such as the enrollment date.',
+    },
+    {
+      q: 'An author has 100 posts. Each post is viewed 1,000 times a year. The author renames once. A write costs 5 reads. Which design costs less, and by how much?',
+      options: [
+        'Normalized: 200,005 units against 100,500 for denormalized',
+        'Denormalized: 100,500 units against 200,005 for normalized',
+        'Equal',
+        'Normalized, because writes are costly',
+      ],
+      answer: 1,
+      explain: 'Normalized: 2 reads per view × 100,000 views = 200,000, plus 1 write × 5 = 200,005. Denormalized: 1 read per view = 100,000, plus 100 post rewrites × 5 = 500, total 100,500. About 2× cheaper, because views dwarf renames.',
+    },
+    {
+      q: 'Which field is the best candidate to copy into each Post row?',
+      options: ['The author’s follower count', 'The author’s display name', 'The author’s current online status', 'The number of posts the author wrote today'],
+      answer: 1,
+      explain: 'Copy what is read often and changes rarely. A display name fits. The other three change every few seconds or minutes, so copying them would turn each change into thousands of writes.',
+    },
+    {
+      q: 'A shop stores price on the Product table and joins to it when it shows an old order. Last month the price rose by 20%. What is the bug?',
+      options: [
+        'The Product table is not normalized',
+        'Old orders now show the new price; the order line needed its own price_at_purchase',
+        'The join is too slow',
+        'Prices should be in a cache',
+      ],
+      answer: 1,
+      explain: 'A historic fact must freeze at the moment of the event. Fully normalizing it makes the past change when the present changes. This copy is correct design, not premature denormalization.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- Martin Kleppmann, *Designing Data-Intensive Applications*, chapter 2 (data models and query languages) and chapter 3 (storage and retrieval).
+- [PostgreSQL docs: Constraints, including primary and foreign keys](https://www.postgresql.org/docs/current/ddl-constraints.html)
+- [PostgreSQL docs: Table basics and the page layout that rows live in](https://www.postgresql.org/docs/current/storage-page-layout.html)

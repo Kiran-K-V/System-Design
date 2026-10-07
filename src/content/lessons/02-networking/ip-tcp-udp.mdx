@@ -1,0 +1,150 @@
+---
+summary: The network only delivers best-effort packets. TCP adds order and reliability and pays round trips for it. UDP adds nothing and pays nothing.
+requires: ['01-one-machine/latency-numbers']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import TcpHandshake from '../../../components/anim/lessons/TcpHandshake.tsx';
+import TcpVsUdp from '../../../components/anim/lessons/TcpVsUdp.tsx';
+import PacketLayers from '../../../components/anim/lessons/PacketLayers.tsx';
+import SlowStartCalc from '../../../components/anim/lessons/SlowStartCalc.tsx';
+
+## The problem
+
+Lesson 1.2 showed that a network round trip costs 0.5 ms inside a data center and 100 ms across an ocean. Now ask what the network does with your bytes.
+
+Your 1 MB file does not travel as one piece. A link carries at most 1,500 bytes in one frame. So the file becomes about 700 pieces. Each piece takes its own path through routers. Routers have full queues, and a full queue drops packets. Pieces arrive late, out of order, twice, or never.
+
+The base network protocol, **IP** (Internet Protocol), makes no promise about any of this. RFC 791 says it plainly: no acknowledgments, no retransmissions, no flow control. IP is a best-effort service.
+
+Your app needs a clean ordered stream of bytes. Something must close that gap.
+
+## Two jobs: find the machine, find the process
+
+Before reliability, you need to name the destination. Two names are used:
+
+- An **IP address** names a machine's network interface. IPv4 uses 32 bits (such as `203.0.113.7`). IPv6 uses 128 bits.
+- A **port** names a program on that machine. It is a 16-bit number, so there are 65,536 ports. A web server listens on 443. A DNS server listens on 53.
+
+A **packet** is one unit of data with a header on the front. The header holds the addresses. The **transport layer** adds ports and decides what to do about loss. TCP and UDP are the two transport protocols you need to know.
+
+<PacketLayers />
+
+Read the nesting from the inside out. Your data gets a TCP header. That makes a segment. The segment gets an IP header. That makes a packet. The packet goes into a link frame. Every layer adds a header and ignores what is inside.
+
+The headers cost bytes. IP adds at least 20 bytes. TCP adds at least 20. Together that is 40 bytes on every packet. A 100-byte message sent alone has 40 bytes of overhead: 29% of what goes on the wire.
+
+## Naive solution: send packets and hope
+
+Use UDP, the simple transport. A UDP header is 8 bytes: source port, destination port, length, checksum. That is all. The sender writes a datagram and sends it. The network may drop it. Nobody tells you.
+
+Watch both protocols handle the same loss.
+
+<TcpVsUdp client:visible />
+
+UDP is fast and honest. It gives you what the network gave it. For a file, a payment, or a web page, that is not enough. A missing piece ruins the whole result.
+
+## The mechanism: TCP builds a reliable stream
+
+**TCP** (Transmission Control Protocol) gives you an ordered, reliable byte stream on top of lossy IP. It uses four ideas.
+
+**1. A handshake creates shared state.** Both sides must agree on starting sequence numbers before data flows. The client sends SYN. The server answers SYN-ACK. The client sends ACK. That is one full round trip before the connection is open. RFC 9293 section 3.4 calls this the three-way handshake.
+
+**2. Sequence numbers and ACKs give order and loss detection.** TCP numbers every byte. The receiver sends ACKs that say "I have everything up to byte N". If an ACK does not come back in time, the sender resends. RFC 6298 sets the retransmission timer to start at 1 second, with a 1 second floor, and doubles it on every timeout.
+
+<TcpHandshake client:visible />
+
+**3. Flow control protects the receiver.** The receiver advertises a window: how many bytes it can still buffer. The sender never sends more than that.
+
+**4. Congestion control protects the network.** The sender does not know how much capacity the path has. So it starts small and probes. A new connection starts with a congestion window of 10 segments (RFC 6928). Each round trip without loss, the window doubles. This phase is called **slow start** (RFC 5681). On loss, TCP shrinks the window.
+
+Slow start has a big consequence. A fresh connection cannot use a fast link at full speed. It needs several round trips to grow the window. Use the widget below.
+
+<SlowStartCalc client:visible />
+
+<Callout type="deep" title="Connections are not unlimited">
+A connection is identified by four values: source IP, source port, destination IP, destination port. One server port (443) can hold millions of connections, because each client brings a different source address or port. But one client talking to one server IP and port has only about 64,000 source ports to use. A busy proxy that opens too many short connections to one backend can run out. After a connection closes, the side that closed first stays in TIME-WAIT for 2 x MSL (RFC 9293 section 3.6.1). That keeps the port busy even longer. The fix is connection reuse, which the next lessons cover.
+</Callout>
+
+## Numbers
+
+Start from lesson 1.2: a same-data-center round trip is ~0.5 ms and a cross-ocean trip is ~100 ms.
+
+| Event | Cost | Example at 100 ms RTT |
+|---|---|---|
+| TCP handshake | 1 RTT | 100 ms before the first data byte |
+| Tiny request and response on a warm connection | 1 RTT | 100 ms |
+| Same, on a new connection | 2 RTT | 200 ms |
+| 1 MB on a new connection (no loss) | ~8 RTT | ~800 ms |
+| One lost packet, timer-based recovery | ≥ 1 s (RFC 6298 floor) | 10 RTTs of waiting |
+| Header overhead per packet | ≥ 40 B (TCP + IP) | 29% of a 100 B message |
+
+Notice that bandwidth does not appear. For small and medium transfers, round trips decide the cost. This is why every layer above TCP tries to avoid new connections.
+
+## Trade-offs
+
+| | TCP | UDP |
+|---|---|---|
+| You gain | Order, no loss, flow and congestion control | No handshake, no head-of-line wait, tiny header (8 B) |
+| You pay | 1 RTT to open, state on both sides, a late packet blocks the ones behind it | You must handle loss, order, and duplicates yourself |
+| Choose when | Correctness matters: web, APIs, databases, file transfer | Fresh data beats complete data: voice, video, games, DNS, and protocols that build their own reliability (QUIC) |
+
+## Interview lens
+
+<Callout type="tip">
+When a design adds a network call, name its cost in round trips. "A new HTTPS connection costs 2 to 3 round trips before the first byte, so we keep connections open and reuse them." This is a precise statement. It also leads naturally to connection pools, keep-alive, and CDNs.
+</Callout>
+
+<Callout type="mistake">
+Do not say "TCP guarantees delivery". It guarantees that bytes arrive in order, or that you get an error. It does not guarantee the other side processed them. If the connection drops after you send a payment request, you cannot tell whether it arrived. That is why Module 3 teaches idempotency.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A client opens a new TCP connection to a server with an 80 ms round-trip time. It sends a small request and reads a small reply. When does the first reply byte arrive, at the earliest?',
+      options: ['40 ms', '80 ms', '160 ms', '240 ms'],
+      answer: 2,
+      explain: 'The handshake takes 1 RTT (80 ms). The request and reply take another RTT (80 ms). Total 160 ms. On an existing connection the same exchange takes only 80 ms.',
+    },
+    {
+      q: 'You send a 1 MB file over a new TCP connection. The RTT is 100 ms and the link is 1 Gbps. About how long does the transfer take?',
+      options: ['~8 ms, set by the link speed', '~100 ms, one round trip', '~800 ms, set by slow start', '~8 s'],
+      answer: 2,
+      explain: 'The window starts at 10 segments and doubles each RTT. About 685 segments need 7 data rounds, plus 1 RTT for the handshake. That is 8 x 100 ms. The link could move the file in 8 ms, but latency decides.',
+    },
+    {
+      q: 'A multiplayer game sends each player position 60 times per second. A packet is lost. Which choice is better and why?',
+      options: [
+        'TCP, because every position must arrive',
+        'UDP, because a resent old position is useless when a newer one is already coming',
+        'TCP, because UDP cannot carry small messages',
+        'UDP, because it is encrypted by default',
+      ],
+      answer: 1,
+      explain: 'With TCP, a lost packet blocks all the newer positions until the old one is resent. The old position is already stale. UDP lets the newest data through at once.',
+    },
+    {
+      q: 'One server listens on port 443. Why can it hold 100,000 connections at the same time?',
+      options: [
+        'Each connection uses a different server port',
+        'A connection is identified by source IP, source port, destination IP, and destination port, so each client makes a unique combination',
+        'TCP shares one connection between all clients',
+        'The operating system opens 100,000 ports on the server',
+      ],
+      answer: 1,
+      explain: 'The server port is the same for all. The client side differs, so every four-value combination is unique. The limit is memory and file descriptors on the server, not ports.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RFC 9293: Transmission Control Protocol](https://www.rfc-editor.org/rfc/rfc9293.html) (handshake, header, TIME-WAIT)
+- [RFC 6298: Computing TCP's Retransmission Timer](https://www.rfc-editor.org/rfc/rfc6298.html)
+- [RFC 6928: Increasing TCP's Initial Window](https://www.rfc-editor.org/rfc/rfc6928.html) and [RFC 5681: TCP Congestion Control](https://www.rfc-editor.org/rfc/rfc5681.html)
+- [RFC 768: User Datagram Protocol](https://www.rfc-editor.org/rfc/rfc768.html) (two pages long)

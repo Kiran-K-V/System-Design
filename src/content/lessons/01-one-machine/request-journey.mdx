@@ -1,0 +1,118 @@
+---
+summary: Before you design a system of many machines, know what one machine does with one request. Every later trade-off comes from these parts.
+requires: []
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import RequestJourney from '../../../components/anim/lessons/RequestJourney.tsx';
+
+## The problem
+
+You have one server. It runs your app and your data. Users say the profile page is slow.
+
+Where do you look first? CPU? Memory? Disk? Network?
+
+Most engineers guess "the code". Usually that guess is wrong. To guess right, you must know what happens to a request inside a machine, and how long each part takes.
+
+## The four parts of a machine
+
+A server has four parts that matter for system design:
+
+| Part | What it does | What it limits |
+|---|---|---|
+| **CPU** | Runs instructions. Parses requests, runs your code, compresses, encrypts. | Requests per second when work is compute-heavy |
+| **RAM** | Holds data the CPU uses now. Fast, small, lost on power off. | How much data you can serve fast |
+| **Disk** (SSD or HDD) | Holds data that must survive restarts. Large, slow. | Durability and reads that miss RAM |
+| **NIC** (network card) | Sends and receives bytes over the network. | Bandwidth in and out |
+
+Two software parts sit on top:
+
+- The **kernel** is the part of the operating system that controls the hardware. Your code asks the kernel to read the network or the disk. It never touches the hardware directly.
+- A **process** is one running program with its own memory. A **thread** is one line of execution inside a process. A process can run many threads at the same time, one per CPU core.
+
+## Follow one request
+
+Step through the animation. Watch the time bar fill.
+
+<RequestJourney client:visible />
+
+Read the result: the network costs about 75% of the time. The disk costs about 15%. The CPU costs less than 10%. The RAM read is too small to see.
+
+This is the normal shape. It is why the next lessons spend so much time on network hops and disk reads, and so little on CPU.
+
+## What changes when load grows
+
+One request is fast. Now send 10,000 per second. Each part runs out in a different way:
+
+- **CPU** runs out when every core is busy. New requests wait in a queue. Lesson 1.3 shows why the wait grows fast near 100% use.
+- **RAM** runs out when your hot data does not fit. Reads fall through to disk. Each miss is 1,000 times slower.
+- **Disk** runs out of operations per second (IOPS). An SSD does about 10k–100k random reads per second.
+- **NIC** runs out of bandwidth. A 10 Gbps card moves about 1.25 GB per second.
+- **Threads** run out. If each request holds a thread while it waits for disk, a pool of 200 threads serves at most 200 requests at the same time.
+
+<Callout type="deep" title="Why threads waiting is a problem">
+A thread that waits for the disk or network does no work. But it still uses memory (about 1 MB of stack) and a slot in the pool. Event-loop servers (Node.js, Nginx, Redis) use one thread for many connections. They do not block while they wait. This is why Redis can serve 100k+ requests per second on one thread.
+</Callout>
+
+## The numbers
+
+| Operation | Time |
+|---|---|
+| Read from RAM | ~100 ns |
+| Read 1 random block from SSD | ~100 µs |
+| Round trip inside one data center | ~500 µs |
+| Round trip across a continent | ~50–150 ms |
+
+Lesson 1.2 shows the full ladder. For now, keep one ratio: **RAM is about 1,000x faster than SSD, and SSD is about 5x faster than a network round trip in the same data center.**
+
+## Trade-offs
+
+| Choice | You gain | You pay |
+|---|---|---|
+| Keep data in RAM | Speed (ns) | Cost per GB, data lost on crash |
+| Keep data on disk | Durability, size | Speed (µs to ms) |
+| More threads | More waiting requests served | Memory, context-switch cost |
+| Event loop | Many connections on one thread | One slow handler blocks all others |
+
+## Interview lens
+
+<Callout type="tip">
+When you say "this will be slow", say **which resource** is the limit. "The database read is a disk seek on every request" is a staff answer. "It will be slow" is not.
+</Callout>
+
+<Callout type="mistake">
+Do not add servers to fix a slow request. More servers add **throughput** (requests per second). They do not make one request faster. To make one request faster, remove a network hop or a disk read.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In the animation, which part took the most time?',
+      options: ['CPU', 'RAM', 'Disk', 'Network'],
+      answer: 3,
+      explain: 'Two network trips (in and out) cost about 510 µs of the 670 µs total.',
+    },
+    {
+      q: 'A handler reads a value from RAM 1,000 times. About how long does that take?',
+      options: ['100 ns', '100 µs', '100 ms', '1 s'],
+      answer: 1,
+      explain: '1,000 × 100 ns = 100 µs. That is the same as one random SSD read.',
+    },
+    {
+      q: 'Your server has 200 threads. Each request waits 50 ms on a slow database. What is the max throughput?',
+      options: ['200 req/s', '4,000 req/s', '10,000 req/s', 'No limit'],
+      answer: 1,
+      explain: 'Each thread finishes 1 / 0.05 s = 20 requests per second. 200 threads × 20 = 4,000 req/s. Lesson 1.3 names this rule: Little’s Law.',
+    },
+    {
+      q: 'Requests are slow because each one reads from disk. What fixes the latency of each request?',
+      options: ['Add more servers', 'Add more CPU cores', 'Keep the hot data in RAM', 'Add more threads'],
+      answer: 2,
+      explain: 'Only removing the disk read makes each request faster. The other options add capacity, not speed.',
+    },
+  ]}
+/>

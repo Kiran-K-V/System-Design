@@ -1,0 +1,159 @@
+---
+summary: Latency is how long one request takes. Throughput is how many finish per second. A queue connects them, and near 100% load the queue wins.
+requires: ['01-one-machine/request-journey', '01-one-machine/latency-numbers']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import QueueSim from '../../../components/anim/lessons/QueueSim.tsx';
+
+## The problem
+
+Your server handles 1,000 requests per second. The CPU graph shows 50%. Users see 40 ms responses.
+
+Traffic grows to 1,800 per second. The CPU graph shows 90%. Nothing is "broken". But users now see 200 ms responses.
+
+Load grew less than 2x. Latency grew 5x. Why?
+
+The answer is the queue.
+
+## Two different numbers
+
+- **Latency**: the time one request takes, from send to response. Measured in ms.
+- **Throughput**: the number of requests the system finishes per second. Measured in requests per second (req/s or QPS, queries per second).
+
+They are not opposites. A system can have low latency and low throughput (one fast thread). It can have high latency and high throughput (a huge batch job).
+
+## Where queues come from
+
+Requests do not arrive evenly. They arrive in random bursts. When a burst comes and the server is busy, the extra requests wait in a **queue**. Every resource from lesson 1.1 has one: the CPU run queue, the socket buffer, the thread pool, the disk.
+
+So the latency a user sees is:
+
+```
+response time = wait in queue + service time
+```
+
+**Service time** is the actual work. It stays the same when load grows. **Wait time** depends on how busy the server is.
+
+## Watch the queue
+
+The server below does 10 requests per second (100 ms each). Requests arrive at random. Move the utilization slider.
+
+<QueueSim client:visible />
+
+**Utilization** is the fraction of time the server is busy: arrival rate ÷ service rate. At 50%, half the time the server is idle.
+
+Read the curve:
+
+| Utilization | Response time | vs. service time |
+|---|---|---|
+| 50% | 200 ms | 2x |
+| 80% | 500 ms | 5x |
+| 90% | 1,000 ms | 10x |
+| 95% | 2,000 ms | 20x |
+| 99% | 10,000 ms | 100x |
+
+This comes from the simplest queue model (random arrivals, one server):
+
+```
+response time = service time / (1 − utilization)
+```
+
+You do not need the formula in an interview. You need the shape: **flat, then a knee, then a wall.** The knee is near 70–80%.
+
+<Callout type="deep" title="Why random arrivals cause this">
+If requests came exactly every 100 ms and took exactly 100 ms, you could run at 100% with no queue. Real arrivals cluster. A cluster builds a queue. The server can only drain that queue in its idle time. At 95% load there is only 5% idle time to drain it, so queues last a long time. More servers reduce this effect, because one idle server can absorb another's burst.
+</Callout>
+
+## Little's Law
+
+One rule connects the three numbers. It works for any stable system: a server, a thread pool, a store checkout line.
+
+```
+items in the system = arrival rate × time each item spends in the system
+        L           =      λ       ×        W
+```
+
+Use it to size things:
+
+- **Thread pools.** 2,000 req/s, each holds a thread for 50 ms. Threads busy = 2,000 × 0.05 = **100 threads**.
+- **Connection pools.** 500 queries/s at 10 ms each = **5 connections** busy on average. Add headroom for bursts.
+- **Max throughput.** 200 threads, 50 ms per request. Max = 200 ÷ 0.05 = **4,000 req/s**. You saw this in the 1.1 quiz.
+
+## Throughput limits
+
+The system's max throughput equals the throughput of its slowest part: the **bottleneck**. Adding capacity anywhere else does nothing.
+
+To raise throughput you have three options:
+
+1. **Do less work per request** (cache results, cheaper queries).
+2. **Do work in parallel** (more threads, more cores, more servers).
+3. **Batch** (amortize fixed costs: one disk write for 100 records, one network call for 50 items). Batching raises throughput but adds latency, because items wait for the batch to fill.
+
+## Tail latency
+
+Users do not feel the average. They feel the slow requests.
+
+- **p50** (median): half of requests are faster than this.
+- **p99**: 99% are faster. 1 in 100 is slower.
+
+Queues hurt the tail most. At high utilization, p50 may look fine while p99 explodes.
+
+Tail latency also multiplies with fan-out. A page that calls 100 services in parallel waits for the slowest one. If each service has a 1% chance of being slow, the page is slow 1 − 0.99¹⁰⁰ = **63%** of the time.
+
+## Trade-offs
+
+| Choice | Throughput | Latency | Cost |
+|---|---|---|---|
+| Run at 90%+ utilization | Max | Very bad tail | Cheap |
+| Run at 50–70% | Good | Stable | Pays for idle capacity |
+| Batch requests | Higher | Higher | Simple |
+| Add parallel workers | Higher | Same or lower | More hardware |
+
+## Interview lens
+
+<Callout type="tip">
+When you size a fleet, plan for 50–70% utilization at peak, not 100%. Say why: "Above ~75% the queue wait dominates and p99 climbs fast. The headroom also absorbs a server failure."
+</Callout>
+
+<Callout type="mistake">
+Do not size with averages alone. "1M requests per day is 12 req/s" is true but useless. Traffic has peaks. Use peak QPS (often 2–10x average) and plan headroom on top. Lesson 1.4 shows how.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A server is at 90% utilization. Service time is 10 ms. About what is the average response time?',
+      options: ['10 ms', '11 ms', '100 ms', '900 ms'],
+      answer: 2,
+      explain: '10 ms / (1 − 0.9) = 100 ms. 90 ms of that is waiting in the queue.',
+    },
+    {
+      q: 'An API gets 3,000 req/s. Each request holds a DB connection for 4 ms. How many connections are busy on average?',
+      options: ['4', '12', '750', '3,000'],
+      answer: 1,
+      explain: 'Little’s Law: 3,000 × 0.004 = 12.',
+    },
+    {
+      q: 'You batch 100 writes into one disk flush. What happens?',
+      options: [
+        'Throughput up, latency per write up',
+        'Throughput up, latency per write down',
+        'Throughput down, latency down',
+        'No change',
+      ],
+      answer: 0,
+      explain: 'The fixed cost is shared by 100 writes, so throughput rises. But each write waits for the batch to fill and flush.',
+    },
+    {
+      q: 'Utilization goes from 50% to 95%. Service time does not change. What happens to response time?',
+      options: ['Doubles', 'Grows about 10x', 'Stays the same', 'Halves'],
+      answer: 1,
+      explain: '50%: 2x service time. 95%: 20x service time. That is a 10x increase.',
+    },
+  ]}
+/>

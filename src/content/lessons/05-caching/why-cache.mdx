@@ -1,0 +1,167 @@
+---
+summary: A cache is a small, fast copy of data that is read often. Skewed traffic makes a small cache absorb most reads, and hit ratio math tells you what it buys you.
+requires: ['01-one-machine/latency-numbers', '01-one-machine/numbers-to-know']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import CacheHitMissFlow from '../../../components/anim/lessons/CacheHitMissFlow.tsx';
+import ZipfCache from '../../../components/anim/lessons/ZipfCache.tsx';
+import HitRatioCalc from '../../../components/anim/lessons/HitRatioCalc.tsx';
+
+## The problem
+
+Your app shows a profile page. Each view reads one user row from a PostgreSQL database. Traffic grows to 30,000 reads per second.
+
+One database node does about 10K–50K simple indexed reads per second (lesson 1.5). Each read takes 1–5 ms. At 30,000 reads per second you sit at the edge. The next marketing email pushes you over. Queries queue, latency climbs, and the page times out.
+
+Look at what the database is doing. It reads the same few thousand popular rows again and again, from disk or its own memory, over the network, for every request. The data did not change between reads. The work is repeated for nothing.
+
+## Naive solution: buy more database
+
+You can add read replicas (lesson 4.6) or shard the data (lesson 4.7). Both work. Both cost money and add operational work: replication lag, a routing layer, rebalancing.
+
+Worse, they scale the wrong thing. You pay for more capacity to answer the same question over and over. The question is not "how do I read more rows per second?" The question is "why am I reading the same row again?"
+
+## The mechanism: keep a copy close
+
+A **cache** is a small, fast store that keeps copies of data from a bigger, slower store. The big store is the **source of truth**. The cache can lose any entry at any time without losing data, because the truth lives elsewhere.
+
+Four words you will use for the rest of this module:
+
+- A **hit** is a read the cache answers.
+- A **miss** is a read the cache cannot answer. The request goes to the source of truth.
+- The **hit ratio** is hits divided by all reads.
+- The **working set** is the data your traffic touches in a window of time. A cache works when the working set fits in it.
+
+Step through one key. Watch the first read pay extra, and the second read pay almost nothing.
+
+<CacheHitMissFlow client:visible />
+
+A miss costs more than having no cache. You asked the cache, then the database, then wrote back. The cache only pays off if later reads hit. So the real question is: will they?
+
+## Why reads repeat: locality and skew
+
+Two properties of real traffic make hits likely.
+
+**Temporal locality.** Data used now is likely to be used again soon. A user who opens a page refreshes it. A viral post is read a million times in an hour.
+
+**Skewed popularity.** A few keys get most of the reads. Think of products, celebrities, trending hashtags, or the config row every request reads. Statisticians model this with a **Zipf law**: the key at popularity rank *r* gets traffic proportional to 1/*r*^s. Redis's own docs say the same in plain words: access patterns usually follow a power law, so an LRU cache is a good default.
+
+Skew is the reason a small cache works. Move the slider and watch how little memory buys a high hit ratio.
+
+<ZipfCache client:visible />
+
+The model uses a clean law. Real traffic is messier. Some workloads are skewed more, some less. The lesson holds: before you size a cache, find out how skewed your reads are. Log key access counts for a day.
+
+## Hit ratio math
+
+For a cache with hit ratio *h*, cache latency *c*, and database latency *d*:
+
+**average latency = h × c + (1 − h) × (c + d)**
+
+A miss pays *c* first (the failed lookup), then *d*. Many people forget the *c* on a miss.
+
+Example: *c* = 0.5 ms, *d* = 10 ms, *h* = 0.9. Average = 0.9 × 0.5 + 0.1 × 10.5 = **1.5 ms**. Without the cache it is 10 ms.
+
+Now try the calculator. Pay close attention to the database reads and the p99 outputs.
+
+<HitRatioCalc client:visible />
+
+Three things to learn from it:
+
+1. **Think in miss ratio, not hit ratio.** Going from 90% to 99% hits looks like +9 points. It cuts database load 10 times. Going from 99% to 99.9% cuts it 10 times again.
+2. **Average latency flattens early.** After 90%, the average improves slowly. The database load keeps falling fast.
+3. **The tail stays slow.** If more than 1% of reads miss, p99 latency is the miss latency. Caches fix the average and the load. They do not fix the tail unless the hit ratio is very high.
+
+<Callout type="deep" title="The cold cache trap">
+Say the cache absorbs 95% of reads, so your database sees 5% of 30,000 = 1,500 reads per second. A small database handles that. Then the cache restarts. Its memory is empty. For the first minutes, every read misses, and the database sees 30,000 reads per second: 20 times its normal load. It falls over. When it falls over, the cache can never refill, and the outage does not end by itself. If the system cannot survive without the cache, the cache is not an optimization any more. It is a required component, and you must treat it like one: replicate it, warm it before you send traffic, and limit how much load can reach the database. Lesson 5.5 covers this.
+</Callout>
+
+## When a cache does not help
+
+- **Uniform reads.** If every key is equally likely and the data set is bigger than the cache, the hit ratio is about cache size divided by data size. A 1 GB cache over 100 GB of uniform data gives ~1% hits.
+- **Write-heavy data.** If a value changes between every two reads, each cached copy is wrong before its second use.
+- **Data that must be exactly fresh.** An account balance during a transfer, or inventory at checkout. A copy can be stale (out of date). Lesson 5.5 shows how stale it can get.
+- **Data that already fits in the database's memory.** The database already caches. PostgreSQL keeps recently used pages in its shared buffers (128 MB by default) and also relies on the operating system's page cache. Adding a Redis in front helps only if you avoid the query work or the network trip, not the disk read.
+
+## The numbers
+
+| Item | Value |
+|---|---|
+| Read from RAM | ~100 ns |
+| Redis or Memcached GET, same data center | ~0.5 ms (the network trip dominates) |
+| Cache node throughput | ~100K–1M simple ops/s. Redis's FAQ cites ~1M requests/s with pipelining. |
+| Indexed database read | ~1–5 ms (lesson 1.5) |
+| Memory for 1M small string keys in Redis | ~85 MB (Redis FAQ) |
+| 1 KB objects | 1M objects ≈ 1 GB. 1B objects ≈ 1 TB (lesson 1.5) |
+
+A cache hit is not "100 ns fast". The memory read is fast. The network trip to reach it is not. That is why caching *inside* the app process (lesson 5.2) is another 1000 times faster than Redis.
+
+## Trade-offs
+
+| Gain | You pay | Choose it when |
+|---|---|---|
+| Lower read latency (average) | Extra latency on every miss | Reads are skewed and repeat |
+| Database load drops by the miss ratio | A new component to run, size, and monitor | The database is the bottleneck or the cost driver |
+| Absorbs traffic spikes on hot data | Stale reads, because the copy can lag the truth | Slightly old data is acceptable |
+| Cheaper than scaling the database | Cold-start risk: a lost cache returns full load to the database | You can warm the cache or shed load |
+
+## Interview lens
+
+<Callout type="tip">
+Do not say "add a cache" and stop. Say what you cache, why it is cacheable, and how big it is. For example: "Reads are 100:1 over writes and the top 1% of products get most views. The hot set is ~10 GB, so it fits in one Redis node. I expect a 95%+ hit ratio, which cuts database reads 20 times." Then name the cost: staleness.
+</Callout>
+
+<Callout type="mistake">
+Do not treat the cache as free speed. Every cache adds a second copy that can disagree with the first. Also do not size the database for the hit case only. State what happens on a cold start.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Cache lookup takes 1 ms. A database read takes 20 ms. The hit ratio is 95%. A miss pays the failed lookup first. What is the average read latency?',
+      options: ['1.0 ms', '1.95 ms', '2.0 ms', '10.5 ms'],
+      answer: 2,
+      explain: '0.95 × 1 + 0.05 × (1 + 20) = 0.95 + 1.05 = 2.0 ms. The 1.95 ms answer forgets the failed lookup on a miss.',
+    },
+    {
+      q: 'Traffic is 30,000 reads per second. You tune the cache and the hit ratio rises from 95% to 99%. What happens to the database load?',
+      options: ['It drops 4%', 'It drops 5 times (1,500 to 300 reads/s)', 'It drops 20 times', 'It does not change'],
+      answer: 1,
+      explain: 'Database reads equal traffic times miss ratio. 5% of 30,000 is 1,500. 1% of 30,000 is 300. The miss ratio fell from 5% to 1%, which is 5 times.',
+    },
+    {
+      q: 'Which workload gets the smallest benefit from a cache?',
+      options: [
+        'Product pages where 1% of items get 80% of views',
+        'The config row every request reads',
+        'Each user downloads a unique 2 GB export once',
+        'A trending-posts list read by millions',
+      ],
+      answer: 2,
+      explain: 'A unique object read once has no repeats, so every read is a miss. Caching needs reuse. The other three have heavy repeat reads.',
+    },
+    {
+      q: 'Your database is sized to handle 10% of peak read traffic because the cache hits 90%. The cache cluster restarts with empty memory at peak. What do you expect?',
+      options: [
+        'Nothing. The database caches too.',
+        'The database sees up to 10 times its normal load until the cache refills',
+        'Latency drops because the cache is no longer in the path',
+        'The hit ratio stays at 90% because keys are still popular',
+      ],
+      answer: 1,
+      explain: 'With zero entries, every read misses, so the database receives the full traffic instead of 10% of it. This cold-start load can overload the database, which then slows the refill. Plan for it.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Redis: Key eviction](https://redis.io/docs/latest/develop/reference/eviction/). The power-law remark and the hit-ratio formula from `INFO`.
+- [Redis FAQ](https://redis.io/docs/latest/develop/get-started/faq/). Memory footprint per key and throughput with pipelining.
+- [PostgreSQL docs: resource consumption](https://www.postgresql.org/docs/current/runtime-config-resource.html). `shared_buffers` default and its relation to the OS cache.
+- [Scaling Memcache at Facebook (NSDI 2013)](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala). A cache serving billions of requests per second.
