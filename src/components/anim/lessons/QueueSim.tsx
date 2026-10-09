@@ -142,7 +142,7 @@ export default function QueueSim() {
             </HandText>
             {s.serving && <circle cx={535} cy={36} r={6} fill="var(--ok)" />}
             <SketchArrow points={[[584, 66], [632, 66]]} seed={31} />
-            <HandText x={608} y={50} size={12} color="var(--muted)">
+            <HandText x={608} y={50} size={13} color="var(--muted)">
               done
             </HandText>
           </svg>
@@ -223,17 +223,17 @@ function Curve({ rho, measured }: { rho: number; measured: number | null }) {
       {[0, 1, 2, 3].map((s) => (
         <g key={s}>
           <line x1={P.l} x2={W - P.r} y1={y(s)} y2={y(s)} stroke="var(--border)" />
-          <text x={P.l - 6} y={y(s) + 4} textAnchor="end" fontSize={10} fill="var(--muted)">
+          <text x={P.l - 6} y={y(s) + 4} textAnchor="end" fontSize={13} fill="var(--muted)">
             {s}s
           </text>
         </g>
       ))}
       {[0, 0.5, 1].map((r) => (
-        <text key={r} x={x(r)} y={H - P.b + 16} textAnchor="middle" fontSize={10} fill="var(--muted)">
+        <text key={r} x={x(r)} y={H - P.b + 16} textAnchor="middle" fontSize={13} fill="var(--muted)">
           {r * 100}%
         </text>
       ))}
-      <text x={(W + P.l) / 2} y={H - 2} textAnchor="middle" fontSize={10} fill="var(--muted)">
+      <text x={(W + P.l) / 2} y={H - 2} textAnchor="middle" fontSize={13} fill="var(--muted)">
         utilization
       </text>
       <polyline points={pts.join(' ')} fill="none" stroke="var(--accent)" strokeWidth={2} />
