@@ -1,0 +1,214 @@
+---
+summary: An index is a second, sorted structure that turns a scan of a billion rows into about four page reads. Learn the B-tree and the LSM tree, and the rules that decide whether a query can use an index at all.
+requires: ['04-data/data-modeling', '04-data/storage-engines']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import BTreeSim from '../../../components/anim/lessons/BTreeSim.tsx';
+import BTreeHeight from '../../../components/anim/lessons/BTreeHeight.tsx';
+import CompositeIndexLab from '../../../components/anim/lessons/CompositeIndexLab.tsx';
+import LsmFlow from '../../../components/anim/lessons/LsmFlow.tsx';
+import InvertedIndexBuild from '../../../components/anim/lessons/InvertedIndexBuild.tsx';
+
+## The problem
+
+Lesson 4.2 ended with a two-line database: append on write, scan on read. A scan is fine for 1,000 rows. Now take a table of **1 billion orders** at ~200 B per row. That is 200 GB.
+
+Your app asks: `SELECT * FROM orders WHERE order_id = 7351902264`. The answer is one row. To find it without help, the database reads the whole table. A fast NVMe disk reads 3 to 7 GB/s in a straight line (lesson 1.2). So the scan takes about **30 to 70 seconds**. Your target is a few milliseconds.
+
+An **index** is the fix. It is a second structure, built from one or more columns, that lets the database jump to the right rows. The index costs disk space and slows every write. You must know how much, and when it is worth it.
+
+## Naive: a sorted file and binary search
+
+Suppose the keys sit in a file, sorted. You find a key by **binary search**: look at the middle, discard half, repeat. For 1 billion keys that is log2(10^9) = ~30 steps.
+
+Each step lands on a different place in the file. Each is a separate page read. Page reads from SSD cost ~100 µs, so 30 steps cost ~3 ms. That is far better than 50 seconds. But two things are wrong.
+
+1. **30 page reads is too many.** Each read returns an 8 KB page, and we use one key from it. Waste.
+2. **A sorted file cannot take inserts.** A new key belongs in the middle. Making room means shifting about half the file, ~100 GB.
+
+The first problem has a direct fix. Make each step of the search consume a whole page. If one page holds 400 keys, one step discards 399/400 of the data, not 1/2. This is the idea behind the B-tree.
+
+## The mechanism: the B-tree
+
+A **B-tree** is a tree where every node is exactly one page. A node holds sorted keys and, between them, pointers to child pages. To find a key, read the root, pick the child whose range contains the key, read that child, and repeat until you reach a **leaf**. A leaf holds the key and a pointer to the table row.
+
+Most databases use the **B+tree** variant. Only leaves hold row pointers. Leaves are also chained in a doubly linked list in key order, so a range query (`BETWEEN`) finds the first key and then walks along the leaves. The tree is **balanced**: every leaf is at the same depth. That is the property that keeps lookups predictable.
+
+### Height: do the arithmetic
+
+The cost of a lookup is the tree's **height**, because each level is one page read. Height depends on the **fan-out** F: how many children a node has. If every node has F children, a tree of height H holds about F^H keys.
+
+Derive F for PostgreSQL. A page is 8 kB. The first 24 bytes are a header, and each entry needs a 4-byte slot (both from the PostgreSQL page-layout docs). Assume an entry of an 8-byte key plus an 8-byte entry header, 16 bytes. The entry header size is my assumption, not a number from the docs. Then each entry costs 20 bytes:
+
+```text
+F = (8192 - 24) / 20 = ~408   ->  use F = 400
+400^3 = 64 million        < 1 billion
+400^4 = 25.6 billion     >= 1 billion   ->  height 4
+```
+
+Count the pages level by level, from the leaves up:
+
+```text
+leaves   : 1,000,000,000 / 400 = 2,500,000 pages   (20 GB)
+level 3  :     2,500,000 / 400 =     6,250 pages   (50 MB)
+level 2  :         6,250 / 400 =        16 pages
+root     :                           1 page
+```
+
+<BTreeHeight />
+
+Read the figure from the bottom. The leaves hold 99.75% of the pages, which agrees with the PostgreSQL docs ("typically, over 99% of all pages are leaf pages"). The three upper levels total 6,267 pages, ~51 MB. That fits in RAM on any server, and it is the part every lookup touches. So a real lookup does **no disk reads for the top three levels**. It does one SSD read for the leaf and one for the table page: 2 × ~100 µs, **~0.2 ms**. Against ~50 s for the scan, that is about 250,000 times faster.
+
+How sensitive is the answer to my guess of F? Height stays 4 for any F from 178 up to 999, because 178^4 is about 10^9 and 1,000^3 is 10^9. Halve the entry size or double it: still 4. Drop F to 100 and it becomes 5 (100^4 = 10^8 is too small). Use The Index Luke says real indexes on millions of rows have a depth of 4 or 5, which matches.
+
+### Insert: the split
+
+Inserting a key means finding its leaf and adding it in sorted order. If the leaf has room, one page changes. If the leaf is full, it **splits**: half the keys move to a new page, and the middle key moves up into the parent as a new pointer. If the parent is full it splits too. Splits cascade upward. When the root splits, the tree grows one level taller. That is the only way a B-tree gets taller, so it stays balanced by construction.
+
+Try it. The nodes below hold 3 keys so splits are easy to see. Insert 10, 20, 30, then 40. Keep going and watch the root.
+
+<BTreeSim client:visible />
+
+Notice how rare a split is. In a real index with F = 400, a leaf splits about once per 200 inserts, and a root split happens a handful of times in the life of a table.
+
+### What an index costs on write
+
+A lookup got cheap. A write got dearer. A row insert touches the table page **and one leaf page in every index** on the table. A table with 6 indexes writes 1 table page plus 6 index leaf pages for each insert, all in place (lesson 4.2) and all recorded in the log. Update a column that is indexed and you change both its old and its new place in that index. The PostgreSQL docs say this too: a changed indexed column needs a new entry in every index.
+
+That is why the rule is **not** "index every column". Index the columns that the hot queries filter, join, or sort on. Drop the rest.
+
+## Which queries can use an index?
+
+An index on **several columns** is one tree sorted by the first column, then by the second inside each first-column value. It is a phone book: sorted by surname, then by first name. You cannot look someone up by first name alone. Use The Index Luke makes the same point: a two-column index "does not support searching on the second column alone".
+
+Three rules follow. Use the widget to check each one. Pick an index, pick a query, and watch how many of the 200 entries get read.
+
+<CompositeIndexLab client:visible />
+
+1. **Leftmost prefix.** The index helps only if the query has a condition on its first column. `age = 30` on an index `(city, age)` reads all 200 entries.
+2. **Equality columns first, range column last.** Go left to right. Every `=` condition narrows the range, and the scan continues. The first **range** condition (`>`, `BETWEEN`) narrows the range and ends the narrowing. Columns after it can only filter entries already read. So `city = 'Oslo' AND age > 40` wants `(city, age)`. The reverse order `(age, city)` reads 113 entries to return 23.
+3. **Covering index.** If the index holds every column the query needs, the database never visits the table. This is an **index-only scan**. It saves one page read per row returned. The price is a wider index: more memory and more work on each write.
+
+## Another way: the LSM tree
+
+A B-tree updates pages in place. Each insert is a random page write. When the write rate is very high, that is the bottleneck. Lesson 4.2 introduced the other family: log-structured storage. Its index is the **LSM tree** (log-structured merge tree), used by RocksDB, Cassandra, and LevelDB.
+
+Writes go to a sorted map in RAM, the **memtable**, and to a log for crash safety. A full memtable is flushed as one sorted, immutable file, an **SSTable**. Nothing is edited in place. Old versions pile up in older files. A background job, **compaction**, merges files and drops overwritten and deleted keys.
+
+Step through it. Watch the read in steps 7 and 8.
+
+<LsmFlow client:visible />
+
+A read must check the memtable, then files from newest to oldest. To avoid useless disk reads, each file carries a **Bloom filter**: a small in-memory summary that can say "this key is definitely not in this file". It never says "not here" wrongly, but it can say "maybe here" wrongly. RocksDB documents the exchange: 9.9 bits per key gives a 1% false-positive rate, and 15.5 bits gives 0.1%. At 1% and 20 files, a read for a missing key wastes about 20 × 0.01 = 0.2 disk reads on average.
+
+The memory cost is real. At 9.9 bits per key, 1 billion keys need 9.9 × 10^9 bits, ~1.2 GB of filters.
+
+The bill moves, it does not vanish. Compaction rewrites the same data many times. The RocksDB docs say the write amplification of leveled compaction is "often larger than 10". Every byte you write may be written to disk ten times or more, in the background.
+
+## Two more index shapes
+
+**Hash index.** It maps a hash of the key to a row location. Lookup by equality is one step. But a hash scatters neighbors, so it cannot do ranges or sorted output. PostgreSQL's docs say a hash index stores a 32-bit hash code and "can only handle simple equality comparisons". A B-tree does equality almost as fast and does everything else. Hash indexes are rare in practice.
+
+**Inverted index.** A B-tree answers "which row has this key?". Search needs the opposite: "which rows **contain** this word?". An inverted index maps each term to a **posting list** of the documents that hold it. PostgreSQL's GIN index is this, and Lucene (inside Elasticsearch) is built on it. Watch one get built from three documents.
+
+<InvertedIndexBuild client:visible />
+
+Location search is a third need. A B-tree sorts one dimension, so a range on latitude still reads a whole band across the planet. Spatial indexes split the plane into regions instead. PostgreSQL provides the GiST framework for such indexes. Lesson 10.1 builds the idea from scratch.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Page size: PostgreSQL / InnoDB | 8 kB / 16 KB | Their docs |
+| Fan-out, 8 KB page, 20 B entry | ~400 (assumed entry size) | Derived above |
+| B-tree height, 1 billion keys | 4 (any F from 178 to 999) | Derived above |
+| Upper 3 levels of that tree | ~51 MB | Derived above |
+| Lookup, top levels cached | ~0.2 ms (2 SSD reads) | Lesson 1.2 latencies |
+| Full scan of 200 GB | ~30 to 70 s | Lesson 1.2 throughput |
+| Bloom filter, 1% false positives | 9.9 bits per key | RocksDB wiki |
+| Leveled compaction write amplification | often above 10 | RocksDB wiki |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| B-tree | Fast point and range reads, sorted output | A random page write per index per insert; page splits | Read-heavy or mixed OLTP. The default. |
+| LSM tree | Very high write rate; sequential disk writes | Several files per read; Bloom filter memory; compaction I/O | Write-heavy ingest: events, messages, metrics |
+| Hash index | One-step equality lookup | No ranges, no ordering | Almost never; a B-tree is nearly as fast |
+| Inverted index | Search by contained term | Updates one list per distinct term of each new document | Text search, array contains, tags |
+| Composite index | One tree serves several filters | Order matters; wider entries | A hot query filters on 2 or more columns |
+| Covering index | No table access | More memory, slower writes | A few very hot read queries |
+
+## Interview lens
+
+<Callout type="tip">
+When you propose an index, say three things. The columns and their order, and why (equality first, then range). What query it serves and how often it runs. What it costs: "this table takes 5,000 inserts per second, and one more index adds one more random page write to each." That last sentence is what separates a staff answer from "add an index".
+</Callout>
+
+<Callout type="mistake">
+"A lookup is O(log n), so it is cheap" is incomplete. State the page reads: height 4 for a billion keys, and the top levels are cached. Also do not say "index every column". And never promise that an index on `(b, a)` serves `WHERE a = ?`. It does not. Check the leftmost-prefix rule before you draw it.
+</Callout>
+
+<Callout type="deep" title="Why not a binary tree in memory, on disk?">
+A binary search tree has 2 children per node. On disk each node would be its own page, so 1 billion keys need 30 page reads. The B-tree wins by matching the node size to the disk's unit of I/O. This is the general lesson: when a layer moves data in blocks, design the structure around the block size. The same reasoning gives you wide LSM files and big sequential writes.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A B-tree has fan-out 100. About how many levels does it need for 1 billion keys?',
+      options: ['3', '4', '5', '9'],
+      answer: 2,
+      explain: '100^4 = 100 million, which is below 1 billion. 100^5 = 10 billion, which is enough. So 5 levels. With fan-out 400 it was 4. Fan-out matters, but only a little: a 4x change moved the height by one level.',
+    },
+    {
+      q: 'You have an index on (city, age). Which query reads the fewest index entries?',
+      options: [
+        "WHERE age = 30",
+        "WHERE city = 'Oslo' AND age = 30",
+        "WHERE city > 'Lima' AND age = 30",
+        'All three read the same number',
+      ],
+      answer: 1,
+      explain: 'With two equality conditions, both columns narrow the range, so only matching entries are read (1 in the lab). The range on city in the third query stops the narrowing, so every entry with city above Lima is read (75 in the lab). The first query has no condition on city, so it reads all 200.',
+    },
+    {
+      q: 'A table has 6 indexes. About how many pages does one ordinary insert write, if no page splits?',
+      options: ['1', '2', '7', '12'],
+      answer: 2,
+      explain: 'One table page plus one leaf page in each of the 6 indexes: 7. This is why each extra index slows writes, and why you drop indexes that no hot query uses.',
+    },
+    {
+      q: 'An LSM store holds 20 SSTables. Bloom filters use 9.9 bits per key. You read a key that does not exist. How many wasted disk reads do you expect?',
+      options: ['0', 'About 0.2', 'About 2', '20'],
+      answer: 1,
+      explain: 'A Bloom filter has no false negatives, so a present key is never skipped. For an absent key each file has a 1% chance of a false "maybe". 20 files x 0.01 = 0.2 wasted reads on average. Without filters you would read all 20.',
+    },
+    {
+      q: 'A service ingests 200,000 small events per second and reads them back rarely, by key. Which storage structure fits, and why?',
+      options: [
+        'A B-tree, because O(log n) lookups are fast',
+        'A hash index, because reads are by key',
+        'An LSM tree, because writes become sequential and in-memory first',
+        'An inverted index, because the data is small',
+      ],
+      answer: 2,
+      explain: 'The load is write-dominated. A B-tree would do random in-place page writes for each event. An LSM tree absorbs writes in memory and a log, then writes sorted files sequentially. The price is compaction I/O and slightly slower reads, which this workload barely uses.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Use The Index Luke: The anatomy of an index, the tree](https://use-the-index-luke.com/sql/anatomy/the-tree)
+- [Use The Index Luke: Concatenated indexes](https://use-the-index-luke.com/sql/where-clause/the-equals-operator/concatenated-keys)
+- [Use The Index Luke: Index-only scan and covering index](https://use-the-index-luke.com/sql/clustering/index-only-scan-covering-index)
+- [PostgreSQL docs: B-tree indexes](https://www.postgresql.org/docs/current/btree.html)
+- [PostgreSQL docs: Index types](https://www.postgresql.org/docs/current/indexes-types.html)
+- [RocksDB wiki: Bloom filter](https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter)
+- [RocksDB wiki: Leveled compaction](https://github.com/facebook/rocksdb/wiki/Leveled-Compaction)

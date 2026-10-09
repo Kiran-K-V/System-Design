@@ -6,7 +6,7 @@ const PRESETS = [
   { id: 'hot', label: 'Hot keys', text: 'A B A C A B D A B A E A B C A D A B A F', note: 'A and B are popular, the rest are one-offs. Frequency and recency both help.' },
   { id: 'scan', label: 'Scan', text: 'A B A B A B X1 X2 X3 X4 A B A B A B', note: 'A one-time scan (X1..X4) flushes LRU and FIFO. LFU keeps the hot keys.' },
   { id: 'shift', label: 'Shift', text: 'A B A B A B A B A B C D C D C D C D C D', note: 'The hot set changes from A,B to C,D. Old counts trap LFU. LRU adapts.' },
-  { id: 'loop', label: 'Loop', text: 'A B C D A B C D A B C D A B C D', note: 'A cycle bigger than the cache. Every policy gets 0 hits. Only more memory helps.' },
+  { id: 'loop', label: 'Loop', text: 'A B C D A B C D A B C D A B C D', note: 'A cycle of 4 keys, bigger than a 3-key cache. Every policy gets 0 hits. Raise capacity to 4 and all three jump to 75%.' },
 ];
 
 const POLICIES: { id: Policy; name: string; rule: string }[] = [
@@ -27,6 +27,7 @@ export default function EvictionLab() {
   const pick = (id: string) => {
     setPreset(id);
     setText(PRESETS.find((p) => p.id === id)!.text);
+    setCap(3);
     setK(0);
   };
 
@@ -36,7 +37,7 @@ export default function EvictionLab() {
       hint="same trace, same capacity"
       caption={
         <>
-          Pick <b>Scan</b> and press <b>Run all</b>: LFU wins. Pick <b>Shift</b>: LFU loses badly. Pick <b>Loop</b>: all three fail. No policy is best for every trace. Type your
+          Pick <b>Scan</b> and press <b>Run all</b>: LFU wins. Pick <b>Shift</b>: LFU loses badly. Pick <b>Loop</b>: all three fail until the cache grows to 4. No policy is best for every trace. Type your
           own keys (letters or words, split by spaces) to test an idea. Capacity is in keys, and every key has the same size here.
         </>
       }

@@ -1,0 +1,241 @@
+---
+summary: A cache has a fixed size, so it must throw entries away. LRU, LFU, and their cheap approximations decide which ones. The right policy depends on the shape of your traffic.
+requires: ['05-caching/why-cache', '05-caching/cache-strategies']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import LruWalk from '../../../components/anim/lessons/LruWalk.tsx';
+import EvictionLab from '../../../components/anim/lessons/EvictionLab.tsx';
+import SampledLru from '../../../components/anim/lessons/SampledLru.tsx';
+
+## The problem
+
+Your cache has room for 1 million entries. It is full. Read number 1,000,001 misses, loads a row from the database, and wants to store it.
+
+Memory does not grow by itself. Something must leave so the new entry can come in. Which entry?
+
+The choice matters because every wrong choice costs a miss. Lesson 5.1 showed what a miss costs: a cache check plus a database read. A good choice keeps the entries that will be read soon. A bad choice throws one out a second before it is needed. The **hit ratio** is the score of your eviction policy.
+
+One fact makes this easy to act on. A cache entry is a **copy**. The database holds the truth (lesson 5.1). So you can drop any entry at any time without losing data. The next read misses and loads it again. Redis's documentation says the same: because entries are copies of stored data, it is usually safe to evict them when memory runs out.
+
+## Naive solutions
+
+**Refuse new entries.** The cache fills up and then stops accepting anything. The first million keys stay forever, even if nobody reads them. Redis does exactly this by default. Its default policy is `noeviction`: when the memory limit is reached, commands that add data return an error. Reads still work. That is right for a database. It is wrong for a cache, because a cache that cannot learn is a cache that slowly dies.
+
+**Throw out the oldest arrival (FIFO).** This is a queue: the first key in is the first key out. It is simple and cheap. It also ignores how often a key is used. Imagine the config row that every request reads. It was cached at startup, so it is the oldest entry. FIFO evicts it first. The next request misses and reloads it, and now it is the newest entry. A hot key gets thrown out on a fixed schedule, for no reason.
+
+**Evict a random key.** This costs almost nothing, and it is fair. It is also blind. It works when all keys are used about equally. Redis's docs name one case: an app that reads items in a repeating cycle. Real traffic is skewed (lesson 5.1), so you can do better.
+
+The better idea uses a fact you already know. Reads repeat. A key used a moment ago is likely to be used again soon.
+
+## LRU: evict the key not used for the longest time
+
+**LRU** means *least recently used*. Keep keys in order of last use. Every access moves its key to the front. When the cache is full, evict the key at the back.
+
+Step through a cache of three keys. Watch what happens to `A` on each hit.
+
+<LruWalk client:visible />
+
+### How can it be fast?
+
+A cache is read thousands of times per second. Finding the back of the list or moving a key must not scan anything. Exact LRU uses two structures together:
+
+- A **hash map** from key to list node. It finds any key in O(1).
+- A **doubly linked list** ordered by recency. Each node knows its neighbor on both sides, so you can unlink a node from the middle in O(1) and put it at the front.
+
+```text
+get(k):   node = map[k]            // O(1) lookup
+          if none: return miss
+          unlink(node); push_front(node)
+          return node.value
+
+put(k,v): if k in map: update value; move node to front
+          else:
+            if size == capacity:
+              victim = list.pop_back()   // least recently used
+              delete map[victim.key]
+            node = push_front(k, v)
+            map[k] = node
+```
+
+A common wrong answer is "sort by timestamp". Sorting is O(n log n). The map finds the node and the list moves it. Neither step looks at other entries.
+
+### Where LRU fails: the scan
+
+A nightly job reads every row of a big table once. Every row is a miss. Each one goes to the front and pushes a hot key toward the back. After enough rows, the hot keys are gone. The cache is now full of rows that will never be read again. This is called **cache pollution**. LRU cannot tell "used once" from "used all day". It only knows "used last".
+
+## LFU: evict the key used least often
+
+**LFU** means *least frequently used*. Keep a counter for each key. Every hit adds one. Evict the key with the smallest count.
+
+LFU fixes the scan. A hot key has a big count. A one-time scan key has a count of 1, so the scan keys evict each other and leave the hot keys alone.
+
+LFU has three problems of its own:
+
+- **Old popularity sticks.** A key that was hot last week has a huge count. It stays even when nobody asks for it. The new hot keys cannot beat it.
+- **New keys are weak.** A new key starts at 1. It is the first to go, before it has had time to earn hits.
+- **Counters cost memory.** Every key needs a count. Exact counts are also expensive to keep sorted.
+
+Real systems patch these. Redis keeps an *approximate* count in a few bits using a **Morris counter**: a probabilistic counter that adds one only sometimes, so a small number can stand for a very large count. It also makes the count **decay**. By default the counter saturates at around one million requests and decays every minute. Decay is the fix for old popularity: a key must keep being used to stay popular.
+
+## Try the policies on the same traffic
+
+The lab below runs LRU, LFU, and FIFO on one trace of accesses. Press **Run all** for each preset. Before you press, guess which policy wins.
+
+<EvictionLab client:visible />
+
+Three facts to take from it:
+
+1. **Skewed traffic with a scan favors LFU.** LRU loses its hot keys to the scan.
+2. **A change of popular keys favors LRU.** LFU holds on to the old keys and misses the new ones, until their counts decay.
+3. **A loop bigger than the cache beats every policy.** All three get zero hits at capacity 3. Capacity 4 fixes it for all three. When no policy helps, the cache is too small for the working set.
+
+The **working set** is the set of keys your traffic touches in a time window that matters. Size the cache to hold it. A policy only chooses who to drop. It cannot create room.
+
+## Real systems cheat: sampled LRU
+
+Exact LRU needs a list and two extra pointers per key. At a billion keys that is a lot of memory. Redis does not do it. Its docs say the reason: true LRU costs more memory.
+
+Redis **samples**. On eviction it reads a small random set of keys, looks at when each was last used, and evicts the oldest of those. The default sample size is 5 (`maxmemory-samples 5`). Since Redis 3.0 it also keeps a pool of good candidates between samples, which makes the result close to true LRU.
+
+<SampledLru client:visible />
+
+The Redis docs say that on a power-law access pattern the difference between true LRU and the approximation was minimal or non-existent in their simulations. `redis.conf` says 5 "produces good enough results", 10 approximates true LRU very closely but costs more CPU, and 3 is faster but not very accurate.
+
+<Callout type="deep" title="Memcached: many small caches">
+Memcached splits its memory into 1 MB pages. Each page is given to one **slab class**, a set of fixed-size chunks. An item goes into the class with the nearest fit. Once a page is assigned to a class, it is never moved. Each class has its **own LRU**. When a class has no free chunk and no free page is left, memcached looks at the last few items of that class's LRU for an expired one to reuse. If none is expired, it evicts an unexpired one. The result: a flood of 100-byte items can evict 100-byte items only. A single big item does not push out small ones. The cost is wasted space inside chunks, and a class can starve if the item sizes of your workload shift.
+</Callout>
+
+<Callout type="deep" title="W-TinyLFU: ask before you admit">
+LRU always admits the newcomer. LFU struggles with new keys. The library Caffeine (Java) uses **W-TinyLFU**, which fixes both. A small LRU **window** takes every new entry. When the window overflows, its oldest entry is a candidate for the large main space. A frequency filter, **TinyLFU**, estimates how popular the candidate and the main space's victim are. Only a candidate that looks more popular gets in. The filter uses a 4-bit count-min sketch, a small table of counters that estimates counts without storing every key. Caffeine says it grows at about 8 bytes per cache entry. A scan therefore cannot flush hot keys, and a new burst still gets a chance in the window. You will not build this in an interview. Know that "admission policy" is the name for the idea.
+</Callout>
+
+## Eviction is not expiry
+
+Two different rules remove entries, for two different reasons.
+
+| | Eviction | Expiry (TTL) |
+|---|---|---|
+| **Why** | The cache ran out of space | The entry may be out of date |
+| **When** | Only when memory is full | When the time limit passes, even if memory is free |
+| **Who is picked** | Least useful by the policy | Every entry whose time is up |
+| **Protects** | Memory | Freshness (lesson 5.5) |
+
+They work together. Redis's docs note that if you use expiry well, keys often expire before memory runs out, so you run into the limit less. They also note that setting an expiry on a key costs memory, so a policy like `allkeys-lru`, which needs no expiry to work, is more memory efficient.
+
+## Choose a policy
+
+For Redis, set `maxmemory` and then `maxmemory-policy`. The options that matter:
+
+| Policy | Evicts | Use when |
+|---|---|---|
+| `noeviction` (default) | Nothing. Writes that add data fail | Redis is a database, not a cache |
+| `allkeys-lru` | Least recently used, any key | Default for a pure cache. A small set of keys gets most reads |
+| `allkeys-lfu` | Least frequently used, any key | A stable hot set, and scans or one-off bursts that you want to ignore |
+| `allkeys-random` | Random key | All keys are used about equally, or reads cycle |
+| `volatile-lru`, `volatile-lfu`, `volatile-random` | Same rules, but only keys that have a TTL | One Redis holds both cache keys and keys you must keep |
+| `volatile-ttl` | The key with the shortest remaining TTL | Your code can assign short TTLs to the keys that matter least |
+
+Redis docs add a warning: the `volatile-*` policies behave like `noeviction` when no key has a TTL. If you pick `volatile-lru` for a cache and forget to set TTLs, the cache fills, writes fail, and nothing is evicted.
+
+To check your policy, read the numbers Redis reports (`INFO stats`). Hit ratio is `keyspace_hits / (keyspace_hits + keyspace_misses)`. If it is lower than you expect and `evicted_keys` is high, the wrong keys are being evicted too often, or the cache is too small. If `evicted_keys` is low and `expired_keys` is high, your TTLs may be too short.
+
+## The numbers
+
+| Item | Value |
+|---|---|
+| Redis `maxmemory` default | 0: no limit on 64-bit systems (32-bit has an implicit 3 GB limit) |
+| Redis `maxmemory-policy` default | `noeviction` |
+| Redis `maxmemory-samples` default | 5 (10 is close to true LRU, more CPU. The largest value you can set is 64) |
+| Redis LFU defaults | counter saturates near 1,000,000 hits, decays every 1 minute |
+| Exact LRU cost | O(1) per access, with a hash map and a doubly linked list |
+| Memcached memory and page size | `-m` defaults to 64 MB. Pages are 1 MB |
+| Caffeine frequency sketch | 4-bit counters, about 8 bytes per entry |
+
+With replication or persistence turned on, Redis keeps update buffers outside the `maxmemory` count. Leave some RAM free for them, or the process can use more memory than the limit you set.
+
+## Trade-offs
+
+| Policy | You gain | You pay | Choose it when |
+|---|---|---|---|
+| FIFO | Cheapest bookkeeping | Ignores use, evicts hot keys on schedule | Almost never for a cache |
+| Random | No metadata at all | Blind to use | All keys have similar rates |
+| LRU | Simple, adapts fast when hot keys change | A scan flushes the hot set | The default. Recent use predicts near-future use |
+| Sampled LRU | No list, little memory | Approximate, costs CPU per eviction | You run a huge cache, as Redis does |
+| LFU | Resists scans, keeps the stable hot set | Slow to forget, weak for new keys, needs decay | Popularity is steady and scans happen |
+| W-TinyLFU | Often the best hit ratio | More code and more tuning | A library cache in a process, such as Caffeine |
+
+## Interview lens
+
+<Callout type="tip">
+Name the policy and justify it with the traffic. "I will use Redis with `allkeys-lru`. Reads are skewed, so recently used keys are likely to be used again. The cache is sized to the hot set, about 10 GB. If a nightly job scans the table, I will switch to `allkeys-lfu`, or have the job bypass the cache, so the scan cannot flush hot keys." Then say how you will check: watch the hit ratio and `evicted_keys`.
+</Callout>
+
+<Callout type="tip">
+If asked "implement an LRU cache", write the hash map plus doubly linked list and state that both `get` and `put` are O(1). Say why the list is doubly linked: unlinking a node from the middle needs the previous pointer.
+</Callout>
+
+<Callout type="mistake">
+Do not say "LRU protects against scans". It is the policy that scans hurt most. Do not leave Redis on its default policy for a cache and expect eviction. The default `noeviction` returns errors on writes. Do not pick a `volatile-*` policy without setting a TTL on the keys. And do not tune the policy before you check the size: if the working set does not fit, no policy helps.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An LRU cache holds 3 keys. Starting empty, the accesses are A, B, C, A, then D. Which key does D evict?',
+      options: ['A', 'B', 'C', 'Nothing. There is room.'],
+      answer: 1,
+      explain: 'After A, B, C the order front to back is C, B, A. The second access to A is a hit and moves A to the front: A, C, B. B is now the least recently used. D is a miss on a full cache, so it evicts B.',
+    },
+    {
+      q: 'Traffic: keys A and B are read constantly. Once a night, a job reads 100,000 other keys exactly once. Which policy best protects A and B during the job?',
+      options: ['LRU', 'FIFO', 'LFU', 'They all behave the same'],
+      answer: 2,
+      explain: 'LRU and FIFO treat every scan key as new and push A and B out. LFU sees counts: A and B have large counts, scan keys have 1, so the scan keys evict each other. That is the Scan preset in the lab.',
+    },
+    {
+      q: 'A team starts Redis as a cache with maxmemory 4gb and changes no other setting. The cache fills. What happens?',
+      options: [
+        'Redis evicts the least recently used keys.',
+        'Redis evicts random keys.',
+        'Commands that add data return an error. Reads still work.',
+        'Redis grows beyond 4 GB.',
+      ],
+      answer: 2,
+      explain: 'The default maxmemory-policy is noeviction. At the limit, Redis refuses commands that need more memory. You must set a policy such as allkeys-lru to get eviction.',
+    },
+    {
+      q: 'Why does Redis not keep an exact LRU list, and what does it do instead?',
+      options: [
+        'Exact LRU is not possible with a hash map.',
+        'Exact LRU costs more memory. Redis samples a few random keys, 5 by default, and evicts the one idle longest.',
+        'Exact LRU needs a disk. Redis keeps timestamps in the database.',
+        'Redis only supports LFU.',
+      ],
+      answer: 1,
+      explain: 'Redis docs: true LRU costs more memory, so Redis approximates it. It samples keys and evicts the oldest of the sample. A larger sample (10) gets closer to true LRU for more CPU. The approximation is close for skewed traffic.',
+    },
+    {
+      q: 'Reads cycle through 4 keys, A B C D A B C D, on a cache of capacity 3. What hit ratio do LRU, LFU, and FIFO get, and what is the fix?',
+      options: [
+        'About 75% for all. No fix needed.',
+        '0% for all. Capacity 4 makes it work for all of them.',
+        '0% for LRU and FIFO, but LFU gets 75%.',
+        '50% for all. Use a better policy.',
+      ],
+      answer: 1,
+      explain: 'In a loop bigger than the cache, each key is evicted just before it is needed again, under every policy shown. The fix is more memory: the working set is 4 keys. At capacity 4, all three reach 75% on a 16-access trace, because only the first 4 reads miss.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Redis: key eviction](https://redis.io/docs/latest/develop/reference/eviction/). All policies, the approximated LRU, LFU counters, and how to read `INFO` stats.
+- [redis.conf](https://raw.githubusercontent.com/redis/redis/unstable/redis.conf). The defaults for `maxmemory-policy` and `maxmemory-samples`, in the maintainers' own words.
+- [Memcached user internals](https://github.com/memcached/memcached/wiki/UserInternals). Slab classes, 1 MB pages, and one LRU per class.
+- [Caffeine: efficiency](https://github.com/ben-manes/caffeine/wiki/Efficiency). The W-TinyLFU design: window, admission filter, segmented main space.

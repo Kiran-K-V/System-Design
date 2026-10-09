@@ -1,0 +1,198 @@
+---
+summary: HTTP only answers questions. Polling, long polling, SSE, WebSocket and WebRTC are five ways to let the server speak first, and each trades idle cost, direction and state.
+requires: ['02-networking/http-tls', '02-networking/load-balancing']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import RealtimeLanes from '../../../components/anim/lessons/RealtimeLanes.tsx';
+import { WsUpgrade, SseResume } from '../../../components/anim/lessons/RealtimeHandshakes.tsx';
+import SocketFanout from '../../../components/anim/lessons/SocketFanout.tsx';
+import ReconnectStorm from '../../../components/anim/lessons/ReconnectStorm.tsx';
+
+## The problem
+
+HTTP (lesson 2.3) is request and response. The client always speaks first. The server answers and then has nothing more to say.
+
+A chat app breaks that rule. Alice sends a message. Bob's browser must show it within a second, and Bob has asked for nothing. The server has news and no way to deliver it. The same is true for a live score, a delivery map, or a document that three people edit.
+
+So how does the server reach the client? Every answer below is a trick on top of the same HTTP and TCP you already know. Each trick changes three costs: what an idle client costs, how late the news arrives, and who may send.
+
+## Naive solution: short polling
+
+**Short polling** means the client asks "anything new?" on a timer. It is plain HTTP. Any server, proxy and CDN supports it. A poll is stateless, so a load balancer can send it to any server.
+
+It fails in two ways. First, most polls are empty. Say the browser polls every 2 seconds. That is 1,800 requests per hour per user. If 1 million users are online, the servers see 500,000 requests per second (1,000,000 / 2). Most carry no data, and every one pays for headers, auth and a log line.
+
+Second, the news is late. An event that happens just after a poll waits almost a full interval. A 2 second interval means up to 2 seconds of delay. Polling every 100 ms cuts the delay and multiplies the load by 20.
+
+You cannot lower both. That is the signal to hold the connection open instead. Step through four approaches on the same three events. Watch the request count and the delay in each lane.
+
+<RealtimeLanes client:visible />
+
+## The mechanism: hold a connection open
+
+### Long polling
+
+The client sends a request. The server does not answer yet. It holds the request open until it has news (or a timeout of tens of seconds), answers, and the client sends the next request at once.
+
+The delay drops to about one network trip. No poll is empty, because a response always carries data (except at timeout). But every event still costs a full new HTTP request with all its headers. And each client holds one open request on the server at all times.
+
+Long polling works everywhere HTTP works. That is its value. Use it as a fallback.
+
+### Server-sent events (SSE)
+
+**SSE** (server-sent events) keeps one HTTP response open forever. The server writes events into it as lines of text. The browser reads them with the `EventSource` API.
+
+```text
+id: 41
+event: message
+data: {"from":"alice","text":"hi"}
+
+```
+
+The spec (WHATWG HTML Standard) sets the format. Fields are `data`, `event`, `id` and `retry`. A blank line ends one event. The media type is `text/event-stream`, and the text must be UTF-8.
+
+SSE flows one way only: server to client. The client talks back with normal HTTP requests. In return you get **automatic reconnect with replay**. The browser remembers the last `id` it saw. After a drop it reconnects and sends `Last-Event-ID`. Your server answers with everything after that id.
+
+<SseResume client:visible />
+
+Two details matter in production. SSE over HTTP/1.1 is limited by MDN to 6 connections per browser and domain, shared across all tabs. Over HTTP/2 the limit is the negotiated stream count, which MDN says defaults to 100. And legacy proxies drop quiet connections, so the spec suggests a comment line (a line starting with `:`) every 15 seconds or so.
+
+### WebSocket
+
+A **WebSocket** (RFC 6455) turns one HTTP request into a two-way pipe. After the upgrade, both sides send **frames** (small message units) whenever they like. It is **full duplex**: both directions at once.
+
+<WsUpgrade client:visible />
+
+Frames are cheap. A header is 2 to 14 bytes. A chat message costs a few bytes of framing, not hundreds of bytes of HTTP headers. That is why WebSocket suits chat, games, and shared editing, where the client talks as often as the server.
+
+The price is that the connection is now **state**. A browser's `WebSocket` does not reconnect by itself. Your code must handle `close` and `error`, reconnect, and work out what it missed. A load balancer must keep the socket on one server for its whole life. A deploy that restarts servers drops every socket on them.
+
+### WebRTC
+
+**WebRTC** lets two browsers talk directly, mostly for audio and video. The server is not in the data path, which saves bandwidth and delay. But most devices sit behind a router that hides them with **NAT** (network address translation). So WebRTC runs a framework called ICE. A **STUN** server tells a device its public address. If the router blocks direct links (MDN calls out symmetric NAT), a **TURN** server relays all the data. MDN notes TURN "comes with some overhead", so it is a last resort.
+
+Before any of that, the two peers must swap connection details. They need some channel for that, and the standard does not pick one. Many apps use a WebSocket. For system design interviews, WebRTC is the answer to "video call" and "peer-to-peer", and the wrong answer to "chat" or "notifications".
+
+## Keeping connections alive
+
+An idle socket looks dead to every box between the client and you. nginx, by default, closes a proxied connection after 60 seconds without data (`proxy_read_timeout`). Phones switch networks and never send a close frame.
+
+The fix is a **heartbeat**: a small message sent on a timer, in both directions. In WebSocket it is a ping frame, answered by a pong. Discord's gateway lets the server choose the interval: the Hello message carries `heartbeat_interval` in milliseconds. If the client sees no acknowledgement, it drops the connection and reconnects. A missed heartbeat is the only way to learn the network vanished.
+
+## Scaling: sockets are state
+
+A stateless HTTP server is easy to scale (lesson 2.4). Any server can take any request. A socket breaks that. The user is attached to one machine, and a message for the user must reach that machine.
+
+The common answer splits two jobs. **Gateways** hold sockets and nothing else. **Channel servers** (or a pub/sub layer, Module 6) decide who gets which message. Slack describes this design. Each channel has one owning channel server, picked by consistent hashing. The channel server sends a message to every gateway with a subscriber. Each gateway writes to its own sockets.
+
+<SocketFanout client:visible />
+
+Slack reports about 16 million channels per host at peak, delivery worldwide in about 500 ms, and a replacement channel server ready in under 20 seconds.
+
+### Reconnects can cause the outage
+
+Say a gateway holds 100,000 sockets and dies. All 100,000 clients notice at about the same moment. If each retries immediately, the survivors receive 100,000 connection attempts in one second. They fail, the clients retry, and the storm continues.
+
+Two rules fix it. **Exponential backoff** doubles the wait after each failed attempt. **Jitter** adds randomness, so clients do not retry in step. Backoff without jitter keeps clients synchronized: they all wait the same 2, 4, 8 seconds. Try the widget. Set your own capacity.
+
+<ReconnectStorm client:visible />
+
+Reconnect also has to **resume**. Discord's client sends the `session_id` and the last sequence number `seq` it saw. The server replays the missed events in order. SSE gives you the same idea with `Last-Event-ID`. For a WebSocket, you build it.
+
+## Numbers
+
+| Method | Requests per hour per user (idle, 2 s poll) | Typical delay | Direction |
+|---|---|---|---|
+| Short polling, 2 s | 1,800 | 0 to 2 s | Client asks |
+| Short polling, 30 s | 120 | 0 to 30 s | Client asks |
+| Long polling | 1 per event, plus timeouts | ~1 network trip | Client asks, server holds |
+| SSE | 1 (the stream) | ~1 network trip | Server to client |
+| WebSocket | 1 (the upgrade) | ~1 network trip | Both |
+
+Idle memory per connection and sockets per server depend on your runtime and kernel settings. Do not quote a number from memory. Measure with a test, or say "I would load test it".
+
+## Trade-offs
+
+| Choice | You gain | You pay | Pick it when |
+|---|---|---|---|
+| Short polling | Stateless, works through any proxy | Empty requests, delay up to the interval | Slow updates (every minute or more) |
+| Long polling | Near real time over plain HTTP | A held request per client, a full request per event | Fallback, or a legacy network |
+| SSE | Auto-reconnect and replay, plain HTTP | One way only, 6 connections per domain on HTTP/1.1 | Feeds, notifications, dashboards |
+| WebSocket | Two ways, tiny frames | Stateful sockets, manual reconnect, special LB and deploy care | Chat, games, collaboration |
+| WebRTC | Peer to peer, no server in the media path | Signaling, NAT traversal, TURN cost | Video and voice calls |
+
+## Interview lens
+
+<Callout type="tip">
+Start from the direction of data, not from a favorite tool. "Updates only flow server to client, so SSE: it reconnects and resumes by itself. If the client also sends often, like chat, use WebSocket." Then name the scale problem: sockets are state, so gateways hold them and a channel layer routes messages. Add heartbeats and reconnect with jitter.
+</Callout>
+
+<Callout type="mistake">
+Do not say "WebSocket is always better" or "SSE is two-way". WebSocket costs you a stateful fleet. SSE is one way. Also do not answer "what if a server dies?" with "the client reconnects". Say how it resumes (last id or sequence number), and how you stop a reconnect storm (backoff plus jitter).
+</Callout>
+
+<Callout type="deep" title="Why a WebSocket client must mask frames">
+RFC 6455 requires every client frame to carry a random 4-byte mask, and requires the server to close on an unmasked one. The mask is not encryption. It stops a script in the browser from crafting bytes that a confused proxy might read as an HTTP request, which would poison the proxy's cache. Servers never mask. Use TLS (wss://) for real confidentiality.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A dashboard polls every 5 seconds. 20,000 users are online. About how many requests per second hit the server, and what is the worst-case delay for an event?',
+      options: ['4,000 per second, up to 5 s late', '20,000 per second, up to 5 s late', '4,000 per second, always instant', '100 per second, up to 20 s late'],
+      answer: 0,
+      explain: '20,000 users / 5 s = 4,000 requests per second, whatever the data. An event just after a poll waits almost the whole 5 s. To cut the delay you must poll more, which raises the load, or hold a connection open.',
+    },
+    {
+      q: 'A live sports page pushes score updates. Clients never send anything. Mobile networks drop often, and users must not miss an update. Which is the best fit?',
+      options: [
+        'WebSocket, because it is full duplex',
+        'SSE with an id on each event, so the browser reconnects with Last-Event-ID',
+        'Short polling every 100 ms',
+        'WebRTC data channels',
+      ],
+      answer: 1,
+      explain: 'Data flows one way, and the browser reconnects and asks for missed events on its own. You keep a short replay buffer by id. WebSocket works too, but you would write the reconnect and replay yourself for no gain.',
+    },
+    {
+      q: 'Your WebSocket connections die after exactly 60 seconds of silence, behind nginx. Users on slow chats complain. What is the most likely cause and fix?',
+      options: [
+        'The browser has a 60 s limit. Open a second socket.',
+        'Proxy idle timeout (proxy_read_timeout is 60 s by default). Send a heartbeat ping more often than that.',
+        'TLS certificates expire after 60 s. Renew them.',
+        'WebSocket frames cannot be larger than 60 KB.',
+      ],
+      answer: 1,
+      explain: 'The proxy closes a connection that carries no bytes for its read timeout. A ping and pong every 20 to 30 s keeps traffic flowing and also tells you when the peer is gone. Raising the timeout alone also works but hides dead peers.',
+    },
+    {
+      q: 'A gateway holding 200,000 sockets crashes. Clients retry after exactly 1 s, then 2 s, then 4 s. The survivors still collapse. Why?',
+      options: [
+        'Exponential backoff is wrong for sockets',
+        'Backoff without jitter keeps all clients in lockstep, so every retry wave arrives at once',
+        'The clients waited too long',
+        'The load balancer cannot handle WebSocket',
+      ],
+      answer: 1,
+      explain: 'All 200,000 clients started at the same instant and use the same schedule, so each retry arrives as one spike. Random jitter spreads each wave across the window. With a 30 s window the expected rate is about 6,700 per second instead of 200,000 at once.',
+    },
+    {
+      q: 'In the gateway and channel-server design, a channel has 1 million subscribers spread over 500 gateways. How many sends does the channel server make for one message?',
+      options: ['1,000,000', '500', '1', '500,000'],
+      answer: 1,
+      explain: 'The channel server sends once per gateway that has a subscriber: 500. Each gateway then writes to its own sockets. Splitting fan-out into two levels keeps the owner of a hot channel from doing a million writes.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RFC 6455: The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455) (section 1.3 handshake, section 5.1 masking, section 5.5.2 ping and pong)
+- [WHATWG HTML Standard: Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html) (event stream format, Last-Event-ID, retry)
+- [Slack Engineering: Real-time Messaging](https://slack.engineering/real-time-messaging/) (gateway servers, channel servers, consistent hashing)
+- [Discord: Gateway](https://docs.discord.com/developers/events/gateway) (heartbeat interval and resume with session id and sequence number)
