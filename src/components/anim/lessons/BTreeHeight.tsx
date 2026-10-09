@@ -13,6 +13,7 @@ const CX = 264;
 export default function BTreeHeight() {
   return (
     <figure className="not-prose my-8 overflow-hidden rounded-xl border border-line bg-bg px-2 py-4 sm:px-4">
+      <div>
       <SketchSvg width={700} height={350} label="A B-tree over one billion keys has four levels. The top three levels hold about 6,267 pages, or 51 megabytes.">
         <HandText x={350} y={18} size={15} weight={700}>
           1 billion keys, 8 KB pages, ~20 bytes per entry: fan-out F is about 400
@@ -38,6 +39,7 @@ export default function BTreeHeight() {
           400 x 400 x 400 x 400 = 25.6 billion, more than 1 billion. So 4 levels.
         </HandText>
       </SketchSvg>
+      </div>
       <figcaption className="px-2 pt-2 text-sm text-muted">The numbered badges show the order of page reads for one lookup.</figcaption>
     </figure>
   );

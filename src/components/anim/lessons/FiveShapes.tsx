@@ -47,7 +47,7 @@ const steps: Step[] = [
     caption: 'Graph. Entities are nodes. Relationships are first-class, typed, directed edges that are stored with the nodes. Q2 becomes a two-hop walk: Ana, Ben, Cy. In a relational store that is a self-join per hop. The price: totals over all the data (Q3) are not what this shape is for.',
     shape: 'graph',
     good: 'Paths across many hops:\nfriends of friends,\nfraud rings.',
-    weak: 'Bulk totals over all\nnodes. Less common\nto operate.',
+    weak: 'Bulk totals over all\nnodes (Q3) are not\nits strength.',
   },
 ];
 
@@ -230,7 +230,7 @@ function Drawing({ shape }: { shape: Shape }) {
               <SketchArrow points={[[(from as number) + ((x as number) - (from as number)) * 0.1, 128], [x as number, 212]]} stroke="var(--muted)" seed={seedOf(`gw${t}`)} />
             </g>
           ))}
-          <HandText x={64} y={170} size={14} color="var(--muted)">
+          <HandText x={34} y={172} size={14} color="var(--muted)">
             WROTE
           </HandText>
           <HandText x={225} y={290} size={14} color="var(--accent)">

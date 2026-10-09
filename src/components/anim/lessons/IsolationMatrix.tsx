@@ -19,6 +19,7 @@ const CW = 100;
 export default function IsolationMatrix() {
   return (
     <figure className="not-prose my-8 overflow-hidden rounded-xl border border-line bg-bg px-2 py-4 sm:px-4">
+      <div>
       <SketchSvg width={700} height={376} label="Which anomalies each PostgreSQL isolation level allows. Read committed allows non-repeatable read, lost update, write skew and phantom read. Repeatable read allows only write skew. Serializable allows none.">
         {COLS.map((c, i) => (
           <HandText key={c} x={X0 + i * CW + CW / 2} y={42} size={15} weight={700}>
@@ -50,6 +51,7 @@ export default function IsolationMatrix() {
           {'PostgreSQL treats Read uncommitted as Read committed. Other engines differ.\nRead committed lost update: the app reads, computes, then writes the value.'}
         </HandText>
       </SketchSvg>
+      </div>
     </figure>
   );
 }
