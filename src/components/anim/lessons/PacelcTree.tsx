@@ -15,7 +15,7 @@ function Box({ cx, cy, w, h, text, color, id, size = 15 }: { cx: number; cy: num
 export default function PacelcTree() {
   return (
     <SketchSvg width={720} height={350} label="PACELC decision tree: if partition, choose availability or consistency; else choose latency or consistency">
-      <Box id="root" cx={360} cy={34} w={230} h={48} text="Is there a network partition?" size={17} />
+      <Box id="root" cx={360} cy={34} w={320} h={48} text="Is there a network partition?" size={17} />
       <SketchArrow points={[[300, 60], [190, 112]]} seed={seedOf('t1')} />
       <SketchArrow points={[[420, 60], [530, 112]]} seed={seedOf('t2')} />
       <HandText x={215} y={80} size={16} color="var(--bad)" weight={700}>

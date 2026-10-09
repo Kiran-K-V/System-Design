@@ -1,4 +1,4 @@
-import { HandText, SketchArrow, SketchBox, SketchCylinder, SketchSvg, seedOf } from '../sketch';
+import { HandText, SketchArrow, SketchCylinder, SketchSvg, seedOf } from '../sketch';
 
 /** Static infographic: three ways to arrange copies. */
 function Node({ cx, cy, w = 96, h = 54, text, id, color }: { cx: number; cy: number; w?: number; h?: number; text: string; id: string; color?: string }) {

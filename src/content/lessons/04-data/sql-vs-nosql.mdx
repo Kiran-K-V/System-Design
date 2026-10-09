@@ -1,0 +1,163 @@
+---
+summary: 'SQL or NoSQL is the wrong question. Each database shape is a bet on one primary access path, and you pay for the bet with queries it cannot answer. Choose from the access pattern, then check the numbers.'
+requires: ['04-data/data-modeling', '04-data/indexing', '04-data/transactions']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import FiveShapes from '../../../components/anim/lessons/FiveShapes.tsx';
+import DecisionFlow from '../../../components/anim/lessons/DecisionFlow.tsx';
+
+## The problem
+
+In every design interview you pick a database. The weakest answers name a brand: "I would use Mongo." The next weakest repeat a slogan: "SQL for structured data, NoSQL for scale." Neither is an argument.
+
+A real story shows what an argument looks like. Discord stored its chat messages in MongoDB. In its 2017 engineering post, the team says that around November 2015 it reached 100 million stored messages, and that the data and its index could no longer fit in RAM (lesson 1.2: RAM is ~1,000x faster than SSD). They needed a store that grows by adding machines and has predictable reads for one pattern: "give me the recent messages in this channel". They moved to Cassandra. By the time of the post they ran a 12-node cluster with replication factor 3 and more than 120 million messages a day.
+
+Notice what the story does **not** say. It does not say MongoDB is bad. It says one access pattern, at one size, hit one limit.
+
+## Naive: choose by label
+
+Two slogans, and where each fails.
+
+**"NoSQL has no schema."** It has no schema **enforced by the database**. The schema moves into your code. MongoDB's own docs describe a flexible data model where documents in one collection need not share fields, and also advise adding schema validation where you need stricter control. Your code still expects `user.name` to exist.
+
+**"SQL does not scale."** One relational server holds more than people think. Lesson 4.3 used a 1-billion-row, 200 GB table. PostgreSQL's limits are a 32 TB table, a 1 GB field, and an unlimited database size. The real limit is not size. It is that all writes go through one primary machine until you shard (lesson 4.7).
+
+The slogans fail because they sort databases by **what they are**. Sort by **what they are good at answering**.
+
+## The mechanism: five shapes, five bets
+
+Every database answers one kind of question cheaply: its **primary access path**. The data is laid out to make that path fast. Questions off the path are slow, awkward, or impossible. That is the bet.
+
+Step through the same data in five shapes. Read the right-hand panel at each step.
+
+<FiveShapes client:visible />
+
+Now the details that decide interviews.
+
+**Relational.** The default, because it keeps every option open. You can add an index later for a question you did not foresee (lesson 4.3). You get multi-row transactions (lesson 4.4). You pay when write volume or data size outgrows one primary machine. Use it for money, inventory, and anything with complex queries.
+
+**Key-value.** Redis maps a key to a value of up to 512 MB. Its `INCR` is atomic: the Redis docs state that two clients incrementing one key never race. DynamoDB places each item in a partition chosen by its partition key. Use it for sessions, caches, counters, and rate limits. Do not expect `WHERE`.
+
+**Document.** MongoDB's rule: data accessed together should be stored together. You choose per relationship whether to **embed** (nest inside) or **reference** (store the id). Embed what is bounded and read together. Reference what is unbounded or shared. Embedding without a bound has a hard failure. A DynamoDB item may be at most 400 KB. If each post is ~300 B, a user item that embeds all posts overflows after about 400 KB / 300 B = ~1,300 posts. A prolific user will pass that.
+
+**Wide-column.** Cassandra splits a row's key in two. The **partition key** is hashed to choose the node (by consistent hashing, lesson 4.8). The **clustering key** sorts rows inside a partition. Storage is an LSM tree (lesson 4.3), so writes are cheap. The Cassandra docs show the design method: list your queries first, then create a table for each query. The same data appears in several tables with different keys. This is denormalization (lesson 4.1) made mandatory.
+
+Discord's key shows the care this needs. They first used `(channel_id, message_id)`. A busy channel makes one huge partition, and they saw partitions over 100 MB. So they added a time bucket to the partition key: `((channel_id, bucket), message_id)`, with about 10 days of messages per bucket, to stay under 100 MB. The lesson: **a partition key must bound partition size, or one key becomes a hot, oversized spot**.
+
+Cassandra also lets you choose consistency per request: `ONE` (one replica answers), `QUORUM` (a majority, n/2 + 1), or `ALL`. Why those words matter is lesson 4.6 and lesson 4.10.
+
+**Graph.** Neo4j stores nodes, typed relationships, and properties. Relationships are stored natively alongside the nodes, so walking an edge does not need a join. Use it when the question is a path: friends of friends, shortest route, fraud rings. For counts over all data, a relational or column store fits better.
+
+### Do the key-value arithmetic
+
+Wide stores publish hard limits. Use them. DynamoDB delivers at most 1,000 write units and 3,000 read units per second **per partition**. One write unit is one write per second of an item up to 1 KB. A 3 KB item costs 3 write units.
+
+- You need 10,000 writes per second of 1 KB items. That is 10,000 write units. At 1,000 per partition, you need at least **10 partitions**, and only if keys spread perfectly.
+- One hot key receiving 3 KB writes can take at most 1,000 / 3 = **~333 writes per second**. No setting changes this. The fix is a different key.
+
+The docs tell you to design for "uniform activity across all partition keys". That sentence is the partition-key lesson again.
+
+## Choosing: ask in this order
+
+<DecisionFlow />
+
+The order matters. Relational comes first because it is the default that keeps options open, and you leave it only for a reason you can state. Notice each exit is a property of the **access pattern**, not of the data's look.
+
+Most real systems use more than one store. A common pattern: relational is the source of truth, a cache sits in front (Module 5), a search index serves text queries (lesson 4.3), and a log of changes keeps them in sync (lesson 6.5). That is called **polyglot persistence**. It works if there is one source of truth and the others can be rebuilt from it.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| DynamoDB max item size | 400 KB | AWS FAQ |
+| DynamoDB per-partition limit | 3,000 read units/s, 1,000 write units/s | AWS docs |
+| 1 write unit / 1 read unit | one write/s up to 1 KB / one strongly consistent read/s up to 4 KB | AWS docs |
+| DynamoDB default table throughput | 40,000 read and 40,000 write units (can be raised) | AWS docs |
+| Redis max value size | 512 MB | Redis docs |
+| PostgreSQL table / field limit | 32 TB (8 kB pages) / 1 GB | PostgreSQL docs |
+| Cassandra QUORUM | n/2 + 1 replicas must answer | Cassandra docs |
+| Discord, 2017 | 12 nodes, replication factor 3, 120M+ messages/day, partitions kept under 100 MB | Discord blog |
+
+## Trade-offs
+
+| Shape | You gain | You pay | Choose when |
+|---|---|---|---|
+| Relational | Joins, constraints, transactions, any new query | One primary for writes until sharded | Money, inventory, complex queries. The default. |
+| Key-value | Fastest get/put by key; easy to scale by key | No query by value | Sessions, caches, counters |
+| Document | One read per aggregate; flexible fields | Copies and app-side joins | Varied records read whole: catalogs, profiles |
+| Wide-column | Linear write scale; per-request consistency | Every query must fit a partition key; one table per query | High-volume writes with known access: messages, events |
+| Graph | Multi-hop traversal without joins | Weak at bulk aggregates | Relationship-heavy questions |
+
+## Interview lens
+
+<Callout type="tip">
+Say the access pattern before the database: "Suppose the hot read is the latest 50 messages in a channel, at an assumed 100,000 per second. The hot write is an append. So I would partition by channel and time bucket and sort by message id. That is a wide-column fit." Then say what you give up: "I lose ad hoc queries, so search goes to a separate index." Naming the cost is what makes the choice sound like engineering.
+</Callout>
+
+<Callout type="mistake">
+Four wrong sentences to avoid. "NoSQL has no schema." "SQL cannot scale", without a number. "DynamoDB can answer any query": it answers by key and by indexes you declare. "Cassandra is always consistent": `ONE` and `QUORUM` trade consistency for latency. And never say "graph database" because the data is connected. Almost all data is connected. Use a graph store only when the **queries** walk many hops.
+</Callout>
+
+<Callout type="deep" title="Why wide-column and key-value stores scale by key">
+A hash of the key picks the machine. Any request for one key goes to one machine and needs no coordination with the rest. Throughput grows by adding machines, as long as keys spread evenly. A relational query with a join across two tables may need rows from many machines, and a transaction across rows needs agreement between them. Those are the exact features these stores drop. The price of scale is the removal of the features that need coordination.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A login service stores a session per token (about 1 KB), looks it up by token on every request, and expires it after 30 minutes. 50,000 lookups per second. Which shape fits best?',
+      options: ['Relational', 'Key-value', 'Graph', 'Wide-column with a clustering key'],
+      answer: 1,
+      explain: 'Every access is one key to one value, with no queries by other fields. That is the key-value bet, and an in-memory store such as Redis serves it at that rate. Relational would work but pays for joins and transactions that this access pattern never uses.',
+    },
+    {
+      q: 'In DynamoDB, one product key gets heavy writes of 4 KB items. Per-partition write limit is 1,000 write units per second. What is the most writes per second that single key can take?',
+      options: ['4,000', '1,000', '250', '4'],
+      answer: 2,
+      explain: 'A 4 KB item costs 4 write units (1 write unit = up to 1 KB). 1,000 / 4 = 250 writes per second for that one key. More partitions do not help, because one key lives in one partition. The fix is to spread the writes across several keys.',
+    },
+    {
+      q: 'Each post is ~300 B. You embed all of a user\'s posts inside the user item. The store limits an item to 400 KB. About how many posts fit?',
+      options: ['~130', '~1,300', '~13,000', 'No limit'],
+      answer: 1,
+      explain: '400 KB / 300 B = about 1,300 posts (a little over 1,360 with exact kilobytes). Embed only bounded lists. For an unbounded list such as posts, store each post as its own item and reference the user.',
+    },
+    {
+      q: 'A Cassandra table has partition key user_id and clustering key created_at. Which query does it serve badly?',
+      options: [
+        'The 20 latest posts of user 7',
+        'Posts of user 7 from last week',
+        'All posts anywhere that contain the word "sql"',
+        'The newest post of user 9',
+      ],
+      answer: 2,
+      explain: 'The first, second and fourth queries read one partition in sorted order. A word search across all users does not match the partition key, so it would scan every partition. That question needs its own table or a search index. This is why Cassandra data modeling starts from the queries.',
+    },
+    {
+      q: 'An interviewer says: "Use MongoDB, because we need to scale and SQL does not." What is the best reply?',
+      options: [
+        'Agree. Document stores always scale better.',
+        'Ask for the access pattern and the numbers. One relational primary holds hundreds of GB comfortably, so state the write rate and data size at which it stops being enough.',
+        'Say that NoSQL cannot do transactions at all.',
+        'Pick Cassandra because it is faster than both.',
+      ],
+      answer: 1,
+      explain: 'The choice follows from the access pattern and the numbers. No shape is faster in general, and the claim that SQL cannot scale needs a figure. Also, document and wide-column stores differ a lot in transaction support, so "NoSQL cannot do transactions" is too broad.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [MongoDB docs: Data modeling](https://www.mongodb.com/docs/manual/data-modeling/)
+- [Cassandra docs: Dynamo-style architecture](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html)
+- [Cassandra docs: Logical data modeling](https://cassandra.apache.org/doc/latest/cassandra/developing/data-modeling/data-modeling_logical.html)
+- [AWS docs: Partition key design in DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html)
+- [Redis docs: Strings](https://redis.io/docs/latest/develop/data-types/strings/)
+- [Neo4j docs: What is a graph database](https://neo4j.com/docs/getting-started/graph-database/)
+- [Discord: How Discord stores billions of messages](https://discord.com/blog/how-discord-stores-billions-of-messages)

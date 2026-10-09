@@ -26,7 +26,7 @@ const ROWS: Row[] = [
       'The app (the client) wants to read a user\'s data from the API. Before it does anything, it makes a secret for this one login: the code_verifier. It is a random string of 43 to 128 characters. It stays in the app and is not sent yet.',
   },
   {
-    m: { from: 'App', to: 'App', label: 'challenge = SHA-256(verifier)', note: true, tone: 'accent' },
+    m: { from: 'App', to: 'App', label: 'make challenge = hash', note: true, tone: 'accent' },
     mem: 'challenge',
     caption:
       'The app hashes the verifier with SHA-256 and base64url-encodes it. That is the code_challenge (S256 method). A hash cannot be reversed, so the challenge can travel openly. It is a sealed envelope: the verifier will open it later.',
@@ -62,7 +62,7 @@ const ROWS: Row[] = [
       'Step D. The app sends the code to the token endpoint, now together with the original code_verifier. This is a direct call from the app to the server, not through the browser address bar.',
   },
   {
-    m: { from: 'Auth server', to: 'Auth server', label: 'SHA-256(verifier) = challenge?', note: true, tone: 'warn' },
+    m: { from: 'Auth server', to: 'Auth server', label: 'hash matches challenge?', note: true, tone: 'warn' },
     mem: 'verifier',
     caption:
       'The server hashes the verifier it just received and compares it with the challenge it stored. They match only if the same app that started the login finishes it. An attacker who stole the code has no verifier, so the server answers invalid_grant.',

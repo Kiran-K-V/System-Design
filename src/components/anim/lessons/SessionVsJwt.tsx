@@ -101,12 +101,12 @@ export default function SessionVsJwt() {
     <AnimFrame title="Session cookie versus JWT" steps={steps} interval={4200}>
       {(i, s) => {
         const nodes: FlowNode[] = [
-          { id: 'cS', x: 55, y: 150, w: 80, h: 56, label: 'Browser' },
-          { id: 'aS', x: 175, y: 150, w: 80, h: 56, label: 'API' },
-          { id: 'stS', x: 300, y: 150, w: 90, h: 76, shape: 'db', label: 'Session\nstore', tone: s.storeDeleted ? 'bad' : 'default' },
-          { id: 'cJ', x: 440, y: 150, w: 80, h: 56, label: 'Browser' },
-          { id: 'aJ', x: 565, y: 150, w: 80, h: 56, label: 'API' },
-          { id: 'key', x: 675, y: 150, w: 70, h: 56, shape: 'dashed', label: 'Key' },
+          { id: 'cS', x: 90, y: 70, w: 110, h: 56, label: 'Browser' },
+          { id: 'aS', x: 340, y: 70, w: 110, h: 56, label: 'API' },
+          { id: 'stS', x: 590, y: 70, w: 120, h: 92, shape: 'db', label: 'Session\nstore', tone: s.storeDeleted ? 'bad' : 'default' },
+          { id: 'cJ', x: 90, y: 215, w: 110, h: 56, label: 'Browser' },
+          { id: 'aJ', x: 340, y: 215, w: 110, h: 56, label: 'API' },
+          { id: 'key', x: 590, y: 215, w: 110, h: 56, shape: 'dashed', label: 'Key' },
         ];
         const edges: FlowEdge[] = [
           { from: 'cS', to: 'aS', head: 'both' },
@@ -115,15 +115,15 @@ export default function SessionVsJwt() {
           { from: 'aJ', to: 'key', head: 'both', dashed: true },
         ];
         const notes: FlowNote[] = [
-          { x: 180, y: 22, text: 'Session', anchor: 'middle', size: 20, tone: 'accent' },
-          { x: 560, y: 22, text: 'JWT', anchor: 'middle', size: 20, tone: 'accent' },
-          { x: 180, y: 245, text: s.left, anchor: 'middle', size: 15, tone: s.leftTone },
-          { x: 560, y: 245, text: s.right, anchor: 'middle', size: 15, tone: s.rightTone },
+          { x: 10, y: 14, text: 'Session: the server remembers', anchor: 'start', size: 18, tone: 'accent' },
+          { x: 10, y: 160, text: 'JWT: the token remembers', anchor: 'start', size: 18, tone: 'accent' },
+          { x: 360, y: 122, text: s.left, anchor: 'middle', size: 16, tone: s.leftTone },
+          { x: 360, y: 268, text: s.right, anchor: 'middle', size: 16, tone: s.rightTone },
         ];
         return (
           <FlowDiagram
             width={720}
-            height={275}
+            height={290}
             nodes={nodes}
             edges={edges}
             notes={notes}

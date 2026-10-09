@@ -154,8 +154,8 @@ export default function CapPartition() {
           ];
           const notes: FlowNote[] = [];
           if (s.cut) notes.push({ x: 360, y: 150, text: '✕', anchor: 'middle', size: 30, tone: 'bad' });
-          if (s.noteA) notes.push({ x: 235, y: 228, text: s.noteA, anchor: 'middle', size: 15, tone: 'bad' });
-          if (s.noteB) notes.push({ x: 485, y: 228, text: s.noteB, anchor: 'middle', size: 15, tone: 'bad' });
+          if (s.noteA) notes.push({ x: 235, y: 228, text: s.noteA, anchor: 'middle', size: 15, tone: s.noteA === 'serving again' ? 'ok' : s.noteA === 'alive' ? 'muted' : 'bad' });
+          if (s.noteB) notes.push({ x: 485, y: 228, text: s.noteB, anchor: 'middle', size: 15, tone: s.noteB === 'serving again' ? 'ok' : s.noteB === 'alive' ? 'muted' : 'bad' });
           return (
             <FlowDiagram
               width={720}

@@ -8,7 +8,7 @@ const PRESETS: { id: string; label: string; s: Scenario }[] = [
   { id: 'stale', label: 'Stale read after a write finished', s: { r1Start: 4, r2Start: 6, r1: 0, r2: 1 } },
   { id: 'flip', label: 'New value, then old (quorum read mid-write)', s: { r1Start: 6, r2Start: 8, r1: 2, r2: 1 } },
   { id: 'good', label: 'Reads during the write: old, then new', s: { r1Start: 6, r2Start: 8, r1: 1, r2: 2 } },
-  { id: 'late', label: 'Read long after the last write', s: { r1Start: 10, r2Start: 11, r1: 1, r2: 2 } },
+  { id: 'late', label: 'Read long after the last write', s: { r1Start: 10, r2Start: 11, r1: 2, r2: 2 } },
 ];
 
 const pos = (t: number) => `${(t / AXIS) * 100}%`;

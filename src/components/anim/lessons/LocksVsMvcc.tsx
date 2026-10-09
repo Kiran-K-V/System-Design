@@ -22,7 +22,8 @@ interface Panel {
   readerName: string;
   /** Arrow from the reader to the row is dashed when the reader waits. */
   readerWaits?: boolean;
-  noReader?: boolean;
+  /** Index of the version the reader reads. Defaults to the last one. */
+  readFrom?: number;
 }
 
 interface Step {
@@ -45,12 +46,12 @@ const steps: Step[] = [
   {
     caption: 'Reader R runs SELECT X while W is still open. Locking: R needs a read lock, W holds the lock, so R waits. MVCC: R reads the newest committed version, v1, and gets 100 at once. This is the PostgreSQL rule: "reading never blocks writing and writing never blocks reading".',
     lock: { versions: [{ label: 'X = 150', dashed: true }], tag: { text: 'locked by W', tone: 'warn' }, writer: 'UPDATE X = 150', writerTone: 'accent', reader: 'SELECT X: waiting...', readerTone: 'bad', readerName: 'Reader R', readerWaits: true },
-    mvcc: { versions: [{ label: 'v1: X = 100', tone: 'ok' }, { label: 'v2: X = 150', dashed: true }], writer: 'UPDATE X = 150', writerTone: 'accent', reader: 'SELECT X -> 100', readerTone: 'ok', readerName: 'Reader R' },
+    mvcc: { versions: [{ label: 'v1: X = 100', tone: 'ok' }, { label: 'v2: X = 150', dashed: true }], writer: 'UPDATE X = 150', writerTone: 'accent', reader: 'SELECT X -> 100', readerTone: 'ok', readerName: 'Reader R', readFrom: 0 },
   },
   {
     caption: 'W commits. Locking: the lock is released, R wakes up and reads 150. R waited for the whole length of W\'s transaction. MVCC: v2 becomes the committed version. R already has its answer, 100. A reader that starts now sees 150. Old version v1 is kept until no transaction can need it, then cleaned up.',
     lock: { versions: [{ label: 'X = 150', tone: 'ok' }], writer: 'COMMIT', writerTone: 'ok', reader: 'SELECT X -> 150\n(after waiting)', readerTone: 'warn', readerName: 'Reader R' },
-    mvcc: { versions: [{ label: 'v1: X = 100', dashed: true }, { label: 'v2: X = 150', tone: 'ok' }], writer: 'COMMIT', writerTone: 'ok', reader: 'got 100, no wait', readerTone: 'ok', readerName: 'Reader R' },
+    mvcc: { versions: [{ label: 'v1: X = 100', dashed: true }, { label: 'v2: X = 150', tone: 'ok' }], writer: 'COMMIT', writerTone: 'ok', reader: 'got 100, no wait', readerTone: 'ok', readerName: 'Reader R', readFrom: 0 },
   },
   {
     caption: 'Two writers on the same row. W1 has updated X and not committed. W2 now runs UPDATE X too. Both designs make W2 wait for W1\'s row lock. MVCC removes read-write blocking only. Write-write conflicts still queue, and that is where hot rows get slow.',
@@ -67,8 +68,8 @@ function PanelView({ p, title, x0 }: { p: Panel; title: string; x0: number }) {
   const vw = n === 1 ? 150 : 140;
   const rowY = 118;
   const xs = n === 1 ? [cx] : [cx - 74, cx + 74];
-  const wx = x0 + 78;
-  const rx = x0 + PW - 78;
+  const wx = x0 + PW - 78; // writer on the right, next to the newest version
+  const rx = x0 + 78;
   return (
     <g>
       <SketchBox cx={cx} cy={175} w={PW - 10} h={330} r={14} dashed stroke="var(--muted)" seed={seedOf(`pn${title}`)} />
@@ -88,7 +89,7 @@ function PanelView({ p, title, x0 }: { p: Panel; title: string; x0: number }) {
           </HandText>
         </g>
       ))}
-      <HandText x={cx} y={rowY + 40} size={14} color="var(--muted)">
+      <HandText x={cx} y={54} size={14} color="var(--muted)">
         {n === 1 ? 'one row, changed in place' : 'versions of one row'}
       </HandText>
       <SketchBox cx={wx} cy={250} w={130} h={40} r={8} seed={seedOf(`${title}w`)} fill="var(--bg)" fillStyle="solid" />
@@ -105,13 +106,15 @@ function PanelView({ p, title, x0 }: { p: Panel; title: string; x0: number }) {
       <HandText x={rx} y={296} size={14} color={p.readerTone ? TONE[p.readerTone] : 'var(--muted)'}>
         {p.reader}
       </HandText>
-      <SketchArrow points={[[wx + 10, 228], [xs[0] - 20, rowY + 26]]} stroke={p.writerTone ? TONE[p.writerTone] : 'var(--muted)'} seed={seedOf(`${title}wa`)} />
-      <SketchArrow
-        points={[[rx - 10, 228], [xs[n - 1] + 20, rowY + 26]]}
-        stroke={p.readerTone ? TONE[p.readerTone] : 'var(--muted)'}
-        dashed={p.readerWaits}
-        seed={seedOf(`${title}ra`)}
-      />
+      {p.writer !== 'idle' && <SketchArrow points={[[wx + 10, 228], [xs[n - 1] - 24, rowY + 28]]} stroke={p.writerTone ? TONE[p.writerTone] : 'var(--muted)'} seed={seedOf(`${title}wa`)} />}
+      {p.reader !== 'idle' && (
+        <SketchArrow
+          points={[[rx - 10, 228], [xs[p.readFrom ?? n - 1] + 24, rowY + 28]]}
+          stroke={p.readerTone ? TONE[p.readerTone] : 'var(--muted)'}
+          dashed={p.readerWaits}
+          seed={seedOf(`${title}ra`)}
+        />
+      )}
     </g>
   );
 }

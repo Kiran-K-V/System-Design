@@ -150,6 +150,7 @@ const SCENARIOS: Scenario[] = [
 ];
 
 interface TxStep {
+  rows: number;
   caption: string;
   run: Run;
   shown: number;
@@ -158,10 +159,11 @@ interface TxStep {
 
 function stepsFor(s: Scenario): TxStep[] {
   const out: TxStep[] = [];
+  const rows = Math.max(s.bad.events.length, s.fix.events.length);
   for (const run of [s.bad, s.fix]) {
-    out.push({ caption: run.intro, run, shown: 0 });
-    run.events.forEach((e, i) => out.push({ caption: e.caption, run, shown: i + 1 }));
-    out.push({ caption: `${run.verdict} ${run === s.bad ? 'Next step: the same schedule at a stronger isolation level.' : ''}`.trim(), run, shown: run.events.length, banner: run.verdict });
+    out.push({ rows, caption: run.intro, run, shown: 0 });
+    run.events.forEach((e, i) => out.push({ rows, caption: e.caption, run, shown: i + 1 }));
+    out.push({ rows, caption: `${run.verdict} ${run === s.bad ? 'Next step: the same schedule at a stronger isolation level.' : ''}`.trim(), run, shown: run.events.length, banner: run.verdict });
   }
   return out;
 }
@@ -169,11 +171,11 @@ function stepsFor(s: Scenario): TxStep[] {
 const COL = { 1: 118, db: 350, 2: 582 } as const;
 const ROW0 = 128;
 const ROW = 54;
-const H = 408;
 
 function Diagram({ step }: { step: TxStep }) {
-  const { run, shown, banner } = step;
-  const lifeBottom = ROW0 + ROW * 5 - 20;
+  const { run, shown, banner, rows } = step;
+  const lifeBottom = ROW0 + rows * ROW - 22;
+  const H = ROW0 + rows * ROW + 20;
   return (
     <SketchSvg width={700} height={H} label={`Two transactions on one database at isolation level ${run.level}`}>
       <HandText x={350} y={16} size={15} weight={700} color={TONE[run.levelTone]}>
@@ -199,19 +201,19 @@ function Diagram({ step }: { step: TxStep }) {
         return (
           <g key={i}>
             <SketchBox cx={lx} cy={y} w={230} h={44} r={8} seed={seedOf(`ev${run.level}${i}`)} stroke={color} strokeWidth={latest ? 2.2 : 1.4} fill="var(--bg)" fillStyle="solid" />
-            <HandText x={lx} y={y} size={14}>
+            <HandText x={lx} y={y} size={15}>
               {e.text}
             </HandText>
             <SketchArrow points={pts} stroke={color} seed={seedOf(`ar${run.level}${i}`)} />
-            <SketchBox cx={COL.db} cy={y} w={150} h={e.db.split('\n').length > 2 ? 52 : 44} r={8} seed={seedOf(`db${run.level}${i}`)} stroke={color} dashed={e.dashed} fill="var(--surface)" fillStyle="solid" />
-            <HandText x={COL.db} y={y} size={14} color={e.tone ? TONE[e.tone] : undefined}>
+            <SketchBox cx={COL.db} cy={y} w={150} h={e.db.split('\n').length > 2 ? 60 : 44} r={8} seed={seedOf(`db${run.level}${i}`)} stroke={color} dashed={e.dashed} fill="var(--surface)" fillStyle="solid" />
+            <HandText x={COL.db} y={y} size={15} color={e.tone ? TONE[e.tone] : undefined}>
               {e.db}
             </HandText>
           </g>
         );
       })}
       {banner && (
-        <HandText x={350} y={H - 22} size={16} weight={700} color={TONE[run.levelTone]} halo>
+        <HandText x={350} y={H - 12} size={16} weight={700} color={TONE[run.levelTone]} halo>
           {banner}
         </HandText>
       )}

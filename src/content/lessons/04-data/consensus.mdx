@@ -1,0 +1,222 @@
+---
+summary: Consensus lets a group of machines agree on one leader or one ordered log while some of them crash. Majorities make it work. Raft shows how.
+requires: ['04-data/replication', '04-data/cap-pacelc', '04-data/consistency-models']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import QuorumCalc from '../../../components/anim/lessons/QuorumCalc.tsx';
+import RaftWalk from '../../../components/anim/lessons/RaftWalk.tsx';
+
+## The problem
+
+Lesson 4.6 ended with an open question. When the leader dies, **who decides** which follower becomes leader, and who hands out the new epoch number? If one machine decides, that machine is a new single point of failure. If every machine decides alone, two of them may crown themselves.
+
+The same question appears in many places:
+
+- Which server holds this lock right now?
+- Which node owns shard 7 after a failure?
+- What is the one agreed order of these 10 updates?
+
+All three need several machines to **agree on one answer**, even when some crash and some messages are lost or delayed. That problem is **consensus**.
+
+In practice we want more than one answer. We want a stream of them: an agreed, ordered **log** of commands. If every machine applies the same commands in the same order, every machine ends in the same state. This is a **replicated state machine**. It is the write-ahead log of lesson 4.2, made fault tolerant.
+
+A consensus algorithm must give two kinds of promise.
+
+- **Safety**: nothing wrong ever happens. Two nodes never decide different values.
+- **Liveness**: something good eventually happens. The group does decide.
+
+The FLP result (Fischer, Lynch, Paterson, 1985) shows why you cannot have both for free. In a fully asynchronous system, where message delay has no bound and a crashed node looks the same as a slow one, no consensus protocol can tolerate even one crash. The paper puts it this way: "no completely asynchronous consensus protocol can tolerate even a single unannounced process death". Real systems escape by adding timeouts. They stay **safe** always. They make progress only when the network behaves well enough.
+
+## Naive attempts
+
+**Two nodes watch each other.** Node A and node B ping each other. If B stops answering, A promotes itself. Now cut the cable between them. A sees silence and promotes itself. B sees silence and does the same. Two leaders, split brain. The opposite rule, "do nothing if unsure", stalls the system on every glitch. Two nodes cannot tell a crash from a cut cable.
+
+**One referee decides.** A third machine chooses the leader. Now the referee is a single point of failure. You moved the problem.
+
+**Wait for everyone.** Ask all nodes and proceed only when all agree. One crash halts the whole group.
+
+The way out is a **majority**. A majority is more than half of the nodes. Two different majorities of the same group always share at least one node. That is the whole trick. A node that sits in both can carry the facts from the old decision into the new one, and it will not say yes to two conflicting proposals.
+
+## Quorums: the overlap rule
+
+A **quorum** is the number of nodes that must take part in an operation. Say you have `N` copies. A write must reach `W` of them. A read asks `R` of them.
+
+- If `R + W > N`, every read set shares at least one node with every write set. A read therefore meets at least one copy of the latest **completed** write.
+- If `2W > N`, any two write sets share a node. Two sides of a network split cannot both complete a write.
+
+A majority satisfies both. Play with the numbers. Try the presets, then drag the sliders.
+
+<QuorumCalc client:visible />
+
+What to notice:
+
+1. **Cassandra's `QUORUM`** is `n/2 + 1`, rounded down. With 3 replicas and `QUORUM` on both reads and writes, `2 + 2 > 3`. The overlap holds. `ONE`/`ONE` does not overlap. A read can miss the write. That is the knob lesson 4.9 mentioned.
+2. **Write ALL, read ONE** overlaps, but a single dead replica blocks every write. Tolerance for writes is `N − W = 0`.
+3. **Latency is the slowest node you must wait for.** Dynamo's paper says the latency of a get or put "is dictated by the slowest of the R (or W) replicas". The widget uses fixed round trips: 0.5 ms, 1 ms, 70 ms, 70 ms, 150 ms, and so on. Raising W from 2 to 3 of 3 jumps from ~1 ms to ~70 ms.
+4. **Odd sizes win.** Compare 5 and 6 nodes. Both tolerate 2 failures. The sixth node adds cost and no safety. etcd's FAQ says it directly: an odd-size cluster tolerates the same number of failures as an even-size one, with fewer nodes.
+
+| Nodes | Majority | Failures tolerated |
+|---|---|---|
+| 1 | 1 | 0 |
+| 2 | 2 | 0 |
+| 3 | 2 | 1 |
+| 4 | 3 | 1 |
+| 5 | 3 | 2 |
+| 7 | 4 | 3 |
+| 9 | 5 | 4 |
+
+(Same as the etcd FAQ table. Aurora applies the same idea to storage: 6 copies across 3 zones, write quorum 4, read quorum 3.)
+
+A quorum alone is not consensus. It gives overlap for finished writes. It does not choose a single leader, or one order for **concurrent** writes. For that you need a protocol around the quorum.
+
+## The mechanism: Raft
+
+**Raft** is a consensus algorithm designed to be understandable. It splits the job into three parts: electing a leader, replicating a log, and keeping that safe. The Raft site says it is "equivalent to Paxos in fault-tolerance and performance". Paxos is the older algorithm. Spanner, for example, runs a Paxos group per replica set and commits a write once a majority of voting replicas agree.
+
+Four ideas carry Raft.
+
+1. **Terms.** Time is cut into numbered terms. Each term has at most one leader. Every message carries a term. A server that sees a higher term updates itself. A leader that sees a higher term steps down. This is the fencing from lesson 4.6, built in.
+2. **Election.** A follower that hears no heartbeat for a random **election timeout** becomes a candidate, adds one to the term, and asks for votes. Each server votes for at most one candidate per term. A candidate with a majority wins. Random timeouts make split votes rare. The paper's example range is 150–300 ms.
+3. **Replication.** Only the leader accepts writes. It appends each command to its log and sends it to followers (`AppendEntries`). Once a **majority** has stored an entry, the entry is **committed**: the leader applies it and answers the client.
+4. **Safety.** A voter refuses a candidate whose log is less up to date than its own. So a new leader always holds every committed entry.
+
+Step through one run on five servers: an election, one committed write, a leader crash, a second election, and a late rejoin.
+
+<RaftWalk client:visible />
+
+Two details deserve a second look.
+
+**The client does not wait for everyone.** With five servers the leader needs two follower acknowledgements to reach three copies. It waits for the **second-fastest** follower. The paper notes that a single slow follower will not slow the cluster.
+
+**The new leader is never missing committed data.** Entry 1 was committed on a majority. The election needs votes from a majority. Two majorities share a server, and that server's log contains entry 1. It will not vote for a candidate that lacks it. This is the same overlap rule, used twice.
+
+Raft also keeps one rule for safety that is easy to miss. A leader never commits an entry from an earlier term by counting copies. It commits an entry from its **own** term by counting. Doing so also commits every entry before it. The paper's Figure 8 shows an older entry stored on a majority that is later overwritten.
+
+## Timing
+
+Raft's safety does not depend on timing. Its availability does. The paper states the requirement as `broadcastTime ≪ electionTimeout ≪ MTBF`. Broadcast time is how long a round of messages takes. MTBF is the time between failures of one server. The paper says disk writes put broadcast time between 0.5 ms and 20 ms, so the election timeout is likely between 10 ms and 500 ms. When a leader crashes the system is unavailable for roughly one election timeout.
+
+etcd, a key-value store built on Raft, ships with a 100 ms heartbeat and a 1,000 ms election timeout. Its tuning guide says the election timeout should be at least 10 times the round-trip time, and caps it at 50,000 ms for globally spread clusters.
+
+## What consensus is for
+
+Consensus is slow and small by design. Each committed write needs a majority round trip and a disk sync. Everything goes through one leader. etcd's FAQ recommends no more than seven nodes, because "write performance suffers" as you add members.
+
+So use it for **small, critical facts**:
+
+| Use | Example |
+|---|---|
+| Leader election and failover | Which replica leads shard 7? Epoch numbers |
+| Locks and leases | One worker owns this job |
+| Cluster configuration and metadata | Kubernetes keeps all cluster state in etcd. Kafka's controllers need a majority alive, and its docs say admins typically pick 3 or 5. |
+| Ordering a small log | Spanner commits writes through a Paxos group per replica set |
+
+Do **not** push bulk data through it. The standard pattern: a small consensus group (3 or 5 nodes) holds the metadata, such as who is leader of each shard. The data path uses ordinary leader-follower replication (lesson 4.6) and the leader is the one the consensus group named. That also answers lesson 4.6's open question.
+
+And consensus is a CP choice (lesson 4.9). When a partition leaves fewer than a majority on one side, that side stops accepting writes. The side with the majority carries on.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| 5 servers tolerate | 2 failures | Raft site, etcd FAQ |
+| Raft example election timeout | 150–300 ms | Raft paper |
+| Broadcast time, paper estimate | 0.5–20 ms (disk-bound) | Raft paper |
+| etcd default heartbeat / election timeout | 100 ms / 1,000 ms | etcd tuning guide |
+| etcd election timeout rule | at least 10× RTT | etcd tuning guide |
+| etcd recommended cluster size | at most 7 | etcd FAQ |
+| Spanner regional config | 3 read-write replicas | Spanner docs |
+| Commit latency, 5 servers | the 2nd-fastest follower round trip, plus a disk sync | Derived: leader + 2 acks = 3 |
+| Same, followers at 1, 70, 70, 150 ms | ~70 ms | Derived |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Consensus group of 3 | Survives 1 failure, simplest | Majority is 2: lose two nodes and it halts | Small metadata, one region or 3 zones |
+| Consensus group of 5 | Survives 2 failures | More messages, slightly slower writes | Production control planes |
+| Spread nodes across regions | Survives a region loss | Writes wait for a cross-region round trip (~70+ ms) | Region-level durability matters more than latency |
+| Consensus per write | No acknowledged write is lost. One agreed order. | Majority round trip plus fsync per write. One leader. | Metadata, locks, config |
+| No consensus (async replication) | Low latency | Failover can lose writes or split the brain | Bulk, tolerant data |
+
+## Interview lens
+
+<Callout type="tip">
+When your design needs a lock, a leader, or config, say "a small etcd or ZooKeeper cluster, 3 or 5 nodes across zones". Say what it holds: "who leads each shard, and the lock for the cron job". Then say what it does **not** hold: "user data never goes through it". Mention the cost: "each write there is a majority round trip, which is fine for rare metadata."
+</Callout>
+
+<Callout type="mistake">
+Do not say "two nodes give fault tolerance", because a majority of two is two. Do not say "Raft always makes progress". Safety is always held, but progress needs a majority up and a network good enough for heartbeats (FLP). Do not use an even number of nodes "to break ties". It adds cost and no failure tolerance. And do not put application data through the consensus log.
+</Callout>
+
+<Callout type="deep" title="Why a leader never counts old-term entries">
+Suppose a leader replicates an entry from an older term onto a majority. It looks committed. But the paper's Figure 8 shows that a different server can still win a later election and overwrite that entry. So Raft commits an entry only by counting copies of an entry from the leader's **current** term. When that entry commits, every entry before it commits too. This is why Raft has each new leader commit a blank no-op entry at the start of its term, so that older entries can be committed behind it.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A Raft cluster has 5 servers. Two crash. Can it still commit writes? What if three crash?',
+      options: [
+        'Yes with two down. No with three down.',
+        'Yes in both cases, because one server is enough.',
+        'No in both cases.',
+        'No with two down, because it needs all but one.',
+      ],
+      answer: 0,
+      explain: 'The majority of 5 is 3. With two down, three servers remain and can commit. With three down, only two remain, which is below the majority, so no write can commit. Raft stops making progress. It does not return wrong answers.',
+    },
+    {
+      q: 'You run 6 consensus nodes instead of 5, "for extra safety". What do you get?',
+      options: [
+        'Tolerance of 3 failures',
+        'The same tolerance of 2 failures, with a larger majority (4) and more messages',
+        'Faster writes',
+        'The ability to survive a 3-3 network split',
+      ],
+      answer: 1,
+      explain: 'The majority of 6 is 4. You can lose 2 nodes (4 remain). Losing 3 leaves 3, which is not a majority. So 6 tolerates the same 2 failures as 5, but every write needs 4 acknowledgements. A 3-3 split leaves neither side with a majority.',
+    },
+    {
+      q: 'In a 5-server cluster, the leader and one follower get cut off from the other three. A client sends the leader a write. What happens?',
+      options: [
+        'It commits, because the leader is still alive',
+        'It cannot commit: 2 of 5 is not a majority. The other three elect a new leader in a higher term.',
+        'It commits on both sides and merges later',
+        'It commits on the follower first',
+      ],
+      answer: 1,
+      explain: 'The leader can reach only itself and one follower: 2 copies, below the majority of 3. It cannot commit, so it cannot answer OK. The three connected servers time out, elect a leader in a higher term, and carry on. When the network heals, the old leader sees the higher term and steps down.',
+    },
+    {
+      q: 'A leader replicates to 4 followers. Their round trips are 1 ms, 70 ms, 70 ms, and 150 ms. Disk sync on each node is small. About how long does a commit take?',
+      options: ['~1 ms', '~70 ms', '~150 ms', '~290 ms'],
+      answer: 1,
+      explain: 'The leader counts as one copy. A majority of 5 is 3, so it needs 2 follower acknowledgements. The two fastest are 1 ms and 70 ms, so the second one decides: ~70 ms. The 150 ms follower does not slow the commit.',
+    },
+    {
+      q: 'A candidate in a new term has an empty log. Voters hold a committed entry. What do the voters do, and why?',
+      options: [
+        'Vote yes, because its term is higher',
+        'Vote no, because its log is less up to date than theirs',
+        'Vote yes, then copy its empty log',
+        'Ignore it and wait for a timeout',
+      ],
+      answer: 1,
+      explain: 'A voter refuses a candidate whose log is less up to date than its own. This guarantees that any winner holds every committed entry. A higher term alone is not enough.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Ongaro and Ousterhout, "In Search of an Understandable Consensus Algorithm" (the Raft paper)](https://raft.github.io/raft.pdf)
+- [raft.github.io](https://raft.github.io/), with the RaftScope visualization.
+- [etcd FAQ](https://etcd.io/docs/v3.5/faq/) and [etcd tuning guide](https://etcd.io/docs/v3.5/tuning/), cluster size, quorum table, and timeouts.
+- [Fischer, Lynch, Paterson, "Impossibility of Distributed Consensus with One Faulty Process"](https://groups.csail.mit.edu/tds/papers/Lynch/jacm85.pdf)
+- [Google Spanner: replication](https://docs.cloud.google.com/spanner/docs/replication), Paxos groups in production.

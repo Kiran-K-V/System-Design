@@ -67,7 +67,7 @@ export default function TtlJitterLab() {
         {yTicks.map((v) => (
           <g key={v}>
             <line x1={P.l} x2={W - P.r} y1={yOf(v)} y2={yOf(v)} stroke="var(--border)" />
-            <text x={P.l - 6} y={yOf(v) + 5} textAnchor="end" fontSize={14} fill="var(--muted)">
+            <text x={P.l - 6} y={yOf(v) + 5} textAnchor="end" fontSize={15} fill="var(--muted)">
               {fmt(v)}
             </text>
           </g>
@@ -78,19 +78,19 @@ export default function TtlJitterLab() {
           ) : null,
         )}
         <line x1={P.l} x2={W - P.r} y1={yOf(cap)} y2={yOf(cap)} stroke="var(--ok)" strokeWidth={2} strokeDasharray="6 5" />
-        <text x={W - P.r - 4} y={yOf(cap) - 6} textAnchor="end" fontSize={14} fill="var(--ok)">
+        <text x={W - P.r - 4} y={yOf(cap) - 6} textAnchor="end" fontSize={15} fill="var(--ok)">
           database limit {fmt(cap)}/s
         </text>
         <line x1={P.l} x2={W - P.r} y1={H - P.b} y2={H - P.b} stroke="var(--muted)" />
         {ticks.map((t) => (
-          <text key={t} x={xOf(t)} y={H - P.b + 18} textAnchor="middle" fontSize={14} fill="var(--muted)">
+          <text key={t} x={xOf(t)} y={H - P.b + 18} textAnchor="middle" fontSize={15} fill="var(--muted)">
             {t}s
           </text>
         ))}
-        <text x={(P.l + W - P.r) / 2} y={H - 6} textAnchor="middle" fontSize={14} fill="var(--muted)">
+        <text x={(P.l + W - P.r) / 2} y={H - 6} textAnchor="middle" fontSize={15} fill="var(--muted)">
           seconds after the keys were cached
         </text>
-        <text x={P.l + 4} y={P.t + 4} fontSize={14} fill="var(--muted)">
+        <text x={P.l + 4} y={P.t + 4} fontSize={15} fill="var(--muted)">
           keys expiring per second
         </text>
       </svg>

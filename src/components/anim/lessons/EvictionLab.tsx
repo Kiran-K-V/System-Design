@@ -116,7 +116,7 @@ export default function EvictionLab() {
           const slots = Array.from({ length: cap }, (_, i) => s.cache[i] ?? null);
           return (
             <div key={p.id} className="rounded-lg border border-line p-3">
-              <div className="flex items-baseline justify-between">
+              <div className="flex flex-wrap items-baseline justify-between gap-x-2">
                 <span className="text-base font-semibold">{p.name}</span>
                 <span className="text-xs text-muted">{p.rule}</span>
               </div>
