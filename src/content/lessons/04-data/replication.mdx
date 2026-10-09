@@ -1,0 +1,206 @@
+---
+summary: Keep copies of the same data on several machines by shipping one leader's log to followers. Replication buys survival and read capacity. It does not buy write capacity, and it creates replica lag.
+requires: ['04-data/storage-engines', '01-one-machine/latency-numbers']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import DualWriteRace from '../../../components/anim/lessons/DualWriteRace.tsx';
+import ReplicationCommit from '../../../components/anim/lessons/ReplicationCommit.tsx';
+import ReplicaLagSim from '../../../components/anim/lessons/ReplicaLagSim.tsx';
+import Failover from '../../../components/anim/lessons/Failover.tsx';
+import ReplicationTopologies from '../../../components/anim/lessons/ReplicationTopologies.tsx';
+
+## The problem
+
+You run one database node. It is correct, fast, and doing fine. Then three things happen.
+
+1. **The machine dies.** A disk fails or a kernel panics. Your app is down until you rebuild it from a backup. A nightly backup means you lose up to a day of data.
+2. **You patch the machine.** Even planned restarts take the app offline.
+3. **Reads outgrow it.** Lesson 1.5 says one node handles roughly 10K–50K indexed reads per second. Your product needs 200K.
+
+The answer to all three is the same: **keep copies of the data on other machines.** That is **replication**. Each copy is a **replica**.
+
+Replication does three jobs. It keeps the system **alive** when a machine dies. It adds **read capacity**, because any replica can answer a read. And it can put data **near users**: a replica in Frankfurt answers European reads with a few ms of network time, not ~100 ms (lesson 1.2).
+
+It does **not** add write capacity. Every replica must apply every write. Seven replicas of a database that tops out at 15K writes per second still top out at 15K. Splitting writes is sharding, the next lesson.
+
+Here is how much copies help availability. Say one node is up 99.9% of the time. That is ~8.8 hours of downtime a year (0.001 × 8,760 h). With two nodes that fail **independently** and a **perfect, instant** failover, both are down together 0.001 × 0.001 = 0.0001% of the time, about 30 seconds a year. Neither assumption holds in real life. Failover takes time and failures are often correlated. But the direction is right: copies make downtime rarer by orders of magnitude.
+
+## Naive: let the app write to both
+
+The first idea is the simplest. The app sends every write to database A and to database B. Watch what two clients can do to it.
+
+<DualWriteRace client:visible />
+
+Two writes to the same row reached the two databases in opposite order. Each database applied them correctly in the order it saw. They ended in different states, forever, with no error.
+
+The root cause: **nothing owns the order of writes.** Any design where several writers push to several copies has this flaw. The fix is to choose one machine to decide the order. Everyone else follows it.
+
+## The mechanism: one leader, one log
+
+In **leader-based replication** (also called primary-replica, or leader-follower):
+
+- One node is the **leader**. It accepts all writes.
+- The leader writes each change to its log. This is the write-ahead log from lesson 4.2. The log is already an ordered list of every change.
+- Other nodes are **followers**. The leader sends them the log. Each follower replays it in order.
+- Followers serve reads. They never accept writes.
+
+Because every follower replays the same ordered log, every follower reaches the same state. The ordering problem is gone: the leader's log **is** the order.
+
+This is why lesson 4.2 ended on "replicas replay the same log". A follower is a database in permanent crash recovery.
+
+### What travels in the log
+
+Systems differ in what a log record contains.
+
+| Format | What is shipped | Example | Catch |
+|---|---|---|---|
+| Physical log | The raw storage-level change records | PostgreSQL streaming replication | Follower must run the same storage format and version |
+| Statement | The SQL text, re-run on each follower | MySQL `STATEMENT` | A function like `UUID()` or `RAND()` can give a different value on each follower |
+| Row | The new contents of each changed row | MySQL `ROW` (the default) | Bigger log for large updates |
+
+MySQL's manual states that row-based logging is its default method. It exists because statements can be unsafe to re-run.
+
+### The key choice: when does the leader say OK?
+
+This is the most important decision in replication. After the leader has the write in its own log, does it answer the client **now**, or **wait** for followers? Step through both cases. Each one ends with the same leader crash.
+
+<ReplicationCommit client:visible />
+
+The two designs have names.
+
+- **Asynchronous.** The leader answers after its own fsync. Fast. If the leader dies before shipping the record, an acknowledged write is lost. PostgreSQL's streaming replication is asynchronous by default.
+- **Synchronous (or semi-synchronous).** The leader waits until a follower confirms it has the record. MySQL's semi-synchronous mode waits for one acknowledgement by default. The write now lives on two machines before the client hears OK.
+
+Waiting for **every** follower is a trap. One slow or dead follower then stalls every commit. PostgreSQL's manual warns that commits "may never be completed if any one of the synchronous standbys should crash". MySQL's answer: after a timeout (default 10 seconds) the leader gives up waiting and reverts to asynchronous replication. A common design is one synchronous follower plus the rest asynchronous. If the synchronous follower dies, another takes its role.
+
+PostgreSQL also lets you pick **how far** the follower must get. `remote_write` waits until the follower's OS has the record. `on` waits until it is flushed to the follower's disk. `remote_apply` waits until the follower has replayed it, so a read on the follower will see it.
+
+## Replica lag
+
+Even in the best case followers are behind. The delay between "the leader committed" and "the follower shows it" is **replica lag**. PostgreSQL's manual says it is typically under one second for asynchronous streaming. Aurora reports lag that is usually much less than 100 ms, and says it grows when the write rate is high. Lag is not constant. It spikes under load, big transactions, or a slow follower disk.
+
+Lag is invisible when you look at one machine. It shows up as strange user experiences. A user saves a profile, the page reloads from a follower, and the old profile appears. The write worked. The read was early.
+
+Play with this. Set the user's read delay to 300 ms. Follower 2 is 1,200 ms behind. Then try each routing policy.
+
+<ReplicaLagSim client:visible />
+
+Three fixes for "I cannot see what I just wrote":
+
+- **Read the leader after a write.** For a short window, send that user's reads to the leader. Simple. It adds leader load.
+- **Use a position token.** The write returns a log position. A follower answers only if it has reached that position. Cosmos DB's session consistency works this way with a session token. The next lesson names the guarantee: read-your-writes.
+- **Wait for the follower.** Use `remote_apply`-style waits for the few writes that need it.
+
+Lag also causes a second oddity: a user who reads from two followers can see data go **backward** in time. The next lesson calls it a monotonic-reads violation and shows the fix.
+
+## Failover: when the leader dies
+
+A leader will die. **Failover** means promoting a follower to take its place. It sounds easy and has three traps. Step through them.
+
+<Failover client:visible />
+
+1. **Detection is a guess.** You cannot tell a dead leader from a slow network. A short timeout causes false failovers. A long one extends the outage.
+2. **Choosing the new leader.** Pick the follower with the longest log. With asynchronous replication the best follower may still lack the last few writes. Those are lost. This is the data-loss window from the first animation.
+3. **Split brain.** The old leader may return still thinking it leads. Two leaders accept writes and the data diverges. The defense is **fencing**: each leader reign gets an increasing number (an epoch or term). Everyone rejects the lower number.
+
+PostgreSQL promotes a standby with `pg_ctl promote` or `pg_promote()`. Aurora promotes a reader automatically if the writer fails. Aurora notes that during the switch, reads and writes to the old primary fail with an exception. Plan for a brief error window.
+
+One question is left: **who decides** who is leader and hands out those numbers? If one machine decides, that machine is a new single point of failure. Lesson 4.11 answers it.
+
+## Other layouts
+
+Single-leader is the default. Two other layouts exist.
+
+<ReplicationTopologies />
+
+- **Multi-leader** puts one leader in each region, so writes stay local. The price is conflicts. Two leaders can accept different writes to the same row at once. "Last write wins" keeps the write with the higher timestamp and silently drops the other. Dynamo-style systems instead keep both versions and hand them to the application. The Dynamo paper says both versions "must be kept and presented to a client (upon a read) for semantic reconciliation".
+- **Leaderless** sends each write to several nodes and reads from several nodes. A write succeeds after `W` of `N` replicas accept it. A read asks `R` replicas. When `R + W > N`, a read overlaps at least one node that has the latest write. Dynamo describes this and says its common configuration is `(N, R, W) = (3, 2, 2)`. It also uses **hinted handoff**: if a replica is down, another node holds the write and hands it over when the first node returns. Lesson 4.11 builds the quorum math.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Replica lag, PostgreSQL async streaming | typically under 1 s | PostgreSQL docs |
+| Replica lag, Aurora | usually much less than 100 ms, higher under heavy writes | Aurora docs |
+| Replicas per Aurora cluster | up to 15 | Aurora docs |
+| MySQL semi-sync default acks | 1 | MySQL docs |
+| MySQL semi-sync timeout before async | 10,000 ms | MySQL docs |
+| Dynamo common `(N, R, W)` | (3, 2, 2) | Dynamo paper |
+| Network RTT, same data center / across an ocean | ~0.5 ms / ~100 ms | Lesson 1.2 |
+| Sync commit to a follower 70 ms away | +~70 ms per write | Derived: one round trip |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Asynchronous | Fast commits. Leader never waits. | Acknowledged writes can be lost in a crash. Lag. | Feeds, analytics, anything you can replay |
+| Semi-synchronous (1 follower) | No loss if the leader dies alone | One round trip per write. A slow follower hurts. | Orders, payments in one region |
+| Synchronous to a remote region | Region-level durability | Writes cost a cross-region round trip | Rare. Strict durability across regions |
+| Read from followers | Read capacity, local reads | Stale reads, lag management | Read-heavy workloads |
+| Multi-leader | Local writes in every region | Conflict resolution | Multi-region apps that tolerate merges |
+| Leaderless quorum | No failover step. High availability. | Conflicts, tuning `R` and `W` | Always-on key-value stores |
+
+## Interview lens
+
+<Callout type="tip">
+Say what replication is **for** before you add it. "I add two followers in other zones for failover, and I read from them for the feed, which tolerates a second of lag. Account balance reads go to the leader." Then name the commit mode: "Semi-synchronous to one follower, so a single machine loss cannot drop an acknowledged write."
+</Callout>
+
+<Callout type="mistake">
+Do not say "add replicas to scale writes". Every replica replays every write, so write capacity stays the same. Do not say "failover is automatic, so it is solved" either. Name the guess in detection, the lost tail of the log, and split brain with fencing.
+</Callout>
+
+<Callout type="deep" title="Why replication slots can fill your disk">
+A leader must keep log segments until every follower has them. PostgreSQL's replication slots enforce this. The manual warns that slots "can cause the server to retain so many WAL segments that they fill up the space allocated for pg_wal". A follower that is down for hours can make the leader run out of disk. Set a cap such as `max_slot_wal_keep_size` and alert on lag.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A user saves a profile and reloads 300 ms later. Two followers are 80 ms and 1,200 ms behind. The router picks a follower at random. About how often does the user see the OLD profile?',
+      options: ['Never', '25% of the time', '50% of the time', 'Always'],
+      answer: 2,
+      explain: 'After 300 ms, the follower with 80 ms lag has the write and the follower with 1,200 ms lag does not. The router picks each with equal chance, so one read in two is stale.',
+    },
+    {
+      q: 'A leader replicates asynchronously. It acknowledges a write, then its machine dies before shipping the record. Followers hold log positions 41, 41, 39 and the lost write was 42. What is true after failover?',
+      options: [
+        'The write is safe because the client received OK',
+        'The write is lost, and you should promote the follower at 41',
+        'The write is lost, and you should promote the follower at 39 to stay consistent',
+        'The write returns when the old leader restarts, with no conflict',
+      ],
+      answer: 1,
+      explain: 'No follower received record 42, so it is gone. Promote the follower with the longest log (41) so you lose as little as possible. If the old leader returns with record 42, it holds a write the cluster never accepted. It must be discarded or reconciled by hand.',
+    },
+    {
+      q: 'Your database tops out at 15K writes per second. You add 5 read replicas. What happens to the maximum write rate?',
+      options: ['It grows to ~90K', 'It stays about the same', 'It drops to ~3K', 'It doubles'],
+      answer: 1,
+      explain: 'Every replica must apply every write. Writes still go through one leader. Replicas help reads and survival, not write throughput. Split the data with sharding to scale writes.',
+    },
+    {
+      q: 'A leader waits for acknowledgements from ALL three followers before it answers a client. One follower goes down. What do you expect?',
+      options: [
+        'Writes continue as before',
+        'Writes stall or fail until the follower returns or the system relaxes the rule',
+        'The leader loses data',
+        'Reads become stale but writes continue',
+      ],
+      answer: 1,
+      explain: 'The leader is waiting for an acknowledgement that will not come. PostgreSQL warns that commits may never finish when a synchronous standby crashes. MySQL falls back to asynchronous after a timeout. The common practice is to wait for one follower, not all.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [PostgreSQL docs: log-shipping standby servers](https://www.postgresql.org/docs/current/warm-standby.html), streaming, sync, slots, promotion.
+- [MySQL docs: semisynchronous replication](https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html)
+- [Amazon Aurora replication](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Replication.html)
+- [DeCandia et al., "Dynamo: Amazon's Highly Available Key-value Store"](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf), leaderless replication, quorums, hinted handoff.

@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { WidgetFrame } from '../data-kit';
 import { encodeUser, hex, jsonBytes, totalBytes, type Piece } from './protoWire';
 
 /**

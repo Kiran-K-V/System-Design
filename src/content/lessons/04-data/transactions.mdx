@@ -1,0 +1,214 @@
+---
+summary: A transaction groups several reads and writes into one all-or-nothing unit. Isolation decides what concurrent transactions can see of each other, and every weaker level lets a specific bug through.
+requires: ['04-data/data-modeling', '04-data/storage-engines']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import TxAnomalyLab from '../../../components/anim/lessons/TxAnomalyLab.tsx';
+import IsolationMatrix from '../../../components/anim/lessons/IsolationMatrix.tsx';
+import LocksVsMvcc from '../../../components/anim/lessons/LocksVsMvcc.tsx';
+import TwoPhaseCommit from '../../../components/anim/lessons/TwoPhaseCommit.tsx';
+
+## The problem
+
+Lesson 4.2 showed one danger: a crash between two writes. A transfer debited A, the power failed, B was never credited, and 30 units vanished. The write-ahead log fixed that.
+
+There is a second danger, and no crash is needed. **Two requests run at the same time.** A ticket site shows seat 12A as free to two buyers. Both click Buy within the same millisecond. Each request reads "free", then writes "sold to me". The second write silently wins. Two people hold a ticket for one seat.
+
+Both dangers have one tool as the answer: the **transaction**. A transaction is a group of reads and writes that the database treats as one unit. You mark it with `BEGIN` and `COMMIT`. The classic summary is four promises, called **ACID**.
+
+- **Atomicity.** All steps happen, or none do. PostgreSQL's tutorial states it as: from the point of view of other transactions, it "either happens completely or not at all".
+- **Consistency.** Your rules hold before and after. The database enforces the rules you declare: `UNIQUE`, `CHECK`, `FOREIGN KEY`. A rule it does not know about, such as "at least one doctor stays on call", is your job. This is the odd letter. The other three are promises by the database. This one is a promise shared with your code.
+- **Isolation.** Concurrent transactions do not see each other's half-finished work.
+- **Durability.** Once the database says "committed", the change survives a crash. It is "logged in permanent storage" first, in the PostgreSQL tutorial's words. This is the write-ahead log of lesson 4.2.
+
+Atomicity and durability came from the log. This lesson is about **isolation**, the hard one. It is also where interviews go deep.
+
+## Naive: run everything as it arrives
+
+The simplest database runs each statement the moment it arrives, with no regard for other transactions. Each statement is correct. The mix is not.
+
+Four bugs come from this. Use the tabs. For each one, step through the bad run, then step on to the fix.
+
+<TxAnomalyLab client:visible />
+
+Name them. You need the words.
+
+1. **Dirty read.** T2 reads data T1 wrote but has not committed. If T1 rolls back, T2 used a value that never existed.
+2. **Non-repeatable read.** T1 reads a row twice and gets two values, because T2 committed a change in between.
+3. **Lost update.** T1 and T2 both read a value, both compute a new one from it, and both write. The last write wins and the other update disappears. This is the ticket-seat bug, and a counter that undercounts. Berenson and colleagues define it as: T1 reads an item, T2 updates it, then T1 updates it based on the old read.
+4. **Write skew.** T1 and T2 read overlapping data, then each writes a **different** row. No row is written twice, so no write conflict is detected. Yet together they break a rule that spans rows. Our doctors example is the standard one. Berenson's paper uses a bank rule: two accounts may go negative as long as their sum stays positive.
+
+A fifth, **phantom read**, is write skew's cousin: a query returns a different set of rows the second time, because another transaction inserted a row that matches.
+
+## The menu: isolation levels
+
+You cannot have full isolation for free. The database offers a menu. Each **isolation level** blocks some of these bugs and lets the rest through. Pick the weakest level your logic can survive, because stronger levels cost aborts, waits, or both.
+
+<IsolationMatrix />
+
+Read the matrix this way.
+
+- **Read committed.** Every query sees only data committed before that query began. The default in PostgreSQL. It blocks dirty reads and nothing else.
+- **Repeatable read.** The transaction takes one **snapshot** at its first query and uses it to the end. A snapshot is a frozen view of the committed data. PostgreSQL's version also blocks phantoms, and stops lost updates by failing the second writer with "could not serialize access due to concurrent update". Write skew still gets through. This level is **snapshot isolation**.
+- **Serializable.** The result equals some order of running the transactions one at a time. It blocks everything. The PostgreSQL docs add the price: applications "must be prepared to retry transactions due to serialization failures".
+
+Two warnings.
+
+First, level names are not portable. MySQL's InnoDB defaults to Repeatable read and PostgreSQL defaults to Read committed. The SQL standard defines levels by which anomalies they allow, so two engines can both say "Repeatable read" and behave differently. Check the engine's docs.
+
+Second, the standard's list is incomplete. It has no lost update and no write skew. Berenson's 1995 critique of the standard exists to point this out. When someone says "Repeatable read is safe", ask: safe against what?
+
+## How the database does it: locks or versions
+
+Two mechanisms give isolation.
+
+**Locks.** A transaction locks what it touches. A writer takes a lock on the row. Others who want the row wait until the writer commits. It is simple and strong. Readers also wait if they need a read lock.
+
+**MVCC** (multi-version concurrency control). The database keeps several versions of each row. A writer adds a new version. A reader reads the version that was committed when its snapshot was taken. Readers and writers do not meet. Watch both side by side.
+
+<LocksVsMvcc client:visible />
+
+PostgreSQL's docs put the benefit in one sentence: with MVCC, "reading never blocks writing and writing never blocks reading". That is why a long report query does not freeze order inserts. The cost is that old versions pile up and need cleaning later.
+
+Step 5 is the part people miss. **MVCC does not mean no locks.** Two writers on one row still queue behind a row lock. Many systems use both: versions for readers, locks for writers.
+
+### Taking control yourself
+
+Isolation levels are one lever. You also have two coding patterns.
+
+**Pessimistic: lock first.** Read the row with a lock, then change it. Others wait.
+
+```sql
+BEGIN;
+SELECT seats_left FROM events WHERE id = 7 FOR UPDATE;  -- others who want this row wait here
+UPDATE events SET seats_left = seats_left - 1 WHERE id = 7;
+COMMIT;
+```
+
+PostgreSQL's docs say `FOR UPDATE` blocks other `UPDATE`, `DELETE`, and `SELECT FOR UPDATE` on those rows until the transaction ends. It also warns that in Repeatable read or Serializable, if the row changed since the snapshot began, you get an error, not a wait.
+
+**Optimistic: assume no conflict, check at the end.** Keep a `version` column. The update succeeds only if nobody else changed the row.
+
+```sql
+UPDATE events SET seats_left = 41, version = 8
+WHERE id = 7 AND version = 7;   -- if 0 rows changed, someone else won. Re-read and retry.
+```
+
+Pick by contention. If conflicts are rare, optimistic wins, because nobody waits. If conflicts are common (one hot row), optimistic wastes work on retries and locks win.
+
+The simplest fix for the seat bug needs neither: `UPDATE ... SET seats_left = seats_left - 1 WHERE seats_left > 0`. The database does the read and write as one step. At Read committed, PostgreSQL makes a second updater wait for the first to finish, then checks the `WHERE` clause again against the new version of the row. So the last seat is sold once. Reach for atomic updates first.
+
+Write skew needs more. Either run at **Serializable** and retry on error, or lock **the rows your decision depends on** (`SELECT ... FOR UPDATE` on all on-call doctors) so the two transactions line up one behind the other.
+
+## Across machines: two-phase commit
+
+Everything so far is one database. What if the debit is in database A and the credit in database B? Neither database can see the other's log.
+
+**Two-phase commit** (2PC) adds a coordinator. Phase 1: it asks each database to **prepare**: do the work, store the state on disk, keep the locks, and vote. Phase 2: if all voted yes, it tells everyone to commit.
+
+<TwoPhaseCommit client:visible />
+
+The cost shows in the last two steps. Between the YES vote and the COMMIT message, a database is not allowed to decide on its own. If the coordinator dies there, the locks stay. PostgreSQL's docs warn that a prepared transaction "continues to hold whatever locks it held", and that leaving one open "will interfere with the ability of VACUUM to reclaim storage". They also say `PREPARE TRANSACTION` is for external transaction managers, not for application code.
+
+So most systems avoid 2PC across services. They use a sequence of local transactions with compensating steps (a **saga**), or write an event in the same transaction and publish it afterwards (an **outbox**). Lessons 6.5 and 9.5 cover both.
+
+## Numbers
+
+| Fact | Value |
+|---|---|
+| PostgreSQL default isolation | Read committed |
+| MySQL InnoDB default isolation | Repeatable read |
+| PostgreSQL retry signal | SQLSTATE `40001` (serialization failure) |
+| Same-datacenter round trip | ~0.5 ms (lesson 1.2) |
+| Log flush on SSD | ~0.1 to 1 ms (lesson 4.2) |
+
+Now one derived number that decides real designs: the **hot-row ceiling**. If transactions must queue on one row, and each holds the row lock for t milliseconds, at most 1000 / t of them finish per second.
+
+- A transaction that locks the row, updates it, and commits holds the lock for about three round trips (3 × 0.5 ms) plus a log flush (up to 1 ms). That is ~2.5 ms. The ceiling is **~400 per second per row**.
+- Add one call to a payment API, ~100 ms, inside the transaction. Hold time becomes ~102 ms. The ceiling falls to **~10 per second per row**.
+
+A flash sale on one product row hits this wall. Two rules follow. Keep transactions short. Never call another service while holding a lock.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Read committed | Few waits, no aborts | Non-repeatable reads, lost updates, write skew | Most OLTP, with atomic updates for counters |
+| Repeatable read (snapshot) | Stable view for multi-query logic | Retries after concurrent-update errors; write skew remains | Reports and checks that read several rows |
+| Serializable | No anomalies | Aborts and retries; you need retry code | A rule spans rows (on-call, balance sums, seat maps) |
+| Pessimistic lock (`FOR UPDATE`) | No retries | Waits, deadlocks (the database aborts one), a lower hot-row ceiling | High contention on known rows |
+| Optimistic (version column) | No waits at low contention | Wasted work and retries at high contention | Rare conflicts, long think time between read and write |
+| Two-phase commit | Atomic across databases | Blocks if the coordinator fails; locks held across a network | Rare. Prefer sagas or an outbox |
+
+## Interview lens
+
+<Callout type="tip">
+When a design has a read-then-write on shared data (inventory, balance, seats, "at most N"), name the anomaly before it is raised: "That is a lost update. I would use an atomic decrement with a condition, so no isolation level is needed." For rules that span rows, say write skew and choose Serializable with retries or explicit locks. Naming the exact bug and its cheapest fix is the staff answer.
+</Callout>
+
+<Callout type="mistake">
+Three common errors. "Serializable is the safe default": it costs aborts and latency, and you must write retry code. "Repeatable read prevents all anomalies": snapshot isolation still allows write skew. "MVCC means no locks": writers still lock rows. And do not say "ACID consistency" and "CAP consistency" are the same thing. The first is about rules holding. The second is about replicas agreeing, and it is lesson 4.9.
+</Callout>
+
+<Callout type="deep" title="Why write skew slips past snapshot isolation">
+Snapshot isolation detects conflicts by write sets: two transactions that write the same row collide. In write skew the write sets are different rows, so nothing collides. The harm lives in the read set: each transaction read a fact the other one then falsified. Serializable mode in PostgreSQL tracks read-write dependencies between transactions for this reason, and aborts one when the dependencies could not come from any one-at-a-time order. That bookkeeping is the cost.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Read committed. The balance is 100. T1 reads 100 and later writes 150 (adding 50) and commits. T2 read 100 earlier and later writes 120 (adding 20) and commits last. What is the final balance, and what is the bug?',
+      options: ['170, no bug', '150, dirty read', '120, lost update', '120, write skew'],
+      answer: 2,
+      explain: 'T2 computed its value from a stale read and wrote last, so T1\'s +50 vanished. The right answer was 170. Both transactions read the same item and wrote the same item, which is a lost update. Write skew needs two different rows written.',
+    },
+    {
+      q: 'Two doctors each check that someone else is on call and then go off call, in separate transactions. Which lowest PostgreSQL level stops this?',
+      options: ['Read committed', 'Repeatable read', 'Serializable', 'None. It cannot be stopped'],
+      answer: 2,
+      explain: 'The two transactions write different rows, so Repeatable read sees no conflict. Only Serializable notices that no one-at-a-time order explains both results and aborts one. You could also lock the rows the decision reads, with SELECT FOR UPDATE.',
+    },
+    {
+      q: 'In PostgreSQL, T1 has updated row X and not committed. T2 runs SELECT on X. T3 runs UPDATE on X. What happens?',
+      options: [
+        'Both wait until T1 commits',
+        'T2 reads the old committed value at once. T3 waits for T1.',
+        'T2 waits. T3 reads the old value.',
+        'T2 reads T1\'s uncommitted value. T3 waits.',
+      ],
+      answer: 1,
+      explain: 'MVCC lets the reader see the last committed version, so reading never blocks. Two writers on one row still queue behind the row lock. Reading T1\'s uncommitted value would be a dirty read, which PostgreSQL does not allow.',
+    },
+    {
+      q: 'Every purchase locks the same product row for 25 ms, from lock to commit. What is the best-case number of purchases per second for that product?',
+      options: ['25', '40', '250', '1,000'],
+      answer: 1,
+      explain: 'Transactions on one row run one at a time. 1000 ms / 25 ms = 40 per second. No faster hardware raises this. Shorten the hold time, or split the row, for example into several counters.',
+    },
+    {
+      q: 'A coordinator running two-phase commit crashes after both databases voted YES and before it sent COMMIT. What is the state of the two databases?',
+      options: [
+        'They roll back after a timeout',
+        'They commit on their own, because both voted yes',
+        'They wait and keep their locks until the coordinator recovers',
+        'They commit on one and roll back on the other',
+      ],
+      answer: 2,
+      explain: 'A prepared participant promised to follow the coordinator and may not decide alone, because the coordinator might have decided to abort. So it waits with its locks held. This blocking behavior is the reason 2PC is avoided across services.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [PostgreSQL docs: Transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html)
+- [PostgreSQL docs: Introduction to MVCC](https://www.postgresql.org/docs/current/mvcc-intro.html)
+- [PostgreSQL docs: Explicit locking](https://www.postgresql.org/docs/current/explicit-locking.html)
+- [PostgreSQL docs: PREPARE TRANSACTION](https://www.postgresql.org/docs/current/sql-prepare-transaction.html)
+- [MySQL docs: InnoDB transaction isolation levels](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html)
+- Berenson, Bernstein, Gray, Melton, O'Neil, O'Neil. [A Critique of ANSI SQL Isolation Levels](https://arxiv.org/abs/cs/0701157). SIGMOD 1995.

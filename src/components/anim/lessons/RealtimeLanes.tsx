@@ -90,7 +90,7 @@ export default function RealtimeLanes() {
 
             {laneLabel(ROW.poll, 'Short polling', `${polls.length} req, ${empties.length} empty`)}
             {polls.map((p) => {
-              const ev = EVENTS.findIndex((e, k) => pollDelivery[k] === p);
+              const ev = EVENTS.findIndex((_e, k) => pollDelivery[k] === p);
               const empty = ev === -1;
               return (
                 <g key={p}>

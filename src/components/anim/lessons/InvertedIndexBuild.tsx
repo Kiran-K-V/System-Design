@@ -4,7 +4,7 @@ import { HandText, SketchArrow, SketchBox, SketchSvg, seedOf } from '../sketch';
 
 const DOCS = [
   { id: 1, text: 'Fast database writes', tokens: ['fast', 'database', 'writes'] },
-  { id: 2, text: 'Database indexes make reads fast', tokens: ['database', 'indexes', 'make', 'reads', 'fast'] },
+  { id: 2, text: 'Indexes make reads fast', tokens: ['indexes', 'make', 'reads', 'fast'] },
   { id: 3, text: 'Slow writes hurt users', tokens: ['slow', 'writes', 'hurt', 'users'] },
 ];
 
@@ -12,7 +12,7 @@ const steps = [
   { caption: 'Three documents. Question: which documents contain the word "fast"? Scanning every document works for 3. For 3 billion it takes hours. We need an index: a structure built ahead of time that answers by lookup.' },
   { caption: 'Step 1: analyze each document. Split the text into words (tokens) and lowercase them. Real engines also remove stop words ("the") and stem words ("writes" to "write"). We skip those to keep it small.' },
   { caption: 'Step 2: index document 1. For each token, add the document id to that token’s posting list. The table is the inverted index: it maps word to documents. The "inverse" is that a normal index maps document to words.' },
-  { caption: 'Step 3: index document 2. "database" and "fast" already exist, so their lists grow. "indexes", "make", "reads" are new rows. The term dictionary stays sorted, so finding a term is a binary search or a B-tree lookup.' },
+  { caption: 'Step 3: index document 2. "fast" already exists, so its list grows to [1, 2]. "indexes", "make", "reads" are new rows. The term dictionary stays sorted, so finding a term is a binary search or a B-tree lookup.' },
   { caption: 'Step 4: index document 3. "writes" now lists documents 1 and 3. The index is built. Each posting list is sorted by document id, which makes the next step cheap.' },
   { caption: 'Query: fast AND writes. Look up each term (two cheap lookups). Intersect the sorted lists by walking them together: fast = [1, 2], writes = [1, 3]. Only 1 is in both. No document was scanned.' },
   { caption: 'Cost model: a query touches only the posting lists of its terms, not the corpus. The price is paid at write time: indexing one document updates one list per distinct word. Search engines such as Lucene (inside Elasticsearch) build on exactly this structure.' },
@@ -97,7 +97,7 @@ export default function InvertedIndexBuild() {
             })}
             {i === 5 && (
               <Fade step={i} born={5}>
-                <SketchArrow points={[[470, 68 + 1 * ROWH + 26], [470, 352]]} stroke="var(--accent)" head="none" seed={seedOf('qa')} />
+                <SketchArrow points={[[452, 68 + 1 * ROWH + 16], [452, 346]]} stroke="var(--accent)" head="none" seed={seedOf('qa')} />
                 <SketchBox cx={520} cy={364} w={230} h={34} r={8} seed={seedOf('qres')} stroke="var(--ok)" fill="var(--surface)" fillStyle="solid" />
                 <HandText x={520} y={364} size={15.5} weight={700} color="var(--ok)">
                   [1,2] ∩ [1,3] = [1]

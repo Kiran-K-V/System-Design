@@ -1,0 +1,194 @@
+---
+summary: A consistency model is a contract about what a read may return when copies disagree. Know the cheap session guarantees, what linearizability really demands, and which one each feature needs.
+requires: ['04-data/replication', '04-data/cap-pacelc']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import AnomalyWalk from '../../../components/anim/lessons/AnomalyWalk.tsx';
+import LinearizabilityLab from '../../../components/anim/lessons/LinearizabilityLab.tsx';
+import ModelLadder from '../../../components/anim/lessons/ModelLadder.tsx';
+
+## The problem
+
+You replicated your database (lesson 4.6). Reads go to followers. Now a user changes their display name from "Ann" to "Anna" and keeps refreshing the page. They see "Anna", then "Ann", then "Anna".
+
+Each follower answered correctly for its own state. No bug exists. But the user sees time run backward, and support gets a ticket.
+
+Replication lag turns "what is the value of x?" into a question with several honest answers. PostgreSQL's manual puts asynchronous lag at typically under one second. It can grow under load. During that window, replicas disagree.
+
+So you need a precise way to say **which answers are acceptable**. That is a **consistency model**: a contract that says which values a read may return, given the writes that came before.
+
+One warning about words. "Consistent" means different things in different places. In ACID it means "the data obeys the schema's rules". In CAP (lesson 4.9) it means linearizability, defined below. In this lesson it only means: **what can a read see?**
+
+## Naive: pick "strong" or "eventual"
+
+Most people know two words.
+
+**Eventual consistency** says: if writes stop, all replicas end up the same. That is all it says. While writes continue it promises nothing. Azure Cosmos DB's documentation is blunt: with eventual consistency, a client "might read values older than those values it read in the past". The animation below shows exactly that.
+
+**Strong consistency** says: every read returns the latest write, as if there were one copy. It is easy to reason about. It is not cheap. Cosmos DB documents that for a multi-region account with strong consistency, write latency is about two round trips between the two farthest regions, plus 10 ms at the 99th percentile. With a 70 ms round trip (the coast-to-coast figure from lesson 4.9) that is about 2 × 70 + 10 = 150 ms per write. Cosmos blocks strong consistency by default when regions are more than 5,000 miles apart, because the write latency is so high.
+
+Two words are not enough. Between them sits a ladder of cheaper contracts, and most features need only one of the lower rungs.
+
+## The cheap guarantees: what one user needs
+
+Three small guarantees fix the most common complaints. Each is a promise to **one client**, not to the whole world. They are called session guarantees.
+
+- **Read your writes.** After I write, my later reads show my write (or something newer).
+- **Monotonic reads.** Once I read a value, I never read an older value.
+- **Consistent prefix.** I never see an effect without its cause. If write A happened before write B, then I never see B without A.
+
+Pick an anomaly. Step through it with the guarantee off. Then flip the guarantee on and compare.
+
+<AnomalyWalk client:visible />
+
+How systems provide each guarantee is usually plain routing or bookkeeping, not heavy coordination.
+
+| Guarantee | Typical implementation | Cost |
+|---|---|---|
+| Read your writes | Read from the leader after you write, or send a position token with the read and let a follower answer only if it has reached it | Extra leader load, or a retry |
+| Monotonic reads | Route each user to the same follower | A failed follower breaks the pin once |
+| Consistent prefix | Keep causally related writes in order, for example on one shard, or tag writes with what they depend on | Extra metadata, or limits on sharding |
+
+Real products package these. Cosmos DB's **session** level uses a session token: the client sends the token on reads, and a replica answers only if it holds data at least as new as the token. If not, the client tries another replica. Cosmos calls session consistency the most widely used level and says its latency and availability are comparable to eventual consistency. MongoDB's causally consistent sessions guarantee read your writes, monotonic reads, monotonic writes, and writes follow reads. They apply only when reads use the `majority` read concern and writes use the `majority` write concern.
+
+## The strong end: linearizability
+
+Now the top of the ladder. **Linearizability** says: every operation appears to take effect at a single instant somewhere between when the client sent it and when it got the answer. And that order must respect the clock: if operation A finishes before operation B starts, then B sees A's effect.
+
+In plain words: the system behaves as if there is **one copy** of the data, and operations touch it one at a time.
+
+The word "clock" is the key. Compare with a weaker model, **sequential consistency**. It also requires one order that every client agrees on, and it keeps each client's own order. But it ignores real time. A client may read arbitrarily stale state. Jepsen's definition notes this.
+
+Use the lab. Client A writes `x = 1`, then `x = 2`. Client B reads twice. Click a preset, then change times and returned values. The verdicts are computed by a small checker that tries every order of the four operations.
+
+<LinearizabilityLab client:visible />
+
+Try these:
+
+1. **Stale read after a write finished.** B starts R1 after A's first write completed, yet R1 returns the old value 0. Linearizable fails. Sequential still passes: B just reads from the past.
+2. **New value, then old.** R1 sees 2 and R2 sees 1. Nothing can explain this. Every model with an order and per-client order fails.
+3. **Reads during a write.** Both reads overlap A's write of 2. They may return 1 or 2. A write that is still running may or may not be visible.
+
+That third case is the subtle one. While a write is running, linearizability allows a read to return either the old or the new value, but not both in the wrong order. Once any read has shown the new value, every later read must show it too.
+
+The cost of linearizability is availability. Jepsen states that a linearizable system "cannot be totally or sticky available", and that during a partition "some or all nodes will be unable to make progress". This is the C in CAP, so lesson 4.9 predicted it.
+
+## The whole ladder
+
+Jepsen lays the models in a hierarchy. A stronger model implies the weaker ones. Strict serializable implies linearizable, which implies sequential, then causal, then PRAM. PRAM implies read your writes, monotonic reads, and monotonic writes. The picture also shows what each rung costs in availability.
+
+<ModelLadder />
+
+- **Causal consistency** keeps causes before effects across all clients. It is the strongest model Jepsen lists as sticky available: it keeps working through a partition as long as each client keeps using the same server.
+- **Serializable** is a different axis. It is about **transactions** and says concurrent transactions behave as if run one after another (lesson 4.4). It has no real-time rule. **Strict serializable** adds the real-time rule of linearizability, across many objects.
+
+## Strong consistency in real systems
+
+Every major store lets you pick a point on the ladder, often per request.
+
+| Store | Default | Stronger option | Notes |
+|---|---|---|---|
+| DynamoDB | Eventually consistent reads | `ConsistentRead` per read | Eventual reads cost half as much. Strong reads are not supported on global secondary indexes. Global tables replicate "typically within a second" by default. |
+| Cosmos DB | Chosen per account | Five levels: strong, bounded staleness, session, consistent prefix, eventual | Strong and bounded staleness read from two replicas, so read throughput per request unit is half. |
+| Spanner | External consistency | n/a | Stronger than linearizability: it also orders multi-object transactions. Uses TrueTime, a distributed clock service. |
+| MongoDB | `local` read concern is described as able to read data later rolled back | `majority`, `linearizable` | `linearizable` reads with `majority` writes act as if one thread did the operations in real time. |
+| Cassandra | You choose per request | `QUORUM` for reads and writes | Overlapping reads and writes (`W + R > RF`) make acknowledged writes visible to later reads. |
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| PostgreSQL async replica lag | typically under 1 s | PostgreSQL docs |
+| Cosmos DB read latency | p99 under 10 ms. p50 typically 4 ms or less | Cosmos docs |
+| Cosmos strong write, multi-region | about 2 × RTT + 10 ms at p99 | Cosmos docs |
+| Same, with a 70 ms RTT | about 150 ms | Derived from the formula |
+| Cosmos bounded staleness minimum, one region | 10 writes or 5 s | Cosmos docs |
+| Cosmos bounded staleness minimum, multi-region | 100,000 writes or 300 s | Cosmos docs |
+| DynamoDB eventual vs strong read cost | half | DynamoDB docs |
+| Dynamo-style quorum (3, 2, 2) | `R + W = 4 > N = 3` | Dynamo paper |
+
+## Trade-offs
+
+| Model | You gain | You pay | Choose when |
+|---|---|---|---|
+| Eventual | Highest availability and throughput, cheapest reads | Stale and out-of-order reads | Counters, likes, analytics, caches |
+| Monotonic reads | Pages never go backward | A routing rule | Feeds, dashboards |
+| Read your writes / session | Users see their own changes | A token or leader read | Profile edits, settings, "post then view" |
+| Consistent prefix / causal | Causes before effects | Dependency tracking | Chat, comments, threaded data |
+| Linearizable | One-copy behavior, simple code | Cross-region latency, no availability under partition | Locks, unique names, balances, leader election |
+
+## Interview lens
+
+<Callout type="tip">
+Choose per feature and name the guarantee. "Profile edit needs read your writes, so I read the leader for 10 seconds after a write, or use a position token. The feed needs monotonic reads: pin the user to a follower. Wallet balance and username uniqueness need linearizability: they go through the leader, and I accept a higher latency." This answer shows you know the menu is longer than two items.
+</Callout>
+
+<Callout type="mistake">
+Do not say "eventual consistency means the data may be wrong". It means replicas converge once writes stop. Do not say "serializable and linearizable are the same". Serializable orders transactions and has no clock. Linearizable orders operations on one object and respects the clock. Do not say a database is "strongly consistent" without saying for which reads.
+</Callout>
+
+<Callout type="deep" title="A quorum read is not automatically linearizable">
+Take `N = 3`, write quorum `W = 2`, read quorum `R = 2`, so `R + W > N`. A write of the new value is still in flight: only one replica has it so far. Read 1 happens to ask that replica and one other, and sees the new value. Read 2 starts later, asks the two replicas that do not have it yet, and sees the old value. The overlap rule held for finished writes, but this read pair is exactly the "new, then old" case in the lab above. Real systems add repair or a leader-confirmed read to close the gap. Sloppy quorums (lesson 4.6, hinted handoff) and clock-based last-write-wins break it further.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Client A finishes writing x = 1 at time 2. Client B starts a read at time 3 and gets x = 0. No other writes happen. Which models allow this?',
+      options: [
+        'Linearizable and sequential',
+        'Sequential and eventual, but not linearizable',
+        'Only eventual',
+        'None. The history is impossible.',
+      ],
+      answer: 1,
+      explain: 'Linearizability needs the clock: A finished before B started, so B must see 1. Sequential consistency ignores real time. It can place B’s read before A’s write in its single order. Eventual allows any value while replicas catch up.',
+    },
+    {
+      q: 'A user edits their bio, and the next page load shows the old bio. Which is the cheapest correct fix?',
+      options: [
+        'Make every read linearizable',
+        'Read from the leader (or use a position token) for that user right after the write',
+        'Turn on monotonic reads',
+        'Add more followers',
+      ],
+      answer: 1,
+      explain: 'This is a read-your-writes failure. A session-level fix is enough. Making every read linearizable works but is far more expensive. Monotonic reads would not help, because the user never saw the new value earlier. More followers do not fix lag.',
+    },
+    {
+      q: 'You refresh a page and see "Anna", then "Ann", then "Anna". The system has two followers behind a random router. Which guarantee is broken, and what is the simplest fix?',
+      options: [
+        'Read your writes. Fix: write to every follower.',
+        'Monotonic reads. Fix: pin each user to one follower.',
+        'Consistent prefix. Fix: use one shard.',
+        'Linearizability. Fix: add a cache.',
+      ],
+      answer: 1,
+      explain: 'A later read returned something older than an earlier read. That is a monotonic-reads violation. Routing each user to the same follower stops the page from going backward without any cross-node coordination.',
+    },
+    {
+      q: 'A Dynamo-style store has N = 3, W = 2, R = 2. A write is in flight and has reached only one replica. Read 1 hits that replica and sees the new value. Read 2, later, hits the other two replicas. What can Read 2 return?',
+      options: [
+        'Always the new value, because R + W > N',
+        'The old value, which breaks linearizability',
+        'An error, because the quorum overlaps',
+        'The new value, because Read 1 already saw it',
+      ],
+      answer: 1,
+      explain: 'R + W > N guarantees overlap with writes that have finished with W acknowledgements. This write has not. The two replicas Read 2 asks have no copy of it. So Read 2 returns the old value after Read 1 returned the new one. That is not linearizable.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Jepsen: consistency models](https://jepsen.io/consistency/models), the hierarchy, with availability for each model.
+- [Azure Cosmos DB: consistency level choices](https://learn.microsoft.com/en-us/azure/cosmos-db/consistency-levels), five levels explained with numbers.
+- [Amazon DynamoDB: read consistency](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html)
+- [MongoDB: read isolation, consistency, and recency](https://www.mongodb.com/docs/manual/core/read-isolation-consistency-recency/), causal sessions and read concerns.
+- [Google Spanner: TrueTime and external consistency](https://docs.cloud.google.com/spanner/docs/true-time-external-consistency)

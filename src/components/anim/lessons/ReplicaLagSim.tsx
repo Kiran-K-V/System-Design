@@ -60,7 +60,7 @@ export default function ReplicaLagSim() {
           </div>
           <Slider id="lag1" label="Follower 1 lag" value={lag1} min={0} max={AXIS} step={20} onChange={setLag1} />
           <Slider id="lag2" label="Follower 2 lag" value={lag2} min={0} max={AXIS} step={20} onChange={setLag2} />
-          <Slider id="delay" label="User reads this long after the write" value={delay} min={0} max={AXIS} step={20} onChange={setDelay} />
+          <Slider id="delay" label="Read delay after the write" value={delay} min={0} max={AXIS} step={20} onChange={setDelay} />
           {policy === 'leader-window' && <Slider id="win" label="Leader window" value={win} min={0} max={AXIS} step={100} onChange={setWin} />}
         </div>
 

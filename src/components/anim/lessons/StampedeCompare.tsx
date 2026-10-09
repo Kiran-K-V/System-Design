@@ -95,7 +95,7 @@ export default function StampedeCompare() {
                 </HandText>
                 <SketchArrow points={[[cx, 102], [cx, 140]]} seed={seedOf(`a${k}`)} stroke="var(--muted)" />
                 {c.wait && (
-                  <HandText x={cx + 10} y={122} size={14} anchor="start" color="var(--warn)">
+                  <HandText x={cx + 10} y={122} size={15} anchor="start" color="var(--warn)">
                     {c.wait}
                   </HandText>
                 )}
@@ -103,27 +103,27 @@ export default function StampedeCompare() {
                 <HandText x={cx} y={170} size={15} color={COLOR[c.cacheTone]}>
                   {c.cache}
                 </HandText>
-                <HandText x={cx - CW / 2 + 4} y={211} size={14} anchor="start" color="var(--muted)">
+                <HandText x={cx - CW / 2 + 4} y={211} size={15} anchor="start" color="var(--muted)">
                   cache
                 </HandText>
 
                 {c.toDb && (
                   <motion.g key={`db${i}`} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.5 }}>
                     <SketchArrow points={[[cx, 198], [cx, 252]]} seed={seedOf(`b${k}${i}`)} stroke={miss && c.db > 100 ? 'var(--bad)' : 'var(--accent)'} strokeWidth={c.db > 100 ? 3.2 : 1.6} />
-                    <HandText x={cx + 10} y={226} size={14} anchor="start" color={c.db > 100 ? 'var(--bad)' : 'var(--ok)'}>
+                    <HandText x={cx + 10} y={226} size={15} anchor="start" color={c.db > 100 ? 'var(--bad)' : 'var(--ok)'}>
                       {c.toDb}
                     </HandText>
                   </motion.g>
                 )}
                 <SketchCylinder cx={cx} cy={292} w={90} h={66} seed={seedOf(`db${k}`)} stroke={COLOR[c.dbTone]} />
-                <HandText x={cx} y={296} size={14} color="var(--muted)">
+                <HandText x={cx} y={296} size={15} color="var(--muted)">
                   DB
                 </HandText>
                 <HandText x={cx} y={344} size={17} weight={700} color={COLOR[c.dbTone]}>
                   {`queries: ${c.db.toLocaleString('en-US')}`}
                 </HandText>
                 <SketchBox cx={cx} cy={386} w={CW} h={40} r={9} seed={seedOf(`out${k}`)} stroke={COLOR[c.outTone]} />
-                <HandText x={cx} y={386} size={14} color={COLOR[c.outTone]}>
+                <HandText x={cx} y={386} size={15} color={COLOR[c.outTone]}>
                   {c.out}
                 </HandText>
               </g>

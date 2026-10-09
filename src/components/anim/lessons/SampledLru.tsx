@@ -115,7 +115,7 @@ export default function SampledLru() {
               return (
                 <g key={k.key} opacity={0.9}>
                   <SketchBox cx={cx} cy={cy} w={CW} h={CH} r={10} dashed stroke="var(--muted)" seed={seedOf('gone' + k.key)} />
-                  <HandText x={cx} y={cy} size={14} color="var(--muted)">
+                  <HandText x={cx} y={cy} size={15} color="var(--muted)">
                     {'evicted'}
                   </HandText>
                 </g>

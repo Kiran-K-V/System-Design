@@ -182,11 +182,17 @@ export default function ReplicationCommit() {
             { id: 'f1', x: 615, y: 70, w: 170, h: 90, shape: 'db', label: 'Follower 1', sub: s.f1.sub, tone: s.f1.tone },
             { id: 'f2', x: 615, y: 232, w: 170, h: 90, shape: 'db', label: 'Follower 2', sub: s.f2.sub, tone: s.f2.tone },
           ];
-          const edges: FlowEdge[] = [
-            { from: 'client', to: 'leader', head: 'both' },
-            { from: 'leader', to: 'f1', label: 'ship log', labelAt: [-8, -20], dashed: !s.ack, head: s.ack ? 'both' : 'end' },
-            { from: 'leader', to: 'f2', label: 'ship log', labelAt: [-8, 22], dashed: true },
-          ];
+          const crashed = s.leader.tone === 'bad';
+          const promoted = s.f1.sub.startsWith('new leader');
+          const edges: FlowEdge[] = crashed
+            ? promoted
+              ? [{ from: 'f1', to: 'f2', label: 'ship log', labelAt: [-34, 0], dashed: true }]
+              : []
+            : [
+                { from: 'client', to: 'leader', head: 'both' },
+                { from: 'leader', to: 'f1', label: 'ship log', labelAt: [-8, -20], dashed: !s.ack, head: s.ack ? 'both' : 'end' },
+                { from: 'leader', to: 'f2', label: 'ship log', labelAt: [-8, 22], dashed: true },
+              ];
           const notes: FlowNote[] = s.note ? [{ x: 255, y: 262, text: s.note, anchor: 'middle', tone: s.noteTone, size: 16 }] : [];
           return (
             <FlowDiagram
