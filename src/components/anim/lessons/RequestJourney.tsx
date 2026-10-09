@@ -13,12 +13,12 @@ interface JourneyStep {
 }
 
 const nodes: FlowNode[] = [
-  { id: 'client', x: 75, y: 160, w: 120, label: 'Browser', sub: 'user' },
-  { id: 'nic', x: 265, y: 160, w: 120, label: 'NIC', sub: 'network card' },
-  { id: 'kernel', x: 450, y: 160, w: 130, label: 'Kernel', sub: 'TCP stack' },
-  { id: 'app', x: 650, y: 160, w: 150, label: 'App process', sub: 'your code on CPU' },
-  { id: 'ram', x: 830, y: 55, w: 110, h: 60, label: 'RAM', sub: '~100 ns' },
-  { id: 'disk', x: 830, y: 270, w: 100, h: 84, shape: 'db', label: 'SSD', sub: '~100 µs' },
+  { id: 'client', tone: 'accent', x: 70, y: 160, w: 120, label: 'Browser', sub: 'user' },
+  { id: 'nic', tone: 'accent', x: 298, y: 160, w: 150, label: 'NIC', sub: 'network card' },
+  { id: 'kernel', tone: 'warn', x: 478, y: 160, w: 140, label: 'Kernel', sub: 'TCP stack' },
+  { id: 'app', tone: 'purple', x: 722, y: 160, w: 180, label: 'App process', sub: 'your code on CPU' },
+  { id: 'ram', tone: 'ok', x: 882, y: 55, w: 110, h: 60, label: 'RAM', sub: '~100 ns' },
+  { id: 'disk', tone: 'bad', x: 882, y: 270, w: 100, h: 84, shape: 'db', label: 'SSD', sub: '~100 µs' },
 ];
 
 const edges: FlowEdge[] = [
@@ -30,10 +30,10 @@ const edges: FlowEdge[] = [
 ];
 
 const notes: FlowNote[] = [
-  { x: 650, y: 222, text: '1) parse HTTP\n2) run handler\n3) build JSON', anchor: 'middle' },
+  { x: 660, y: 236, text: '1) parse HTTP\n2) run handler\n3) build JSON', anchor: 'middle' },
 ];
 
-const groups: FlowGroup[] = [{ x: 200, y: 6, w: 695, h: 320, label: 'one server' }];
+const groups: FlowGroup[] = [{ x: 212, y: 6, w: 726, h: 320, label: 'one server' }];
 
 const steps: JourneyStep[] = [
   {
@@ -145,7 +145,7 @@ export default function RequestJourney() {
       {(i, step) => (
         <>
           <FlowDiagram
-            width={900}
+            width={940}
             height={330}
             nodes={nodes}
             edges={edges}

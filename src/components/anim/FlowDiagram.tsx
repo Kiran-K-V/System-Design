@@ -13,7 +13,7 @@ import {
   type Pt,
 } from './sketch';
 
-export type Tone = 'default' | 'accent' | 'ok' | 'warn' | 'bad' | 'muted';
+export type Tone = 'default' | 'accent' | 'ok' | 'warn' | 'bad' | 'muted' | 'purple';
 
 export interface FlowNode {
   id: string;
@@ -94,6 +94,7 @@ export const TONE: Record<Tone, string> = {
   warn: 'var(--warn)',
   bad: 'var(--bad)',
   muted: 'var(--muted)',
+  purple: 'var(--purple)',
 };
 
 const DEFAULT_W = 130;
@@ -190,7 +191,7 @@ export default function FlowDiagram({
       {nodes.map((n) => {
         const { w, h } = size(n);
         const isActive = active.includes(n.id);
-        const stroke = isActive ? 'var(--accent)' : TONE[n.tone ?? 'default'];
+        const stroke = isActive && (!n.tone || n.tone === 'default') ? 'var(--accent)' : TONE[n.tone ?? 'default'];
         const seed = seedOf(n.id);
         const strokeWidth = isActive ? 2.2 : 1.4;
         return (
