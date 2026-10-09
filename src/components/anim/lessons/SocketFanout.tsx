@@ -73,7 +73,7 @@ const steps: Step[] = [
       'Failure 2: gateway B dies. Dan loses his socket. His client waits a random delay, reconnects through the load balancer to any gateway (here A), and sends the last sequence number it saw. The new gateway replays what Dan missed.',
     note: 'gateway down: clients reconnect + resume',
     noteTone: 'warn',
-    packets: [{ from: 'dan', to: 'gw1', label: 'resume seq 7', tone: 'warn' }],
+    packets: [{ from: 'dan', to: 'gw1', label: 'resume', tone: 'warn' }],
     active: ['gw1'],
     gw2: 'dead',
     danTo: 'gw1',
@@ -108,10 +108,10 @@ export default function SocketFanout() {
           { from: 'gw1', to: 'bob', head: 'both' },
           { from: 'gw1', to: 'carol', head: 'both' },
           ...(s.danTo === 'gw1'
-            ? ([{ from: 'dan', to: 'gw1', head: 'both', tone: 'warn', dashed: true }] as FlowEdge[])
+            ? ([{ from: 'dan', to: 'gw1', head: 'both', tone: 'warn', dashed: true, bend: 40 }] as FlowEdge[])
             : ([{ from: 'gw2', to: 'dan', head: 'both' }] as FlowEdge[])),
         ];
-        const notes: FlowNote[] = [{ x: 330, y: 14, text: s.note, anchor: 'middle', size: 15, tone: s.noteTone }];
+        const notes: FlowNote[] = [{ x: 330, y: 14, text: s.note, anchor: 'middle', size: 16, tone: s.noteTone }];
         return (
           <FlowDiagram
             width={720}

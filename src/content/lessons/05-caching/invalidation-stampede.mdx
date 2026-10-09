@@ -1,0 +1,285 @@
+---
+summary: A cached copy must leave when it goes stale, and leaving at the wrong moment can bring down the database. This lesson covers invalidation, stampedes, avalanches, and requests for keys that do not exist.
+requires: ['05-caching/cache-strategies', '05-caching/eviction']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import StampedeCompare from '../../../components/anim/lessons/StampedeCompare.tsx';
+import LeaseHerd from '../../../components/anim/lessons/LeaseHerd.tsx';
+import TtlJitterLab from '../../../components/anim/lessons/TtlJitterLab.tsx';
+
+## The problem
+
+A cache holds a copy. Two things can go wrong with a copy.
+
+1. **It is stale.** The database changed. The copy did not. Readers see old data.
+2. **It disappears at a bad moment.** The entry expires or is deleted while thousands of readers want it. All of them miss together, and all of them go to the database.
+
+Lesson 5.3 showed how a write can leave a stale copy behind. Lesson 5.4 showed how a full cache drops entries. This lesson is about the rest: how to remove stale copies on purpose, and what to do so that removing a copy does not hurt more than keeping it.
+
+## Part 1: Getting stale copies out
+
+### Naive solution: just set a TTL and forget it
+
+The easiest rule is a **TTL** (time to live). Each entry gets a time limit. When it passes, the entry expires. The longest a reader can see old data is one TTL. Many caches need nothing else.
+
+Hello Interview's caching page uses 60 seconds for a homepage feed, and 10 minutes for user profiles. A TTL is a promise about how wrong the cache may be, not a guess about how often data changes. Ask the product owner: "How old may this value be before a user is hurt?" The answer is the TTL.
+
+A TTL alone fails when staleness hurts sooner. A user changes her display name and sees the old one for 10 minutes. For these keys, invalidate on write.
+
+### The toolbox
+
+| Method | How it works | Staleness | Main risk |
+|---|---|---|---|
+| **TTL only** | Entry expires after N seconds | Up to N seconds | Everything stale for N seconds. Stampede at expiry |
+| **Delete on write** | After the database write, delete the key. The next read refills it | Short, if the delete runs | A late reader refills with old data (the race in lesson 5.3). A failed delete leaves stale data |
+| **Update on write** | Write the new value into the cache too | Short | Two writers can land in different orders in the cache and the database |
+| **Versioned keys** | Put a version in the key: `user:42:v7`. A write bumps the version. Readers build the key from the version | None for the key, once readers see the new version | An extra lookup for the version. Old keys sit unused until eviction (lesson 5.4) removes them |
+| **Event-driven** | A change-data-capture stream (lesson 6.5) reads the database log and deletes keys | Seconds, the stream delay | A new pipeline to run. Events can be late or repeated, so deletes must be safe to repeat |
+
+Combine them. A common pattern: **delete on write plus a TTL as a safety net**. The delete gives freshness in the normal case. The TTL bounds the damage when the delete fails.
+
+<Callout type="deep" title="No scheme gives a guarantee">
+Facebook's memcache paper is plain about it: the system provides *best-effort eventual consistency*, and invalidation and replication are not transactional. They chose performance and availability over a guarantee. If a value must be exactly fresh, such as an account balance during a transfer, read it from the source of truth. Do not read it from a cache and try to make the cache perfect.
+</Callout>
+
+## Part 2: The stampede
+
+### The problem in numbers
+
+A product page key gets 5,000 reads per second. It is cached with a TTL. Rebuilding it takes 200 ms: three queries and some work. These are example numbers.
+
+Most of the time the database sees none of these reads. Then the TTL runs out. For the next 200 ms, until the first rebuild finishes, every read misses. How many?
+
+**5,000 reads per second × 0.2 seconds = 1,000 reads.** All 1,000 find an empty cache. All 1,000 query the database for the same row. This is the same rule as Little's law (lesson 1.3): the number of requests in flight equals arrival rate times time spent.
+
+This is a **cache stampede**, also called a **thundering herd**. A popular entry expires, and many requests try to rebuild it at the same time. It gets worse in a loop. The extra load slows the database. The rebuild now takes 2 seconds instead of 200 ms. That is 10,000 misses instead of 1,000, so the database slows more. A slow rebuild feeds the herd.
+
+### Three ways out, side by side
+
+Watch the same expiry under three rules. Step through all five steps. Compare the DB counter in each column.
+
+<StampedeCompare client:visible />
+
+All three are the same idea at different costs. The herd exists because *every reader does the rebuild*. Fix that, and you only choose what the *other* readers do while one rebuilds: **wait** (single-flight, lock, lease), or **take the old value** (stale-while-revalidate).
+
+### Fix 1: Single-flight, also called request coalescing
+
+Inside one server, keep a table of loads in progress, one per key. The first request for a missing key starts the load and stores a **promise**: an object that will hold the result later. Every later request for that key finds the promise and awaits it. When the load ends, all of them get the same value. Hello Interview calls this "request coalescing" and names it the most effective solution.
+
+It is cheap. It needs no network call. It has a limit: it works per process. With 50 app servers, 50 requests still reach the database, one from each. That is 50, not 1,000, and often enough. When it is not enough, you need a lock that all servers share.
+
+### Fix 2: A lock in the cache
+
+Use the cache as the coordinator. The first reader to miss takes a lock with an expiry. Other readers wait a few milliseconds and look in the cache again, or return stale or default data, or fail fast. In Redis, the lock is one command:
+
+```text
+SET lock:popular_key <random-token> NX PX 5000
+```
+
+`NX` means "only set if the key does not exist", so only one client wins. `PX 5000` means "expire in 5,000 ms", so a client that crashes while holding the lock cannot block the key forever. When you release, delete the lock only if its value still equals your token. Otherwise your lock may have expired and now belongs to someone else, and you would delete theirs. The Redis team's page on stampede prevention recommends starting with a lock like this for most applications.
+
+Two risks: the lock must expire (a crashed holder), and if the rebuild takes longer than the lock lifetime, a second client may take the lock and rebuild too. Set the lock time above the 99th percentile rebuild time.
+
+### Fix 3: Leases
+
+Facebook's memcache builds the lock into the cache. When a get misses, memcache gives the client a **lease**: a 64-bit token tied to that key. The client must show the token when it fills the key. Watch what happens to the second client.
+
+<LeaseHerd client:visible />
+
+The token does two jobs. It lets one client rebuild. And a delete by a writer voids the token, so a slow reader's late fill is refused. That is the stale-set race from lesson 5.3. The paper compares it to load-link/store-conditional in a CPU.
+
+Facebook limits how fast tokens leave: by default a server returns a token once every 10 seconds per key. Any request in that window gets "wait a short time". The paper's own data for keys prone to herds shows a peak database query rate of 17K per second without leases and 1.3K per second with leases.
+
+### Fix 4: Serve stale while you refresh
+
+Waiting costs latency. Another choice: let readers have the **old** value while one request fetches the new one in the background. The web standard calls this **stale-while-revalidate**. RFC 5861 defines it as a `Cache-Control` extension. Caches may serve a response after it goes stale, for the number of seconds you state. An example from the RFC:
+
+```text
+Cache-Control: max-age=600, stale-while-revalidate=30
+```
+
+The response is fresh for 600 seconds. For the next 30 seconds a cache may still serve it while it checks for a new one. The same idea works in your own cache layer: store the value with a logical expiry inside it, keep the entry alive longer than that, and let the first reader after the logical expiry start a refresh.
+
+Facebook does a version of it. A deleted value moves to a small structure of recently deleted items for a short time, and a get can return it marked as stale. The paper notes that applications that can make progress with stale data do not need to wait for the latest value. Their experience was that most applications could use a stale value without changes.
+
+The cost: readers can see data up to one refresh older. Do not use this where a stale read does harm.
+
+### Fix 5: Refresh early, with a dice roll
+
+You can avoid the empty cache entirely. Refresh the entry *before* it expires. The simple version, **refresh-ahead**, refreshes popular keys on a timer. It only helps for keys you know are popular.
+
+**XFetch** (probabilistic early expiration) needs no timer and no lock. Each reader that sees a cached value rolls a die. The closer the entry is to expiry, the more likely the roll says "refresh now". Usually exactly one reader refreshes, just before expiry, and the rest keep using the cached value. The method comes from the paper *Optimal Probabilistic Cache Stampede Prevention* (Vattani, Chierichetti, Lowenstein, 2015). The rule from the paper:
+
+```text
+// delta = how long the last recompute took. beta = 1 by default.
+if (no value) or  now - delta * beta * log(rand()) >= expiry:
+    recompute, and store the new delta
+```
+
+`rand()` is between 0 and 1, so `log(rand())` is negative, and the term adds a random gap to `now`. A key that is slow to build has a large `delta`, so it refreshes earlier. A larger `beta` favors earlier refresh. You pay with some extra recomputes, and gain safety without coordination.
+
+### Which one?
+
+| Fix | Readers during the rebuild | Database queries | You pay |
+|---|---|---|---|
+| Nothing | Slow, or failed | One per reader | An outage risk |
+| Single-flight | Wait | One per server | Only per process |
+| Lock or lease | Wait a short time | One | A lock to expire, a smarter cache |
+| Stale-while-revalidate | Get old data at once | One | Bounded staleness |
+| XFetch | Never wait | About one, early | Extra recomputes, `delta` stored with the value |
+
+Hot keys with cheap rebuilds: single-flight and a TTL. Hot keys that are costly or shared across many servers: lease or lock, or stale-while-revalidate if old data is fine.
+
+## Part 3: The avalanche
+
+A stampede is **one** key. An **avalanche** is **many** keys expiring at once.
+
+How does it happen? You warm the cache at 02:00 by loading 10,000 keys with a TTL of 300 seconds. At 02:05 all of them expire in the same second. A cache restart or the loss of a node does the same: the keys are gone together.
+
+Each key alone is harmless. Together they are a stampede that is 10,000 keys wide. The fix is **jitter**: add a small random amount to each TTL so the keys expire at different times. Drag the sliders. See where the peak crosses your database's limit.
+
+<TtlJitterLab client:visible />
+
+Jitter is the cheapest fix in this lesson. One line of code: `ttl = base * (1 + random() * 0.1)`. The expiry is spread over a window, the rebuilds are spread with it, and the database sees a ramp, not a wall.
+
+For a cache that restarts or loses a node, jitter does not help. The keys vanish at once. The cold cache trap in lesson 5.1 needs other defenses: replicate the cache so one node loss does not empty it, warm it before you send traffic, and **cap the concurrency** that can reach the database, so extra misses wait or fail fast instead of crushing it.
+
+## Part 4: Requests for keys that do not exist
+
+A cache stores what exists. What if the key is not in the database either? A scraper walks `/users/1`, `/users/2`, ... up to ids that were never created. Each request misses the cache, queries the database, finds nothing, and caches nothing. The next one does the same. This is **cache penetration**: the requests go through the cache every time.
+
+Two fixes:
+
+- **Negative caching.** Cache the *absence* too: store "not found" with a short TTL. The second request for the same missing id hits the cache. The risk: if the row is created later, the cache says "not found" until the TTL ends. Delete the negative entry when you create the row, and keep its TTL short.
+- **Bloom filter.** A Bloom filter (lesson 10.3) is a small bit table that answers "definitely not in the set" or "maybe in the set". Put all valid ids in it. Check it first. If it says "definitely not", reject the request without touching the cache or the database. A "maybe" can be a false alarm, so the database check stays.
+
+Validation helps too: reject an id with a wrong format before it reaches any cache.
+
+### Names you will meet
+
+| Name | What happens | Main fix |
+|---|---|---|
+| Stampede, thundering herd | One hot key expires and many requests rebuild it | Single-flight, lock or lease, stale-while-revalidate, XFetch |
+| Avalanche | Many keys expire together, or the cache loses many keys | Jittered TTL, replication, warming, load cap |
+| Penetration | Requests for keys that do not exist always reach the database | Negative caching, Bloom filter, validation |
+
+Some books also use "breakdown" for a single hot key expiring. That is the stampede. Do not depend on the label in an interview. Describe the mechanism.
+
+## The numbers
+
+| Item | Value |
+|---|---|
+| Example TTLs, Hello Interview | 60 s homepage feed, 10 min user profile |
+| Stampede size | reads per second × rebuild time in seconds. 5,000 × 0.2 = 1,000 |
+| Facebook lease token | 64-bit, tied to one key |
+| Facebook lease rate | One token per key every 10 s by default |
+| Facebook herd result | Peak DB query rate 17K/s without leases, 1.3K/s with leases |
+| Redis lock command | `SET key token NX PX 5000` (the 5,000 ms is the Redis team's example) |
+| XFetch `beta` | 1.0 by default |
+| RFC 5861 example | `max-age=600, stale-while-revalidate=30` |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Short TTL | Bounded staleness, no invalidation code | More misses, more rebuild load | Some staleness is fine |
+| Delete on write + TTL | Fresh in the normal case, bounded when a delete fails | Late-reader race, extra code in writers | User-visible edits |
+| Lock or lease | One rebuild | Waiting readers, a lock that can expire | A hot, costly key on many servers |
+| Stale-while-revalidate | No waiting, one rebuild | Readers see old data | Feeds, counts, anything old data does not hurt |
+| XFetch | No lock, no wait | Some early rebuilds | Very hot keys with costly rebuilds |
+| TTL jitter | Spreads many expiries | Slightly longer life for some keys | Always, on bulk-loaded keys |
+| Negative cache / Bloom filter | Blocks lookups for missing keys | Hides new rows until the TTL, a false-positive check | Public ids that can be guessed |
+
+## Interview lens
+
+<Callout type="tip">
+When you add a cache for a hot read path, add the failure story in one breath. "The home feed is cached for 60 seconds with 10% jitter. On expiry I let one request rebuild it. The others get the previous value for up to 5 more seconds, so a hot key cannot stampede the database. Writes delete the key, and the TTL bounds staleness if a delete fails."
+</Callout>
+
+<Callout type="tip">
+Interviewers like the question "the cache goes down, what happens?". Answer with the cold cache: the database sees full load. Then give the defenses: replicas of the cache, warming, and a limit on how many queries can reach the database at once.
+</Callout>
+
+<Callout type="mistake">
+Do not say "TTL solves it". A TTL is what *causes* the stampede on a hot key. Do not set one fixed TTL for a million keys loaded together. And do not claim the cache is consistent with the database after "invalidating on write". A failed delete, a late reader, or lag in the invalidation path can all leave a stale value. Say "bounded staleness".
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A hot key gets 2,000 reads per second. Rebuilding it takes 500 ms. Its TTL expires and nothing else protects it. About how many database queries does the herd cause?',
+      options: ['1', 'About 500', 'About 1,000', 'About 2,000'],
+      answer: 2,
+      explain: 'Reads that arrive while the rebuild is running all miss. 2,000 per second × 0.5 seconds = 1,000. If the extra load makes the rebuild slower, the number grows.',
+    },
+    {
+      q: 'In the three-column animation, columns 2 and 3 both send one query to the database. What is the difference for the readers?',
+      options: [
+        'None. Both give fresh data at once.',
+        'Column 2 readers wait about one rebuild. Column 3 readers get the old value at once, so it can be slightly stale.',
+        'Column 2 readers get stale data. Column 3 readers wait.',
+        'Column 3 sends more queries later.',
+      ],
+      answer: 1,
+      explain: 'Lock or lease means the other readers wait for the single rebuild. Stale-while-revalidate means they keep reading the old value while the refresh runs in the background. You trade latency for freshness.',
+    },
+    {
+      q: 'A server in the lease animation gets a second GET for key k while a lease is out. What does memcache do with the second client?',
+      options: [
+        'Sends it to the database too.',
+        'Gives it a second lease.',
+        'Tells it to wait a short time and retry, because the first client will fill the key.',
+        'Returns an error and drops the key.',
+      ],
+      answer: 2,
+      explain: 'Only one client holds the lease. Others are told to wait. By the time they retry, the lease holder has usually filled the key, so they hit the cache. The database sees one query.',
+    },
+    {
+      q: 'A job loads 50,000 product keys into Redis at midnight, all with TTL 3,600 seconds. At 01:00 the database overloads. What is the best fix?',
+      options: [
+        'Add a lock to each key.',
+        'Raise the TTL to 7,200 seconds.',
+        'Add random jitter to each TTL so the keys expire over a window.',
+        'Remove the TTL and never expire.',
+      ],
+      answer: 2,
+      explain: 'All 50,000 keys expire in the same second: an avalanche. Jitter spreads the expiry, so rebuild load becomes a ramp. A longer TTL only moves the wall to a later time. A per-key lock would still allow 50,000 rebuilds, one per key.',
+    },
+    {
+      q: 'An attacker requests ids that do not exist, at 20,000 per second. Each request hits the database, and your cache never fills. What is the name of this problem, and a fix?',
+      options: [
+        'Stampede. Use a lock.',
+        'Avalanche. Use jitter.',
+        'Penetration. Cache the "not found" result for a short time, or check a Bloom filter first.',
+        'Stale read. Delete on write.',
+      ],
+      answer: 2,
+      explain: 'The requests are for keys that are not in the database, so there is never a value to cache. Negative caching stores the absence, so repeats are answered by the cache. A Bloom filter rejects ids that cannot exist before they reach the cache or database.',
+    },
+    {
+      q: 'XFetch does the check "now - delta * beta * log(rand()) >= expiry" on every read. A key takes 2 seconds to rebuild. Another key takes 20 ms. Which one starts refreshing earlier before its expiry, on average?',
+      options: [
+        'The 20 ms key, because it is cheap.',
+        'The 2 second key. A bigger delta makes the random gap larger, so it refreshes earlier.',
+        'Both at the same time.',
+        'Neither. XFetch only reacts after expiry.',
+      ],
+      answer: 1,
+      explain: 'delta is the time of the last rebuild. The random gap added to now scales with delta. A slow key gets a larger gap, so the check passes earlier. That gives an expensive rebuild more time to finish before readers need it.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Scaling Memcache at Facebook (NSDI 2013)](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala). Section 3.2.1 covers leases, stale sets, thundering herds, and stale values.
+- [MIT 6.824 memcache FAQ](https://pdos.csail.mit.edu/6.824/papers/memcache-faq.txt). A short Q&A on the same paper, including the stale set example.
+- [RFC 5861: HTTP Cache-Control extensions for stale content](https://www.rfc-editor.org/rfc/rfc5861). The standard for `stale-while-revalidate` and `stale-if-error`.
+- [Redis: cache stampede prevention](https://redis.antirez.com/fundamental/cache-stampede-prevention.html). Lock with `SET NX PX`, and the XFetch formula.
+- [Optimal Probabilistic Cache Stampede Prevention (PVLDB 2015)](https://cseweb.ucsd.edu/~avattani/papers/cache_stampede.pdf). The XFetch paper and its pseudo-code.
+- [Hello Interview: caching](https://www.hellointerview.com/learn/system-design/core-concepts/caching). Stampede, consistency, and example TTLs at interview depth.

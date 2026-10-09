@@ -38,6 +38,7 @@ export default function BTreeHeight() {
           400 x 400 x 400 x 400 = 25.6 billion, more than 1 billion. So 4 levels.
         </HandText>
       </SketchSvg>
+      <figcaption className="px-2 pt-2 text-sm text-muted">The numbered badges show the order of page reads for one lookup.</figcaption>
     </figure>
   );
 }

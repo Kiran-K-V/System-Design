@@ -74,7 +74,7 @@ export default function RealtimeLanes() {
             {[0, 2, 4, 6, 8, 10].map((s) => (
               <g key={s}>
                 <line x1={x(s)} x2={x(s)} y1={56} y2={304} stroke="var(--border)" strokeDasharray="3 5" />
-                <text x={x(s)} y={326} textAnchor="middle" fontSize={13} fill="var(--muted)">{`${s} s`}</text>
+                <text x={x(s)} y={326} textAnchor="middle" fontSize={14} fill="var(--muted)">{`${s} s`}</text>
               </g>
             ))}
             {/* now marker */}
@@ -84,7 +84,7 @@ export default function RealtimeLanes() {
             {shownEvents.map((e, k) => (
               <g key={e}>
                 <Dot cx={x(e)} cy={ROW.events} color="var(--warn)" />
-                <text x={x(e)} y={ROW.events - 14} textAnchor="middle" fontSize={13} fill="var(--warn)">{`e${k + 1}`}</text>
+                <text x={x(e)} y={ROW.events - 14} textAnchor="middle" fontSize={14} fill="var(--warn)">{`e${k + 1}`}</text>
               </g>
             ))}
 

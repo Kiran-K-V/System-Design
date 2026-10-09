@@ -12,7 +12,7 @@ const WS: { m: SeqMessage; caption: string; wire: string }[] = [
       'A WebSocket starts as an ordinary HTTP request. The browser asks to switch protocols. It sends a random Sec-WebSocket-Key (RFC 6455 example: dGhlIHNhbXBsZSBub25jZQ==) and Sec-WebSocket-Version: 13.',
   },
   {
-    m: { from: 'Server', to: 'Server', label: 'accept = base64(SHA-1(key + GUID))', note: true, tone: 'accent' },
+    m: { from: 'Server', to: 'Server', label: 'accept: SHA-1(key+GUID)', note: true, tone: 'accent' },
     wire: 'HTTP/1.1',
     caption:
       'The server proves it understands WebSocket. It appends a fixed GUID (258EAFA5-E914-47DA-95CA-C5AB0DC85B11) to the key, hashes with SHA-1, and base64-encodes. For the example key the result is s3pPLMBiTxaQ9kYGzzhZRbK+xOo=. This stops a plain HTTP server from answering by accident.',
