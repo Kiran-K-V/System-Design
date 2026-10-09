@@ -222,7 +222,7 @@ export default function LsmFlow() {
               <Fade step={i} born={8}>
                 <SketchArrow points={[[SLOT_X[1] + 70, BOX_TOP + rowsH(3) + 6], [SLOT_X[3] + 40, walY - 6]]} stroke="var(--ok)" seed={seedOf('m1')} />
                 <SketchArrow points={[[SLOT_X[2] + 70, BOX_TOP + rowsH(3) + 6], [SLOT_X[3] + 100, walY - 6]]} stroke="var(--ok)" seed={seedOf('m2')} />
-                <HandText x={SLOT_X[3] + SST_W + 8} y={walY + 60} size={14} anchor="start" color="var(--ok)">
+                <HandText x={278} y={170} size={14} color="var(--ok)">
                   {'merge-sort,\nkeep newest'}
                 </HandText>
               </Fade>

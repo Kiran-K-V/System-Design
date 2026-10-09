@@ -8,7 +8,7 @@ const LEVELS = [
   { y: 206, w: 350, text: 'level 3: 6,250 pages (50 MB)', tone: 'var(--ok)' },
   { y: 270, w: 440, text: 'leaves: 2,500,000 pages (20 GB)', tone: 'var(--warn)' },
 ];
-const CX = 250;
+const CX = 264;
 
 export default function BTreeHeight() {
   return (
