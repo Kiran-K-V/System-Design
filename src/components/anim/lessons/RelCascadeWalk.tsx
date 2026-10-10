@@ -46,7 +46,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Servers 2 and 3 are overloaded. Queues grow, so every request gets slower. Clients time out and retry, which adds even more load. The Google SRE book notes that a server pushed past its limit often serves less than its capacity, not exactly its capacity, because it wastes work on requests that will time out anyway.',
+      'Servers 2 and 3 are overloaded. Queues grow, so every request gets slower. Clients time out and retry, which adds even more load. The Google SRE book gives a two-cluster example: a cluster pushed from 1,000 to 1,200 requests per second ends up with successful throughput well below 1,000.',
     headline: 'Overload makes servers slower, and slow makes it worse.',
     headTone: 'bad',
     servers: [{ load: 0, down: true, tag: 'crashed' }, { load: 1300, tag: 'slow, queues' }, { load: 1300, tag: 'slow, queues' }],

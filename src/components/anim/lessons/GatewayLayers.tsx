@@ -9,12 +9,12 @@ export default function GatewayLayers() {
         height={280}
         label="Client traffic enters through a load balancer and an API gateway. Inside the cluster a service mesh carries service-to-service calls."
         nodes={[
-          { id: 'client', x: 60, y: 110, w: 90, h: 56, label: 'Client' },
-          { id: 'lb', x: 190, y: 110, w: 110, h: 56, label: 'Load balancer' },
-          { id: 'gw', x: 345, y: 110, w: 110, h: 56, label: 'API gateway', tone: 'accent' },
-          { id: 'orders', x: 540, y: 80, w: 100, h: 50, label: 'Orders' },
-          { id: 'users', x: 540, y: 150, w: 100, h: 50, label: 'Users' },
-          { id: 'pay', x: 665, y: 115, w: 80, h: 50, label: 'Pay' },
+          { id: 'client', x: 70, y: 110, w: 90, h: 56, label: 'Client' },
+          { id: 'lb', x: 215, y: 110, w: 130, h: 56, label: 'Load balancer' },
+          { id: 'gw', x: 380, y: 110, w: 120, h: 56, label: 'API gateway', tone: 'accent' },
+          { id: 'orders', x: 560, y: 80, w: 90, h: 50, label: 'Orders' },
+          { id: 'users', x: 560, y: 150, w: 90, h: 50, label: 'Users' },
+          { id: 'pay', x: 668, y: 115, w: 70, h: 50, label: 'Pay' },
         ]}
         edges={[
           { from: 'client', to: 'lb' },
@@ -24,12 +24,12 @@ export default function GatewayLayers() {
           { from: 'orders', to: 'pay', tone: 'purple' },
           { from: 'users', to: 'pay', tone: 'purple' },
         ]}
-        groups={[{ x: 460, y: 20, w: 250, h: 200, label: 'Cluster with a mesh' }]}
+        groups={[{ x: 495, y: 20, w: 215, h: 200, label: 'Cluster with a mesh' }]}
         notes={[
-          { x: 200, y: 215, text: 'North-south: outside to inside', anchor: 'middle', tone: 'accent' },
-          { x: 200, y: 240, text: 'API gateway: auth, limits, routes', anchor: 'middle' },
-          { x: 590, y: 245, text: 'East-west: service to service', anchor: 'middle', tone: 'purple' },
-          { x: 590, y: 265, text: 'Mesh sidecars: retries, mTLS', anchor: 'middle' },
+          { x: 225, y: 215, text: 'North-south: outside to inside', anchor: 'middle', tone: 'accent' },
+          { x: 225, y: 240, text: 'API gateway: auth, limits, routes', anchor: 'middle' },
+          { x: 600, y: 245, text: 'East-west: service to service', anchor: 'middle', tone: 'purple' },
+          { x: 600, y: 265, text: 'Mesh sidecars: retries, mTLS', anchor: 'middle' },
         ]}
       />
     </figure>
