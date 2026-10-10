@@ -1,0 +1,196 @@
+---
+summary: 'Temporal runs multi-step processes as ordinary code. It saves each step in an event history, and a new worker replays that history to resume after a crash.'
+requires: ['03-api-design/idempotency', '07-reliability/timeouts-retries']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import TemporalReplay from '../../../components/anim/lessons/TemporalReplay.tsx';
+import TemporalSplit from '../../../components/anim/lessons/TemporalSplit.tsx';
+
+## What it is
+
+Many real processes have several steps that take time and can fail: charge a card, reserve stock, ship the order, email the customer. The whole thing may take seconds or days. A crash between two steps must not leave the order half done.
+
+**Temporal** is a **durable execution** engine. You write the process as normal code. Temporal records the progress of that code, so if the machine running it dies, another machine continues from the same point. "Durable" means the progress survives a crash.
+
+## The problem without it
+
+Build the order flow the usual way. You keep an `order_state` column. A queue (lesson [6.1](/learn/06-async/queues/)) carries a message per step. Each consumer reads the message, calls an API, updates the column, and publishes the next message. Then the failures arrive.
+
+- The consumer charges the card and crashes before it saves the new state. The retry charges again.
+- A step needs "retry in 10 minutes, then in an hour, then give up". You write a scheduler for it.
+- The customer must pay within 24 hours or the order is canceled. You write a timer job.
+- To see where order 42 stands, you read four tables and three queues.
+
+Each fix is more glue code. The process itself is spread over queues, tables, and cron jobs, and no single place shows what should happen. Retries (lesson [7.2](/learn/07-reliability/timeouts-retries/)) and idempotency (lesson [3.4](/learn/03-api-design/idempotency/)) are still your job on every step.
+
+## Internal model
+
+Temporal splits the work into two kinds of code.
+
+A **workflow** is the orchestration: the order of steps, the branches, the waits. It must be **deterministic**: the same input and the same history give the same sequence of calls. An **activity** is one piece of work in the outside world: an API call, a database write. Activities may do anything, and each result is recorded.
+
+<TemporalSplit />
+
+The **Temporal Service** keeps an **event history** for each workflow execution: an ordered log of everything that happened (workflow started, activity scheduled, activity completed). The history is the source of truth. It is a write-ahead log (lesson [4.2](/learn/04-data/storage-engines/)) for your program.
+
+**Workers** are your processes. They poll a **task queue** for work and run workflow code or activity code. Workers are stateless. The Temporal docs say a blocked workflow can be resumed on any worker. That is why a crash is survivable: no worker holds the only copy of anything.
+
+### Replay: how a new worker rebuilds state
+
+Here is the trick. A worker does not store the workflow's variables. When it needs to continue a workflow, it gets the history and **replays** the code from the top. As the code runs, it emits **commands**, such as "schedule activity charge". The SDK compares each command with the next event in the history. If there is a matching event, the SDK returns the recorded result and does not run the activity again. When the code goes past the end of the history, the command is new and the workflow runs live again.
+
+<TemporalReplay client:visible />
+
+In steps 6 to 8 the customer is charged once, though the workflow code ran twice. The history made that true.
+
+### Determinism, and what it forbids
+
+Replay only works if the code makes the same commands every time. If the SDK emits a command that does not match the history, the workflow fails with a non-determinism error. So workflow code must not do things that can differ between runs:
+
+- Call an API or a database directly. Put it in an activity.
+- Read the local clock or a random number. Use the SDK's own time and random calls, which record their values in the history.
+- Reorder, add, or remove commands in a running workflow without **versioning** the change. Step 9 shows the failure.
+
+This is the main cost of Temporal. The rules are simple but easy to break by accident.
+
+### Failure handling
+
+Activities **retry by default**. The default policy is an initial interval of 1 second, a backoff coefficient of 2.0, a maximum interval of 100 times the initial interval, and unlimited attempts. Workflow executions do **not** retry by default, and the docs advise against retrying a whole workflow, because replay is deterministic and would fail again the same way.
+
+How does Temporal notice a dead worker? It does not, directly. The docs say the server does not detect a worker crash. It relies on the **start-to-close timeout**, the longest a single attempt may run. When it passes, the attempt counts as failed and the retry policy schedules another. The service has no default for it, and it rejects an activity with neither a start-to-close nor a schedule-to-close timeout. A **heartbeat timeout** gives faster detection for long activities: the activity must report in within that gap.
+
+Because an attempt can finish its side effect and die before reporting, an activity can run more than once. Make activities idempotent (lesson [3.4](/learn/03-api-design/idempotency/)), for example by passing an idempotency key to the payment API.
+
+## When to use it
+
+- **Multi-step business processes** where a failure in the middle needs a defined response: orders, onboarding, payouts. This is the saga pattern in lesson [9.5](/learn/09-patterns/multi-step/).
+- **Long-running tasks** that wait for people or for days: approvals, trials that end in 14 days, long jobs (lesson [9.7](/learn/09-patterns/long-running-tasks/)).
+- **Retries with backoff** as a built-in, not as scheduler code.
+- **Visibility.** The history shows exactly where a process stands.
+
+## When not to use it
+
+- **One-step background work.** A queue and a worker do it with less machinery.
+- **Very high event rates for tiny jobs.** Every command is written to the history. Per-event processing at massive rates belongs to a stream system (lesson [8.7](/learn/08-technologies/flink/)).
+- **The latency-critical request path.** A workflow adds service round trips. Use it behind the request, not in it.
+- **A team that cannot follow determinism rules.** Wrong code fails at replay, sometimes weeks after the change.
+
+## Numbers
+
+| Fact | Value |
+|---|---|
+| Activity retry: initial interval | 1 second |
+| Activity retry: backoff coefficient | 2.0 |
+| Activity retry: maximum interval | 100 × initial = 100 seconds |
+| Activity retry: maximum attempts | unlimited |
+| Event history: warning logged | after 10,240 events |
+| Event history: execution terminated | above 51,200 events, 2,000 updates, or 10,000 signals |
+| Start-to-close timeout | no default. Set one |
+
+With the defaults, the waits between attempts are 1, 2, 4, 8, 16, 32, 64 seconds, then 100 seconds each (the cap). The first seven waits add up to 127 seconds. History grows with every step, so a workflow that loops forever must call **Continue-As-New**: it closes the current execution and starts a fresh one with a new, empty history. The docs recommend doing it periodically. I give no history size in megabytes, because the page I used states none.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Temporal workflow | Crash-safe code. Built-in retries and timers. Visible state | A new service to run. Determinism rules. Versioning | Multi-step, long, or high-stakes processes |
+| Queue plus state table | Simple parts you know | Glue for retries, timers, and recovery | One or two steps |
+| Short start-to-close | Fast detection of a dead worker | Slow healthy attempts get cut off | Activities with a known short runtime |
+| Long start-to-close with heartbeats | Detects crashes in long jobs fast | Activity must send heartbeats | Long activities, such as file processing |
+| Many activities per workflow | Fine-grained retry | Larger history | Processes with distinct failure points |
+
+<Callout type="tip">
+Say: "The order flow is a workflow. Charge, reserve, and ship are activities with retry policies and an idempotency key. If a worker dies, another replays the history and continues. Failures after charging trigger a compensating refund." Then name the cost: "workflow code must be deterministic, so no direct I/O or clock in it."
+</Callout>
+
+<Callout type="mistake">
+Do not say "Temporal re-runs the step when the worker crashes right away". It waits for the start-to-close timeout. Do not say "workflows retry by default". Activities do. Do not put an API call in workflow code "because it is faster". Replay would repeat it. And do not forget idempotency: an activity can run twice.
+</Callout>
+
+<Callout type="deep" title="Why not just snapshot the variables?">
+You could save the program's memory at each step instead of replaying. Replay needs only the small, append-only history, which is cheap to write and easy to inspect. A snapshot of a running program is large, tied to one version of the code, and hard to move between machines. The price of replay is determinism. The same idea is behind a database write-ahead log and the replicated log in lesson [4.11](/learn/04-data/consensus/): a log of what happened is enough to rebuild the state.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why must workflow code put a payment API call inside an activity instead of calling the API itself?',
+      options: [
+        'Because replay runs the code again and would repeat the charge',
+        'Because network calls are too slow to run inside workflow code',
+        'Because the Temporal Service blocks outgoing network calls from workflows',
+        'Because activities always run faster than workflow code does',
+      ],
+      answer: 0,
+      explain: 'Replay re-runs the workflow code from the top. A direct call would be made again every time. An activity result is recorded in the history, so replay uses the recorded result and does not call the API again.',
+    },
+    {
+      q: 'A worker running an activity loses power. How does Temporal find out?',
+      options: [
+        'The server notices the dropped connection at once and retries',
+        'The start-to-close timeout expires, then a retry is scheduled',
+        'The workflow code catches an exception from the crashed worker',
+        'It never finds out until someone restarts the crashed worker',
+      ],
+      answer: 1,
+      explain: 'The server does not detect a crashed worker itself. It relies on the start-to-close timeout (or a heartbeat timeout). When time runs out, the attempt fails and the retry policy decides what happens next.',
+    },
+    {
+      q: 'An activity throws a network error. Its retry policy is left at the defaults. What happens?',
+      options: [
+        'The workflow fails immediately and an operator must restart the activity',
+        'It retries exactly 3 times, one second apart, and then fails the workflow',
+        'It retries with growing gaps, up to 100 s, with no attempt limit',
+        'It retries once after 1 second and then gives up on the activity',
+      ],
+      answer: 2,
+      explain: 'The default policy has a 1 second initial interval, a coefficient of 2.0, a 100 second cap, and unlimited attempts. You usually set a limit or a timeout yourself to stop a hopeless retry loop.',
+    },
+    {
+      q: 'You deploy new workflow code that adds an activity call before the first existing one, while 500 workflows are in the middle of a run. What happens on replay?',
+      options: [
+        'The new call runs for each workflow and everything continues',
+        'Temporal ignores the new call and replays the old code',
+        'The history is rewritten to include the new call',
+        'Replay no longer matches the history: non-determinism errors',
+      ],
+      answer: 3,
+      explain: 'The replay emits a command that does not match the next event. That is a non-determinism error. Changing running workflows needs versioning, so old executions follow the old path.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="A workflow that loops"
+  scenario="A workflow polls a partner API in a loop, forever. Assume each loop iteration adds 8 events to the event history and takes 20 seconds. Use the Temporal limits: a warning is logged at 10,240 events and the execution is terminated above 51,200 events."
+  steps={[
+    {
+      prompt: 'How many iterations until the warning at 10,240 events?',
+      unit: 'iterations',
+      answer: 1280,
+      within: 1.1,
+      explain: '10,240 / 8 = 1,280 iterations.',
+    },
+    {
+      prompt: 'How many days until the execution would be terminated at 51,200 events, if nothing is done?',
+      unit: 'days',
+      answer: 1.5,
+      within: 1.3,
+      explain: '51,200 / 8 = 6,400 iterations. 6,400 × 20 s = 128,000 s. 128,000 / 86,400 is about 1.5 days. The fix is Continue-As-New: close the execution before the limit and start a new one with a fresh history.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Temporal: Workflow Definition](https://docs.temporal.io/workflow-definition) (determinism, replay, non-determinism errors)
+- [Temporal: Detecting Activity failures](https://docs.temporal.io/encyclopedia/detecting-activity-failures) (start-to-close and heartbeat timeouts)
+- [Temporal: Retry Policies](https://docs.temporal.io/encyclopedia/retry-policies) (defaults, activity and workflow retries)
+- [Temporal: Event History](https://docs.temporal.io/workflow-execution/event) (event limits, Continue-As-New)

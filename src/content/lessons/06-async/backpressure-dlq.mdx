@@ -1,0 +1,178 @@
+---
+summary: 'When workers fall behind, lag grows. Backpressure pushes the slowness back to producers, and a dead-letter queue sets aside the messages that keep failing.'
+requires: ['01-one-machine/throughput-vs-latency', '06-async/queues', '06-async/delivery-semantics']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import AsyncFlowLab from '../../../components/anim/lessons/AsyncFlowLab.tsx';
+import AsyncPoisonWalk from '../../../components/anim/lessons/AsyncPoisonWalk.tsx';
+
+## The problem
+
+Lesson 6.1 said a queue hides a spike. It did not say what happens when the spike never ends. During a sale, orders arrive at 120 per second. The workers finish 100 per second. Nothing crashes. The queue just grows by 20 messages every second.
+
+- After one hour: 20 × 3,600 = **72,000 messages** waiting.
+- A new order waits 72,000 ÷ 100 = **720 s**, 12 minutes, before a worker sees it.
+
+The difference between how fast messages arrive and how fast they are handled is called **lag**. Consumer lag is how far behind the newest message the consumer is. Lag shows up as a wait. Users see "my order is stuck". The queue itself looks healthy.
+
+A second problem hides in the same system. One message is broken. Every attempt to process it fails. The worker retries it again and again, and the line behind it stops moving.
+
+This lesson covers both: what to do when the queue grows, and what to do with a message that never succeeds.
+
+## When the line grows
+
+You have five levers. Each moves the pain to a different place.
+
+1. **Add consumers.** This works if you have spare partitions or workers, and the downstream system can take the load. It costs money and has a limit (lesson 6.2: partitions cap a group).
+2. **Slow the producers.** This is **backpressure**: the slow stage pushes the slowness back toward the source. An API can return `429 Too Many Requests`. Lesson 7.4 covers rate limiting.
+3. **Bound the queue and block.** The queue has a size limit. When it is full, producers are held back or rejected. Nothing is lost, but callers wait or see errors.
+4. **Bound the queue and drop.** When the queue is full, throw something away: the newest message or the oldest. Nothing blocks. Data is lost.
+5. **Limit what a worker holds.** This is **prefetch**. A RabbitMQ consumer may hold only a set number of unacknowledged messages. The docs say values of 100 to 300 "usually offer good throughput". A value of 1 is the most conservative. Zero means no limit. A high prefetch leaves one worker with many messages while another sits idle.
+
+RabbitMQ offers both bounded modes. A queue with a length limit has an `overflow` setting. With `drop-head`, the default, it removes messages from the front. With `reject-publish`, it refuses new ones. When publisher confirms are on, the publisher gets a `basic.nack` for a refused message and can react.
+
+Try the three policies on the same burst. The queue limit is 200 messages. Workers do 50 per second. Producers send 30 per second, then 300 per second for 20 seconds.
+
+<AsyncFlowLab client:visible policies initial={{ burstLen: 20, policy: 'drop', cap: 200 }} title="Full queue: grow, block, or drop" />
+
+Compare the three runs:
+
+| Policy | Peak queue | Worst wait | Lost messages | Who feels it |
+|---|---|---|---|---|
+| No limit | grows to (300 − 50) × 20 = 5,000 | 5,000 ÷ 50 = 100 s | 0 | Every user waits |
+| Block | stays at 200 | 200 ÷ 50 = 4 s | 0 | Producers wait. Their callers feel it. |
+| Drop | stays at 200 | 4 s | thousands | Dropped users lose data |
+
+The numbers in the first row are derived by hand and match the widget. Choose by asking what the work is worth. Dropping a "like" event is fine. Dropping a payment is not. Blocking protects the data and moves the wait upstream. That only helps if the upstream can wait or can tell its own callers "try later".
+
+Also watch the right signal. **Queue age** (how old the oldest message is) tells you the user wait. Queue size alone does not. SQS reports `ApproximateAgeOfOldestMessage` for this. Autoscale workers and alert on age.
+
+## The message that never succeeds
+
+Most failures are **transient**: a timeout, a lock, a brief outage. A retry fixes them. Some failures are **permanent**: a malformed payload, a missing record, a bug on one input. A retry never fixes them. A message that always fails is a **poison message**.
+
+The naive design retries forever. It fails in two ways. The poison message burns worker time on every attempt. And in an ordered queue, or in one partition of a log, it sits at the front. Nothing behind it moves, and lag climbs.
+
+The standard fix is a **dead-letter queue** (DLQ): a second queue for messages that failed too many times. The main queue counts how often a message was received. At a limit, it moves the message to the DLQ. SQS calls the limit `maxReceiveCount`.
+
+<AsyncPoisonWalk client:visible />
+
+Rules from the SQS docs worth remembering:
+
+- A DLQ must live in the same account and Region as the source queue. Create it first.
+- **Set DLQ retention longer than source retention.** For a standard queue, the enqueue time does not change when a message moves. A message that waited 1 day in the source queue, with a 4 day DLQ retention, is deleted from the DLQ after 3 more days, not 4.
+- A low `maxReceiveCount` such as 1 means a single failure sends the message to the DLQ. Set it high enough to allow for real retries.
+- With a standard queue and `maxReceiveCount` above 3, a message received 3 or more times without a delete moves to the back of the queue.
+- Do not use a DLQ with a FIFO queue if you need exact order. The message leaves the sequence.
+- **Redrive** moves messages from the DLQ back to a source queue, after you fix the cause.
+
+RabbitMQ has the same idea. A `basic.nack` or `basic.reject` with `requeue=false` sends the message to a dead-letter exchange, or discards it if none is set. Requeueing in a tight loop wastes resources. Quorum queues have a delivery limit, 20 by default since RabbitMQ 4.0, after which the message is dropped or dead-lettered.
+
+A log does not count receives for you. RabbitMQ streams have no dead-letter exchange. In a log, your consumer code must set the bad record aside, for example by writing it to another topic, so the offset can move on.
+
+A DLQ is **not** the fix. It keeps a bad message safe and out of the way. A person still has to read it, find the cause, and fix it. So put an **alarm** on the DLQ. A DLQ that fills in silence is a bug that nobody sees.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Example: 120 in, 100 out per second, 1 hour | 72,000 backlog, 720 s wait | Derived |
+| SQS `maxReceiveCount` back-of-queue move | received 3 or more times, when the limit is above 3 | SQS DLQ docs |
+| SQS in-flight messages, standard queue | about 120,000 | SQS docs |
+| RabbitMQ prefetch for good throughput | 100 to 300 | RabbitMQ docs |
+| RabbitMQ quorum queue prefetch cap | 2,000 | RabbitMQ docs |
+| RabbitMQ quorum queue delivery limit, default | 20 (4.0 and later) | RabbitMQ docs |
+| DLQ monitoring metric (SQS) | `ApproximateAgeOfOldestMessage` | SQS DLQ docs |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Unbounded queue | No loss, no producer blocking | Wait grows without limit. Storage grows. | Short bursts you can drain, with alerts |
+| Block producers | No loss | Latency moves upstream | Data must not be lost |
+| Drop messages | Fast, bounded | Data loss | Data that is cheap or replaceable |
+| Low `maxReceiveCount` | Poison messages leave fast | Transient errors reach the DLQ | Failures are usually permanent |
+| High `maxReceiveCount` | Rides out transient errors | Poison messages waste many attempts and are found later | Dependencies are flaky |
+| High prefetch | Throughput | Uneven work across consumers | Short, equal jobs |
+| Low prefetch | Even spread | More round trips | Long or very uneven jobs |
+
+## Interview lens
+
+<Callout type="tip">
+Name the signal and the policy. "I alert on the age of the oldest message, not the depth. If the queue passes its limit, producers get a 429 and retry with backoff. Workers retry a message up to 5 times. After that it goes to a DLQ with an alarm, and we redrive after a fix." That one answer covers lag, backpressure, and poison messages.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the queue will absorb it" without saying what happens if the load stays high. Do not say "retry until it works". A poison message never works. Do not call the DLQ the fix: it only stores the problem. And do not set the DLQ retention shorter than the source queue. The old messages vanish from the DLQ almost at once.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A RabbitMQ queue has a length limit of 1,000 and the default overflow setting. A 1,001st message is published. What happens?',
+      options: ['The oldest message is dropped from the front', 'The new message is refused and the publisher gets a nack', 'The queue grows past the limit', 'The producer blocks until a worker takes a message'],
+      answer: 0,
+      explain: 'The default, drop-head, removes from the front of the queue (or dead-letters it). Refusing the new message is the reject-publish setting. No overflow setting silently exceeds the limit.',
+    },
+    {
+      q: 'A standard SQS message waited 3 days in the source queue, then moved to a DLQ with 4 day retention. About how long can it stay in the DLQ?',
+      options: ['4 days', '7 days', 'About 1 day, because the enqueue time does not change', 'It is deleted at once'],
+      answer: 2,
+      explain: 'For standard queues the expiry is based on the original enqueue time, so 3 of the 4 days are already used. That is why DLQ retention should be longer than the source retention. 7 days would add the two periods, which does not happen.',
+    },
+    {
+      q: 'Your consumer calls a payment API that times out about 2% of the time. The queue has maxReceiveCount = 1. What do you see?',
+      options: ['Poison messages are retried forever', 'Each timeout sends a good message to the DLQ with no retry', 'The DLQ stays empty', 'The queue blocks the producers'],
+      answer: 1,
+      explain: 'A limit of 1 means one failed receive is enough. A timeout is transient, so a retry would likely work. With a limit of 1 it never gets that chance, and the DLQ fills with good messages.',
+    },
+    {
+      q: 'A queue sits at its limit. Which policy keeps every message and still protects the workers?',
+      options: ['Drop the oldest message', 'Drop the newest message', 'Block or reject producers, so the wait moves upstream', 'Raise prefetch to 0'],
+      answer: 2,
+      explain: 'Blocking or rejecting producers loses nothing, and the workers see no more than the queue limit. Both drop options lose data. A prefetch of 0 removes the limit on what one consumer holds, which makes uneven load worse.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Email backlog"
+  scenario="Email workers send 40 messages per second in total. A 20 minute promotion enqueues 55 messages per second. After the promotion, the app enqueues 25 per second."
+  steps={[
+    {
+      prompt: 'How many messages are waiting when the promotion ends?',
+      unit: 'messages',
+      answer: 18000,
+      within: 1.1,
+      explain: 'The queue grows by 55 − 40 = 15 messages per second, for 20 × 60 = 1,200 seconds: 15 × 1,200 = 18,000.',
+    },
+    {
+      prompt: 'How long does the last promotion email wait before it is sent?',
+      unit: 'seconds',
+      answer: 450,
+      within: 1.1,
+      explain: 'A message that arrives at the end has 18,000 messages ahead of it. Workers clear 40 per second: 18,000 ÷ 40 = 450 s, or 7.5 minutes.',
+    },
+    {
+      prompt: 'After the promotion, how long until the queue is empty?',
+      unit: 'seconds',
+      answer: 1200,
+      within: 1.1,
+      explain: 'Now workers remove 40 and producers add 25, so the queue shrinks by 15 per second: 18,000 ÷ 15 = 1,200 s, or 20 minutes.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Amazon SQS: dead-letter queues](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html): `maxReceiveCount`, retention rules, and redrive.
+- [RabbitMQ: consumer acknowledgements and publisher confirms](https://www.rabbitmq.com/docs/confirms): nack, requeue, dead-lettering, and prefetch.
+- [RabbitMQ: queue length limits](https://www.rabbitmq.com/docs/maxlength): `drop-head` and `reject-publish`.
+- [RabbitMQ: quorum queues](https://www.rabbitmq.com/docs/quorum-queues): the delivery limit and dead-lettering.

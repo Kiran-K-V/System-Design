@@ -1,0 +1,192 @@
+---
+summary: 'Flink runs stateful computations over event streams. Watermarks close event-time windows, and checkpoint barriers make state recover after a crash.'
+requires: ['08-technologies/kafka', '06-async/delivery-semantics']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import FlinkWindows from '../../../components/anim/lessons/FlinkWindows.tsx';
+import FlinkCheckpoint from '../../../components/anim/lessons/FlinkCheckpoint.tsx';
+
+## What it is
+
+Flink is an engine that runs computations over **streams** of events that never end. You write a **job**: a graph with a **source** that reads events (often a Kafka topic, lesson [8.6](/learn/08-technologies/kafka/)), **operators** that transform them, and a **sink** that writes results.
+
+What makes it special is **state**. An operator can remember things between events: a running total per user, the last 10 minutes of clicks, a half-finished join. Flink keeps that state next to the code, on the machine that runs the operator. Reading it costs a local lookup, not a network call to a database.
+
+Flink runs as a small cluster. A **JobManager** schedules tasks, coordinates checkpoints, and coordinates recovery after failures. **TaskManagers** are the workers that run the tasks and move data between them. Each TaskManager offers a fixed number of **task slots**, its smallest unit of scheduling.
+
+Compare with a plain consumer service. A consumer reads one record at a time and keeps state in an outside database. That works until you need "orders per merchant per 5 minutes" with correct results when events arrive late or a machine dies. Flink gives you time, windows, and recovery as built-in tools.
+
+## Internal model
+
+### Event time and watermarks
+
+There are two clocks. **Processing time** is the wall clock of the machine running the operator. **Event time** is when the event happened at its source, stamped inside the event. Flink's docs say event time gives results that depend on the data, not on machine speed. A job replayed tomorrow gives the same answer. A job on processing time does not.
+
+Events arrive late and out of order. A phone that was offline sends a click minutes after it happened. So how does the job know that a window is complete? It cannot know. It uses a **watermark**. A `Watermark(t)` declares that event time has reached `t`: no more events with timestamp `t` or lower should arrive. It is a promise the job trusts. Events that break it are **late**.
+
+A common watermark rule is "the largest timestamp seen, minus a delay". The delay is your tolerance for disorder. When an operator reads several inputs, its event time is the **minimum** of its inputs' event times. One slow input holds everything back.
+
+### Windows
+
+A **window** groups events so you can aggregate an endless stream. Flink has four window types:
+
+- **Tumbling**: fixed size, no overlap. Each event is in exactly one window.
+- **Sliding**: fixed size, moves by a smaller step, so windows overlap and one event can be in several.
+- **Session**: no fixed size. A window closes after a gap with no events.
+- **Global**: one window per key. You supply a trigger yourself.
+
+The default event-time trigger fires when the watermark passes the end of the window. Late events are dropped by default, because the default **allowed lateness** is 0. You can raise it. The cost is that Flink holds window state longer. Step through three tumbling windows with a 5-second tolerance.
+
+<FlinkWindows client:visible />
+
+Notice the trade-off in step 7. A watermark that waits longer catches more late events and delays every result. A tight watermark gives fast results and drops more late events. You pick the point.
+
+### Keys, parallelism, and state
+
+`keyBy(userId)` splits the stream into logical streams, one per key. Flink spreads keys over parallel tasks, like partitions (lesson [4.7](/learn/04-data/sharding/)). Each key's state lives with the task that owns the key. A window on a keyed stream runs in parallel. A window on a stream with no key (`windowAll`) runs in one task, a bottleneck.
+
+### Checkpoints make state safe
+
+State on one machine is lost when the machine dies. Flink saves it with **checkpoints**. The method is inspired by the Chandy-Lamport algorithm for distributed snapshots. The checkpoint coordinator tells the sources to start checkpoint *n*. Each source records its position and puts a numbered **barrier** into its stream. The barrier flows with the data. When an operator sees the barrier, it saves its state. Checkpoint *n* then holds the effects of every event before barrier *n* and none after it. An operator with two inputs waits for the barrier on both, which is called **barrier alignment**.
+
+<FlinkCheckpoint client:visible />
+
+On a failure, Flink restores every operator from the last complete checkpoint and **rewinds and replays** the source from the saved position. This needs a **replayable source**. Kafka qualifies, because it keeps the log (lesson [6.2](/learn/06-async/pubsub-logs/)).
+
+Flink's docs define exactly-once carefully. It does not mean each event is processed once. It means each event affects the **state** Flink manages exactly once. Events 121 to 135 in the animation are processed twice, but the restored state counts them once. For results that leave Flink, the docs list two conditions for end-to-end exactly-once: replayable sources, and sinks that are **transactional or idempotent**. Otherwise the output has duplicates. That is the same problem as lesson [6.3](/learn/06-async/delivery-semantics/).
+
+## When to use it
+
+- **Windowed aggregates** over events: counts, sums, and rates per minute.
+- **Stateful rules** on a live stream, such as a fraud check that needs the last N events of a card.
+- **Stream joins and enrichment**, where two streams meet in state.
+- **Anything that needs correct time handling** when data is late or replayed.
+
+## When not to use it
+
+- **A stateless transform.** A plain consumer does it with less to run.
+- **Small jobs in Kafka only.** The Kafka Streams library may be enough. It is part of your app, with no separate cluster.
+- **Ad hoc analysis.** A warehouse answers one-off queries. Flink is for continuous ones.
+- **Request and response.** Flink is not an RPC server.
+- **A team that cannot run a cluster.** State, checkpoints, and upgrades are real operational work.
+
+## Numbers
+
+The Flink pages I used give **no default numbers** for checkpoint interval, state size, or latency, so I state none. The facts that are safe to say:
+
+| Fact | Value |
+|---|---|
+| Allowed lateness | 0 by default |
+| Late events in a window | Dropped by default |
+| Checkpoint contents | Source positions plus operator state at one barrier |
+| Without barrier alignment | `AT_LEAST_ONCE` mode. Faster, may count events twice in state |
+
+Size the checkpoint interval from the recovery cost you accept. The interval is the amount of data you may replay after a crash. Example with assumed numbers: 50,000 events per second and a 60-second interval means up to 60 × 50,000 = 3,000,000 events to replay. See lesson [1.4](/learn/01-one-machine/estimation/) for the habit.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Event time | Same result on replay. Handles disorder | Watermarks delay results | Billing, analytics, anything replayed |
+| Processing time | Simple. Lowest delay | Results depend on speed and arrival | Rough monitoring |
+| Longer allowed lateness | Fewer dropped events | More state held | Mobile clients with bad networks |
+| Exactly-once mode | State counted once | Barrier alignment cost. Needs a transactional or idempotent sink | Money and counters |
+| `AT_LEAST_ONCE` | Less overhead | Possible duplicates in state | Approximate metrics |
+| Keyed windows | Scale over keys | Hot keys are slow | Many keys, even load |
+
+<Callout type="tip">
+Name the clock, the window, and the recovery in one pass: "I use event time with a watermark of 5 seconds, tumbling 1-minute windows keyed by merchant, and allowed lateness of 1 minute. State is checkpointed to durable storage. Source is Kafka, so it can replay. The sink writes with a transaction, or an idempotent upsert, for end-to-end exactly-once."
+</Callout>
+
+<Callout type="mistake">
+Do not say "a watermark is the latest timestamp". It is a promise that earlier events are done. Do not use processing time for billing, since a replay would give a different bill. Do not say "Flink is exactly-once end to end by default". It needs a replayable source and a transactional or idempotent sink. And do not use a non-keyed window on a busy stream: it runs in a single task.
+</Callout>
+
+<Callout type="deep" title="Why one slow source holds a window open">
+An operator with several inputs takes the minimum of their event times. If one Kafka partition goes quiet, its watermark stops. The operator's clock stops with it, and no event-time window closes. The job looks frozen though most data flows. The fix is to mark such an input as idle (`withIdleness` in the watermark strategy), so the others can move on. The lesson is that watermarks are a shared clock, and one bad input can hold it back.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A tumbling window covers event times [0, 10). The watermark is currently 7. An event with timestamp 9 arrives. What happens to it?',
+      options: [
+        'It is counted, because the window has not fired yet',
+        'It is dropped as late, because its timestamp is below 10',
+        'It moves the watermark back to 4',
+        'It opens a new window [5, 15)',
+      ],
+      answer: 0,
+      explain: 'A window fires when the watermark reaches its end. At 7 the window is still open, so the out-of-order event counts. A watermark never moves back. Lateness is decided against the watermark, not against the order of arrival.',
+    },
+    {
+      q: 'You replay yesterday\'s topic through a job that windows on processing time. What is likely to differ from the first run?',
+      options: [
+        'Nothing, because the data is exactly the same as before',
+        'Only the order of rows written to the sink changes',
+        'Events land in other windows: the clock is now, not event time',
+        'Flink refuses to replay a topic with processing-time windows',
+      ],
+      answer: 2,
+      explain: 'Processing time is the machine clock. A replay runs at a different time and speed, so events land in other windows. Event time reads the timestamp inside the record, so the replay gives the same windows.',
+    },
+    {
+      q: 'Flink restores from checkpoint 5 after a crash and the sink writes to a plain table with INSERT. What do you get?',
+      options: [
+        'Exactly-once output, because the state was restored',
+        'State is exact, but replayed output rows may repeat',
+        'No output at all until the next checkpoint completes',
+        'A fatal error, because inserts cannot be replayed',
+      ],
+      answer: 1,
+      explain: 'Exactly-once covers Flink state. The sink already received some rows before the crash, and replay sends them again. A transactional sink or an idempotent upsert keyed by event id removes the duplicates.',
+    },
+    {
+      q: 'What does checkpoint barrier n mark in the stream?',
+      options: [
+        'The newest event that the source has read so far',
+        'A moment at which all operators pause until it is done',
+        'The end of a window, when its result is emitted',
+        'A cut: events before it are in checkpoint n, later ones are not',
+      ],
+      answer: 3,
+      explain: 'The barrier splits the stream into before and after. Each operator saves its state when the barrier reaches it, while it keeps running. Checkpoint n then matches one consistent cut across all operators.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Recovery after a crash"
+  scenario="A Flink job reads 40,000 events per second from Kafka. It checkpoints every 90 seconds. The job crashes just before checkpoint 12 completes, so it restores from checkpoint 11. After restart it can process 80,000 events per second."
+  steps={[
+    {
+      prompt: 'About how many events must it replay from the source? (Worst case: a full interval.)',
+      unit: 'events',
+      answer: 3_600_000,
+      within: 1.1,
+      explain: '90 s × 40,000 events/s = 3,600,000 events happened since checkpoint 11.',
+    },
+    {
+      prompt: 'New events keep arriving at 40,000/s while it replays. How many seconds until it has caught up?',
+      unit: 'seconds',
+      answer: 90,
+      within: 1.1,
+      explain: 'The job drains the backlog at 80,000 − 40,000 = 40,000 events per second net. 3,600,000 / 40,000 = 90 seconds, plus the restart time. A longer interval means a longer backlog and a longer catch-up.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Flink: Timely stream processing](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/) (event time, processing time, watermarks)
+- [Flink: Windows](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/) (tumbling, sliding, session, allowed lateness)
+- [Flink: Fault tolerance via state snapshots](https://nightlies.apache.org/flink/flink-docs-stable/docs/learn-flink/fault_tolerance/) (barriers, exactly-once, recovery)
+- [Flink: Generating watermarks](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/event-time/generating_watermarks/) (bounded out-of-orderness, idle sources)
+- [Flink: Architecture](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/flink-architecture/) (JobManager, TaskManagers, task slots)

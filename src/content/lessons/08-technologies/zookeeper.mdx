@@ -1,0 +1,206 @@
+---
+summary: 'ZooKeeper and etcd are small consensus-backed stores for locks, leaders, and config. Ephemeral nodes or leases free a lock when its owner dies.'
+requires: ['04-data/replication', '04-data/consensus']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import ZkLock from '../../../components/anim/lessons/ZkLock.tsx';
+import ZkEnsemble from '../../../components/anim/lessons/ZkEnsemble.tsx';
+
+## What it is
+
+Lesson [4.11](/learn/04-data/consensus/) ended with a rule: keep small, critical facts in a consensus group, and keep bulk data elsewhere. Which server leads shard 7? Who holds the lock for this job? What is the current config? Writing Raft yourself for each of these is a bad plan. ZooKeeper and etcd are ready-made consensus groups with a small API on top.
+
+They are **coordination services**. They store tiny pieces of data, with strong guarantees, and tell clients when data changes.
+
+- **ZooKeeper** keeps a tree of **znodes**, like a file system. Each znode holds a small piece of data. The ZooKeeper docs describe it as usually in the byte to kilobyte range. The data is kept in memory.
+- **etcd** is a key-value store built on Raft. Kubernetes keeps its cluster state in etcd and watches it for changes.
+
+The two differ in API and data model. They agree on the core: a small odd-sized cluster, majority writes, change notifications, and a way to tie data to a client's liveness.
+
+## Internal model
+
+### An ensemble that needs a majority
+
+A ZooKeeper cluster is an **ensemble** of servers. A client keeps a TCP connection to one server. If it breaks, the client connects to another. As long as a majority of the ensemble is up, the service is available. The docs advise an odd number of servers, and three as the minimum for fault tolerance. This is the quorum rule from lesson [4.11](/learn/04-data/consensus/). etcd works the same way: a write needs `(n/2)+1` members.
+
+Try it. Crash servers and watch the majority. Compare 4 with 3.
+
+<ZkEnsemble client:visible />
+
+Three servers tolerate 1 failure. Four also tolerate 1, because the majority of 4 is 3. Five tolerate 2. The etcd FAQ recommends no more than seven nodes, because every extra member adds work to each write. ZooKeeper performs best when reads outnumber writes, at ratios of about 10:1, because writes must be synchronized across the servers.
+
+ZooKeeper's overview lists its guarantees. Updates from one client apply in the order sent (sequential consistency). Updates succeed or fail whole (atomicity). A client sees the same view whichever server it uses. An applied update persists. And the client's view is up to date within a time bound. Compare these with the models in lesson [4.10](/learn/04-data/consistency-models/).
+
+### Ephemeral nodes and sessions
+
+A client connects with a **session**. The client sends heartbeats to keep it alive. If heartbeats stop for longer than the session timeout, the session expires. An **ephemeral znode** exists only as long as the session that created it is active. So a znode can mean "this client is alive".
+
+That gives you locks and leader election without a timer you write yourself. The lock recipe in the ZooKeeper docs has five steps:
+
+1. Create an ephemeral **sequential** znode under the lock path. ZooKeeper adds an increasing number.
+2. List the children of the lock path.
+3. If your number is the lowest, you hold the lock.
+4. Otherwise watch the znode just before yours.
+5. When it goes away, list the children again.
+
+Step 4 matters. If every waiter watched the lock path, every release would wake every waiter, the **herd effect**. Watching only the predecessor wakes one client. A **watch** is a one-time trigger: it fires once and is removed. Since version 3.6.0 you can also set permanent, recursive watches.
+
+<ZkLock client:visible />
+
+The session timeout is a trade-off. ZooKeeper's default `minSessionTimeout` is 2 × `tickTime` and `maxSessionTimeout` is 20 × `tickTime`. With the docs' sample `tickTime` of 2,000 ms, that is a range of 4 to 40 seconds. A short timeout recovers fast and gives false alarms on a slow network. A long timeout is stable and leaves a dead owner's lock stuck longer.
+
+### etcd: leases and watches
+
+etcd uses a **lease** instead of a session: a time-to-live that a client keeps renewing. Keys attached to a lease are deleted when it expires. etcd's Lock and Election APIs tie the lock or the leadership to a lease. When the lease expires or is revoked, the lock is released. etcd's watch reports both past and current changes and does not silently drop events. That is how Kubernetes tracks cluster state.
+
+### What neither tool can do for you
+
+The animation ended with a danger. The service deletes the dead owner's node, but it cannot stop a paused owner from waking up. Leases also depend on clocks, and etcd's own documentation warns that clock skew can leave a client believing it holds a lock the server has already revoked. The full answer is the **fencing token** from lesson [4.6](/learn/04-data/replication/). Attach a number that only grows to every write, and let the protected resource reject any lower number. In the ZooKeeper recipe, the sequence number can play that role.
+
+## When to use it
+
+- **Leader election** for a service that needs exactly one active instance.
+- **Distributed locks and leases** for rare, important work, such as one cron job at a time.
+- **Configuration** that many processes must see change quickly. They watch it.
+- **Service registration.** Each instance creates an ephemeral node. A crashed instance disappears from the list.
+- **Cluster metadata** for other systems, such as who owns each shard. Kafka used ZooKeeper for this. Since version 4.0 it uses its own Raft-based quorum instead (lesson [8.6](/learn/08-technologies/kafka/)).
+
+## When not to use it
+
+- **Bulk data.** It is built for tiny values. Put big data in a database or blob storage (lesson [8.11](/learn/08-technologies/blob-storage/)).
+- **A high write rate.** Every write is a majority round trip through one leader.
+- **The path of each user request.** A lock per request turns a small cluster into your bottleneck. Use it for rare decisions.
+- **A multi-region cluster for low latency.** A majority spread over regions makes every write wait for a long round trip (~70 ms or more, lesson [4.11](/learn/04-data/consensus/)).
+- **When your database already offers it.** A conditional write or a lock in a database you run anyway may be enough.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Fault tolerance, 3 / 5 / 7 servers | 1 / 2 / 3 failures | etcd FAQ |
+| Quorum, 3 / 5 / 7 servers | 2 / 3 / 4 | etcd FAQ |
+| Recommended etcd cluster size | at most 7 | etcd FAQ |
+| ZooKeeper minimum for fault tolerance | 3 servers | ZooKeeper admin guide |
+| ZooKeeper `minSessionTimeout` | 2 × `tickTime` | ZooKeeper admin guide |
+| ZooKeeper `maxSessionTimeout` | 20 × `tickTime` | ZooKeeper admin guide |
+| Read to write ratio ZooKeeper suits | about 10 : 1 | ZooKeeper overview |
+
+I give no default lease time-to-live and no watch latency, because the pages I read do not state them.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| 3 servers | Simplest. Survives 1 failure | Two failures stop writes | Small systems, one region |
+| 5 servers | Survives 2 failures | More work per write | Production control planes |
+| Short session timeout | Fast failover | False alarms in GC pauses and network blips | Latency-sensitive failover |
+| Long session timeout | Stable | A dead owner holds the lock longer | Noisy networks |
+| ZooKeeper | Rich recipes, mature | Sessions and watch re-registration to manage | Existing ecosystem |
+| etcd | Simple key-value API, leases, Kubernetes standard | Time-based leases need fencing | New systems, Kubernetes |
+
+<Callout type="tip">
+Say: "I keep the leader and the lock in a 3 or 5 node etcd or ZooKeeper cluster across zones. Locks are ephemeral and tied to a session or lease, so a crashed owner frees them. I add a fencing token to every write, because a paused owner can wake up. User data never goes through it." Then add the cost: "each write is a majority round trip, which is fine for rare events."
+</Callout>
+
+<Callout type="mistake">
+Do not say "a key with a TTL is a safe lock". A TTL expires by the clock, and the old owner may still be running. Do not use an even number of servers to "break ties". Do not store application data in it. And do not say "every client watches the lock node": that is the herd effect. Watch the predecessor.
+</Callout>
+
+<Callout type="deep" title="Why a watch is one-time">
+A one-time watch keeps server state small: the server remembers a watch only until it fires. The client then reads the new state and sets a new watch. Changes in between are not lost, because the client re-reads the data after each event instead of trusting the event to carry it. Treat a watch as a hint to read again, not as a log of changes.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Seven clients wait for one ZooKeeper lock. The holder releases it. With the predecessor-watch recipe, how many clients wake up?',
+      options: ['1, the next waiter in line', '6, every waiter', '7, including the old holder', 'None, they must poll'],
+      answer: 0,
+      explain: 'Each waiter watches only the node just before its own. Deleting the holder\'s node fires one watch. This avoids the herd effect, where every release causes a burst of requests from all waiters.',
+    },
+    {
+      q: 'A ZooKeeper ensemble has 7 servers. Four crash. What happens to writes?',
+      options: [
+        'They continue, because 3 of 7 is nearly half',
+        'They stop: the majority is 4 and only 3 are up',
+        'They continue on the first server that answers',
+        'They stop for 4 seconds, then resume with 3 servers',
+      ],
+      answer: 1,
+      explain: 'The majority is counted against the whole ensemble: 7 → 4. Three servers are not enough, so writes are blocked until a fourth returns. The service does not shrink its quorum to fit the survivors, because that would allow two sides of a split to both write.',
+    },
+    {
+      q: 'A lock holder pauses for 20 seconds in garbage collection. Its session timeout is 10 seconds. It wakes up and writes to the protected resource. What stops a stale write?',
+      options: [
+        'ZooKeeper reaches into the client and cancels the write',
+        'The ephemeral node, because it is still there',
+        'A growing fencing token the resource checks',
+        'A longer lock path name',
+      ],
+      answer: 2,
+      explain: 'The session expired and the node was deleted, so another client may hold the lock. ZooKeeper cannot stop the paused client. The resource must compare a token that only grows and reject the older one.',
+    },
+    {
+      q: 'Which of these is a good fit for ZooKeeper or etcd?',
+      options: [
+        'Storing 2 GB of uploaded videos',
+        'Holding the name of the current primary of each shard, which changes a few times a day',
+        'Counting page views at 50,000 writes per second',
+        'Caching user profiles for every request',
+      ],
+      answer: 1,
+      explain: 'Small, rarely changing, critical facts are the target. Videos are bulk data. Page-view counts and profile caches are high-rate and do not need consensus, and each write would cost a majority round trip.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="zookeeper-two-datacenters"
+  title="Both data centers stop"
+  scenario="A team runs a 6-server ZooKeeper ensemble: 3 servers in data center A and 3 in data center B. They believed this would survive the loss of a whole data center. The link between A and B fails. Both data centers stay up."
+  facts={[
+    'DC A: servers 1, 2, 3  (all running)',
+    'DC B: servers 4, 5, 6  (all running)',
+    'link A <-> B: down',
+    'writes in A: blocked',
+    'writes in B: blocked',
+  ]}
+  steps={[
+    {
+      prompt: 'Why are writes blocked on both sides?',
+      options: [
+        'Each side has 3 of 6 servers, and a majority of 6 is 4',
+        'ZooKeeper needs all servers to agree when the link fails',
+        'Sessions expired on every client at once',
+        'Reads and writes use different servers',
+      ],
+      answer: 0,
+      explain: 'A majority is more than half of the whole ensemble. For 6 servers that is 4. A split of 3 and 3 leaves neither side with a majority. This is exactly the guard that prevents two leaders, working as intended.',
+    },
+    {
+      prompt: 'Which layout survives losing any one site?',
+      options: [
+        'Two sites with 3 servers each, but a faster link',
+        'Seven servers in site A and one in site B',
+        'Five servers over three sites as 2, 2, 1',
+        'Six servers over two sites with a manual override',
+      ],
+      answer: 2,
+      explain: 'With 2, 2, 1 the majority is 3. Lose any single site and at least 3 servers remain. Seven in A and one in B survives losing B, but not A. With only two sites, whichever site holds the majority is a single point of failure for writes. A third site fixes that.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [ZooKeeper overview](https://zookeeper.apache.org/doc/current/zookeeperOver.html) (znodes, guarantees, watches, ephemeral nodes)
+- [ZooKeeper recipes](https://zookeeper.apache.org/doc/current/recipes.html) (lock and leader election with ephemeral sequential nodes)
+- [ZooKeeper administrator's guide](https://zookeeper.apache.org/doc/current/zookeeperAdmin.html) (ensemble size, session timeouts)
+- [etcd FAQ](https://etcd.io/docs/v3.5/faq/) (cluster size and failure tolerance table)

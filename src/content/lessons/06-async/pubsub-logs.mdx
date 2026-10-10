@@ -1,0 +1,194 @@
+---
+summary: 'A log keeps records in order and lets many readers each keep their own position. Partitions spread the log across machines, and consumer groups share the reading.'
+requires: ['06-async/queues', '04-data/replication', '04-data/sharding']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import AsyncQueueVsLog from '../../../components/anim/lessons/AsyncQueueVsLog.tsx';
+import AsyncGroupWalk from '../../../components/anim/lessons/AsyncGroupWalk.tsx';
+import AsyncGroupLab from '../../../components/anim/lessons/AsyncGroupLab.tsx';
+
+## The problem
+
+An order is placed. Billing must charge it. Email must confirm it. Analytics must count it. Three teams need the **same** event.
+
+A queue (lesson 6.1) gives each message to **one** worker and then deletes it. Three consumers would split the orders. Each would see a third of them. That is not what you want.
+
+You could give each team its own queue and have the order service write to all three. Now the order service must know every consumer. Adding a fourth team means changing and deploying the producer. And once a message is deleted, it is gone. A new team cannot read last week's orders. A team that fixes a bug cannot reprocess the day's events.
+
+We want two things a queue lacks: **fan-out** (many readers get every message) and **replay** (a reader can go back).
+
+## Publish/subscribe
+
+In **publish/subscribe** (pub/sub), a producer publishes to a named **topic**. It does not know who listens. Each consumer **subscribes** to the topic and gets its own copy of every message. The producer stays the same when a fourth team joins.
+
+A common cloud pattern: publish once to a topic (SNS on AWS), and give each subscriber its own queue. SQS fits one subscriber per queue, and SNS fans out to many. Each team then reads its queue at its own speed. This solves fan-out. It does not solve replay, because each queue still deletes what it hands out.
+
+## The log: records that stay
+
+A **log** is an ordered, append-only list of records. Writers add at the end. Readers read from any position. Reading does not remove anything. A record leaves only when **retention** removes it, by age or size.
+
+Each record has an **offset**, its position in the log, counted from 0. A reader needs to remember one thing: the offset of the next record to read. The Kafka docs say it plainly: the position of a consumer in each partition "is just a single integer."
+
+Compare the two designs.
+
+<AsyncQueueVsLog />
+
+Because reading is non-destructive, the log gives you replay and fan-out together. RabbitMQ streams describe themselves the same way: they are non-destructive, and consumers can read the same messages repeatedly. A new service starts at offset 0 and catches up. A fixed bug is re-run by moving the offset back.
+
+What you pay is disk. Kafka's broker defaults keep records for 168 hours (7 days) and set no size limit, and a log file segment is 1 GiB. You choose how long to keep data.
+
+## Partitions: splitting the log
+
+One log has one writer path and, for each reader, one position. It lives on one machine's disk and network. That caps throughput. So split the topic into **partitions**. Each partition is its own ordered log, and different partitions live on different brokers. This is sharding (lesson 4.7), with the same questions about how to choose a key.
+
+The producer picks a partition by **hashing the record key**. Records with the same key land in the same partition. Kafka's docs describe the idea as letting the user "specify a key to partition by and using this to hash to a partition". So all events for one user stay in order. The price: **order exists only inside a partition**. Across partitions there is none.
+
+Each partition has one leader and some followers (lesson 4.6). Kafka says a committed message is not lost as long as at least one in-sync replica is alive.
+
+## Consumer groups: sharing the reading
+
+Many consumers can read one topic. A **consumer group** is a set of consumers that share one subscription. The rule: **each partition goes to exactly one consumer in the group** at a time. Together the members read every record once. A second group reads everything again, with its own offsets. That is how billing and analytics each get all orders.
+
+Step through a run. Watch the keys, the offsets, a crash, and the handover.
+
+<AsyncGroupWalk client:visible />
+
+Three things happened in that run.
+
+1. **Same key, same partition.** The second A landed behind the first A on P0, so one key stays in order.
+2. **Commit.** A consumer saves the offset it finished. The saved offset is the group's bookmark. Kafka stores it in an internal topic.
+3. **Rebalance.** The group moved partitions when a member died and when it came back. The new owner started at the **committed** offset. Records read but not committed are read again. That is at-least-once delivery, the same as the visibility timeout in lesson 6.1. Lesson 6.3 shows how to live with it.
+
+How fast does the group notice a dead member? In the current Kafka consumer settings the default session timeout is 45 seconds, and members send a heartbeat every 3 seconds. A consumer that goes too long between calls to `poll` is also dropped. That limit, `max.poll.interval.ms`, is 5 minutes by default. Kafka 4.0 made a new rebalance protocol generally available. The broker assigns partitions, and the docs say it no longer relies on a global synchronization barrier. Consumers opt in with `group.protocol=consumer`.
+
+## The ceiling: partitions
+
+A partition goes to one consumer. So the number of partitions caps the parallelism of one group. Try it.
+
+<AsyncGroupLab client:visible />
+
+Plan the partition count for your **peak** consumer count, with headroom. More partitions mean more work in every rebalance and more things to manage. And hash placement depends on the count. Changing it later changes where keys go, so per-key order across the change is not guaranteed.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Kafka log retention, broker default | 168 hours (7 days) | Kafka broker configs |
+| Kafka retention size limit, default | none (-1) | Kafka broker configs |
+| Kafka log segment size, default | 1 GiB | Kafka broker configs |
+| Consumer session timeout, default | 45 s | Kafka consumer configs |
+| Consumer heartbeat interval, default | 3 s | Kafka consumer configs |
+| `max.poll.interval.ms`, default | 5 min | Kafka consumer configs |
+| Compacted topic, tombstone retention | 24 h by default (`delete.retention.ms`) | Kafka design docs |
+| Throughput of one broker | ~100s of MB/s (lesson 1.5) | Lesson 1.5 |
+| RabbitMQ stream segment size, default | 500,000,000 bytes | RabbitMQ streams docs |
+
+A compacted topic keeps the latest record per key and drops older ones. A tombstone is a record with a key and no value, which marks a delete. Compaction suits "current state" topics, where you want the last value and not the whole history.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Queue (consume and delete) | Simple. Work is shared by workers. | No replay. One reader gets each message. | Tasks done once, like emails or resizes |
+| Pub/sub with a queue per subscriber | Fan-out. Each reader paces itself. | No replay. Producer-side cost per subscriber. | A few independent consumers |
+| Log with consumer groups | Fan-out, replay, order per key, high throughput | Disk for retention. Partition count caps parallelism. Rebalances. | Event streams, many consumers, reprocessing |
+| One partition | Total order | One consumer per group. Throughput capped. | Low volume that needs one order |
+| Many partitions | Throughput and parallelism | Order only per key. Rebalance and file cost. | High volume with a good key |
+| Short retention | Low disk | A slow or new consumer can miss data | Real-time only |
+| Long retention | Replay and recovery | Disk and cost | Rebuilding state from events |
+
+## Interview lens
+
+<Callout type="tip">
+Pick the data structure by the question "does a second reader need this message?". If yes, say "a log, partitioned by the user id, with one consumer group per team". Then state the guarantees: "Order holds per user. Each group tracks its own offsets. I can replay by resetting an offset. Parallelism is capped by the partition count, so I start with N partitions for the peak consumer count."
+</Callout>
+
+<Callout type="mistake">
+Do not say "Kafka keeps messages in order". Order holds inside one partition only. Do not say "we will add more consumers to go faster" without checking the partition count. And do not say "I will use one partition to keep order". That caps the whole topic at one consumer per group. Choose a key so that the events that must stay in order share a partition.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A topic has 3 partitions. One consumer group has 5 consumers. How many consumers do work?',
+      options: ['3, and 2 sit idle', '5, and each reads part of a partition', '5, because the group balances by record', '1, because only the leader reads'],
+      answer: 0,
+      explain: 'A partition is read by one consumer in a group at a time, so 3 partitions give at most 3 working consumers. Two consumers are idle. They stand by in case another member fails.',
+    },
+    {
+      q: 'The billing group has read to offset 5000. A new group, analytics, subscribes and starts from the earliest offset. What happens to billing?',
+      options: ['Billing is reset to offset 0', 'Billing continues, because each group keeps its own offsets', 'Billing and analytics now split the records', 'Billing stops until analytics catches up'],
+      answer: 1,
+      explain: 'Offsets belong to the group, not to the topic. Analytics reads everything with its own position. Billing is not affected. Splitting records is what consumers inside one group do, not what two groups do.',
+    },
+    {
+      q: 'Events use the key user-7 or user-8 on a topic with 6 partitions. What order do you get?',
+      options: ['One total order across all events', 'No order at all', 'Order among the events of user-7, and among the events of user-8', 'Order between user-7 and user-8 events only'],
+      answer: 2,
+      explain: 'The same key always hashes to the same partition, and a partition is an ordered log. So each user’s events keep their order. Two users may be in different partitions, so no order is promised between them.',
+    },
+    {
+      q: 'A consumer reads 3 records, then crashes before it commits their offsets. A new member takes over the partition. Where does it start?',
+      options: ['After the 3 records, because they were read', 'At the end of the partition', 'At offset 0', 'At the committed offset: the 3 records are read again'],
+      answer: 3,
+      explain: 'The committed offset is the only bookmark the group has. The 3 records were read but not committed, so they are delivered again. That is why consumers must handle duplicates (lesson 6.3).',
+    },
+    {
+      q: 'A new service needs the last 3 days of order events. Which design supports that, and why?',
+      options: ['A queue, because it stores every message', 'A log with 7 day retention, because reading does not remove records', 'Pub/sub with a queue per subscriber, because it fans out', 'A queue with a long visibility timeout'],
+      answer: 1,
+      explain: 'A log keeps records until retention ends, so a new reader can start from an earlier offset. A queue deletes a message once it is acked. Fan-out alone does not give history.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="pubsub-hot-partition"
+  title="One slow partition"
+  scenario="A clickstream topic has 12 partitions, keyed by customer id. A group of 12 consumers reads it. On-call sees lag on one partition only."
+  facts={[
+    'partition 7 lag:       480,000 records',
+    'partitions 0-6, 8-11:  under 100 records each',
+    'consumer on P7:        95% CPU',
+    'other consumers:       about 5% CPU',
+    'top key by volume:     customer "acme", about 38% of records',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the cause?',
+      options: [
+        'One huge key hashes to one partition, so one consumer gets 38% of the traffic',
+        'The group has too few consumers',
+        'Kafka lost the records of P7',
+        'The session timeout is too long',
+      ],
+      answer: 0,
+      explain: 'Same key, same partition. A partition has one reader in the group. The "acme" key makes P7 about 4.5 times busier than an even share of 1 in 12. The other 11 consumers sit nearly idle, so the number of consumers is not the limit.',
+    },
+    {
+      prompt: 'Which fix helps, and what does it cost?',
+      options: [
+        'Add consumers. It costs nothing.',
+        'Add partitions to the topic. The same key still maps to one partition.',
+        'Spread the hot key, for example key by customer id plus a small suffix. Order for that customer then holds only per suffix.',
+        'Raise retention to 30 days',
+      ],
+      answer: 2,
+      explain: 'More consumers cannot share one partition, and more partitions still send one key to one place. Splitting the hot key across several partitions spreads the load. The cost is that order for that one customer is now only per suffix. If you need strict order for acme, you must make the single consumer faster instead.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Apache Kafka: design](https://kafka.apache.org/43/design/design/): partitions, consumer position, replication, and delivery semantics.
+- [Apache Kafka: consumer rebalance protocol](https://kafka.apache.org/43/operations/consumer-rebalance-protocol/): the new server-side protocol and how to opt in.
+- [Apache Kafka: consumer configs](https://kafka.apache.org/43/configuration/consumer-configs/): session timeout, heartbeat, and poll interval defaults.
+- [RabbitMQ streams](https://www.rabbitmq.com/docs/streams): a non-destructive log inside a queueing broker.

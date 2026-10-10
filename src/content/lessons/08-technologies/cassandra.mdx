@@ -1,0 +1,230 @@
+---
+summary: 'Cassandra spreads a table over a ring of equal nodes. A commit log and memtable make writes fast. You choose the consistency level for each request.'
+requires: ['04-data/storage-engines', '04-data/consistent-hashing', '04-data/consistency-models']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import CassWritePath from '../../../components/anim/lessons/CassWritePath.tsx';
+import CassConsistency from '../../../components/anim/lessons/CassConsistency.tsx';
+import QuorumCalc from '../../../components/anim/lessons/QuorumCalc.tsx';
+
+## What it is
+
+Apache Cassandra is a wide-column, distributed, peer-to-peer database. It is built for a high write rate and horizontal scale. "Peer-to-peer" means no node is special. There is no leader and no single master. Any node can take any request.
+
+It is the working example of ideas you have already seen. Its storage is the log-structured design from [lesson 4.2](/learn/04-data/storage-engines). Its placement is [consistent hashing](/learn/04-data/consistent-hashing). Its consistency is the quorum rule from [lesson 4.11](/learn/04-data/consensus), which you set per request ([lesson 4.10](/learn/04-data/consistency-models)).
+
+## The internal model
+
+### The ring: who owns which key
+
+Cassandra hashes the **partition key** of each row into a token. The tokens form a ring. Each node owns ranges of the ring. A row belongs to the node that owns its token, and to the next nodes around the ring up to the replication factor. **Replication factor** (RF) is how many copies of each row exist. Cassandra's dynamo design page says nodes use **virtual nodes**, so each machine owns many small ranges and the load spreads evenly. Replication settings are set per keyspace, and the docs advise NetworkTopologyStrategy for production.
+
+There is no central place that holds the ring map. Every node runs the **gossip** task by itself, on a timer. Gossip passes membership, token ownership, and schema versions between nodes. The docs show a gossip round about once per second. One detail worth knowing: whether a peer is UP or DOWN is a local decision of each node. It is not passed around by gossip.
+
+### The data model: partition key and clustering columns
+
+A table's primary key has two parts.
+
+- The **partition key** picks the node and groups rows into a partition. The docs say only an equality is allowed on a partition key.
+- The **clustering columns** order rows inside a partition. Range queries on them must ask for a contiguous set of rows.
+
+```sql
+CREATE TABLE readings_by_sensor (
+  sensor_id  uuid,
+  read_at    timestamp,
+  value      double,
+  PRIMARY KEY ((sensor_id), read_at)
+) WITH CLUSTERING ORDER BY (read_at DESC);
+```
+
+Here `sensor_id` is the partition key and `read_at` is a clustering column. "Latest 100 readings for sensor X" reads one partition from its start. "All readings above 50 across all sensors" has no partition key, so it is not a query this table supports. DataStax's guide puts it this way: the partition key decides which node stores the data, and by default a query must use the whole partition key in its `WHERE` clause. So you model a table for each query you plan to run, and you copy data ([lesson 4.1](/learn/04-data/data-modeling)). This is the price of a ring with no coordinator that knows where everything is.
+
+### The write path
+
+A write needs only a sequential disk append and a memory insert. Step through one replica.
+
+<CassWritePath client:visible />
+
+The three parts, from the Cassandra storage docs:
+
+1. The **commit log** gets every write first. It is only for crash recovery.
+2. The **memtable** is an in-memory structure that "stores writes in sorted order until reaching a configurable limit".
+3. A **flush** writes the memtable to an **SSTable**. "SSTables are immutable, and never written to again after the memtable is flushed."
+
+Then **compaction**: "Cassandra triggers compactions which combine multiple SSTables into one." It costs I/O because it rewrites data. The reward is fewer files per read. A delete is also a write, a marker called a tombstone, since files cannot be edited.
+
+Reads may touch the memtable and several SSTables. That is why reads are costlier than writes here, and why compaction matters.
+
+### Tunable consistency
+
+With RF = 3, each write goes to three replicas. How many must answer before the coordinator replies? The Cassandra docs list the consistency levels. Three of them:
+
+| Level | Meaning |
+|---|---|
+| `ONE` | "Only a single replica must respond." |
+| `QUORUM` | "A majority (n/2 + 1) of the replicas must respond." |
+| `ALL` | "All of the replicas must respond." |
+
+`LOCAL_QUORUM` is a majority of the replicas in the coordinator's own data center. The docs give the overlap rule as `W + R > RF`, where W and R are the write and read levels. That is the quorum rule of lesson 4.11. Watch what happens at `ONE`, then at `QUORUM`.
+
+<CassConsistency client:visible />
+
+At `ONE`/`ONE`, W + R = 2 is not more than 3, so a read can miss a write. At `QUORUM`/`QUORUM`, W + R = 4 is more than 3, so a read always meets a replica that took the latest completed write. Cassandra is, in the docs' words, an "eventually consistent storage system". You buy stronger reads with latency and with availability. Try the calculator. Pick the Cassandra presets.
+
+<QuorumCalc client:visible />
+
+Cassandra also has **lightweight transactions** for compare-and-set, built on Paxos. They need more round trips, so use them for rare cases such as "create this username only if it does not exist", not for every write.
+
+## When to use it
+
+- A very high write rate that you can spread over many partition keys: events, messages, sensor readings, feeds.
+- Data you read by key, with known query shapes, plus a range inside one partition (latest N by time).
+- You need no single leader and no single point of failure, including across data centers.
+- You accept eventual consistency, or you pay for stronger levels per request.
+
+## When not to
+
+| Situation | Why | Look at |
+|---|---|---|
+| Ad-hoc queries, joins, or reports | You can query only by partition key and clustering order | [PostgreSQL](/learn/08-technologies/postgresql) or a warehouse |
+| Multi-row transactions with strong isolation | Only per-partition and lightweight transactions | [PostgreSQL](/learn/08-technologies/postgresql) |
+| Small data on one machine | A ring has operational weight you do not need | [PostgreSQL](/learn/08-technologies/postgresql) |
+| Full-text relevance search | No inverted index with scoring | [Elasticsearch](/learn/08-technologies/elasticsearch) |
+| You want a fully managed key-value store | You run and tune the cluster | [DynamoDB](/learn/08-technologies/dynamodb) |
+
+## Limits and numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Quorum size | n/2 + 1 replicas, rounded down | Cassandra docs, Dynamo page |
+| Overlap rule | W + R > RF | Cassandra docs, Dynamo page |
+| Gossip round | about once per second | Cassandra docs, Dynamo page |
+| Partition key in a query | equality only | Cassandra docs, CQL DML |
+| Partition size guidance | ideally under 100 MB | DataStax docs (vendor guidance, not a hard limit) |
+
+Partition size has no hard limit in the Apache docs we could read. The 100 MB figure is DataStax's recommendation, and other guides repeat it with different ceilings. Treat it as a design target: bound a partition's growth in the schema, for example by adding a time bucket to the partition key. The docs we read give no default replication factor, so say "RF = 3 is the common choice" as your own design choice, not as a default.
+
+## Interview lens
+
+<Callout type="tip">
+Lead with the access pattern: "Messages are read by conversation, newest first. Partition key is the conversation, clustering column is time, descending. Writes are commit log plus memtable, so they are fast." Then state the knob: "RF = 3 with QUORUM reads and writes, so W + R = 4 > 3, and I survive one replica failing."
+</Callout>
+
+<Callout type="mistake">
+Do not say Cassandra is strongly consistent by default. It is eventually consistent unless you raise the level. Do not say a write goes straight to an SSTable. It goes to the commit log and memtable first. Do not say you can update an SSTable in place. And do not pick a partition key that makes one partition grow without bound, such as a constant or a very popular ID.
+</Callout>
+
+<Callout type="deep" title="Why QUORUM tolerates one down node but ALL does not">
+With RF = 3, QUORUM needs 2 acks, so one replica can be down and writes still pass. ALL needs 3, so one dead replica blocks every request for the partitions it holds. You trade availability for the strongest single-request view. The same pattern appears in [CAP and PACELC](/learn/04-data/cap-pacelc): when a replica is unreachable, you pick between answering and being sure.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'RF = 3. A write uses consistency ONE and a read uses consistency ONE. Can the read return a value older than the acknowledged write?',
+      options: [
+        'Yes. W + R = 2 is not more than 3, so the read may hit a replica that has not applied the write.',
+        'No. ONE always reads from the replica that took the write.',
+        'No. Cassandra always applies a write to all replicas before answering.',
+        'Only if a node is down.',
+      ],
+      answer: 0,
+      explain: 'ONE needs a single answer on both sides. The write can be acknowledged by replica A while B and C still lag, and the read can ask C. A node does not have to be down for that. The overlap rule W + R > RF is what rules it out.',
+    },
+    {
+      q: 'In a table with PRIMARY KEY ((user_id), posted_at), which query is the one this design supports well?',
+      options: [
+        'All posts from every user in the last hour',
+        'The 20 newest posts of one user',
+        'All users whose posts mention a keyword',
+        'The user with the most posts',
+      ],
+      answer: 1,
+      explain: 'A query must name the partition key, here user_id. Inside the partition the rows are ordered by posted_at, so the newest 20 are one contiguous slice. The other queries have no partition key. They would scan every node, or they need another table or system.',
+    },
+    {
+      q: 'What is the order of storage steps for one write on a Cassandra replica?',
+      options: [
+        'SSTable, then commit log, then memtable',
+        'Memtable, then SSTable, then commit log',
+        'Commit log and memtable first. SSTable only later, when the memtable is flushed.',
+        'Compaction, then memtable, then commit log',
+      ],
+      answer: 2,
+      explain: 'The write is appended to the commit log and inserted into the memtable. The replica can reply at that point. SSTables are made only when a full memtable is flushed, and compaction runs in the background after that.',
+    },
+    {
+      q: 'RF = 3 and you read and write at QUORUM. One replica goes down. What happens?',
+      options: [
+        'Reads and writes fail until the node returns',
+        'Both still work: 2 live replicas satisfy a quorum of 2',
+        'Writes work but reads fail',
+        'Cassandra switches to consistency ONE by itself',
+      ],
+      answer: 1,
+      explain: 'A quorum of 3 is 2. Two replicas remain, so both reads and writes can still get 2 answers. Cassandra does not change your consistency level on its own.',
+    },
+    {
+      q: 'Why does a read in Cassandra sometimes cost more than a write?',
+      options: [
+        'Writes skip the network',
+        'The commit log must be read first',
+        'Reads are always sent to every replica',
+        'A read may need to check the memtable and several SSTables, and merge what it finds',
+      ],
+      answer: 3,
+      explain: 'A write is one append and one memory insert. A read has to find the newest version of each cell, which can sit in the memtable and in several immutable SSTables. Compaction reduces the number of files. Reads do not always go to every replica, and they do not read the commit log.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="cassandra-hot-channel"
+  title="One giant partition"
+  scenario="A chat service stores messages in a table with PRIMARY KEY ((channel_id), sent_at). After a launch, one public channel gets most of the traffic."
+  facts={[
+    'channels: 2 million   messages per day in the top channel: 40 million',
+    'p99 read for the top channel: 1,900 ms (other channels: 12 ms)',
+    'nodes owning the top channel: 3 of 24 show high disk I/O and long compactions',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the root cause?',
+      options: [
+        'The partition key is channel_id, so all of the top channel lives in one ever-growing partition on 3 replicas',
+        'The replication factor is too high',
+        'Consistency level QUORUM is too strong',
+        'Cassandra cannot store more than a few million rows',
+      ],
+      answer: 0,
+      explain: 'The partition is the unit of placement. One channel means one partition, and it keeps growing, so it concentrates reads, writes, and compaction on three nodes. The other channels are fine.',
+    },
+    {
+      context: 'The team changes the key to ((channel_id, day), sent_at). Each day of one channel is now its own partition.',
+      prompt: 'A client wants the 50 newest messages of the top channel. What must the client do?',
+      options: [
+        'Query today\'s partition. If it holds fewer than 50 rows, query yesterday\'s partition, and so on.',
+        'Run one query with no partition key',
+        'Raise the consistency level to ALL',
+        'Nothing. The old query still works unchanged.',
+      ],
+      answer: 0,
+      explain: 'Each query must name the full partition key, and the key now includes the day. The client walks buckets from the newest backward until it has enough rows. The cost of bucketing is this extra logic. The gain is bounded partitions, spread over many nodes.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Cassandra docs: Dynamo (ring, gossip, consistency levels)](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html)
+- [Cassandra docs: Storage engine (commit log, memtable, SSTable)](https://cassandra.apache.org/doc/latest/cassandra/architecture/storage-engine.html)
+- [Cassandra docs: Guarantees](https://cassandra.apache.org/doc/latest/cassandra/architecture/guarantees.html)
+- [Cassandra docs: Data manipulation (CQL DML)](https://cassandra.apache.org/doc/latest/cassandra/developing/cql/dml.html)
+- [DataStax: Best practices for data modeling](https://docs.datastax.com/en/cql/hcd/data-modeling/best-practices.html)

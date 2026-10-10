@@ -1,0 +1,219 @@
+---
+summary: 'Elasticsearch splits an index into shards, each a Lucene index with its own inverted index. A search fans out to every shard and merges the top hits. New writes are searchable after a refresh.'
+requires: ['04-data/indexing', '04-data/sharding', '04-data/replication']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import InvertedIndexBuild from '../../../components/anim/lessons/InvertedIndexBuild.tsx';
+import EsSearchFlow from '../../../components/anim/lessons/EsSearchFlow.tsx';
+import EsRefresh from '../../../components/anim/lessons/EsRefresh.tsx';
+
+## What it is
+
+Elasticsearch is a distributed search and analytics engine built on Apache Lucene. You store **documents** (JSON objects) in an **index**. You search them by words, filters, and ranges, and you get results ranked by relevance. A SQL `LIKE '%word%'` scans every row. Elasticsearch looks the word up in a prebuilt index.
+
+It is a **secondary** store in most designs. The source of truth lives in a database such as [PostgreSQL](/learn/08-technologies/postgresql). A pipeline copies changes into Elasticsearch, and a search request reads from there. This is our design advice, not an Elastic rule. The reason is in the sections below: writes become visible after a delay, and there are no multi-document transactions.
+
+## The internal model
+
+### The inverted index
+
+Search speed comes from the structure you built in [lesson 4.3](/learn/04-data/indexing). An **inverted index** maps each word to the list of documents that contain it. A query looks up the words and intersects the lists. It never scans the documents.
+
+<InvertedIndexBuild client:visible />
+
+Lucene is the library that builds and reads these indexes. Elasticsearch adds distribution on top.
+
+### Shards and replicas
+
+An index is split into **shards**. The Elasticsearch docs say "Each shard is a self-contained Apache Lucene index", and "Every document belongs to exactly one primary shard". The shard is chosen from the document's ID, by default. That is hash partitioning, as in [lesson 4.7](/learn/04-data/sharding).
+
+Each primary shard can have **replica** copies. Replicas "provide redundancy and serve read requests". This is the leader-follower idea of [lesson 4.6](/learn/04-data/replication): a write goes to the primary and then to its replicas. A search can go to either.
+
+A shard stores its data in **segments**. Segments are immutable. A new document goes into a new segment. This is the same log-structured thinking as the SSTables of [lesson 4.2](/learn/04-data/storage-engines).
+
+### Near-real-time: why a new document waits
+
+Writes do not become searchable at once. Step through the life of one document.
+
+<EsRefresh client:visible />
+
+The docs describe a **refresh** as the step that "makes all operations performed on an index since the last refresh available for search". By default Elasticsearch refreshes every second, but only for indices that "received one search request or more in the last 30 seconds". That is why the system is called near-real-time. Plan for about a second between a write and a search that can see it.
+
+Durability is a separate matter. Lucene commits are too expensive to run on every write, so each shard copy also keeps a **translog**, a log of operations. By default (`index.translog.durability` set to `request`), a write is acknowledged only after the translog is fsynced on the primary and on every allocated replica. A **flush** performs a Lucene commit and starts a new translog generation. So a write is durable at acknowledgement, and searchable after the next refresh.
+
+### How a search runs: query then fetch
+
+Documents are spread over shards by ID, not by content. Any shard may hold a match. So a search goes to every shard. This is the scatter-gather of [lesson 4.7](/learn/04-data/sharding). It happens in two phases.
+
+<EsSearchFlow client:visible />
+
+1. **Query phase.** The coordinating node sends the query to one copy of each shard. Each shard returns only document IDs and scores for its best hits. The coordinator merges the lists.
+2. **Fetch phase.** The coordinator asks only the shards that hold the winners for the document bodies.
+
+Two consequences matter in a design discussion.
+
+- **Latency is set by the slowest shard**, as in any scatter-gather. More shards means more chances for one to be slow.
+- **Scores are computed per shard.** The docs say the default `query_then_fetch` scores with "local term and document frequencies for the shard", which is "usually faster but less accurate". `dfs_query_then_fetch` uses global frequencies, "usually slower but more accurate", because it adds a round trip first.
+
+The default relevance formula is **BM25**. Its two parameters have documented defaults: `k1` is 1.2 and `b` is 0.75. In short, a word that is rare across the corpus counts for more, a word that repeats in a document counts for more but with diminishing returns (`k1`), and a match in a short document counts for more than the same match in a long one (`b`).
+
+### Sizing shards
+
+The sizing guide gives numbers you can use.
+
+- Aim for shard sizes between **10 GB and 50 GB**.
+- Keep documents per shard below **200 million**.
+- More than **1,000 non-frozen shards per node** is a warning threshold.
+
+The reason: each shard has a fixed cost in memory and in cluster bookkeeping. Thousands of tiny shards waste that cost. Very large shards are slow to recover and rebalance. The search request itself also has a limit: `max_concurrent_shard_requests` defaults to 5 per node, so a search over many shards runs in waves.
+
+## When to use it
+
+- Full-text search with ranking, typos, and filters: product search, site search, log search.
+- Analytics over documents with filters and aggregations, where seconds of delay are fine.
+- A derived, rebuildable index fed from your primary database by change data capture.
+
+## When not to
+
+| Situation | Why | Look at |
+|---|---|---|
+| System of record | Writes are visible after a refresh, and there are no multi-document transactions (our advice) | [PostgreSQL](/learn/08-technologies/postgresql) |
+| Read-your-own-write immediately | Near-real-time, about one second | Read from the primary store |
+| Key-value lookups at huge scale | You pay for search features you do not use | [DynamoDB](/learn/08-technologies/dynamodb) |
+| Strict transactions and joins | Not its model | [PostgreSQL](/learn/08-technologies/postgresql) |
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Default refresh interval | 1 second, for indices searched in the last 30 seconds | Elastic docs, near real-time |
+| BM25 defaults | k1 = 1.2, b = 0.75 | Elastic docs, similarity |
+| Recommended shard size | 10 GB to 50 GB | Elastic docs, size your shards |
+| Documents per shard | below 200 million | Elastic docs, size your shards |
+| Shards per node, warning | more than 1,000 non-frozen | Elastic docs, size your shards |
+| `max_concurrent_shard_requests` default | 5 per node | Elastic docs, search |
+| Translog durability default | `request`: fsync before acknowledging | Elastic docs, translog |
+
+## Interview lens
+
+<Callout type="tip">
+Say where it sits: "The database is the source of truth. Changes flow by CDC into Elasticsearch. Search queries read the index, and I accept about a second of delay." Then say how it scales: "Index split into primary shards of 10 to 50 GB each, with replicas for reads and for failover. A query fans out to every shard and the coordinator merges the top hits."
+</Callout>
+
+<Callout type="mistake">
+Do not say a write is searchable immediately. It is searchable after the next refresh, about one second by default. Do not say "TF-IDF" when asked what scores results: the default is BM25. Do not make one shard per node because it sounds neat: size shards by data volume. And do not present Elasticsearch as your only copy of important data.
+</Callout>
+
+<Callout type="deep" title="Deep paging is expensive">
+To return results 9,990 to 10,000, each shard must find and send back its best 10,000 hits, because it cannot know which of them will survive the global merge. The coordinator merges every list and throws most of them away. The cost grows with how deep the page is, and with the number of shards. For deep scrolling, use a cursor-style method (search_after) rather than a large offset, as in the [pagination lesson](/learn/03-api-design/pagination).
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'You index a document and search for it 100 ms later, with default settings. What is the most likely result?',
+      options: [
+        'It is found, because the write was acknowledged',
+        'It may not be found yet, because it becomes searchable at the next refresh',
+        'It is never found until you restart the node',
+        'It is found only on the replica shards',
+      ],
+      answer: 1,
+      explain: 'A refresh writes the in-memory buffer to a new segment and opens it for search, once per second by default. Acknowledgement means the write is durable in the translog, not that it is searchable.',
+    },
+    {
+      q: 'In the query phase of a search over 5 shards, what does each shard send to the coordinating node?',
+      options: [
+        'The full documents of all its matches',
+        'The whole inverted index',
+        'Document IDs and scores for its top hits',
+        'Only a count of matches',
+      ],
+      answer: 2,
+      explain: 'Each shard returns IDs and scores only. The coordinator merges them into one global top list, then fetches the bodies of the winners in the fetch phase. Sending full documents from every shard would waste bandwidth on results that get discarded.',
+    },
+    {
+      q: 'An index holds 100 GB. Which primary shard count follows the sizing guidance (10 GB to 50 GB per shard)?',
+      options: [
+        '1 shard',
+        '100 shards',
+        '1,000 shards',
+        '2 to 10 shards',
+      ],
+      answer: 3,
+      explain: '100 GB over 2 shards is 50 GB each, and over 10 shards is 10 GB each. One shard is 100 GB, above the guidance. 100 or 1,000 shards would make each shard 1 GB or 100 MB, far below the range, and add per-shard overhead.',
+    },
+    {
+      q: 'Why can a search over an index with 40 shards be slower than the same search over 4 shards, with the same data and similar hardware?',
+      options: [
+        'The coordinator waits for all 40 shard responses and merges more lists, so one slow shard sets the latency',
+        'Each shard holds more data, so each is slower',
+        'Replicas are disabled when shards are numerous',
+        'BM25 does not work above 10 shards',
+      ],
+      answer: 0,
+      explain: 'A search fans out to every shard and waits for all lists. More shards give more chances that one is slow and more lists to merge. The shards also each hold less data, not more, and BM25 has no shard limit.',
+    },
+    {
+      q: 'A product team asks for the same score for the same document, whichever shard holds it. Which search type is closest to that request, and what does it cost?',
+      options: [
+        'query_then_fetch, with no extra cost',
+        'A larger refresh interval',
+        'dfs_query_then_fetch, which collects global term statistics first and so adds a round trip',
+        'A replica for every shard',
+      ],
+      answer: 2,
+      explain: 'The default scores with each shard\'s local statistics. dfs_query_then_fetch first gathers global term and document frequencies, which makes scores comparable across shards and is usually slower.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="elasticsearch-tiny-shards"
+  title="Thousands of tiny shards"
+  scenario="A logging team creates one index per service per hour, each with 5 primary shards by default. Months later the cluster is slow and unstable."
+  facts={[
+    'data nodes: 3   shards per node: ~2,400',
+    'median shard size: ~150 MB',
+    'symptoms: heap pressure, slow cluster state updates, searches over many indices are slow',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'Far too many small shards. Each carries fixed overhead, and this cluster is past 1,000 per node.',
+        'The refresh interval is too short',
+        'BM25 scoring is too slow for log data',
+        'There are too few replicas',
+      ],
+      answer: 0,
+      explain: 'The guidance is 10 GB to 50 GB per shard, and more than 1,000 non-frozen shards per node is a warning. At about 150 MB a shard, with about 2,400 per node, the overhead dominates.',
+    },
+    {
+      prompt: 'Which change fixes it at the source?',
+      options: [
+        'Add replicas to every index',
+        'Create indices with fewer primary shards, or switch to size-based rollover, so each shard grows toward tens of GB. Then copy the old data into the new indices.',
+        'Increase the refresh interval to hide the cost',
+        'Query only one shard at a time',
+      ],
+      answer: 1,
+      explain: 'Replicas add more shards, which makes the overhead worse. The refresh interval does not change the shard count. The fix is bigger, fewer shards. The shard count of an existing index is not something you can just edit, so you build new indices and copy the data in.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Elasticsearch docs: Documents and indices (shards, replicas)](https://www.elastic.co/guide/en/elasticsearch/reference/current/documents-indices.html)
+- [Elasticsearch docs: Near real-time search](https://www.elastic.co/guide/en/elasticsearch/reference/current/near-real-time.html)
+- [Elasticsearch docs: Translog](https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules-translog.html)
+- [Elasticsearch docs: Search API (search_type)](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-search.html)
+- [Elastic Search Labs: Batched query phase](https://www.elastic.co/search-labs/blog/elasticsearch-batched-query-phase)

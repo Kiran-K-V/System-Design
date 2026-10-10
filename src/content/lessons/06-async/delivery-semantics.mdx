@@ -1,0 +1,202 @@
+---
+summary: 'No network can tell a lost message from a lost ack, so you pick between loss and duplicates. Exactly-once effects come from at-least-once delivery plus an idempotent consumer.'
+requires: ['03-api-design/idempotency', '06-async/queues', '06-async/pubsub-logs']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import AsyncAckWalk from '../../../components/anim/lessons/AsyncAckWalk.tsx';
+import AsyncCrashMatrix from '../../../components/anim/lessons/AsyncCrashMatrix.tsx';
+
+## The problem
+
+A payment system sends "credit $10" through a broker. Someone asks: "Is delivery exactly-once?" The honest answer is "it depends on which step you mean."
+
+A message travels through three steps. Each can fail alone.
+
+1. **Producer to broker.** The producer sends. The broker stores it and replies with an ack. The ack can be lost.
+2. **Broker to consumer.** The broker hands the message to a consumer. The consumer can crash.
+3. **Consumer to its effect.** The consumer changes a database, sends an email, or calls an API.
+
+In every step, one side acts and the other side cannot see whether it worked. That uncertainty is the whole topic.
+
+## Three guarantees
+
+Kafka's docs define them in one line each.
+
+| Guarantee | Meaning | Risk |
+|---|---|---|
+| **At-most-once** | Messages may be lost but are never redelivered | Loss |
+| **At-least-once** | Messages are never lost but may be redelivered | Duplicates |
+| **Exactly-once** | Each message is processed once and only once | Hard. See below. |
+
+Kafka's default is at-least-once. SQS standard queues are at-least-once too (lesson 6.1).
+
+Why can you not just have both? Because of one fact. When a sender gets no ack, it cannot tell **"the message was lost"** from **"the message arrived and the ack was lost"**. There are two choices. Send again, and risk a duplicate. Do not send again, and risk a loss. No third option exists inside one unreliable link.
+
+Watch the second case happen. The consumer does everything right, and the money still moves twice.
+
+<AsyncAckWalk mode="naive" client:visible />
+
+## The producer hop: idempotent producers
+
+A producer that resends after a lost ack creates a duplicate record in the log. Kafka fixes this inside the broker. Since Kafka 0.11, the broker assigns each producer an ID. The producer sends a **sequence number** with every message. The broker uses that number to drop a resend it has already stored.
+
+This is on by default now: `enable.idempotence` defaults to `true`. It needs `acks=all`, `retries` above 0 (the default is 2,147,483,647), and `max.in.flight.requests.per.connection` of at most 5. The producer's `delivery.timeout.ms` bounds the retrying, with a default of 2 minutes.
+
+The limit matters. The idempotent producer only removes duplicates from **its own internal retries**. The Kafka docs say an application that sends the same data again by hand cannot be de-duplicated. A new send has a new sequence number.
+
+RabbitMQ has a similar step on the producer side: publisher confirms. A persistent message in a durable queue is confirmed after it reaches disk. Without confirms, a crash before the disk write can lose the message. RabbitMQ also has transactions, but the docs say they reduce throughput by a factor of 250.
+
+## The consumer hop: when do you ack?
+
+The consumer has two jobs after it receives a message: **process** it and **ack** it. The order matters. Pick a rule, pick a crash point, and read the result.
+
+<AsyncCrashMatrix client:visible />
+
+Read the table in three lines.
+
+- **Ack first** can lose work. If the consumer dies after the ack and before the work, the broker thinks it is done. That is at-most-once.
+- **Work first** can repeat work. If the consumer dies after the work and before the ack, the broker sends it again. That is at-least-once.
+- **Work first, plus dedupe**, is safe at both points.
+
+For anything that must not be lost, pick work first and fix the duplicates.
+
+## Exactly-once effects: dedupe at the consumer
+
+True exactly-once delivery over a network is not on offer. What you can get is **exactly-once effect**: the message may arrive twice, but the change happens once. The recipe is an **idempotent consumer**, from lesson 3.4.
+
+Give every message a unique id. The consumer keeps a table of processed ids. Before it acts, it checks the table. The check and the effect must be in **one database transaction** (lesson 4.4). Then a crash can never leave one without the other.
+
+<AsyncAckWalk mode="dedupe" client:visible />
+
+If the id is saved in a different system from the effect, you rebuild the gap. Save the id first and crash, and the work is lost. Do the work first and crash, and the work repeats.
+
+A dedupe table grows. Keep each id at least as long as the longest time a redelivery can arrive. Then expire it.
+
+<Callout type="deep" title="What Kafka transactions give you">
+Kafka can make "read, process, write" exactly-once **inside Kafka**. A transactional producer writes the output records and the consumer's offsets in one transaction. The consumer reads with `isolation.level=read_committed`, so it sees only committed transactions, and it sets `enable.auto.commit=false`. A transaction that stays open too long is aborted by the coordinator: `transaction.timeout.ms` defaults to 1 minute. Kafka's own docs add the limit: for other destination systems, exactly-once "generally requires cooperation with such systems". If your consumer writes to Postgres or calls an API, Kafka transactions do not cover that write. Use a dedupe table or an idempotency key there.
+</Callout>
+
+## What the platforms offer
+
+| System | What it gives | Limit |
+|---|---|---|
+| Kafka idempotent producer | No duplicates from producer retries | Not for resends by your own code |
+| Kafka transactions | Atomic read-process-write inside Kafka | Kafka to Kafka only |
+| SQS standard | At-least-once, high throughput | Duplicates, no order |
+| SQS FIFO | No duplicate sends inside a 5 minute deduplication interval. It uses a deduplication id, or a SHA-256 hash of the body with content-based deduplication. | A repeat after 5 minutes is a new message |
+| RabbitMQ | Publisher confirms. Quorum queues confirm after replicas accept. A delivery limit (20 by default since 4.0) stops endless redelivery. | Confirms add latency. Transactions are far slower. |
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Kafka producer `acks`, default | `all` | Kafka producer configs |
+| Kafka `enable.idempotence`, default | `true` | Kafka producer configs |
+| Kafka producer `retries`, default | 2,147,483,647 | Kafka producer configs |
+| Kafka `max.in.flight.requests.per.connection`, default | 5 | Kafka producer configs |
+| Kafka `delivery.timeout.ms`, default | 120,000 ms (2 min) | Kafka producer configs |
+| Kafka `transaction.timeout.ms`, default | 60,000 ms (1 min) | Kafka producer configs |
+| SQS FIFO deduplication interval | 5 min | SQS FIFO docs |
+| RabbitMQ transactions | throughput lower by a factor of 250 | RabbitMQ docs |
+| RabbitMQ quorum queue delivery limit, default | 20 (4.0 and later) | RabbitMQ docs |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| At-most-once | Lowest latency. No duplicates. | Lost messages | Metrics, logs, anything where a gap is fine |
+| At-least-once, no dedupe | Nothing is lost | Duplicates reach the effect | The effect is naturally idempotent, like "set price to 9" |
+| At-least-once + idempotent consumer | Safe, correct effects | A dedupe table and a transaction per message | Payments, orders, ledgers |
+| Kafka transactions | Atomic inside Kafka | Latency and throughput | Stream processing from topic to topic |
+| `acks=all` | No loss from one broker failure | Slower writes | Almost always |
+| `acks=1` | Faster writes | A leader crash can lose data | Rarely. Only when loss is cheap. |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "The network gives at-least-once at best. I get exactly-once effects with an idempotent consumer. Every event has a unique id, and the consumer saves the id in the same transaction as the change." Then show you know the edge: "Kafka transactions cover Kafka to Kafka. Writes to an outside system need the dedupe table."
+</Callout>
+
+<Callout type="mistake">
+Do not say "we use Kafka, so it is exactly-once". Say what is exactly-once and over which hops. Do not say "the idempotent producer removes all duplicates". It only covers its own retries. Do not ack before processing and then claim no loss. And do not put the dedupe check in a different store from the effect, with no transaction between them.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A consumer acks first and then writes to the database. It crashes between the ack and the write. What does the system end with?',
+      options: ['The write is lost, and nobody retries it', 'The write happens twice', 'The broker resends and the write happens once', 'The broker blocks until the consumer restarts'],
+      answer: 0,
+      explain: 'The ack told the broker the message was done, so the broker deleted it. The work was never done and the message is gone. That is at-most-once. The other outcomes need a redelivery, and a redelivery only happens when no ack arrived.',
+    },
+    {
+      q: 'You enable Kafka transactions with read_committed. The consumer reads topic A, writes topic B, and calls a payment API. Which step is protected by the transaction?',
+      options: ['Both the write to B and the payment call', 'Only the payment call', 'The write to B and the offset commit. The payment call needs its own idempotency key.', 'None, because transactions are not exactly-once'],
+      answer: 2,
+      explain: 'Kafka commits the output records and the consumer offsets together. A call to an outside API is not part of that transaction. A retry can charge twice unless the API call carries an idempotency key.',
+    },
+    {
+      q: 'You keep a "processed ids" table to drop duplicates. Where must the id be written so a crash never splits it from the effect?',
+      options: ['In an in-memory set in the consumer', 'In Redis, right after the database write', 'In the broker, before the consumer starts work', 'In the same database transaction as the effect'],
+      answer: 3,
+      explain: 'One transaction commits the id and the effect together, or neither. A separate store leaves a gap between the two writes, and a crash in the gap loses the work or repeats it. Memory is lost on restart.',
+    },
+    {
+      q: 'A producer sends a message, gets no ack, and does not know why. Which statement is true?',
+      options: ['It can tell, because lost messages return an error', 'It cannot tell a lost message from a lost ack, so it must choose between a resend and a possible loss', 'It should always resend, because duplicates are impossible', 'It should wait one second, and then it can tell'],
+      answer: 1,
+      explain: 'Silence looks the same in both cases. Resending risks a duplicate. Not resending risks a loss. Waiting does not reveal which case it was. Duplicates are possible, which is why you pair resends with dedupe.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="delivery-fifo-eight-minutes"
+  title="Two shipments for one order"
+  scenario="An order service sends to an SQS FIFO queue and uses content-based deduplication. Warehouse staff report that some orders shipped twice."
+  facts={[
+    'queue type:               FIFO, content-based deduplication on',
+    'consumer:                 writes a shipment row, no id check',
+    'cause found in logs:      the same order JSON was sent twice, 8 minutes apart',
+    'event before the resend:  a regional outage, the producer gave up',
+    'a nightly job re-sends orders that have no shipment',
+  ]}
+  steps={[
+    {
+      prompt: 'Why did FIFO deduplication not stop it?',
+      options: [
+        'The deduplication interval is 5 minutes. A copy sent after 8 minutes is a new message.',
+        'FIFO queues deliver every message twice',
+        'Content-based deduplication needs a message id header',
+        'SHA-256 hashes collide often',
+      ],
+      answer: 0,
+      explain: 'SQS FIFO only suppresses duplicate sends inside the 5 minute deduplication interval. After it, the same body is accepted again as new.',
+    },
+    {
+      prompt: 'What is the robust fix?',
+      options: [
+        'Resend faster than 5 minutes',
+        'Move to a standard queue',
+        'Make the consumer idempotent: a unique key on the order id, written in the same transaction as the shipment row',
+        'Delete the nightly job and hope the producer never gives up',
+      ],
+      answer: 2,
+      explain: 'The queue’s window is a limited tool. The consumer must be the last line of defence. A unique constraint on the business key stops a second shipment however late the copy arrives. A standard queue gives no dedupe at all.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Apache Kafka: design, message delivery semantics](https://kafka.apache.org/43/design/design/): the three guarantees, idempotent producers, and transactions.
+- [Apache Kafka: producer configs](https://kafka.apache.org/43/configuration/producer-configs/): idempotence, acks, retries, and the transaction timeout.
+- [Amazon SQS: FIFO exactly-once processing](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-exactly-once-processing.html): the 5 minute deduplication interval.
+- [RabbitMQ: consumer acknowledgements and publisher confirms](https://www.rabbitmq.com/docs/confirms): confirms, requeue, and transaction cost.

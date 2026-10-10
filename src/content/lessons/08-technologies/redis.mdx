@@ -1,0 +1,211 @@
+---
+summary: 'Redis keeps rich data structures in memory and runs commands on one thread. That design makes it fast and simple, and it sets the limits on durability, big commands, and clustering.'
+requires: ['05-caching/cache-strategies', '05-caching/eviction', '04-data/replication']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import RedisEventLoop from '../../../components/anim/lessons/RedisEventLoop.tsx';
+import RedisLeaderboard from '../../../components/anim/lessons/RedisLeaderboard.tsx';
+
+## What it is
+
+Redis is an in-memory data structure server. It keeps its data in RAM and offers rich types, not just a plain key-value map: strings, hashes, lists, sets, sorted sets, and streams. Disk persistence is optional.
+
+You met Redis in Module 5 as a [shared cache](/learn/05-caching/cache-placement) and as the place where [cache strategies](/learn/05-caching/cache-strategies) and [eviction](/learn/05-caching/eviction) happen. This lesson looks inside it. The same engine also does leaderboards, counters, rate limits, and locks. Each of those uses a data structure, not a cache trick.
+
+## The internal model
+
+### One thread runs the commands
+
+The Redis docs describe it this way: "Redis is, mostly, a single-threaded server from the POV of commands execution (actually modern versions of Redis use threads for different things)." So treat command execution as one thread. To use more cores, you run more Redis instances.
+
+One thread has a big benefit. A command runs to the end before the next one starts, so each command is atomic. No other client can see a `ZADD` half done. You do not need locks inside the server.
+
+One thread also has a cost. A slow command stops every other client. Step through it.
+
+<RedisEventLoop client:visible />
+
+Look at the difference between a cheap and an expensive command. `GET` and `ZADD` touch memory only. `KEYS *` walks the whole keyspace, so its cost grows with the number of keys. `SCAN` gives the same walk in small slices, so other clients get turns in between. Whenever a command is O(N) in a large collection, ask what else is waiting behind it.
+
+### Pipelining: fewer round trips
+
+A normal Redis client sends a command, then waits for the reply. The docs call this a request/response protocol. Time spent in the network is the round trip time (RTT). The docs give an extreme example. If the RTT is 250 ms, then even a server that can process 100,000 requests per second serves at most four requests per second to one client that waits for each reply.
+
+Inside one data center the RTT is much smaller. Lesson 5.2 used ~0.5 ms. It still adds up when you send thousands of commands in a row.
+
+**Pipelining** means sending many commands without waiting for each reply, then reading all replies at once. It also helps the server. The docs explain that without pipelining each command needs a `read()` and a `write()` system call, which means a switch from user space to kernel space. With pipelining, one `read()` takes in many commands and one `write()` sends many replies. The docs say the rate "initially increases almost linearly with longer pipelines, and eventually reaches 10 times the baseline". The server queues replies in memory, so send batches (the docs suggest about 10,000 commands), not one giant stream.
+
+A Lua script solves a different case: read, decide, then write. A pipeline cannot do that, because the client needs the reply to the read before it writes.
+
+### Sorted sets: a leaderboard in two commands
+
+A **sorted set** is a collection of unique strings where each one has a score, and the set stays ordered by score. `ZADD` adds a member or moves it to a new score. The Redis docs give its cost as O(log N) per item added. `ZRANGE` with `REV` reads from the top, at O(log N + M), where M is the number of members returned. So "top 10 of ten million players" costs one slice, not a sort.
+
+Equal scores sort lexicographically, byte by byte. With `REV`, ties come out in reverse order. Try it.
+
+<RedisLeaderboard client:visible />
+
+Scores are 64-bit floating-point numbers. They hold integers exactly between -2^53 and 2^53. Beyond that you may get an approximation.
+
+### Persistence: RAM first, disk second
+
+Redis offers two ways to write to disk, and you can use both.
+
+| Method | What it stores | Cost |
+|---|---|---|
+| **RDB** | A point-in-time snapshot, taken with a fork | Compact and quick to restart from. You can lose everything since the last snapshot. |
+| **AOF** (append-only file) | A log of every write | Larger files. Durability depends on `appendfsync`. |
+
+The `appendfsync` setting has three policies: `always`, `everysec` (the default), and `no`. The docs say that with `everysec` "you may lose 1 second of data". So an acknowledged write can still be lost in a crash. This is the same fsync trade-off as in [lesson 4.2](/learn/04-data/storage-engines), with a clear label.
+
+### Replication and Redis Cluster
+
+Redis replication is asynchronous: "Redis uses asynchronous replication." Replicas are read-only by default. The `WAIT` command asks for acknowledgement from a number of replicas, which makes loss less likely. The docs say it still does not make the guarantee strict. After a failover, writes the old primary acknowledged can be gone ([lesson 4.6](/learn/04-data/replication)).
+
+Redis Cluster shards the keyspace into **16,384 hash slots**. A key's slot is `CRC16(key) mod 16384`. Each primary owns a subset of the slots. This is a fixed-slot cousin of [consistent hashing](/learn/04-data/consistent-hashing): you move whole slots between nodes, not individual keys. Multi-key commands work only when all keys are in one slot. A **hash tag**, the part of a key in braces such as `{user:7}:cart`, makes keys share a slot.
+
+### Locks, with a warning
+
+For one Redis instance, the docs show the lock as `SET resource_name my_random_value NX PX 30000`. `NX` means "only if the key does not exist". `PX 30000` is an auto-release time of 30 seconds, so a crashed holder cannot lock forever. To release, check that the stored value still matches your random value, then delete it. Do the check and delete in one Lua script. Otherwise you might delete a lock another client took after yours expired.
+
+Redlock extends this to N=5 separate primaries and asks for a majority, 3. The docs themselves warn that Redis expiry does not use a monotonic clock, and they advise **fencing tokens**: a number that grows with each lock grant, which the protected resource checks. A lock that only guards efficiency (avoid duplicate work) can be a Redis lock. A lock that guards correctness needs a fencing token or a consensus system ([lesson 4.11](/learn/04-data/consensus)).
+
+## When to use it
+
+- A shared cache in front of a database (cache-aside, [lesson 5.3](/learn/05-caching/cache-strategies)).
+- Leaderboards and "top K" lists with sorted sets.
+- Counters and rate limiters. Atomic increments are cheap because commands run one at a time.
+- Sessions and short-lived tokens, with a TTL.
+- Streams, when you want a lightweight append-only log in the same server.
+
+## When not to
+
+| Situation | Why | Look at |
+|---|---|---|
+| The only copy of data you cannot lose | Async replication and `everysec` fsync can lose acknowledged writes | [PostgreSQL](/learn/08-technologies/postgresql) |
+| Data far larger than RAM | Everything lives in memory, so cost grows with data size | [DynamoDB](/learn/08-technologies/dynamodb) or [Cassandra](/learn/08-technologies/cassandra) |
+| Multi-key transactions across many keys on a cluster | Keys must share a slot | A database with transactions |
+| Lock that guards correctness, with no fencing | Clock jumps and pauses can break it | [ZooKeeper / etcd](/learn/08-technologies/zookeeper) |
+
+## Numbers
+
+Do not quote one "Redis does N ops per second" figure. It depends on the hardware, the command, the value size, the network, and pipelining. The Redis benchmark page shows two example runs on its own test machines, and it calls them examples, not promises. One run, with no pipelining, gave about 72,000 `SET` per second. Another, with a pipeline of 16, gave about 1.5 million per second, on a laptop. The lesson from the pair is the ratio and the cause, not the number. Benchmark your own workload.
+
+| Fact | Value | Source |
+|---|---|---|
+| Hash slots in Redis Cluster | 16,384 | Cluster spec |
+| Default `appendfsync` | `everysec`, up to 1 second of writes at risk | Persistence docs |
+| ZADD cost | O(log N) per item | ZADD docs |
+| ZRANGE cost | O(log N + M) | ZRANGE docs |
+| Pipelining gain, docs figure | up to about 10x over no pipelining | Pipelining docs |
+| Redlock instances | 5, majority 3 | Distributed locks docs |
+| Exact integer scores | between -2^53 and 2^53 | ZADD docs |
+
+## Interview lens
+
+<Callout type="tip">
+Say what structure you use, not just "Redis". "Leaderboard: a sorted set, `ZADD` on score change, `ZRANGE REV` for the top 100, O(log N) per update." "Rate limiter: an atomic counter with a TTL." Then say the cost: "It is in memory and replicates asynchronously, so I treat it as a derived store that I can rebuild from the database."
+</Callout>
+
+<Callout type="mistake">
+Do not say Redis is fast because "it is in memory" and stop there. Name the single-threaded design and the pipeline. Do not say "Redis is single-threaded" without the caveat that modern versions use threads for other work. Do not put `KEYS *` in a production code path. Do not call a Redis lock "safe" without a fencing token. And do not promise that an acknowledged write survives a failover.
+</Callout>
+
+<Callout type="deep" title="Why not make the thread pool bigger?">
+A multi-threaded store must lock shared structures, and every lock costs time and adds bugs. One thread removes that whole class of cost and makes each command atomic. The price is that one core limits each instance. Redis answers with horizontal scaling: more instances, or Redis Cluster with slots, not more threads on one dataset.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why can two clients run INCR on the same Redis key at the same moment and never lose an update?',
+      options: [
+        'Commands run one at a time on one thread, so each INCR finishes before the next starts',
+        'Each key has a lock that clients must take first',
+        'Redis replicates the key before answering',
+        'INCR is retried until it works',
+      ],
+      answer: 0,
+      explain: 'Command execution is mostly single-threaded, so every command is atomic. There is no read-modify-write gap for another client to slip into. There is no per-key lock, and replication has nothing to do with it.',
+    },
+    {
+      q: 'One client runs KEYS * on a database with 50 million keys. What do other clients see?',
+      options: [
+        'Nothing. They use a separate thread.',
+        'Their commands wait until the KEYS command finishes',
+        'Their commands fail at once with an error',
+        'Only the clients that use the same keys wait',
+      ],
+      answer: 1,
+      explain: 'The command thread cannot run anything else while KEYS walks the keyspace. Every client waits, even for cheap commands on other keys. SCAN avoids this by returning small slices.',
+    },
+    {
+      q: 'A game has 20 million players. You need the top 10 at any time while scores change many times a second. Which design fits Redis best?',
+      options: [
+        'A hash with one field per player. Read all fields and sort them in the app.',
+        'A list of player names. Sort it after every score change.',
+        'A sorted set with the score as the sorted-set score. Read the top 10 with ZRANGE and REV.',
+        'A string holding a JSON array of all players',
+      ],
+      answer: 2,
+      explain: 'The sorted set keeps order as part of the write, O(log N) per update. The top 10 is a slice, O(log N + 10). The other designs move all 20 million entries to the client or re-sort on each change.',
+    },
+    {
+      q: 'Redis uses appendfsync everysec and the machine loses power. What can you lose?',
+      options: [
+        'Nothing, because AOF writes every command first',
+        'The whole dataset',
+        'Only keys that have a TTL',
+        'About the last second of acknowledged writes',
+      ],
+      answer: 3,
+      explain: 'With everysec the AOF is fsynced once per second, so a crash can lose up to one second of data. The policy always trades speed for safety. The policy no hands the timing to the operating system.',
+    },
+    {
+      q: 'On Redis Cluster, MGET key1 key2 fails with a cross-slot error. What is the cleanest fix when the two keys belong to one user?',
+      options: [
+        'Raise the number of hash slots',
+        'Send the two commands to two different nodes',
+        'Turn off Cluster mode',
+        'Add a hash tag to both keys, such as {user:7}:a and {user:7}:b, so they share a slot',
+      ],
+      answer: 3,
+      explain: 'A slot is CRC16(key) mod 16384, taken over the hash tag when there is one. Keys with the same tag land in the same slot, so a multi-key command can run. The slot count is fixed at 16,384.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Loading a warm-up cache"
+  scenario="A deploy script preloads 50,000 keys into Redis in the same data center. The round trip is 0.5 ms. Server work per command is tiny, so ignore it."
+  steps={[
+    {
+      prompt: 'The script sends one command, waits for the reply, then sends the next. How long does the load take?',
+      unit: 'seconds',
+      answer: 25,
+      within: 1.2,
+      explain: '50,000 round trips x 0.5 ms = 25,000 ms = 25 seconds. The server is nearly idle. The script spends almost all of its time waiting on the network.',
+    },
+    {
+      prompt: 'Now the script pipelines in batches of 10,000 commands. How many round trips does it make?',
+      unit: 'round trips',
+      answer: 5,
+      within: 1.1,
+      explain: '50,000 / 10,000 = 5 batches, so 5 round trips, about 2.5 ms of waiting. The server still has to execute all 50,000 commands, so the total is dominated by that work, not by the network.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Redis docs: Pipelining](https://redis.io/docs/latest/develop/using-commands/pipelining/)
+- [Redis docs: Persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
+- [Redis docs: Cluster specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/)
+- [Redis docs: Distributed locks with Redis](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
+- [Redis docs: ZADD](https://redis.io/docs/latest/commands/zadd/)

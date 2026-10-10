@@ -1,0 +1,212 @@
+---
+summary: 'DynamoDB is a managed key-value store that hashes your partition key to a partition. It rewards you for knowing your queries up front, and it punishes one hot key.'
+requires: ['04-data/data-modeling', '04-data/sharding', '04-data/consistent-hashing']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import DdbKeyLayout from '../../../components/anim/lessons/DdbKeyLayout.tsx';
+import DdbCapacity from '../../../components/anim/lessons/DdbCapacity.tsx';
+
+## What it is
+
+Amazon DynamoDB is a managed key-value and document database. AWS runs the machines, the partitioning, and the replication. In on-demand mode it is serverless: you pay per request and plan no capacity. You do not choose a node count. You choose a **primary key** and a way to pay for reads and writes.
+
+That trade is the whole product. You give up flexible queries. You get a store that [shards](/learn/04-data/sharding) for you, with no table size limit in practice. The quotas page says there is "no practical limit on a table's size".
+
+## The internal model
+
+### Primary key: partition key plus optional sort key
+
+A table has a primary key. It is either **simple** (a partition key only) or **composite** (a partition key and a sort key). The docs say DynamoDB "uses the partition key's value as input to an internal hash function". The result decides which partition stores the item. This is hash partitioning, as in [lesson 4.7](/learn/04-data/sharding). Items with the same partition key are "stored together, in sorted order by sort key value". Step through a small table, then add an index.
+
+<DdbKeyLayout client:visible />
+
+Two consequences follow.
+
+- A **Query** names one partition key value and, optionally, a range of sort key values. It reads one slice of one partition. A **Scan** reads the whole table. Scan is the slow path.
+- Model related items under the same partition key, so one Query returns them: a user and the user's orders, a chat room and its messages. This is the access-pattern-first design of [lesson 4.1](/learn/04-data/data-modeling).
+
+### Secondary indexes
+
+A **global secondary index** (GSI) has a different partition key and sort key from the table. It is a separate copy of the data, with its own partitions. A **local secondary index** (LSI) has the same partition key as the table and a different sort key. The default quota is 20 GSIs and 5 LSIs per table.
+
+Know three rules about GSIs.
+
+1. **Reads are eventually consistent.** The docs say "All reads from GSIs and streams are eventually consistent." A GSI cannot give a strongly consistent read, even if you ask for one.
+2. **They cost writes.** Every write to the table also writes to each index that holds the item.
+3. **They cannot join back.** A GSI query "cannot fetch attributes from the base table". You must project the attributes you need into the index.
+
+An LSI has a catch. If a table has any LSI, then an item collection (all items with one partition key value) cannot exceed 10 GB. The docs call 10 GB the maximum partition size for such a table. That cap is why many teams avoid LSIs.
+
+### Consistency
+
+A read is eventually consistent by default. You can ask for a **strongly consistent** read on the table. It returns the result of all writes that succeeded before it. It costs twice as much as an eventually consistent read.
+
+### Capacity: units, modes, and the partition ceiling
+
+DynamoDB meters work in **read units** and **write units**.
+
+- One read unit: one strongly consistent read per second, or two eventually consistent reads per second, of an item up to 4 KB.
+- One write unit: one write per second of an item up to 1 KB.
+- Transactional reads and writes cost twice as much.
+- Item sizes are rounded up. Reading a 10 KB item is billed as 12 KB, so 3 read units for a strongly consistent read. Writing a 1.6 KB item is billed as 2 KB.
+
+There are two **capacity modes**. In **on-demand** mode you pay per request. In **provisioned** mode you pay for read and write units per hour. Provisioned is cheaper when the load is steady and predictable. On-demand is simpler when it is not.
+
+Try the numbers. Move the sliders and read the two cards at the bottom.
+
+<DdbCapacity client:visible />
+
+The bottom-right card is the most important one. The docs say each partition "is designed to deliver a maximum capacity of 3,000 read units per second and 1,000 write units per second". The table-level default quota is 40,000 units, and you can ask for more. But if every write goes to one partition key, you are held to one partition's ceiling. A **hot partition** throttles while the rest of the table sits idle. The usual cures:
+
+- Pick a key with many distinct values and even traffic (a user ID, not a country code).
+- For a unavoidably hot key, add a **write-shard suffix**, such as `post#17#3` where the last part is a random number from 0 to 9. Writes spread over ten partitions. The price is that a read must query all ten and merge.
+
+### Streams and transactions
+
+**DynamoDB Streams** records changes to items. Records are removed automatically after 24 hours. You choose what a record holds: `KEYS_ONLY`, `NEW_IMAGE`, `OLD_IMAGE`, or `NEW_AND_OLD_IMAGES`. Order is per item, not across the partition. Streams are how you feed a search index or a cache from the table. This is change data capture.
+
+`TransactWriteItems` and `TransactGetItems` give all-or-nothing operations across items and tables. The docs set the limits: up to 100 unique items and 4 MB in one transaction. DynamoDB does two underlying operations per item, one to prepare and one to commit. That is why a transaction costs twice as many units. A transaction cannot use indexes. And it holds only inside one Region.
+
+## When to use it
+
+- Access patterns are known and simple: get by key, list by key and range.
+- You need to scale with no operations work, with traffic that is spiky or unknown (on-demand).
+- Per-user or per-entity data: sessions, carts, user profiles, device state.
+- You want an event feed from the table through Streams.
+
+## When not to
+
+| Situation | Why | Look at |
+|---|---|---|
+| Ad-hoc queries, joins, reports | Every query must fit a key or an index | [PostgreSQL](/learn/08-technologies/postgresql) |
+| Large blobs | The item size limit is 400 KB | Blob storage with a pointer in the item |
+| Full-text search | No relevance scoring | [Elasticsearch](/learn/08-technologies/elasticsearch) |
+| Wide multi-item transactions | At most 100 items, 4 MB, two units per item | [PostgreSQL](/learn/08-technologies/postgresql) |
+| Open-source or self-hosted requirement | It is an AWS service | [Cassandra](/learn/08-technologies/cassandra) |
+
+## Limits
+
+All values come from the DynamoDB developer guide ("Constraints" and "Service quotas" pages).
+
+| Limit | Value |
+|---|---|
+| Item size (names plus values) | 400 KB |
+| Partition key value length | up to 2,048 bytes |
+| Sort key value length | up to 1,024 bytes |
+| `Query` or `Scan` result per call | 1 MB, then use `LastEvaluatedKey` |
+| `BatchGetItem` | 100 items, 16 MB |
+| `BatchWriteItem` | 25 puts or deletes, 16 MB |
+| Items in one transaction | 100 unique items, 4 MB |
+| GSIs per table (default) | 20 |
+| LSIs per table | 5 |
+| Table with an LSI: item collection | 10 GB |
+| Per partition, designed capacity | 3,000 read units and 1,000 write units per second |
+| Table default quota, provisioned | 40,000 read units and 40,000 write units (adjustable) |
+| Stream record retention | 24 hours |
+
+## Interview lens
+
+<Callout type="tip">
+Start from the access patterns: "Get a user's orders, newest first. Partition key is the user ID, sort key is the order time. For orders by status I add a GSI, and I accept that it is eventually consistent." Then show you know the ceiling: "One partition tops out near 1,000 writes per second, so I avoid a partition key that a few users dominate."
+</Callout>
+
+<Callout type="mistake">
+Do not say a GSI can be strongly consistent. Do not say the limit is the table's throughput when a hot key throttles: the limit is per partition. Do not store 1 MB documents in one item: the limit is 400 KB. Do not use Scan in a request path. And do not model it like a relational database and expect joins.
+</Callout>
+
+<Callout type="deep" title="A missing item still costs a read">
+A read for an item that does not exist still uses read capacity, as if the item was there. The store still has to hash the key, find the partition, and look. It matters for a cache-miss check or a "does this ID exist" call at high volume. It is a cost, even when the answer is empty.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A Query on a global secondary index sets ConsistentRead to true. What happens?',
+      options: [
+        'It cannot be done. A GSI supports only eventually consistent reads.',
+        'It returns a strongly consistent result',
+        'It reads the base table instead',
+        'It costs half as much',
+      ],
+      answer: 0,
+      explain: 'The docs say all reads from GSIs are eventually consistent. The index is a separate copy that is updated after the base table write. If you need a strongly consistent read, read the base table by its primary key.',
+    },
+    {
+      q: 'You store items of 5 KB. How many read units does one strongly consistent read use?',
+      options: ['1', '3', '2', '5'],
+      answer: 2,
+      explain: 'A read unit covers up to 4 KB, and the size is rounded up to the next 4 KB multiple. 5 KB becomes 8 KB, so 2 units. An eventually consistent read of the same item would use 1.',
+    },
+    {
+      q: 'Which design is most likely to throttle at a few thousand writes per second even though the table has plenty of provisioned capacity?',
+      options: [
+        'Partition key = order ID, with random order IDs',
+        'Partition key = user ID for a million users',
+        'Partition key = day of the week, with all writes going to today\'s value',
+        'Composite key of user ID and timestamp',
+      ],
+      answer: 2,
+      explain: 'All writes for today share one partition key value, so they land on one partition, which is designed for about 1,000 write units per second. The other three designs spread writes over many partition key values.',
+    },
+    {
+      q: 'A transaction updates 10 items of 1 KB each. About how many write units does it use?',
+      options: ['10', '11', '20', '100'],
+      answer: 2,
+      explain: 'DynamoDB does two underlying writes per item, one to prepare the transaction and one to commit it. A 1 KB item then costs 2 units, so 10 items cost 20. That cost also applies when the transaction is cancelled.',
+    },
+    {
+      q: 'A product description of 700 KB must be stored with a product record. What is the standard approach?',
+      options: [
+        'Put the text in two attributes of one item',
+        'Raise the table\'s provisioned capacity',
+        'Turn on a Stream so the item can grow',
+        'Store the text in blob storage and keep its key in the DynamoDB item',
+      ],
+      answer: 3,
+      explain: 'An item is capped at 400 KB, and the cap covers every attribute name and value together, so two attributes do not help. Capacity and Streams do not change item size. The standard pattern is to keep large objects in blob storage and put a pointer in the item.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Sizing a provisioned table"
+  scenario="A catalog table stores items of 6 KB. The service makes 1,000 reads per second and also runs 200 transactional writes per second of the same item size."
+  steps={[
+    {
+      prompt: 'How many read units per second for 1,000 strongly consistent reads?',
+      unit: 'read units',
+      answer: 2000,
+      within: 1.1,
+      explain: '6 KB rounds up to 8 KB, which is 2 blocks of 4 KB. One strongly consistent read uses 2 units, so 1,000 reads use 2,000 units per second.',
+    },
+    {
+      prompt: 'If the reads can be eventually consistent, how many read units per second?',
+      unit: 'read units',
+      answer: 1000,
+      within: 1.1,
+      explain: 'An eventually consistent read costs half: 1 unit per read for this item size. So 1,000 units per second. Half the cost, at the price of a possibly stale read.',
+    },
+    {
+      prompt: 'How many write units per second for 200 transactional writes of 6 KB?',
+      unit: 'write units',
+      answer: 2400,
+      within: 1.1,
+      explain: '6 KB is 6 write units of 1 KB. A transactional write costs double, so 12 units each. 200 x 12 = 2,400 units per second. That is more than one partition\'s 1,000, so the keys must spread over at least 3 partitions.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [DynamoDB docs: Core components](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.CoreComponents.html)
+- [DynamoDB docs: Constraints](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Constraints.html)
+- [DynamoDB docs: Read and write operations (capacity units)](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/read-write-operations.html)
+- [DynamoDB docs: Transactions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html)
+- [DynamoDB docs: Partition key design](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html)

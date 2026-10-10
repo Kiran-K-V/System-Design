@@ -1,0 +1,223 @@
+---
+summary: 'PostgreSQL is the default relational database. Know how its row versions, write-ahead log, VACUUM, and one-process-per-connection design shape what it does well and where it stops.'
+requires: ['04-data/storage-engines', '04-data/indexing', '04-data/transactions']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import PgMvcc from '../../../components/anim/lessons/PgMvcc.tsx';
+import PgPooler from '../../../components/anim/lessons/PgPooler.tsx';
+import ReplicationCommit from '../../../components/anim/lessons/ReplicationCommit.tsx';
+
+## What it is
+
+PostgreSQL is an open-source relational database. You describe data as tables with typed columns, and you ask questions in SQL. It gives you transactions with ACID guarantees, joins, constraints, and many index types.
+
+In an interview, PostgreSQL is the safe default. If the data is relational and one primary machine can carry the writes, say "PostgreSQL" and move on. This lesson shows why it is a good default and where the default stops. Everything here builds on three earlier lessons: [how a database stores data](/learn/04-data/storage-engines), [indexing](/learn/04-data/indexing), and [transactions and isolation](/learn/04-data/transactions).
+
+## The internal model
+
+### Rows live in pages, and an update makes a new row version
+
+PostgreSQL stores a table in a **heap**: a set of 8 KB pages ([lesson 4.2](/learn/04-data/storage-engines)). A **row version**, also called a tuple, is one stored state of a row. Every `UPDATE` creates a new row version for the same logical row. The old version stays in the page for now.
+
+Each row version carries two hidden columns. According to the PostgreSQL docs, `xmin` is the ID of the inserting transaction. `xmax` is the ID of the deleting transaction, or zero for a row version that nobody has deleted. A row version where `xmax` is not zero may still be visible. That usually means the deleting transaction has not committed yet, or it rolled back.
+
+### MVCC: readers never wait for writers
+
+This is **multi-version concurrency control** (MVCC): keep several versions of a row, and let each query see a consistent one. The PostgreSQL docs say each statement sees a snapshot of the data "as it was some time ago, regardless of the current state of the underlying data". They also say the locks for reading "do not conflict with locks acquired for writing data, and so reading never blocks writing and writing never blocks reading". Lesson 4.4 compared this with locking. Now watch the row versions themselves.
+
+<PgMvcc client:visible />
+
+MVCC removes read-write blocking only. Two writers on the same row still queue. A hot row is still a hot row.
+
+The cost of MVCC is **dead row versions**. A version becomes dead when no transaction can see it any more. They take space until something removes them.
+
+### VACUUM cleans up dead versions
+
+The docs give four jobs for vacuuming: recover or reuse space used by updated or deleted rows, update planner statistics, update the visibility map (which speeds up index-only scans), and protect against transaction ID wraparound. The standard `VACUUM` "removes dead row versions in tables and indexes and marks the space available for future reuse". It does not return the space to the operating system, except when pages at the end of the table become completely free. `VACUUM FULL` compacts the table and does return space, but it takes an `ACCESS EXCLUSIVE` lock, so nobody can read or write the table meanwhile.
+
+You rarely run VACUUM by hand. **Autovacuum** runs it in the background. Your job is to keep it able to finish. The usual blocker is a transaction that stays open for hours, because VACUUM cannot remove a version that an open snapshot may still read.
+
+Transaction IDs are a fixed-size counter. The docs say every table must be vacuumed "at least once every two billion transactions" to avoid wraparound. The setting `autovacuum_freeze_max_age` defaults to 200 million.
+
+### The write-ahead log
+
+PostgreSQL follows the rule from lesson 4.2: write the log before the page. Changes go to the **write-ahead log** (WAL) first. The docs say that "only the WAL file needs to be flushed to disk to guarantee that a transaction is committed". Data pages can be written later. After a crash, PostgreSQL replays the WAL (REDO) to rebuild the pages. The same log supports point-in-time recovery and replication.
+
+### Indexes
+
+The default is B-tree: `CREATE INDEX` makes one unless you ask for another. The other built-in types fit special queries ([lesson 4.3](/learn/04-data/indexing)).
+
+| Type | Good for |
+|---|---|
+| B-tree | Equality and range queries, sorting. The default. |
+| Hash | Equality only |
+| GIN | Values that hold many items, such as arrays |
+| GiST, SP-GiST | Geometric and other custom search types |
+| BRIN | Huge tables where values correlate with physical order. Stores a min and max per block range. |
+
+### Replication
+
+A **standby** is a second PostgreSQL server that replays the primary's WAL. This is streaming replication. It is asynchronous by default. With synchronous settings, a commit waits until the standby confirms. The docs say the minimum wait time is "the round-trip time between primary and standby". That is the trade-off from [lesson 4.6](/learn/04-data/replication), now with PostgreSQL labels. Step through it again and watch the crash.
+
+<ReplicationCommit client:visible />
+
+### One process per connection
+
+Each client connection is a server process. The default `max_connections` is typically 100. A process costs memory and scheduling time. So 5,000 mostly idle connections is a poor design, and raising the limit to 10,000 is not the fix.
+
+The fix is a **connection pooler** such as PgBouncer. Many clients talk to the pooler, and the pooler shares a few server connections among them.
+
+<PgPooler />
+
+PgBouncer has three modes: session, transaction, and statement. In transaction mode a server connection is lent out only for the length of one transaction. That gives the best sharing. The cost: per the PgBouncer docs, transaction mode "breaks a few session-based features". Examples are `LISTEN`, `PREPARE`, and session-level advisory locks.
+
+## When to use it
+
+- You have relational data with relationships between entities, and you need joins, constraints, and multi-row transactions.
+- One primary can carry the write rate. Add read replicas for read-heavy load ([lesson 4.6](/learn/04-data/replication)).
+- You do not know all the queries up front. SQL and secondary indexes handle new questions without a redesign.
+- You want strong guarantees by default. The default isolation level is Read Committed. Repeatable Read prevents phantoms in PostgreSQL. Serializable prevents all the listed anomalies. Read Uncommitted is accepted but behaves as Read Committed.
+
+## When not to
+
+| Situation | Why PostgreSQL strains | Look at |
+|---|---|---|
+| Write rate beyond one primary | All writes go to one leader. Sharding is your job ([lesson 4.7](/learn/04-data/sharding)). | [Cassandra](/learn/08-technologies/cassandra) or [DynamoDB](/learn/08-technologies/dynamodb) |
+| Key-value access at huge scale with fixed query shapes | You pay for SQL features you do not use | [DynamoDB](/learn/08-technologies/dynamodb) |
+| Ranked full-text search with filters over a large corpus | Search engines build and score inverted indexes for this | [Elasticsearch](/learn/08-technologies/elasticsearch) |
+| Sub-millisecond lookups of hot data | Every query goes through a process, a parser, and disk-backed pages | [Redis](/learn/08-technologies/redis) as a cache |
+
+## Limits that matter
+
+| Limit | Value | Source |
+|---|---|---|
+| Default `max_connections` | typically 100 | PostgreSQL docs, connection settings |
+| Maximum field size | 1 GB | PostgreSQL docs, limits |
+| Maximum table size | 32 TB (with the default 8 KB block size) | PostgreSQL docs, limits |
+| Maximum columns per table | 1,600 | PostgreSQL docs, limits |
+| Database size | unlimited | PostgreSQL docs, limits |
+| Vacuum every table at least once per | 2 billion transactions | PostgreSQL docs, routine vacuuming |
+| `autovacuum_freeze_max_age` default | 200 million | PostgreSQL docs, routine vacuuming |
+
+A row version must fit in one 8 KB heap page. Large values are moved out of the page and stored separately (TOAST). The docs do not give one single "maximum row size" number, so do not quote one.
+
+## Interview lens
+
+<Callout type="tip">
+Name the reason, not just the product: "Orders and payments need multi-row transactions and constraints, so PostgreSQL. One primary plus read replicas covers the load at this scale. If writes outgrow one primary, I would shard by user ID." Then name the operational cost: "Connections are processes, so I will put PgBouncer in front, and I will watch long transactions because they block VACUUM."
+</Callout>
+
+<Callout type="mistake">
+Do not say "readers take row locks, so reads block writes". Under MVCC they do not. Do not say the default isolation level is Serializable. It is Read Committed. Do not fix "too many connections" by raising `max_connections` to a large number. And do not say a standby is always up to date: replication is asynchronous unless you turn on synchronous commit, and then every commit pays a round trip.
+</Callout>
+
+<Callout type="deep" title="Why a hot UPDATE makes bloat">
+A counter row updated 1,000 times leaves 1,000 dead versions behind the live one, until VACUUM can remove them. If the row is updated faster than VACUUM can clean up, or an old transaction holds the horizon back, the table and its indexes grow while the row count stays at one. A common fix is to avoid hot rows: append events and sum them, or keep the counter in Redis and write it back in batches.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Transaction A runs UPDATE on a row and has not committed. Transaction B runs SELECT on the same row. What happens at the default isolation level?',
+      options: [
+        'B waits until A commits or rolls back',
+        'B returns the last committed version at once, with no wait',
+        'B returns A\'s new value, which A has not committed',
+        'B fails with a serialization error',
+      ],
+      answer: 1,
+      explain: 'MVCC keeps the old version, so B reads it without waiting. Reading never blocks writing, and writing never blocks reading. B would see A\'s value only after A commits, and only in a snapshot taken after that. Read Committed never shows uncommitted data.',
+    },
+    {
+      q: 'A table holds 2 million live rows, but its files have grown to ten times the expected size. A report job has been inside one open transaction for two days. What is the most likely link?',
+      options: [
+        'VACUUM cannot remove dead row versions that the open transaction might still see',
+        'Each index on the table duplicates every row',
+        'The write-ahead log is stored inside the table file',
+        'Autovacuum only runs on tables with fewer than 2 million rows',
+      ],
+      answer: 0,
+      explain: 'A dead version is removable only when no open snapshot can see it. The two-day transaction holds the cleanup point back for the whole table. The fix is to end long transactions, not to add disk. The other options are not how PostgreSQL works.',
+    },
+    {
+      q: 'A service has 300 app instances and each opens 10 connections to PostgreSQL. The server runs out of connections. What is the best first fix?',
+      options: [
+        'Raise max_connections to 100,000',
+        'Switch to Read Uncommitted',
+        'Add a pooler such as PgBouncer in transaction mode',
+        'Turn off the write-ahead log',
+      ],
+      answer: 2,
+      explain: 'Each connection is a server process, so a very high limit wastes memory and scheduling time. A pooler lets 3,000 client connections share a small number of server connections. Isolation level and the WAL have nothing to do with connection count.',
+    },
+    {
+      q: 'You need a lookup that matches rows whose array column contains a given tag. Which index type fits?',
+      options: ['Hash', 'BRIN', 'GIN', 'B-tree on the whole array value only'],
+      answer: 2,
+      explain: 'GIN indexes values that hold many items, such as arrays, so it can find rows by one element. Hash handles equality on the whole value. BRIN stores min and max per block range and suits large, physically ordered data. A B-tree on the whole array matches only the full array, not one tag.',
+    },
+    {
+      q: 'What does a plain VACUUM (not VACUUM FULL) do to the table file size?',
+      options: [
+        'It shrinks the file and returns all freed space to the operating system',
+        'It rewrites the whole table and locks it',
+        'It doubles the file size to make room for new versions',
+        'It frees dead row space for reuse, and usually does not shrink the file',
+      ],
+      answer: 3,
+      explain: 'Plain VACUUM marks space from dead versions as available for reuse. It does not return space to the operating system, except when free pages sit at the end of the table. VACUUM FULL rewrites and compacts the table, and takes an ACCESS EXCLUSIVE lock.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="postgresql-connection-flood"
+  title="Too many clients"
+  scenario="A product team scales a stateless API from 10 pods to 200 pods. Each pod keeps a pool of 20 connections to PostgreSQL."
+  facts={[
+    'pods: 200   connections per pod: 20   (4,000 total)',
+    'max_connections: 100 (default)',
+    'database CPU: 12%   disk I/O: low',
+    'errors: "sorry, too many clients already"',
+  ]}
+  steps={[
+    {
+      prompt: 'CPU and disk are idle, but new connections are refused. What is the cause?',
+      options: [
+        'The server is out of connection slots, and each connection is a server process',
+        'The write-ahead log is full',
+        'Autovacuum is blocking new sessions',
+        'Read Committed is too strict for 200 pods',
+      ],
+      answer: 0,
+      explain: 'The limit is a count of connections, not load. 4,000 requested connections against a limit near 100 means most are refused while the machine sits idle.',
+    },
+    {
+      context: 'The team adds PgBouncer in transaction mode. The pods now run well. A week later a feature that uses LISTEN to get notifications from the database stops working.',
+      prompt: 'Why did it break?',
+      options: [
+        'Transaction mode lends a server connection for one transaction only, so session state such as LISTEN is lost between transactions',
+        'PgBouncer does not support SELECT',
+        'LISTEN needs Serializable isolation',
+        'The pooler caches results and returns old rows',
+      ],
+      answer: 0,
+      explain: 'In transaction mode, the next transaction from the same client may run on a different server connection. Session-based features such as LISTEN, PREPARE, and session advisory locks break. Put those clients on a direct connection or a session-mode pool.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [PostgreSQL docs: Concurrency Control, introduction](https://www.postgresql.org/docs/current/mvcc-intro.html)
+- [PostgreSQL docs: Routine Vacuuming](https://www.postgresql.org/docs/current/routine-vacuuming.html)
+- [PostgreSQL docs: System Columns (xmin, xmax)](https://www.postgresql.org/docs/current/ddl-system-columns.html)
+- [PostgreSQL docs: Limits](https://www.postgresql.org/docs/current/limits.html)
+- [PgBouncer: Features](https://www.pgbouncer.org/features.html)

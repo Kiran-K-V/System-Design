@@ -1,0 +1,203 @@
+---
+summary: 'A queue lets a producer hand work to workers and move on. It absorbs bursts and survives worker crashes, but it adds capacity to nothing and delivers at least once.'
+requires: ['01-one-machine/throughput-vs-latency', '03-api-design/idempotency']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import AsyncVisibilityWalk from '../../../components/anim/lessons/AsyncVisibilityWalk.tsx';
+import AsyncFlowLab from '../../../components/anim/lessons/AsyncFlowLab.tsx';
+
+## The problem
+
+A photo app resizes every upload into thumbnails. One resize takes about 200 ms of CPU. A pool of 10 workers does 10 × 5 = **50 resizes per second**. Normal traffic is 30 uploads per second. That is fine.
+
+A marketing email goes out. For 10 seconds, uploads arrive at 300 per second. The upload endpoint now has two bad options.
+
+- **Do the resize inside the request.** The user waits for the resize. Requests pile up on the 10 workers. By lesson 1.3, waiting time explodes once the arrival rate passes the service rate. Users see timeouts.
+- **Buy for the peak.** You need 300 ÷ 5 = 60 workers for 10 seconds, and 10 for the rest of the day. 50 idle machines for a one-time spike.
+
+Both fail for the same reason. The caller and the work are **tied together in time**. The caller must wait. The workers must be ready at the moment of the burst.
+
+## The mechanism: put a buffer in between
+
+A **queue** is a buffer that sits between a **producer**, which creates work, and **workers** (also called consumers), which do it. The producer adds a **message** that describes the job, for example the id of the uploaded photo. The producer returns at once. Workers take messages one by one at their own speed.
+
+This breaks the tie in time. It gives you four things:
+
+1. **The caller does not wait.** The upload returns after one fast write to the queue.
+2. **Bursts are absorbed.** The queue is longer for a while. Nothing times out. The Amazon SQS docs describe it this way: a queue can process each buffered request on its own, "scaling transparently to handle any load increases or spikes."
+3. **Producer and worker are decoupled.** A worker can be down, slow, or deployed again. The messages wait.
+4. **Workers scale on their own.** You add workers when the queue grows.
+
+Try it. Press Play. The workers never change speed. Only the queue depth moves.
+
+<AsyncFlowLab client:visible />
+
+The numbers, derived by hand, match the widget:
+
+- The burst adds messages faster than workers remove them: (300 − 50) × 10 s = **2,500 messages** waiting at the end of the burst.
+- A new message at that moment waits 2,500 ÷ 50 = **50 s**.
+- After the burst, arrivals drop to 30 per second. Workers remove 50. The queue shrinks by 20 per second, so it empties in 2,500 ÷ 20 = **125 s**.
+
+Now set workers to 6. Six workers do 30 per second, exactly the base rate. The queue never empties.
+
+<Callout type="deep" title="A queue buffers. It does not add capacity">
+If producers are faster than workers for long enough, the backlog grows without end. A queue only moves the wait from the caller to the queue. It does not remove the wait. Lesson 1.3 showed why: the closer the load gets to 100% of capacity, the longer the line. Lesson 6.4 covers what to do when the line grows.
+</Callout>
+
+## What a worker does with a message
+
+A worker does three things, in order: **receive** the message, **process** it, then **acknowledge** it (an ack). The ack tells the queue the work is done. Only then does the queue delete the message.
+
+Why not delete on receive? Suppose the worker crashes after receiving and before finishing. The queue already threw the message away. The job is lost, with no error anywhere. So queues keep the message until the worker says it is done.
+
+That creates the next question. How does a queue know a worker died? It cannot. So SQS uses a **visibility timeout**. When a worker receives a message, the queue hides it from other workers for a set time. The default is 30 seconds. If the worker deletes the message in time, it is gone. If not, the timer ends and the message becomes visible for another worker. A worker with a long job can ask for more time with `ChangeMessageVisibility`. RabbitMQ does the same with a different tool: if a consumer's channel closes without an ack, the broker puts the message back in the queue and marks it `redelivered`.
+
+Step through one crash:
+
+<AsyncVisibilityWalk client:visible />
+
+Notice what this buys and what it costs.
+
+- **You get no lost messages.** A crashed worker only delays its message.
+- **You pay with duplicates.** Worker 1 may have done part of the job. A slow job that outlives the timeout gets handed to a second worker while the first still runs. SQS standard queues say so directly: delivery is **at least once**, so design consumers to be idempotent.
+
+The fix is lesson 3.4 again. Make the job safe to run twice. For a thumbnail, write the output to a key built from the photo id. A second run then overwrites the same file.
+
+A timeout that is too short hands a slow job to a second worker, so you get duplicate work. A timeout that is too long makes a crashed worker's message wait before anyone retries it. Pick a value above your slowest normal job.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| SQS default visibility timeout | 30 s (range 0 s to 12 hours) | SQS docs |
+| SQS default retention | 4 days (range 60 s to 14 days) | SQS docs |
+| SQS maximum message size | 1 MiB (1,048,576 bytes). Larger payloads go to S3, with a pointer in the message. | SQS quotas page |
+| SQS messages per batch request | 10 | SQS quotas page |
+| SQS standard queue, in-flight messages | about 120,000 | SQS docs |
+| SQS FIFO queue, per partition | 300 API calls per second per action, or 3,000 messages per second with batching | SQS quotas page |
+| RabbitMQ prefetch | 100 to 300 usually gives good throughput | RabbitMQ docs |
+| Example above: backlog after the burst | (300 − 50) × 10 = 2,500 | Derived |
+| Example above: time to empty | 2,500 ÷ 20 = 125 s | Derived |
+
+Prefetch is how many unacknowledged messages a RabbitMQ consumer may hold at once. A high value keeps workers busy. It can also leave one worker holding many messages while others sit idle.
+
+Store the payload by reference when it is big. A message with an S3 key and a few ids is cheap. A 1 MiB message ties up the queue for every retry.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Queue between caller and work | Fast response. Bursts absorbed. Workers fail safely. | The result is not ready on return. You need a way to report status. Duplicates are possible. | Slow or spiky work the user does not need to wait for |
+| Synchronous call | Simple. Result in hand. | Caller waits. Spikes hit the workers directly. | Fast work and light load |
+| Standard queue (SQS) | Very high throughput | No order guarantee. Duplicates. | Independent jobs |
+| FIFO queue | Order within a group. 5 minute dedupe (lesson 6.3). | Lower throughput | Jobs that must run in order |
+| Short visibility timeout | Fast recovery | Duplicates for slow jobs | Short, idempotent jobs |
+| Long visibility timeout | Few duplicates | Slow recovery after a crash | Long jobs. Or extend the timeout while working. |
+
+## Interview lens
+
+<Callout type="tip">
+Say what the queue is for: "I put a queue between the API and the resize workers. The API returns right away. The queue absorbs the burst and workers drain it at a steady rate. I size workers for the average, and alert on queue age, not queue size." Then name the guarantee: "Delivery is at least once, so the job is idempotent."
+</Callout>
+
+<Callout type="mistake">
+Do not say "the queue makes the system faster". It makes the **caller** faster. Total work is the same. Do not say "SQS delivers exactly once". Standard queues are at least once. Do not say "delete the message first so we never process twice". A crash after the delete loses the job. And do not forget the user: if the work finishes later, say how the user finds out (polling, a push, or an email).
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Producers send 80 messages per second for 30 seconds. Workers finish 50 per second. Nothing else changes. About how many messages are waiting when the burst ends?',
+      options: ['900', '1,500', '2,400', '4,000'],
+      answer: 0,
+      explain: 'The queue grows by the difference: (80 − 50) × 30 = 900. 1,500 would be 50 × 30, the total the workers remove. 2,400 is 80 × 30, the total sent. The queue holds only what workers have not finished yet.',
+    },
+    {
+      q: 'A worker receives a message from a standard SQS queue, then crashes before it deletes the message. What happens?',
+      options: [
+        'The message is lost, because the queue gave it away',
+        'The message waits, and becomes visible again when the visibility timeout ends',
+        'The queue deletes it, because the worker took it',
+        'The message returns at once, because the queue sees the crash',
+      ],
+      answer: 1,
+      explain: 'Receiving only hides the message. Delete is the ack. The queue cannot see a crash, so it waits for the timer to end. It does not return the message at once, and it never deletes without an ack.',
+    },
+    {
+      q: 'Your jobs usually take 10 seconds, but 1 in 100 takes 60 seconds. The visibility timeout is 30 seconds. What do you see?',
+      options: [
+        'Nothing. Jobs over 30 seconds are cancelled cleanly.',
+        'The queue deletes the slow jobs.',
+        'Every job runs twice.',
+        'Slow jobs run twice at once: the message turns visible mid-job.',
+      ],
+      answer: 3,
+      explain: 'At 30 seconds the timer ends and the message turns visible. Another worker takes it while the first still works on it. Fast jobs finish before the timer, so they run once. The fix is a longer timeout, a timeout extension during work, and an idempotent job.',
+    },
+    {
+      q: 'Which problem does a queue NOT solve?',
+      options: [
+        'A spike of requests for 10 seconds',
+        'A worker that restarts during a deploy',
+        'Workers that are slower than producers for the whole day',
+        'A caller that must not wait for slow work',
+      ],
+      answer: 2,
+      explain: 'A queue holds a difference between two rates for a limited time. If workers are slower than producers all day, the backlog grows without end. You need more workers, or less work. A spike, a restart, and a waiting caller are the three cases a buffer handles well.',
+    },
+  ]}
+/>
+
+No lesson text covers this case. Use what you learned.
+
+<Diagnose
+  client:visible
+  id="queues-thumbnail-dupes"
+  title="Duplicate thumbnails"
+  scenario="A thumbnail service reads a standard queue. Customers report that some photos have two thumbnails, and the storage bill is climbing."
+  facts={[
+    'queue type:            standard',
+    'visibility timeout:    30 s (the default)',
+    'job duration p50:      12 s',
+    'job duration p99:      45 s',
+    'worker crashes today:  0',
+    'duplicate outputs:     about 1 in 100 jobs',
+  ]}
+  steps={[
+    {
+      prompt: 'Nothing crashed. Why do duplicates appear?',
+      options: [
+        'Jobs that run longer than 30 s outlive the visibility timeout, so the queue hands the same message to a second worker',
+        'Standard queues copy every message at random',
+        'The retention period of 4 days is too long',
+        'The queue lost the delete request from the fast jobs',
+      ],
+      answer: 0,
+      explain: 'The slowest 1% take 45 s and the timeout is 30 s. The message turns visible while the first worker is still busy. That matches "about 1 in 100". Fast jobs finish well inside the timer.',
+    },
+    {
+      prompt: 'What is the best fix?',
+      options: [
+        'Raise the timeout well above the p99 (or extend it while the job runs) and write the output under a key made from the photo id',
+        'Add more workers so jobs finish sooner',
+        'Switch the queue to FIFO and ignore the idempotency',
+        'Lower the timeout to 5 s so retries happen faster',
+      ],
+      answer: 0,
+      explain: 'A longer timeout removes most duplicates. An output key based on the photo id makes the rest harmless, because a repeat overwrites the same file. More workers do not change the job time. A lower timeout makes duplicates worse.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Amazon SQS: visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html): the timer, extending it, and the 12 hour cap.
+- [Amazon SQS: message quotas](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html): size, retention, batch, and FIFO limits.
+- [Amazon SQS: at-least-once delivery](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues-at-least-once-delivery.html): why standard queues can deliver twice.
+- [RabbitMQ: consumer acknowledgements and publisher confirms](https://www.rabbitmq.com/docs/confirms): ack, nack, requeue, and prefetch.

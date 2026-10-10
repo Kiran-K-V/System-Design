@@ -1,0 +1,232 @@
+---
+summary: 'Kafka is a replicated commit log. Producers append to partitions, followers copy the leader, and each consumer group keeps its own offset.'
+requires: ['04-data/replication', '04-data/consensus', '06-async/pubsub-logs']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import KafkaIsr from '../../../components/anim/lessons/KafkaIsr.tsx';
+import KafkaOffsets from '../../../components/anim/lessons/KafkaOffsets.tsx';
+import KafkaGroups from '../../../components/anim/lessons/KafkaGroups.tsx';
+
+## What it is
+
+Kafka is a system that stores streams of records and lets many programs read them. It is a **distributed commit log**. Lesson [6.2](/learn/06-async/pubsub-logs/) explained the log idea in general. This lesson shows how Kafka builds it.
+
+Four words carry most of the model.
+
+- A **broker** is one Kafka server.
+- A **topic** is a named stream, such as `orders`.
+- A **partition** is one ordered, append-only log that holds part of a topic. Every record in it gets an **offset**: its position, counted from 0.
+- A **consumer group** is a set of consumers that share the work of reading a topic.
+
+A queue (lesson [6.1](/learn/06-async/queues/)) deletes a message once a worker finishes it. Kafka does not. It keeps records until retention removes them. By default that is 7 days (`log.retention.hours` is 168) with no size limit (`log.retention.bytes` is -1). Any consumer can read again from any offset inside that window. That one choice gives you replay, many independent readers, and a buffer between fast producers and slow consumers.
+
+## Internal model
+
+### Partitions give scale and set the order
+
+One log on one machine has a ceiling. So Kafka splits a topic into partitions and spreads them over brokers. The producer picks the partition. When a record has a **key**, the producer hashes the key, so the same key always lands in the same partition.
+
+Order is kept **inside one partition only**. Kafka's docs say so directly: a topic is divided into totally ordered partitions. Two records in different partitions have no agreed order. If you need all events of one user in order, key by user id. If you need one order for the whole topic, you need one partition, and one partition caps your throughput.
+
+This is sharding (lesson [4.7](/learn/04-data/sharding/)) with one extra rule: the shard key decides what stays ordered.
+
+### Replication and the ISR
+
+Each partition has one **leader** and some **followers** on other brokers. This is leader-follower replication (lesson [4.6](/learn/04-data/replication/)). Producers write to the leader. Followers **pull** new records from the leader with fetch requests, the same request a consumer uses.
+
+The leader tracks the **in-sync replicas** (ISR): itself plus every follower that is close enough behind. A follower that cannot catch up within `replica.lag.time.max.ms` (default 30 seconds) leaves the ISR. Only an ISR member may become leader.
+
+The producer chooses how long to wait, with `acks`:
+
+- `acks=0`: do not wait.
+- `acks=1`: wait for the leader only. A leader crash right after the ack can lose the record.
+- `acks=all`: wait for the whole current ISR. The producer docs say the record is not lost as long as one in-sync replica stays alive.
+
+`acks=all` has a gap. If the ISR shrinks to just the leader, "all" means one machine. The setting `min.insync.replicas` closes it. With `acks=all`, the partition accepts writes only while the ISR is at least that size. Step through a write, a slow follower, and two failures.
+
+<KafkaIsr client:visible />
+
+Look at steps 5 to 8. With replication factor 3 and `min.insync.replicas=2`, Kafka survives one broker failure and keeps writing. At two failures it **stops writes** instead of keeping a record on one machine. That is the choice from lesson [4.9](/learn/04-data/cap-pacelc/): consistency over availability. If every ISR member dies, the default `unclean.leader.election.enable=false` keeps the partition offline until one returns. Turning it on restores availability and can lose acknowledged records.
+
+Watch the defaults. The **broker** defaults are `min.insync.replicas=1` and `default.replication.factor=1`. Those give no fault tolerance, so real clusters set them.
+
+### The controller uses consensus
+
+Who is the leader of partition 7? Someone must decide, and that decision needs agreement (lesson [4.11](/learn/04-data/consensus/)). Kafka keeps this metadata with its own Raft-based quorum, called KRaft. Kafka 4.0 supports only KRaft. ZooKeeper mode was removed. Record data does not go through that quorum. It uses the leader-follower path above.
+
+### Consumers, groups, and offsets
+
+A consumer **group** splits a topic's partitions among its members. The design doc says each partition is consumed by exactly one consumer within each subscribing group at any time. Another group reads the same partitions on its own. So the number of partitions is the ceiling on parallel consumers in one group. Try it.
+
+<KafkaGroups client:visible />
+
+A consumer's place in a partition is one number: the offset of the next record to read. The consumer **commits** that number. Kafka stores the commit as a record in an internal topic (`__consumer_offsets`). Not on the consumer, and not in ZooKeeper. After a crash, the new owner of the partition starts from the last committed offset.
+
+<KafkaOffsets client:visible />
+
+The commit timing sets the delivery guarantee (lesson [6.3](/learn/06-async/delivery-semantics/)).
+
+- Commit **after** processing: a crash in between repeats work. That is at-least-once, and Kafka's default.
+- Commit **before** processing: a crash in between loses work. That is at-most-once.
+
+The **idempotent producer** (default on, `enable.idempotence=true`) stops duplicates from producer retries. The broker drops a resend by its producer id and sequence number. It does not cover the consumer side. Kafka offers exactly-once processing inside Kafka with transactions and Kafka Streams. Writing to an outside database still needs an idempotent write (lesson [3.4](/learn/03-api-design/idempotency/)).
+
+## When to use it
+
+- **An event backbone.** Many services publish and many read. Each group has its own offset, so a new consumer can join later and replay.
+- **Buffering a spike.** The log absorbs a burst. Consumers catch up later. Lag (how far a group is behind) is the signal (lesson [6.4](/learn/06-async/backpressure-dlq/)).
+- **Change data capture.** Database changes flow into a topic (lesson [6.5](/learn/06-async/cdc/)).
+- **Stream processing.** A job such as Flink (lesson [8.7](/learn/08-technologies/flink/)) reads a topic and writes another.
+
+## When not to use it
+
+- **Per-message work with retries, delays, or priorities.** A queue fits better. In Kafka one slow record blocks the rest of its partition.
+- **Big payloads.** The broker default `message.max.bytes` is 1,048,588 bytes, about 1 MiB. Store the file in blob storage (lesson [8.11](/learn/08-technologies/blob-storage/)) and send the link.
+- **Request and response.** A caller that waits for an answer does not want a log.
+- **Lookup by key.** It is a log, not a database. Compaction keeps the latest value per key, but you still read by offset.
+- **A tiny, low-volume system.** A managed queue is simpler to run.
+
+## Numbers
+
+| Setting | Default | Where |
+|---|---|---|
+| `acks` | `all` | Producer config |
+| `enable.idempotence` | `true` | Producer config |
+| `delivery.timeout.ms` | 120,000 (2 minutes) | Producer config |
+| `retries` | 2,147,483,647 | Producer config |
+| `max.request.size` | 1,048,576 bytes | Producer config |
+| `min.insync.replicas` | 1 | Broker config |
+| `default.replication.factor` | 1 | Broker config |
+| `replica.lag.time.max.ms` | 30,000 | Broker config |
+| `message.max.bytes` | 1,048,588 | Broker config |
+| `log.retention.hours` | 168 (7 days) | Broker config |
+| `unclean.leader.election.enable` | `false` | Broker config |
+
+These are Kafka 4.3 defaults from the official configuration pages. I give no throughput figure per broker. It depends on hardware, record size, and settings. In an interview, ask for the load and size the partitions from it. Example with assumed numbers: ingest is 100 MB/s and one consumer handles 10 MB/s, so you need at least 100 / 10 = 10 partitions. Lesson [1.5](/learn/01-one-machine/numbers-to-know/) lists the numbers worth knowing.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| `acks=all`, RF 3, `min.insync.replicas=2` | Survives one broker loss with no lost acks | Latency of the slowest ISR member. Writes stop at two losses | Orders, payments, anything you cannot lose |
+| `acks=1` | Lower latency | A leader crash can lose acked records | Metrics, logs |
+| More partitions | More parallel consumers and write throughput | Weaker ordering scope. More files and more metadata | Throughput is the limit |
+| One partition | One total order | One consumer at a time. One broker's throughput | Small, ordered streams |
+| Long retention | Replay far back | Disk cost | Reprocessing and audit matter |
+
+<Callout type="tip">
+Say what the key is and why: "I key by user id, so one user's events stay in order, and different users spread over partitions." Then give the durability setting as one phrase: "replication factor 3, `acks=all`, `min.insync.replicas=2`". Then say what happens on failure: "it survives one broker and refuses writes at two." Add the consumer side: "commit after processing, make the handler idempotent."
+</Callout>
+
+<Callout type="mistake">
+Do not say "Kafka is ordered". It is ordered per partition. Do not say "Kafka never loses data". `acks=1`, unclean election, or a short retention can lose it. Do not say "exactly-once by default". The idempotent producer covers producer retries into one partition. Do not say offsets live in ZooKeeper. They live in an internal topic, and Kafka 4.0 has no ZooKeeper mode.
+</Callout>
+
+<Callout type="deep" title="Why min.insync.replicas needs acks=all">
+`min.insync.replicas` is checked only for producers that use `acks=all`. A producer with `acks=1` is acknowledged by the leader alone, so the ISR size does not matter to it. This is why the two settings are always named together. One sets how many copies must exist. The other makes the producer wait for them.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A topic has 6 partitions and one consumer group has 9 consumers. How many consumers receive records?',
+      options: [
+        '9, because Kafka splits each partition among consumers',
+        '6, and three consumers get no partition',
+        '1, because only one consumer per group may read',
+        '3, because the group size must divide the partitions',
+      ],
+      answer: 1,
+      explain: 'Each partition goes to exactly one consumer in a group. Six partitions feed at most six consumers. The other three sit idle until a consumer fails. To use nine consumers you need at least nine partitions.',
+    },
+    {
+      q: 'Replication factor 3, min.insync.replicas=2, producers use acks=all. Two of the three brokers fail and leave the ISR. What happens to a new write?',
+      options: [
+        'It is accepted, because the leader is alive',
+        'It is accepted and then lost when the leader fails',
+        'It is rejected: the ISR is 1, the minimum is 2',
+        'It waits until all three brokers are back',
+      ],
+      answer: 2,
+      explain: 'With acks=all the partition takes writes only while the ISR is at least min.insync.replicas. One member is below two, so the leader rejects the write. Kafka chooses to refuse a write over holding it on a single machine.',
+    },
+    {
+      q: 'A consumer reads offsets 10 to 14, writes all five results to its database, and crashes before it commits. What does the next consumer of that partition do?',
+      options: [
+        'Starts at the last committed offset and reads 10 to 14 again',
+        'Starts at offset 15, because the database already has the results',
+        'Skips the partition until a human resets the offset',
+        'Starts at offset 0',
+      ],
+      answer: 0,
+      explain: 'Kafka only knows the committed offset. The database write is invisible to it. So the records are delivered again, which is at-least-once. The fix is an idempotent database write, not a different crash rule.',
+    },
+    {
+      q: 'You must process every event of one customer in the order it happened, and you want 20 consumers working in parallel. What do you do?',
+      options: [
+        'Use one partition and 20 consumers',
+        'Use acks=all so Kafka orders the records',
+        'Send each customer to a random partition and sort in the consumer',
+        'Key records by customer id and use at least 20 partitions',
+      ],
+      answer: 3,
+      explain: 'Order holds inside a partition, and one key always goes to one partition. Twenty partitions let twenty consumers run. One partition would leave 19 idle. acks=all is about durability, not order.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="kafka-hot-partition"
+  title="One partition falls behind"
+  scenario="Topic `orders` has 8 partitions, keyed by merchant id. A group of 8 consumers reads it. During a flash sale, one partition's lag climbs while the other seven stay near zero."
+  facts={[
+    'partition  lag (records)',
+    'p0         90',
+    'p1         140',
+    'p2         70',
+    'p3         110',
+    'p4         95',
+    'p5         480,000',
+    'p6         120',
+    'p7         60',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'One merchant sends most of the sale traffic, and its key always hashes to p5',
+        'The leader of p5 was elected with an unclean election',
+        'The group has too few consumers overall',
+        'Retention on p5 is set too low',
+      ],
+      answer: 0,
+      explain: 'Same key, same partition. A hot key puts most records into one partition, and only one consumer can read a partition. The other seven partitions look healthy, so the group size and the cluster are fine.',
+    },
+    {
+      context: 'The team adds 4 more consumers to the group, making 12. Lag on p5 does not move.',
+      prompt: 'What change helps, and what does it cost?',
+      options: [
+        'Raise to 16 partitions so keys spread out. Cost: more files and metadata',
+        'Split the hot key: merchant id + order id mod 10. Cost: no total order per merchant',
+        'Set acks=1 on the producer so writes finish faster. Cost: some lost acks',
+        'Move the topic to one partition so lag is shared. Cost: lower throughput',
+      ],
+      answer: 1,
+      explain: 'More consumers do nothing: one partition has one reader. More partitions re-spread keys, but the hot merchant still hashes to a single partition. Splitting the key spreads its load over several partitions. The price is that order across those sub-keys is gone, so check that you only need order per order id.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Apache Kafka: Design](https://kafka.apache.org/43/design/design/) (partitions, replication, ISR, consumer groups, offsets, delivery semantics)
+- [Apache Kafka: Producer configs](https://kafka.apache.org/43/configuration/producer-configs/) (`acks`, idempotence, timeouts)
+- [Apache Kafka: Broker configs](https://kafka.apache.org/43/configuration/broker-configs/) (replication, retention, message size)
+- [Apache Kafka: Upgrade notes](https://kafka.apache.org/43/getting-started/upgrade/) (ZooKeeper mode removed in 4.0)

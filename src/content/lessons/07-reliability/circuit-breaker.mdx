@@ -1,0 +1,221 @@
+---
+summary: 'A circuit breaker stops calls to a dependency that keeps failing, then tests it with one call before it lets traffic back. Bulkheads and load shedding limit how far a sick dependency can hurt you.'
+requires: ['07-reliability/failure-modes', '07-reliability/timeouts-retries']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import RelBreakerWalk from '../../../components/anim/lessons/RelBreakerWalk.tsx';
+import RelBulkheadLab from '../../../components/anim/lessons/RelBulkheadLab.tsx';
+
+## The problem
+
+[Lesson 7.2](/learn/07-reliability/timeouts-retries/) gave every call a time limit. That caps how long one call hurts. It does not stop the next call from hurting just as much.
+
+Say 500 calls per second go to a dependency that has stopped answering. Each call waits for a 1-second timeout. By Little's law ([lesson 1.3](/learn/01-one-machine/throughput-vs-latency/)) that is 500 x 1 = 500 threads held at any moment. A pool of 200 threads cannot cover it. The caller is stuck on a dependency it already knows is broken, and every retry makes it worse.
+
+The caller needs a way to learn from its own recent failures and stop calling.
+
+## Naive solutions
+
+**Ping first.** "Check that the dependency is healthy, then call." It costs an extra call. The answer is stale by the time the real call goes out. And the ping can pass while the real call fails (gray failure, [lesson 7.1](/learn/07-reliability/failure-modes/)).
+
+**Shorter timeouts only.** A 100 ms timeout holds 50 threads at 500 calls per second, not 500. Better. But every call still goes out, still waits, and still fails. The dependency, which may be recovering, still gets the full load.
+
+**Retry harder.** This is the opposite of what the sick dependency needs.
+
+What you want is a rule that says: "this has failed N times in a row; stop sending, wait, then test gently."
+
+## The mechanism: a circuit breaker
+
+The name comes from the electrical device. A breaker trips when the current is too high and cuts the circuit, so the wires do not burn. A software **circuit breaker** wraps a call and does the same.
+
+Martin Fowler's article describes it as a small state machine with three states.
+
+- **Closed.** Calls pass through. A failure adds one to a counter. A success resets the counter to zero.
+- **Open.** The counter reached the threshold. Calls fail at once. The dependency is not called.
+- **Half-open.** After a **reset timeout**, the breaker lets one trial call through. If it succeeds, the breaker closes. If it fails, the breaker opens again and the timer restarts.
+
+Step through one full cycle. The threshold is 5, the value in Fowler's example code. The 10 s reset timeout is our example value.
+
+<RelBreakerWalk client:visible />
+
+Notice three things.
+
+1. **The count is failures in a row.** One success resets it. A lone blip never trips the breaker.
+2. **An open breaker is a fast failure, not a retry.** A retry repeats the call. A breaker stops it. They work together: the retry loop from lesson 7.2 gets an instant error from an open breaker instead of waiting for a timeout.
+3. **The recovery is automatic.** Half-open is how the breaker finds out the dependency is back, with one call and not a flood.
+
+### Design choices
+
+- **What counts as a failure.** Fowler's example counts timeouts. He also notes that not all errors should trip the circuit: some are normal failures, such as "item not found". Count timeouts, connection errors, and server errors. Do not count a request the client got wrong.
+- **Scope.** A breaker guards one dependency, or better, one endpoint of it. If one slow endpoint trips the breaker for the whole service, healthy endpoints go dark with it.
+- **What to do while open.** Pick a fallback: cached data, a default, a reduced page, or a clear error. A breaker without a plan for the caller only moves the failure.
+- **Show it.** Fowler says every state change should be logged, and breakers should expose their state for monitoring. An open breaker is a symptom you want on a dashboard (lesson 7.5).
+
+## Bulkheads: walls between uses of a resource
+
+A breaker reacts after failures pile up. A **bulkhead** prevents the spread in advance. The word comes from the watertight walls in a ship's hull: a leak floods one compartment, not the whole ship.
+
+In software, give each dependency (or each client) its own limited share of a resource, such as threads or connections. A slow dependency can then fill only its own share.
+
+Try it. A service has 100 threads. Dependency A is healthy. Dependency B gets slow. Drag B's hold time up with each protection mode.
+
+<RelBulkheadLab client:visible />
+
+What to notice:
+
+1. **Shared pool.** At 5 s, B's calls demand 100 x 5 = 500 threads. The pool has 100. About 1 in 5 calls of any kind gets a thread. A is healthy, and A's users still see about 80% failures.
+2. **Bulkhead.** B is confined to 25 threads. B still fails mostly (5% served). But A keeps its own 75 threads and serves everything. The damage stays on the sick path.
+3. **Bulkhead and breaker.** With B's breaker open, B's calls fail at once and hold no threads. The users of B get a fast error or a fallback, and A is untouched.
+
+The price of a bulkhead is that capacity is split. When B is healthy, its 25 threads cannot help A at a peak. That is the trade.
+
+## Load shedding: protect the server, not only the caller
+
+The same idea applies on the server side. When a server is overloaded, it is better to refuse some work early than to accept everything and serve it all badly.
+
+The Google SRE book says to reject excess requests early, and describes **client-side throttling**: each client keeps its last two minutes of history of requests and accepts. The client keeps sending until requests are K times the accepts. After that it rejects some calls itself, without touching the network. A client behaves like a breaker that opens by degrees.
+
+Stripe's rate-limiting post describes a **fleet usage load shedder**. It reserves capacity for critical methods, such as creating a charge. If the reserve is 20%, any non-critical request above the 80% share is rejected with a 503. Their **worker utilization shedder** is the last line of defense. It sorts traffic into four groups (critical methods, POSTs, GETs, and test mode traffic) and sheds test mode traffic first. Stripe warns that shedding and restoring load must happen slowly, to avoid flapping.
+
+Shedding is not free. The AWS article on load shedding says "the act of shedding load isn't free, so eventually the server falls prey to Amdahl's law and goodput drops". Rejecting a request still costs a little work. Shed early and cheaply.
+
+If your work flows through a queue instead of direct calls, the same pressure appears as a growing backlog. [Lesson 6.4](/learn/06-async/backpressure-dlq/) covers backpressure there.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Failure threshold in Fowler's example code | 5 | Martin Fowler, CircuitBreaker |
+| Threads held with no breaker (500 calls/s, 1 s timeout) | 500 | Derived: 500 x 1 s |
+| Threads held with a 100 ms timeout | 50 | Derived: 500 x 0.1 s |
+| Client-side throttling history | last 2 minutes | Google SRE book |
+| Fleet shedder reserve (Stripe's example) | 20% for critical methods | Stripe engineering blog |
+| Shared pool, B holds 5 s (lab) | A served about 20% | Lab model, derived |
+
+The reset timeout and the threshold are tuning values. Pick them from how long your dependency usually takes to recover and how noisy its errors are.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Circuit breaker | Fast failure, threads freed, room for recovery | Needs a fallback. A threshold that is too low trips on noise | Calls to a dependency that can fail for minutes |
+| Low failure threshold | Trips fast | False opens on brief blips | The dependency is critical and failures are rare |
+| High failure threshold | Rides out noise | Callers wait on a sick dependency longer | The dependency is flaky but usually recovers |
+| Bulkhead | One slow path cannot take every thread | Split capacity: an idle pool cannot help a busy one | Several dependencies share one pool |
+| Server-side load shedding | The healthy part of the load is served | Some real requests are refused | Overload where queuing would make everything slow |
+
+## In practice
+
+<Callout type="tip">
+Describe the whole defense in one line: "Each dependency gets a timeout, a small retry budget, a circuit breaker, and its own thread pool. When the breaker is open we serve cached data and show the page without recommendations." Say what the fallback is. A breaker with no fallback only changes the error message.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the circuit breaker retries". It stops calls. Do not say "once it opens it stays open", because half-open tests the dependency. Do not guard a whole service with one breaker when one endpoint is the sick one. And do not trip on a single error: use a count in a row or a failure rate.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A breaker is closed. Its failure count is 4 and the threshold is 5. The next call succeeds. What is the count now?',
+      options: ['4, because the history is kept', '5, because a call was made', '0, because a success resets it', '3, because one failure ages out'],
+      answer: 2,
+      explain: 'In the closed state a success resets the count to zero. The breaker counts failures in a row. Isolated failures never add up to a trip.',
+    },
+    {
+      q: 'A breaker is open and its reset timeout has not passed. A call arrives. What happens?',
+      options: [
+        'The call fails at once, and the dependency is not contacted',
+        'The call goes to the dependency as a trial',
+        'The call waits until the timeout passes',
+        'The call goes through, and the breaker closes',
+      ],
+      answer: 0,
+      explain: 'An open breaker rejects calls without making them. That is how it saves threads and gives the dependency room. Only after the timeout does it allow one trial call.',
+    },
+    {
+      q: 'The trial call in the half-open state fails. What does the breaker do?',
+      options: [
+        'Closes, because the dependency answered',
+        'Opens again and restarts the reset timer',
+        'Lets the next 5 calls through to test again',
+        'Stays half-open until a call succeeds',
+      ],
+      answer: 1,
+      explain: 'A failed trial means the dependency is still sick. The breaker goes back to open and starts the timeout again. A success would close it.',
+    },
+    {
+      q: 'One service calls payments and recommendations from a shared pool of 100 threads. Recommendations slows down and holds every thread. What does a bulkhead change?',
+      options: [
+        'It makes recommendations faster by moving it to its own server',
+        'It retries recommendations more often until they work',
+        'It raises the pool to 1,000 threads so nothing runs out',
+        'Payments keeps its own threads and keeps working',
+      ],
+      answer: 3,
+      explain: 'A bulkhead splits the pool. Recommendations can fill only its own share. Payments has separate threads and is not starved. It does not make the slow dependency faster, and more threads would only delay the same problem.',
+    },
+    {
+      q: 'Why should a breaker not count every error response as a failure?',
+      options: [
+        'Some errors are normal, like "item not found"',
+        'Errors are always caused by the client, never the server',
+        'Counting errors makes the breaker slow to react',
+        'Only timeouts can ever be counted by a breaker',
+      ],
+      answer: 0,
+      explain: 'Fowler notes that not all errors should trip the circuit. A 404 for a missing item is the dependency working correctly, and counting it could cut off a healthy dependency. Count timeouts, connection failures and server errors instead.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="circuit-breaker-catalog-scope"
+  title="One breaker for the whole catalog"
+  scenario="A storefront calls a catalog service. The team put one circuit breaker around every call to it. At 15:00 an admin starts a large export, GET /catalog/export, which takes 20 s per call."
+  facts={[
+    '15:02  /catalog/export: 5 timeouts in a row',
+    '15:02  catalog breaker: OPEN',
+    '15:03  GET /catalog/items/881: rejected (breaker open)',
+    '15:03  /catalog/items p99 on the catalog side: 40 ms, error rate 0%',
+    'product pages: 100% error',
+  ]}
+  steps={[
+    {
+      prompt: 'What went wrong?',
+      options: [
+        'The reset timeout is too short',
+        'One breaker covers all endpoints, so the slow export cut off the healthy ones',
+        'The catalog service is down',
+        'The breaker should have counted the export timeouts as successes',
+      ],
+      answer: 1,
+      explain: 'The items endpoint is healthy: 40 ms and no errors. The breaker has the wrong scope. Failures from the export counted against the whole dependency. A shorter timeout would not change that, and the catalog is not down.',
+    },
+    {
+      prompt: 'Which design fixes it?',
+      options: [
+        'Raise the failure threshold to 500',
+        'Remove the breaker',
+        'A separate breaker and thread pool for /catalog/export, so it trips alone',
+        'Make the export call retry until it works',
+      ],
+      answer: 2,
+      explain: 'Scope the breaker per endpoint, and use a bulkhead so the slow export cannot take the threads that the product pages need. A threshold of 500 would only delay the trip. With no breaker the export would hold threads for 20 s each. Retrying a slow call makes it worse.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Martin Fowler: CircuitBreaker](https://martinfowler.com/bliki/CircuitBreaker.html): the three states, the failure threshold, and the reset timeout.
+- [Google SRE book: Handling Overload](https://sre.google/sre-book/handling-overload/): rejecting load early and client-side throttling.
+- [AWS Builders' Library: Using load shedding to avoid overload](https://builder.aws.com/content/3Eun1EEyX6p2e3VYNyRLSJzLuMV/using-load-shedding-to-avoid-overload): why shedding is not free.
+- [Stripe: Scaling your API with rate limiters](https://stripe.com/blog/rate-limiters): fleet and worker load shedders.

@@ -1,0 +1,234 @@
+---
+summary: 'Every remote call needs a time limit, and a failed call is sometimes worth repeating. Retries without limits, backoff, and jitter turn a small fault into an outage.'
+requires: ['01-one-machine/throughput-vs-latency', '03-api-design/idempotency', '07-reliability/failure-modes']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import RelRetryChain from '../../../components/anim/lessons/RelRetryChain.tsx';
+import RelRetrySim from '../../../components/anim/lessons/RelRetrySim.tsx';
+
+## The problem
+
+A call to another service can end in three ways. It can succeed. It can fail with an error. Or it can do neither: the answer is late, lost, or never comes.
+
+The third case is the dangerous one. [Lesson 7.1](/learn/07-reliability/failure-modes/) showed that a slow dependency holds the caller's threads. The caller then needs two decisions.
+
+1. **How long do I wait?** (the timeout)
+2. **If it failed, do I try again?** (the retry)
+
+Both decisions are easy to get wrong in a way that looks fine in testing and fails in production.
+
+## Naive solutions
+
+**No timeout.** Many clients wait forever by default. [Lesson 2.6](/learn/02-networking/rpc-grpc/) noted that a gRPC call has no deadline unless you set one. Do the sum with Little's law ([lesson 1.3](/learn/01-one-machine/throughput-vs-latency/)). Say 500 calls per second go to a dependency, and the caller has a pool of 200 threads. When the dependency hangs, each call holds a thread forever. The pool is full after 200 / 500 = 0.4 seconds. The caller is now as dead as the dependency, and it did nothing wrong.
+
+**Retry at once, in a loop.** `for attempt in 1..3: call()`. If the cause was a brief network blip, this works. If the cause was overload, every client now sends three times the traffic to a server that is already failing. You have added load at the worst moment.
+
+**Retry on a fixed timer.** "Wait 1 second, try again." Better, but all clients that failed together now retry together. The server sees a wall of requests once a second.
+
+Each fix needs a rule. The rules are the rest of this lesson.
+
+## Timeouts: how long to wait
+
+A timeout is a promise: "after this long, I stop waiting and treat the call as failed."
+
+The AWS Builders' Library gives a method. Pick the rate of false timeouts you can accept, such as 0.1%. A false timeout is a call that would have succeeded but took too long. Then look at the matching latency percentile of the dependency. For 0.1%, that is p99.9. Set the timeout near that value.
+
+Do not use the average. The mean hides the tail ([lesson 1.3](/learn/01-one-machine/throughput-vs-latency/) showed that p99 can be many times the median).
+
+The same article tells a story about a timeout that was too tight. A service set a timeout of about 20 ms for a dependency. After each deploy, new servers had to open a new secure connection, which took longer than 20 ms. Some calls timed out. The fix was to open connections at process start, before traffic arrives ([lesson 2.3](/learn/02-networking/http-tls/) counts why a new TLS connection costs extra round trips).
+
+Two more rules:
+
+- **Set a timeout on every call**, including calls to your own databases and caches.
+- **Pass the deadline down.** If a caller has 300 ms in total and has used 100, the next call gets 200 ms, not a fresh 300 ([lesson 2.6](/learn/02-networking/rpc-grpc/)). Otherwise the work of a call that already timed out keeps running deep in your system.
+
+## Retries: when they help
+
+A retry helps when the failure is **transient**: a dropped packet, a server that was restarting, a brief overload that already passed. It does not help when the failure is permanent, such as a bad request or a dead dependency.
+
+Retry only when all of these hold:
+
+- The failure is likely to be temporary.
+- The operation is safe to repeat. The AWS article says "APIs with side effects aren't safe to retry unless they provide idempotency". A read is usually safe. A payment is not, unless it carries an idempotency key ([lesson 3.4](/learn/03-api-design/idempotency/)).
+- The dependency is not already overloaded.
+- You retry at **one layer** only.
+
+The last rule needs a picture.
+
+## Retries multiply across layers
+
+Say five services call each other in a chain, and each retries a failed call, making 3 attempts in all. When the database fails every call, how many calls does one user request cause at the database? Step through it.
+
+<RelRetryChain client:visible />
+
+The AWS article gives this exact example and states that the load on the database "will increase 243x". The Google SRE book gives a smaller one: three layers that each make 4 attempts (3 retries) can create 64 attempts on the database for one user action. The rule that follows: **retry at one layer**, usually the one closest to the failing call, and let the layers above pass the error up. The SRE book says the same: an overloaded backend's error should bubble up, and be retried only by the layer immediately above it. It also proposes an error that means "overloaded, do not retry".
+
+Add a **retry budget** as a second guard. The SRE book describes two:
+
+- A **per-request budget**: up to three attempts.
+- A **per-client budget**: a request is retried only while the ratio of retries to requests is below 10%.
+
+The SRE book's cascading-failure chapter also suggests a limit per process, for example 60 retries per minute. AWS's SDK, since 2016, uses a token bucket for the same purpose: retries are allowed while there are tokens, and then at a fixed rate. Lesson 7.4 builds the token bucket.
+
+## Backoff and jitter
+
+Now the timing between attempts.
+
+**Exponential backoff** waits longer after each failure. The wait is `base x 2^n` for attempt n, up to a **cap**. The first retry is quick, in case the failure was a blip. Later retries wait longer, to give the dependency room. You also **limit the number of attempts**.
+
+Backoff alone has a flaw. Clients that failed at the same moment compute the same wait. They retry together again, and again. The waves are further apart, but they are still waves.
+
+**Jitter** adds randomness so the clients spread out. The AWS Architecture Blog, "Exponential Backoff And Jitter", names three kinds. Here are the formulas as written in the code of the blog's simulator. `n` counts retries so far, starting at 0.
+
+```
+expo(n)       = min(cap, base * 2^n)
+full jitter   = random(0, expo(n))
+equal jitter  = expo(n) / 2  +  random(0, expo(n) / 2)
+decorrelated  = min(cap, random(base, previous_wait * 3))
+```
+
+- **Full jitter** picks anywhere from zero to the backoff.
+- **Equal jitter** keeps half the backoff and randomizes the other half.
+- **Decorrelated jitter** ignores the attempt number. It grows from the last wait.
+
+Run all five policies on the same failure. 100 clients fail at the same moment. The server can answer 200 calls per second.
+
+<RelRetrySim client:visible />
+
+What to notice:
+
+1. **Fixed delay and plain backoff make the same number of calls.** The clients stay in step, so each wave arrives in one 100 ms slot. Backoff only moves the waves further apart. The height of each spike does not change.
+2. **Jitter spreads the same clients over many slots.** The peak falls and the total number of calls falls with it, because fewer calls land in a slot that is already full and get rejected.
+3. **Raise the clients or lower the capacity.** The no-jitter policies start to give up clients (the "Gave up" column). The jitter policies give up few or none.
+
+The AWS blog ran its own simulation of contending clients. It reports that jitter "reduced our call count by more than half" with 100 contending clients, and that equal jitter does slightly more work than full jitter and takes much longer. Our model is different and smaller, so its numbers differ. The direction is the same.
+
+Jitter is useful beyond retries. The cache lesson used the same idea for expiry times ([lesson 5.5](/learn/05-caching/invalidation-stampede/)). A reconnect storm after a gateway dies is another case ([lesson 2.5](/learn/02-networking/real-time-transport/)). The AWS article adds one note: for scheduled jobs, it prefers a fixed offset per host over a fresh random value each time, so that an overload is easy to reproduce.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Acceptable false timeouts (example) | 0.1%, so use p99.9 | AWS Builders' Library |
+| A timeout that was too tight | about 20 ms, broke after deploys | Same |
+| 5 layers, 3 attempts each | 243x on the database (3^5) | Same |
+| 3 layers, 4 attempts each | 64 attempts (4^3) | Google SRE book |
+| Per-request retry budget | up to 3 attempts | Google SRE book |
+| Per-client retry budget | retry while retries are below 10% of requests | Google SRE book |
+| Per-process budget (example) | 60 retries per minute | Google SRE book |
+| Threads full with no timeout | pool / rate = 200 / 500 = 0.4 s | Derived |
+
+The backoff base and cap are tuning values, not standards. Choose them from your dependency's recovery time.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Short timeout | Threads are freed fast, failures show sooner | More false timeouts, and retries of calls that were fine | The dependency is quick and the tail is tight |
+| Long timeout | Fewer false timeouts | Threads held longer in a slow patch | Slow but valuable calls, with a bulkhead (lesson 7.3) |
+| Retry | Hides transient faults | More load on a struggling dependency | Safe-to-repeat calls, at one layer, with a budget |
+| Retry budget | Caps amplification | Some calls that would have worked are not retried | Always, on any service that retries |
+| Full jitter | Best spread | Any single client may wait a very short time | Default choice for retries |
+| Equal jitter | A guaranteed minimum wait | A bit more work and time than full jitter | You must never retry too soon |
+
+## In practice
+
+<Callout type="tip">
+When you add a call between services, say all four settings: "a timeout from the p99.9 of the dependency, up to 3 attempts, exponential backoff with full jitter, and a retry budget of about 10%. The write carries an idempotency key. Only the edge service retries." That one sentence covers timeout, retry, backoff, budget, idempotency, and layer.
+</Callout>
+
+<Callout type="mistake">
+Do not answer "add retries" to a flaky dependency. Ask what the operation does when repeated, which layers already retry, and what the retries do to a dependency that is already slow. Do not say "exponential backoff solves the thundering herd". Without jitter the clients still line up. And do not set the timeout to the average latency.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: '1,000 clients all get an error at the same instant. Each retries after exactly 1 second, every time. What does the server see at the 1-second mark?',
+      options: [
+        'About 1,000 calls in one moment, and again each second',
+        'About 1,000 calls spread evenly across the whole second',
+        'Nothing, because retries are slower than first calls',
+        'About 100 calls, because clients retry in groups of 10',
+      ],
+      answer: 0,
+      explain: 'Clients that failed together and use the same fixed wait retry together. Nothing spreads them. Each wave is as big as the last. Jitter is what breaks the match.',
+    },
+    {
+      q: 'Base wait is 100 ms and cap is 10 s. For the 4th retry (n = 3), full jitter picks a wait in which range?',
+      options: [
+        'Exactly 800 ms',
+        '0 to 800 ms',
+        '400 to 800 ms',
+        '0 to 10 s',
+      ],
+      answer: 1,
+      explain: 'expo(3) = min(10 s, 100 ms x 2^3) = 800 ms. Full jitter is random(0, 800 ms). The range 400 to 800 ms is equal jitter, which keeps half the backoff. Exactly 800 ms is plain backoff, which has no jitter.',
+    },
+    {
+      q: 'Which call can a client retry automatically with no extra protection?',
+      options: [
+        'POST /charges, with no idempotency key',
+        'POST /emails/send, which sends one email',
+        'GET /orders/42, a read-only lookup',
+        'POST /counter/increment, which adds 1',
+      ],
+      answer: 2,
+      explain: 'A read changes nothing, so a repeat is harmless. The other three change state each time they run. A retry after a lost response could charge twice, send two emails, or count twice. They need an idempotency key first.',
+    },
+    {
+      q: 'Three services in a row each make up to 4 attempts at the next one. The database fails every call. How many calls does one user request cause at the database?',
+      options: ['12', '16', '256', '64'],
+      answer: 3,
+      explain: 'Attempts multiply across layers: 4 x 4 x 4 = 64. Adding them (4 + 4 + 4 = 12) is the common mistake. The count is 4^3.',
+    },
+    {
+      q: 'A dependency has p50 20 ms, p99 80 ms and p99.9 400 ms. You accept 0.1% false timeouts. Which timeout fits best, before you add network margin?',
+      options: ['20 ms', '80 ms', '400 ms', '20 s'],
+      answer: 2,
+      explain: 'A 0.1% false timeout rate means the timeout should sit at the p99.9, which is 400 ms. At 80 ms about 1 in 100 calls would time out. At 20 ms about half would. 20 s would hold threads far too long.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="A mobile app and its API"
+  scenario="A mobile app calls an API. The API calls a database. The app makes up to 5 attempts per tap. The API makes up to 3 attempts per database call. Normal load is 2,000 taps per second. Today the database rejects every call."
+  steps={[
+    {
+      prompt: 'How many database calls does one tap cause at most?',
+      unit: 'calls',
+      answer: 15,
+      within: 1.1,
+      explain: 'Each of the 5 app attempts reaches the API, and each of those makes 3 database attempts. 5 x 3 = 15.',
+    },
+    {
+      prompt: 'At 2,000 taps per second, how many database calls per second is that?',
+      unit: 'calls/s',
+      answer: 30000,
+      within: 1.2,
+      explain: '2,000 x 15 = 30,000 calls per second, against a normal 2,000. That is 15 times the usual load on a database that is already failing.',
+    },
+    {
+      prompt: 'Now only the API retries. The app makes 1 attempt. How many database calls per second?',
+      unit: 'calls/s',
+      answer: 6000,
+      within: 1.2,
+      explain: '2,000 taps x 1 app attempt x 3 API attempts = 6,000 per second. Retrying at one layer cuts the load from 30,000 to 6,000. A retry budget would cut it further.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [AWS Builders' Library: Timeouts, retries, and backoff with jitter](https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter): choosing a timeout, the 243x example, and the retry token bucket.
+- [AWS Architecture Blog: Exponential Backoff And Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/): full, equal, and decorrelated jitter, with a simulation.
+- [Google SRE book: Handling Overload](https://sre.google/sre-book/handling-overload/): per-request and per-client retry budgets.
+- [Google SRE book: Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/): the 64 attempts example and the retry budget per process.

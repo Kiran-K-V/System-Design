@@ -1,0 +1,239 @@
+---
+summary: 'A rate limiter decides which requests may pass and which are refused. Four algorithms (token bucket, fixed window, sliding log, sliding counter) trade burst, accuracy, and memory. Shared counters make the limit global.'
+requires: ['07-reliability/timeouts-retries', '07-reliability/circuit-breaker']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import RelTokenBucket from '../../../components/anim/lessons/RelTokenBucket.tsx';
+import RelWindowCompare from '../../../components/anim/lessons/RelWindowCompare.tsx';
+
+## The problem
+
+[Lesson 7.3](/learn/07-reliability/circuit-breaker/) protected the **caller** from a sick dependency. A **rate limiter** protects the **callee**. It sits at the front door and decides how many requests each client may make.
+
+Why would a server refuse work it could do?
+
+- **Overload.** One client in a tight loop can use the capacity that a thousand clients need. This is the noisy neighbor problem.
+- **Fairness.** Each client should get a share.
+- **Abuse.** Login guessing, scraping, and credential stuffing all use many requests.
+- **Cost.** Some requests are expensive, and a quota keeps the bill in bounds.
+
+A limiter also gives retrying clients a clear signal: "slow down." That is the other half of [lesson 7.2](/learn/07-reliability/timeouts-retries/). A client that retries with jitter meets a server that says no politely.
+
+## Naive solutions
+
+**A counter in each server.** Each server counts requests per client and refuses above 100 a minute. But a load balancer ([lesson 2.4](/learn/02-networking/load-balancing/)) spreads one client's requests over all servers. With 5 servers, each sees about a fifth of the traffic. The client can send about 500 a minute and no server sees more than 100. A local counter enforces a per-server limit, not a global one. We come back to this below.
+
+**Block the IP.** Many users share one IP address behind a corporate network or mobile carrier. Limit by IP alone and you punish them all. Attackers spread across many IPs. The Redis rate-limiting guide lists IP-based, user-based, and application-based limits. IP limits are weaker against distributed attacks. User limits need reliable user identity. Real systems combine them.
+
+**Count requests per calendar minute.** This is a fixed window. It is simple and has a flaw. See below.
+
+## Four algorithms
+
+### 1. Token bucket
+
+The token bucket is the most common. Tokens are added at a fixed **refill rate** r. The bucket holds at most b tokens, its **capacity**. A request removes a token. If the bucket is empty, the request is refused. If a token arrives when the bucket is full, it is discarded.
+
+The two settings do two jobs. Capacity b caps the **burst**. Rate r caps the **long-run average**. Step through it.
+
+<RelTokenBucket client:visible />
+
+You do not need a timer to add tokens. On each request, compute the refill since the last request: `tokens = min(capacity, tokens + elapsed x rate)`. Then take one. That stores two numbers per client: the token count and the last time.
+
+Stripe's engineering blog says its request-rate limiter is a token bucket, with one bucket per user, kept in Redis.
+
+There is a close relative, the **leaky bucket**. In its meter form, it is a mirror image of the token bucket, and the two behave the same. In its **queue** form, requests wait in a queue that drains at a constant rate. The output is smooth, with no bursts. That form is for traffic shaping. It adds delay and needs queue memory.
+
+### 2. Fixed window
+
+Count requests in each calendar window, for example each minute. A counter resets at every boundary. It is the cheapest option: one counter per client.
+
+The flaw is at the edge. Cloudflare's engineering blog says it directly: with fixed windows, the counter is reset at regular intervals, "allowing regular traffic spikes to go through". A client can send a full limit just before the boundary and a full limit just after. The server sees double the limit in a few seconds.
+
+### 3. Sliding window log
+
+Store the time of every request. To check a new one, count how many fall in the last window. This is exact. The cost is memory: one entry per request, per client. Cloudflare's blog notes that storing a timestamp for every request is "more accurate, but has huge processing and memory requirements".
+
+### 4. Sliding window counter
+
+Keep two counters: the current window and the previous one. Estimate the sliding count by weighting the previous window by how much of it is still inside the sliding window:
+
+```
+estimate = previous x (share of previous window still in range) + current
+```
+
+Cloudflare's example: the limit is 50 per minute. The previous minute had 42 requests. The current minute started 15 seconds ago and has 18. So 45 of the previous 60 seconds are still in range:
+
+`42 x (45 / 60) + 18 = 31.5 + 18 = 49.5`
+
+Two numbers per client. Cloudflare tested this on 400 million requests from 270,000 sources. 0.003% of requests were wrongly allowed or limited. The average difference between the real rate and the estimate was 6%. No source that was blocked was below the threshold, and the three sources that got through wrongly were less than 15% over it.
+
+Now compare the three window methods at a boundary. A client sends 10 requests just before the boundary and 10 just after. The limit is 10 per 10 seconds. Move the gap between the bursts.
+
+<RelWindowCompare client:visible />
+
+What to notice:
+
+1. **Fixed window lets all 20 through** whatever the gap, up to the window length.
+2. **The sliding log is exact.** The second burst is refused while the first is still inside the last 10 s.
+3. **The sliding counter sits between.** With a short gap it refuses almost all of the second burst, like the log. As the gap grows, the first burst counts for less in the estimate, so more of the second burst gets through. With a gap of 8 s it allows 4 of 10, where the log still allows none.
+
+## Going global: counters in a shared store
+
+To enforce one limit across many servers, the counters must live in one place. Redis is the usual choice. The Redis guide shows the fixed-window pattern. Use one key per client per minute, such as `api-key:minute`. Run `INCR` on it, and `EXPIRE` so old keys vanish. Put both commands in a `MULTI` / `EXEC` block, so they run as one atomic step. The guide's example limit is 20 per minute.
+
+Two rules for a shared counter:
+
+- **The check and the update must be atomic.** If two servers read the same count and each adds one, a request can slip past. `INCR` is atomic on its own, and a script or transaction keeps multi-step logic atomic.
+- **Decide what happens when the limiter is down.** Stripe's post advises that errors in the limiter should **fail open**: "any coding or operational errors would fail open and the API would still stay functional". If Redis goes down, you accept traffic you cannot count. A limiter that fails closed turns a Redis outage into an API outage. Pair a fail-open limiter with other guards, such as a cap on concurrent requests.
+
+A shared store adds a network hop to each request. That is small next to a typical API call, but it is one more dependency, with the failure modes of [lesson 7.1](/learn/07-reliability/failure-modes/).
+
+## What the client gets back
+
+When a request is refused, say so clearly. HTTP status **429 Too Many Requests** exists for this. RFC 6585 says it "indicates that the user has sent too many requests in a given amount of time". The response may include a `Retry-After` header. RFC 9110 defines that header as either a number of seconds or an HTTP date:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+```
+
+A well-behaved client waits that long, then uses backoff and jitter if it fails again (lesson 7.2). Stripe also notes that you must choose between 429 and 503 for the situation, and that the error message should be actionable. Use 429 for "you sent too many". Use 503 for "we are overloaded".
+
+Stripe runs four kinds of limiter, which shows the range:
+
+| Limiter | What it limits | Detail from the post |
+|---|---|---|
+| Request rate | Requests per second per user | Token bucket. The most important one |
+| Concurrent requests | Requests in flight | Example: 20 at the same time. Protects expensive endpoints. Triggered 12,000 times in the month |
+| Fleet usage shedder | Non-critical traffic | Reserves 20% for critical methods, for example. Rejects the rest above 80% with a 503 |
+| Worker utilization shedder | Traffic by priority | The last line of defense. Sheds test-mode traffic first |
+
+The last two are load shedding ([lesson 7.3](/learn/07-reliability/circuit-breaker/)). The first two are quotas.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Sliding counter example | 42 x 0.75 + 18 = 49.5 | Cloudflare blog |
+| Cloudflare test size | 400 million requests, 270,000 sources | Same |
+| Wrongly allowed or limited | 0.003% | Same |
+| Average error of the estimate | 6% | Same |
+| Stripe concurrency limit example | 20 requests at once | Stripe blog |
+| Stripe fleet shedder reserve (example) | 20% for critical methods | Same |
+| Redis guide example | 20 requests per minute | Redis rate limiting guide |
+| Fixed window worst case | up to 2x the limit near a boundary | Derived (lab above) |
+
+Stripe does not publish its per-second limit in the post, so we give no value for it.
+
+## Trade-offs
+
+| Algorithm | You gain | You pay | Choose when |
+|---|---|---|---|
+| Token bucket | Allows bursts, cheap (two numbers), easy to explain | The burst size b is a choice that needs tuning | Most APIs: allow short bursts, cap the average |
+| Leaky bucket (queue) | Smooth output rate | Added delay and queue memory | Shaping traffic to a fragile downstream |
+| Fixed window | Cheapest, simplest, easy in Redis | Up to 2x the limit at a boundary | Coarse quotas where an edge burst is acceptable |
+| Sliding window log | Exact | Memory grows with traffic | Low limits, strict rules (for example login attempts) |
+| Sliding window counter | Near-exact, two numbers | An estimate, not exact | High-volume limits where small error is fine |
+| Shared counter store | One global limit | A network hop and a new dependency | Many servers behind a load balancer |
+
+## In practice
+
+<Callout type="tip">
+Answer a rate limiter question in four parts. First, what you limit and by what key: "per API key, with a stricter per-IP limit on login." Second, the algorithm: "a token bucket, capacity 20, refilling 10 a second, so short bursts pass and the average is capped." Third, where the state lives: "in Redis, one atomic update per request, failing open." Fourth, what the client sees: "429 with a Retry-After header."
+</Callout>
+
+<Callout type="mistake">
+Do not stop at "a fixed window counter": say what happens at the boundary. Do not keep a local counter on each server and call it a global limit. Do not block when the limiter store fails unless the route is security-critical. And do not return 503 for a quota. 429 tells the client the limit is about them, and 503 says the service is struggling.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A token bucket has capacity 10 and refills 2 tokens per second. It starts full. A client sends 30 requests at once. How many pass at once?',
+      options: ['2', '10', '20', '30'],
+      answer: 1,
+      explain: 'The bucket holds 10 tokens, and each request takes one. The first 10 pass and the other 20 are refused. The refill rate of 2 per second matters only over time, not at the instant of the burst.',
+    },
+    {
+      q: 'The burst above empties the bucket (capacity 10, refill 2 per second). How long until 6 more requests can pass?',
+      options: ['1 second', '2 seconds', '3 seconds', '6 seconds'],
+      answer: 2,
+      explain: 'At 2 tokens per second, 6 tokens take 6 / 2 = 3 seconds. The refill rate sets the long-run speed. The capacity only sets how much can be saved up.',
+    },
+    {
+      q: 'A fixed-window limit is 100 per minute. A client sends 100 requests at 12:00:59 and 100 more at 12:01:01. How many are allowed?',
+      options: ['100', '150', '0', '200'],
+      answer: 3,
+      explain: 'The two bursts fall in different calendar minutes, and the counter resets at 12:01:00. Each minute sees exactly 100. So all 200 pass, in 2 seconds. This edge burst is the flaw of the fixed window.',
+    },
+    {
+      q: 'The limit is 50 per minute. The previous minute had 42 requests. The current minute is 15 seconds old with 18 requests. What does the sliding window counter estimate?',
+      options: ['49.5', '60', '28.5', '18'],
+      answer: 0,
+      explain: 'The previous window is weighted by the part still in range: 45 of 60 seconds, which is 0.75. 42 x 0.75 + 18 = 49.5. The value 28.5 comes from using 0.25 as the weight, which is the part that has already passed.',
+    },
+    {
+      q: 'The Redis cluster that holds the rate limit counters goes down. What should the API do for most routes?',
+      options: [
+        'Refuse every request with a 429',
+        'Return a 503 for all traffic',
+        'Fail open: accept requests, and use other guards',
+        'Shut the API down until Redis is back',
+      ],
+      answer: 2,
+      explain: 'Stripe advises that limiter errors fail open, so a limiter fault does not become an outage. The cost is that excess traffic gets through, so a concurrency cap and load shedders must still guard the servers.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="rate-limiting-local-counters"
+  title="The limit that nobody enforces"
+  scenario="An API runs on 4 servers behind a load balancer. Each server keeps a local counter and allows 100 requests per minute per API key. The documented limit is 100 per minute."
+  facts={[
+    'key K1 requests per minute: 410',
+    'rejections for K1: 0',
+    'server a: K1 count 103 (rejected 3)',
+    'server b: K1 count 99, server c: 105, server d: 103',
+    'downstream database CPU: 95%',
+  ]}
+  steps={[
+    {
+      prompt: 'Why did K1 get through at 410 a minute?',
+      options: [
+        'Each server sees only a share of K1\'s traffic, so a per-server counter allows about 4 times the global limit',
+        'The counters reset more often than once a minute, so they never fill',
+        'The token bucket was too small to hold a full minute of requests',
+        'The limit applies only to new keys, not to existing ones',
+      ],
+      answer: 0,
+      explain: 'The load balancer spreads K1 across 4 servers. Each counts about a quarter of the traffic, so no counter reaches the global limit of 100 for long. A per-server counter limits a server, not the key.',
+    },
+    {
+      prompt: 'The team moves the counter to Redis. A week later Redis has a 20-minute outage and the API returns 500s for all traffic. What is the better design?',
+      options: [
+        'Use a bigger Redis cluster so it never fails',
+        'Treat limiter errors as fail open, and alert on them',
+        'Keep failing closed, because limits are a security feature',
+        'Go back to local counters for good',
+      ],
+      answer: 1,
+      explain: 'Any shared store can fail, so decide the failure policy in advance. Failing open keeps the API up, and an alert tells you the limit is not being enforced. A bigger cluster still has outages. Local counters would bring back the first bug. Failing closed suits some security routes, not a general API.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Cloudflare: How we built rate limiting capable of scaling to millions of domains](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/): the sliding window counter, the 42 and 18 example, and the test on 400 million requests.
+- [Stripe: Scaling your API with rate limiters](https://stripe.com/blog/rate-limiters): token buckets in Redis, four limiter types, fail open.
+- [Redis: Rate limiting](https://redis.io/glossary/rate-limiting/): the INCR and EXPIRE fixed window pattern.
+- [RFC 6585, section 4: 429 Too Many Requests](https://datatracker.ietf.org/doc/html/rfc6585) and [RFC 9110: Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after).
+- [Wikipedia: Token bucket](https://en.wikipedia.org/wiki/Token_bucket): the algorithm, and leaky bucket as a meter and as a queue.

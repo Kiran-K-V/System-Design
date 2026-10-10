@@ -1,0 +1,217 @@
+---
+summary: 'An API gateway is the one front door for client traffic. It ends TLS, checks identity, limits rates, and routes each request to a service.'
+requires: ['02-networking/load-balancing', '03-api-design/auth', '07-reliability/rate-limiting']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import GatewayPipeline from '../../../components/anim/lessons/GatewayPipeline.tsx';
+import GatewayLayers from '../../../components/anim/lessons/GatewayLayers.tsx';
+
+## What it is
+
+A system grows from one service into ten. Now a mobile app needs orders, users, payments, and search. Where does it send each call?
+
+Without a front door, three things go wrong.
+
+- **The client knows the inside.** It needs the address of every service. Moving a service breaks every app version in the field.
+- **Every service repeats the same checks.** Each one validates tokens, limits rates, and handles TLS. The ten copies drift apart. One has a bug.
+- **No single place to see or change policy.** To block one abusive caller, you touch ten services.
+
+An **API gateway** is one entry point for client calls. It sits at the edge and applies the shared checks before a request reaches a service. This is the reverse proxy of lesson [2.7](/learn/02-networking/cdn-proxies/) with API-aware logic added.
+
+## Internal model
+
+### A fixed chain of steps
+
+A gateway runs each request through an ordered chain. A typical chain is:
+
+1. **TLS termination.** The gateway decrypts HTTPS (lesson [2.3](/learn/02-networking/http-tls/)). Later steps see plain HTTP.
+2. **Validation.** Reject malformed requests before they cost anything.
+3. **Authentication.** Check the token or API key (lesson [3.5](/learn/03-api-design/auth/)).
+4. **Rate limiting.** Take a token from the caller's bucket (lesson [7.4](/learn/07-reliability/rate-limiting/)).
+5. **Routing.** Map the path to a service and pick a healthy instance.
+6. **Transform and cache.** Rewrite headers or bodies. Serve repeat answers from a cache.
+
+Step through a good request and three failures.
+
+<GatewayPipeline client:visible />
+
+The order is a design choice. Cheap rejections go first, so bad traffic never reaches expensive work. A limit keyed by IP can run before authentication, to protect the token check. A limit keyed by user must run after it, because it needs the identity.
+
+The gateway proves **who** the caller is. It cannot know whether this caller may read order 42. That rule needs the order's data, so the Orders service enforces it. Central authentication is simple. Authorization still lives in the services.
+
+### Gateway, load balancer, service mesh
+
+These three get mixed up. Each one sits in a different place.
+
+<GatewayLayers />
+
+- A **load balancer** (lesson [2.4](/learn/02-networking/load-balancing/)) spreads connections over identical instances. It knows ports and health. It does not know your API.
+- An **API gateway** handles **north-south** traffic, from outside clients into the system. It knows paths, keys, and policy.
+- A **service mesh** handles **east-west** traffic, from one service to another inside the cluster. It uses sidecar proxies that sit next to each service.
+
+They stack. A load balancer often fronts a gateway fleet, and a managed gateway has one built in.
+
+### It is a shared hop and a shared failure point
+
+Every request now passes through the gateway. That adds one hop of latency, and it makes the gateway a single point of failure. So it must be stateless and run as many copies behind a load balancer. Keep business logic out of it. A gateway full of business rules becomes a bottleneck that every team must change together.
+
+## When to use it
+
+- **Many services behind one public API.** Clients see one address.
+- **Shared policy.** Authentication, rate limits, and request logging in one place.
+- **Many client types.** Routes and transforms let mobile and web see different shapes.
+- **Versioning and migration.** Route `/v2/orders` to the new service and leave `/v1` alone.
+
+## When not to use it
+
+- **One service.** Its own framework middleware can do the same checks with no extra hop.
+- **Service-to-service calls.** Those need a mesh or a client library, not a front door.
+- **Big uploads and long jobs through the gateway itself.** Managed gateways cap body size and time, as the numbers below show.
+- **Business logic.** Keep it in services.
+
+## Numbers
+
+These are limits of **Amazon API Gateway**, from the AWS quota pages. Other gateways set different ones.
+
+| Limit | Value |
+|---|---|
+| REST API integration timeout | 29 seconds by default. Range 50 ms to 29 s. Regional and private APIs can ask for more, which may cost Region-level throttle |
+| HTTP API integration timeout | 30 seconds at most. Not adjustable |
+| Payload size, REST and HTTP APIs | 10 MB |
+| Account throttle, per Region | 10,000 requests per second, with a burst bucket of 5,000 |
+| Same, in some newer Regions | 2,500 requests per second, burst 1,250 |
+| Routes per HTTP API | 300 (can be raised) |
+| Lambda authorizer response timeout, HTTP API | 10 seconds |
+| REST API idle connection timeout | 310 seconds |
+
+The throttle uses a token bucket (lesson [7.4](/learn/07-reliability/rate-limiting/)): the 10,000 is the refill rate and 5,000 is the bucket size.
+
+A long timeout has a cost you can compute. By Little's law (lesson [1.3](/learn/01-one-machine/throughput-vs-latency/)), requests in flight equal rate times time. If 1,000 requests per second each wait the full 29 seconds, 1,000 × 29 = 29,000 requests are open at once. I give no gateway latency overhead in milliseconds, since the AWS pages I read state none.
+
+## Two limits that shape a design
+
+**Payload size.** A 50 MB video cannot pass a 10 MB gateway. Do not raise the limit. Let the gateway hand out a **pre-signed URL** and let the client upload straight to blob storage (lesson [8.11](/learn/08-technologies/blob-storage/)). The gateway then handles a tiny request, not the bytes.
+
+**Time.** A job that takes 60 seconds cannot finish inside a 29 or 30 second gateway window. The gateway returns a 504 to the client while the backend may still be working. The client then retries, and the work runs twice. Instead, accept the request, return a job id at once, and let the client poll or be notified (lesson [9.7](/learn/09-patterns/long-running-tasks/)). Make the retry safe with an idempotency key (lesson [3.4](/learn/03-api-design/idempotency/)).
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Gateway at the edge | One place for auth, limits, routing | One more hop. A shared failure point | Many services, many clients |
+| Managed gateway | No fleet to run. Built-in scaling | Hard caps on time and body size. Vendor limits | Standard APIs on one cloud |
+| Self-run gateway | Full control of limits and plugins | You run and scale it | Special needs or many clouds |
+| Auth in the gateway | Simple. One check | Services still need authorization | Always, together with service checks |
+| Limit by IP | Works before login | Shared NAT addresses are punished | Coarse first line of defense |
+| Limit by user or key | Fair per caller | Needs identity first | Per-customer quotas |
+
+<Callout type="tip">
+Say: "Clients call one gateway. It terminates TLS, validates the token, applies a per-key rate limit, and routes by path. It is stateless and runs as several copies behind a load balancer. Services still check what the user may do." Then add the escape hatches: "uploads go straight to blob storage with a pre-signed URL, and long jobs return a job id."
+</Callout>
+
+<Callout type="mistake">
+Do not say "the gateway is a load balancer". A load balancer spreads connections. A gateway applies API policy. Do not raise the timeout to "fix" a 60 second job. Do not put business rules in the gateway. And do not say authentication at the gateway removes the need for authorization in services.
+</Callout>
+
+<Callout type="deep" title="Why a 504 can mean the work still happens">
+The gateway's timeout is about the gateway's patience, not the backend's work. When the gateway gives up, it closes its side and tells the client 504. Nothing tells the backend to stop. So a 504 does not mean "did not happen". A client that retries without an idempotency key may charge a card twice. Treat a gateway timeout like any lost response: the outcome is unknown.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Which statement best separates an API gateway from a load balancer?',
+      options: [
+        'They are the same product with two names',
+        'A load balancer applies auth and rate limits. A gateway spreads connections.',
+        'A gateway applies API policy. A load balancer spreads load.',
+        'A gateway is only for east-west traffic between services',
+      ],
+      answer: 2,
+      explain: 'A load balancer knows connections, ports, and health. A gateway knows paths, keys, and policy. East-west traffic is the job of a mesh. In practice a gateway fleet often sits behind a load balancer.',
+    },
+    {
+      q: 'A mobile app uploads 40 MB videos through a REST API on Amazon API Gateway. Uploads fail. What is the best fix?',
+      options: [
+        'Return a pre-signed URL and let the client upload straight to blob storage',
+        'Compress the video on the phone until it is under the limit',
+        'Add more gateway instances so the limit grows',
+        'Send the video in a GET request instead of a POST',
+      ],
+      answer: 0,
+      explain: 'The payload limit is 10 MB for REST and HTTP APIs, and it does not scale with instances. A pre-signed URL moves the bytes off the gateway. The gateway only issues the URL.',
+    },
+    {
+      q: 'The backend needs 45 seconds. The gateway integration timeout is 29 seconds. What does the client most likely see, and what happens to the work?',
+      options: [
+        'A 200 after 45 seconds, because the gateway waits for it',
+        'A 429 at once, and the work is canceled by the gateway',
+        'A 401, because the token expired while the work ran',
+        'A 504 after about 29 seconds, while the work may still run',
+      ],
+      answer: 3,
+      explain: 'The gateway gives up first and returns 504. Nothing tells the backend to stop, so the work can still complete. A client retry can then run it twice, so use a job id and an idempotency key.',
+    },
+    {
+      q: 'The gateway validated a user\'s token. Where is the rule "this user may only read their own orders" best enforced?',
+      options: [
+        'Only in the gateway, because it already knows the user',
+        'In the load balancer, before traffic reaches the gateway',
+        'In the Orders service, which has the order data and its owner',
+        'In the client app, before it sends the request',
+      ],
+      answer: 2,
+      explain: 'The gateway proves who the caller is. The ownership rule needs the order record, which the Orders service holds. A client check is never a security control.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="api-gateway-rate-key"
+  title="The limit hits the wrong people"
+  scenario="A team adds a gateway rate limit of 100 requests per minute per client IP address. Next week, a university's 400 students on one campus network get 429 errors. At the same time, a scraper keeps pulling data without being blocked."
+  facts={[
+    'limit key        : client IP',
+    'limit            : 100 requests per minute',
+    'campus network   : 400 users, 1 public IP',
+    'scraper          : 3,000 rotating IPs, 40 req/min each',
+  ]}
+  steps={[
+    {
+      prompt: 'Why does the limit punish the campus and miss the scraper?',
+      options: [
+        'The IP is a poor stand-in for a caller. Many users share one IP, and one attacker can use many IPs',
+        'The token bucket refills too slowly',
+        'The gateway does not run the rate limit step for logged-in users',
+        'The limit is too high for the campus and too low for the scraper',
+      ],
+      answer: 0,
+      explain: 'The key decides who is counted. 400 students behind one address share one bucket. The scraper stays under 100 per minute on each of its 3,000 IPs. The algorithm is fine. The key is wrong.',
+    },
+    {
+      prompt: 'What is a better design?',
+      options: [
+        'Raise the per-IP limit to 100,000 per minute',
+        'Limit by authenticated user or API key after the auth step, and keep a coarse per-IP limit before it',
+        'Block the campus IP range',
+        'Move the limit into each backend service',
+      ],
+      answer: 1,
+      explain: 'A per-user limit counts the real caller, so 400 students get 400 buckets and a scraper with one account gets one. The coarse IP limit still absorbs raw floods before the token check. A very high per-IP limit stops nothing, and per-service limits repeat the drift that the gateway was meant to remove.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Amazon API Gateway quotas](https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html) (account throttle and burst)
+- [Quotas for a REST API](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-execution-service-limits-table.html) (29 second integration timeout, 10 MB payload)
+- [Quotas for an HTTP API](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-quotas.html) (30 second maximum, routes, authorizer timeout)
+- [AWS Compute Blog: Patterns for building an API to upload files to Amazon S3](https://aws.amazon.com/blogs/compute/patterns-for-building-an-api-to-upload-files-to-amazon-s3/) (pre-signed URLs around the 10 MB limit)

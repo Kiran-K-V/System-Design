@@ -1,0 +1,181 @@
+---
+summary: 'Change data capture reads the database log and publishes each committed change. The outbox pattern writes events in the same transaction as the data, so a crash cannot split them.'
+requires: ['04-data/replication', '04-data/transactions', '06-async/delivery-semantics']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import DualWriteRace from '../../../components/anim/lessons/DualWriteRace.tsx';
+import AsyncOutboxWalk from '../../../components/anim/lessons/AsyncOutboxWalk.tsx';
+import AsyncCdcFlow from '../../../components/anim/lessons/AsyncCdcFlow.tsx';
+
+## The problem
+
+A product row changes: the price drops from 10 to 9. That one change must reach other places.
+
+- The **search index** must show the new price.
+- The **cache** must drop its old copy (lesson 5.5).
+- The **analytics warehouse** must record the change.
+- Other services may want to react.
+
+One database is the source of truth. Several other systems hold copies, and they must stay in step with it. How does a change in one reach all the others, reliably?
+
+## Naive solution: the app writes to all of them
+
+The application updates Postgres, then the search index, then the cache. This is a **dual write**: two writes to two systems, with nothing that makes them one unit. It breaks in three ways.
+
+**1. A crash between the writes.** The database commits. The app dies before it tells search. The index is stale and nothing records that a write is missing.
+
+<AsyncOutboxWalk mode="dual" client:visible />
+
+Swapping the order does not help. If you publish first and the database then rejects the write, you have told the world about a change that never happened. A retry loop cannot help after the process itself is gone. The Microservices.io outbox write-up names the root cause: a service cannot easily update its database and send a message **atomically**, and two-phase commit (lesson 4.4) is often not available.
+
+**2. A race.** Two requests change the same row at nearly the same time. Their writes reach the two systems in different orders. The copies disagree for good.
+
+<DualWriteRace client:visible />
+
+**3. Coupling and blind spots.** Every new consumer means a change in the app. A batch script, an admin tool, or a second service that writes to the same table skips the app's code and so skips the extra writes.
+
+## The mechanism: read the log
+
+The database already has an ordered record of every committed change: the write-ahead log (WAL, lesson 4.2). Replication (lesson 4.6) already depends on it. **Change data capture** (CDC) reads that log and turns each change into an event. The app writes one place. Whatever commits to the database shows up in the log, no matter which code path wrote it. And the log is in commit order.
+
+Debezium is a common open source tool. Its MySQL connector reads the binlog. Its PostgreSQL connector reads a logical replication stream through a **replication slot**, which is a bookmark the database keeps for one reader so it does not delete log that reader still needs. It decodes the log with a plug-in: `pgoutput`, which is built in, or `decoderbufs`. The position in the log is the **LSN** (log sequence number).
+
+<AsyncCdcFlow client:visible />
+
+What the connector does, from the Debezium docs:
+
+- **First start: a snapshot.** PostgreSQL purges old WAL after some time, so the log alone cannot rebuild the table. The connector takes a consistent snapshot of the existing rows, then streams changes from that point. The `snapshot.mode` default is `initial`.
+- **It stores each event's LSN.** After a restart it resumes from the last stored position.
+- **Output.** It usually runs inside Kafka Connect and writes one topic per table by default. Debezium Server and an embedded engine are alternatives. The stream is the log of lesson 6.2, so any number of consumers can read it, each with its own offset.
+
+What it does **not** promise:
+
+- **At-least-once, not exactly-once.** In normal operation and graceful shutdown, consumers see each event once. After a failure, Debezium's FAQ says consumers can see an event at least once, and "may likely see at least some messages duplicated during recovery". The walk above shows how. Make consumers idempotent (lesson 6.3).
+- **No DDL events.** Schema changes are not sent as events.
+- **Commit-time publishing.** Changes appear when the transaction commits.
+- **Generated columns.** `pgoutput` does not capture them.
+
+<Callout type="deep" title="The cost of a bookmark: WAL on the primary">
+A replication slot keeps WAL until its reader confirms it. The PostgreSQL manual warns that slots "will prevent removal of required resources even when there is no connection using them", and that a slot nobody needs should be dropped. The setting `max_slot_wal_keep_size` caps how much WAL slots may keep. Its default is `-1`, which means no limit. So a stopped connector can fill the primary's disk with WAL (lesson 4.6). Alert on slot lag. Drop slots you no longer use.
+</Callout>
+
+## The outbox pattern
+
+Raw CDC emits **row changes**. "Row 123 in `orders` changed column `status`" is a fact about your tables, not about your business. Consumers now depend on your table layout. A column rename breaks them. And one business step, like "order placed", may touch three tables and show up as three unrelated events.
+
+The **transactional outbox** fixes this. In the same transaction that changes the business data, the app inserts a row into an `outbox` table. The row holds a ready-made event. A separate **relay** reads the outbox and publishes to the broker. Because both rows are in one database transaction, the event exists **if and only if** the order does. The relay can be a polling publisher that queries the table, or CDC tailing the log.
+
+<AsyncOutboxWalk mode="outbox" client:visible />
+
+Debezium ships an outbox event router for this. It expects a table with the columns `id`, `aggregatetype`, `aggregateid`, `type`, and `payload`. By default it sends events to a topic named `outbox.event.${routedByValue}`. It uses `aggregateid` as the message key, so all events of one aggregate, such as one order, go to the same partition and keep their order (lesson 6.2). It ignores delete events on the outbox table, so you can clean old rows without publishing anything.
+
+The costs, from the Microservices.io pattern page: a developer can forget to write the outbox row, and the relay can publish a message more than once, so consumers must be idempotent. You also run a cleanup job.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Debezium `snapshot.mode`, default | `initial` | Debezium PostgreSQL docs |
+| PostgreSQL `max_slot_wal_keep_size`, default | -1 (no limit) | PostgreSQL docs |
+| Debezium outbox topic, default | `outbox.event.${routedByValue}` | Debezium outbox router docs |
+| Outbox table columns | `id`, `aggregatetype`, `aggregateid`, `type`, `payload` | Debezium outbox router docs |
+| Debezium after a crash | at-least-once, duplicates possible | Debezium FAQ |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Dual write in the app | No new parts | Lost events, races, coupling | Almost never |
+| CDC on business tables | No app changes. Catches every writer. Commit order. | Events mirror your schema. Slot and log care. A connector to run. | Search indexing, cache invalidation, warehouse sync |
+| Outbox + CDC relay | Events are business facts. Written atomically. | An extra table and a cleanup. Developers must write the row. | Microservice events that other teams depend on |
+| Outbox + polling relay | No log access needed | Polling delay and database load | No access to the log, low volume |
+| Two-phase commit across stores | Atomic across both | Blocking, rarely available (lesson 4.4) | Rare |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I never write to the database and the broker separately. I write the business row and an outbox row in one transaction. Debezium tails the log and publishes the outbox rows to Kafka, keyed by order id. Consumers dedupe by event id." For a search index or a cache, say: "CDC on the table, so every writer is covered, and the consumers are idempotent."
+</Callout>
+
+<Callout type="mistake">
+Do not say "write to the DB, then publish to Kafka, and retry on failure". A crash between the steps loses the event. Do not say "CDC is exactly-once". Plan for duplicates. And do not forget the operational side: a stopped connector with an active replication slot makes the database keep WAL without limit by default.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An app saves an order and then publishes "order placed", in two steps. It crashes between them. How does the outbox pattern change that?',
+      options: ['It retries the publish forever', 'The event row commits with the order, so after a crash the event still exists and the relay sends it', 'It makes the broker part of the database transaction', 'It publishes first, then saves the order'],
+      answer: 1,
+      explain: 'The order and the outbox row are written in one transaction, so both exist or neither does. A crash after the commit leaves a row for the relay to publish. The broker is not part of the transaction. Publishing first moves the failure to the other side.',
+    },
+    {
+      q: 'A CDC connector on Postgres is stopped for a week, but its replication slot still exists. What does the primary do with the WAL?',
+      options: ['Deletes it on schedule', 'Sends it to the replicas only', 'Keeps it for the slot, so disk use grows: the default limit is none', 'Compresses it'],
+      answer: 2,
+      explain: 'A slot keeps the WAL its reader has not confirmed, even with nobody connected. max_slot_wal_keep_size defaults to -1, so there is no cap, and the disk can fill. You alert on slot lag and drop slots you do not need.',
+    },
+    {
+      q: 'A connector publishes an event, then crashes before it saves its position. After the restart, what do consumers see?',
+      options: ['The event is lost', 'The connector refuses to restart', 'Nothing, because the position is stored in the event', 'The event again, so consumers must tolerate duplicates'],
+      answer: 3,
+      explain: 'The connector resumes from its last saved position. That position is behind the event it already published, so the event is read and published again. CDC is at-least-once. Consumers dedupe or apply idempotent updates.',
+    },
+    {
+      q: 'Why does a new CDC connector take a snapshot before it starts streaming?',
+      options: ['Because the log no longer holds every row: PostgreSQL purges old WAL', 'To compress the database', 'To check that the schema has no DDL', 'Because streaming is not allowed on an empty topic'],
+      answer: 0,
+      explain: 'The WAL holds changes, and old segments are purged. Rows that never changed are in no log. The snapshot copies the existing rows, and streaming starts from that point so no change is missed.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="cdc-shipped-before-paid"
+  title="Shipped before paid"
+  scenario="A CDC pipeline streams order status changes into a topic. The shipping service sometimes sees the shipped event before the paid event of the same order."
+  facts={[
+    'topic:                 orders.events, 6 partitions',
+    'record key:            none (records spread round robin)',
+    'status order in DB:    created, paid, shipped',
+    'order seen by shipping for order 88: shipped, then paid',
+  ]}
+  steps={[
+    {
+      prompt: 'Why does the order flip?',
+      options: [
+        'The database committed the changes in the wrong order',
+        'The events of one order sit in different partitions, and order holds only inside a partition',
+        'The connector reads the log backwards',
+        'Kafka sorts records by size',
+      ],
+      answer: 1,
+      explain: 'The database log has the right order. With no key, the producer spreads one order’s events over partitions. Two consumers read them at different speeds, so the shipping service can see them in a different order.',
+    },
+    {
+      prompt: 'What should you change?',
+      options: [
+        'Use one partition and give up parallelism for every order',
+        'Key each event by the order id, so one order always lands in one partition',
+        'Add more consumers to the shipping service',
+        'Reduce the connector’s poll interval',
+      ],
+      answer: 1,
+      explain: 'The same key always lands in the same partition, which keeps the events of one order in sequence while different orders still run in parallel. A single partition also fixes order but removes parallelism. More consumers cannot fix a split across partitions.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Debezium: architecture](https://debezium.io/documentation/reference/stable/architecture.html): connectors, Kafka Connect, Debezium Server, and the embedded engine.
+- [Debezium: PostgreSQL connector](https://debezium.io/documentation/reference/stable/connectors/postgresql.html): slots, snapshots, plug-ins, and caveats.
+- [Debezium: outbox event router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html): the table layout and default topic.
+- [Microservices.io: transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html): the dual-write problem and the pattern.

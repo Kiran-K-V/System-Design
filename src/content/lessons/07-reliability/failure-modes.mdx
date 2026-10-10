@@ -1,0 +1,209 @@
+---
+summary: 'Machines fail in more ways than "up" or "down". This lesson names five failure modes, shows which ones a health check misses, and shows how one failure spreads into an outage.'
+requires: ['01-one-machine/throughput-vs-latency', '02-networking/load-balancing', '04-data/replication']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import RelCascadeWalk from '../../../components/anim/lessons/RelCascadeWalk.tsx';
+import RelFaultLab from '../../../components/anim/lessons/RelFaultLab.tsx';
+
+## The problem
+
+[Lesson 4.6](/learn/04-data/replication/) showed that copies make downtime rare. One node that is up 99.9% of the time is down about 8.8 hours a year. Two independent copies with perfect failover are both down about 30 seconds a year. That is a big gain.
+
+Two words in that sentence do a lot of work: **independent** and **perfect**. Real failures break both.
+
+The AWS Builders' Library gives the same sum. Say each server has a 0.01% chance of failing on a given day. Two servers both failing on the same day has a chance of 0.000001%. But the article then says why this is not the full story. It defines a **correlated failure** as "multiple independent components fail due to the same underlying cause". A bad deploy, an expired certificate, or a power fault does not pick one server. It takes all of them in the same minute.
+
+This module is about designing for that. We start with the enemy: how things actually fail.
+
+## Naive model: a server is up or down
+
+The simple picture has two states. A server works or it is dead. A health check ([lesson 2.4](/learn/02-networking/load-balancing/)) finds the dead ones, and the load balancer stops sending them traffic. Replication covers the rest.
+
+This picture is right for one kind of failure, the **crash**. A crash is a failure where the process stops and stays stopped. Engineers call it **fail-stop**. It is the easiest failure to handle because it is loud. Connections are refused, probes fail, and the system routes around it.
+
+Most bad outages come from the other kinds. They are quiet.
+
+## Five failure modes
+
+| Mode | What it is | Who notices | Why it hurts |
+|---|---|---|---|
+| **Crash** | The process or machine stops | Everyone, fast | Its load moves to the survivors |
+| **Slow node** | Still answering, but late | Only callers waiting on it | Calls pile up and hold threads until they time out |
+| **Network partition** | The network splits nodes into groups that cannot talk | Each side sees the other as dead | Both sides may be alive and may both act |
+| **Gray failure** | Partly broken in a way the system's own checks miss | The apps that use it, not the monitor | It is never removed, so it keeps failing users |
+| **Correlated failure** | Many "independent" parts fail for one cause | Everyone at once | Redundancy does not help |
+
+Two of these need more detail.
+
+**A slow node is worse than a dead one.** A dead server fails fast. A slow server accepts the call and then holds the caller. The caller holds a thread ([lesson 1.3](/learn/01-one-machine/throughput-vs-latency/)). The Google SRE book gives an example. Suppose 5% of requests never complete and hold a thread until a long deadline. The frontend can then serve only 19.6% of requests, an 80.4% error rate. A small share of hung calls can use up the whole thread pool. Timeouts ([lesson 7.2](/learn/07-reliability/timeouts-retries/)) exist for this reason.
+
+**Gray failure** is a term from a 2017 paper by Huang and others at Microsoft Research. The paper says a system has a gray failure when at least one app observes that the system is unhealthy, but the system's own observer observes that it is healthy. The authors call this **differential observability**: different observers see different health. Their claim is that the big availability problems in cloud systems "tend to be caused by subtle underlying faults, i.e., gray failure rather than fail-stop failure". An example: a server whose `/health` endpoint answers while its disk is failing. The monitor is green. The users are not.
+
+Try each mode on a small system. S3 gets the fault. Switch between "before the LB reacts" and "after" to see what detection buys you.
+
+<RelFaultLab client:visible />
+
+What to notice:
+
+1. **Crash** has errors only until the probe threshold is reached (the example in lesson 2.4 had a 60 s window). After that, no user errors, but the survivors run hotter: 4 servers at 70% become 3 at 93%.
+2. **Slow node** and **gray failure** keep the probe green. The LB never removes them. This is why a health check that only asks "is the process up?" is not enough. Real traffic outcomes (error rate, latency) must feed the decision.
+3. **Partition** gives no user errors after detection, but S3 is alive. If S3 is a database leader, you now have a leadership question. That is the territory of CAP ([lesson 4.9](/learn/04-data/cap-pacelc/)) and consensus ([lesson 4.11](/learn/04-data/consensus/)).
+
+## How one failure becomes an outage
+
+Failures spread through load. When a server leaves, its work goes somewhere else. Step through a cascade on three servers.
+
+<RelCascadeWalk client:visible />
+
+The key sentence: **the outage was caused by the load that moved, not by the first crash.** Three servers at 80% have no room to lose one. The Google SRE book describes the same trap at larger scale. If a service healthy at 10,000 requests per second fails at 11,000 because of crashes, it may need the load to drop to about 1,000 per second to recover, when only 10% of servers are healthy enough to serve. It also describes a two-cluster case: cluster A takes traffic from a failed cluster B, goes from 1,000 to 1,200 requests per second, and its successful throughput falls well below 1,000.
+
+Slow requests and retries feed the loop. A slow server holds threads. Callers time out and retry (lesson 7.2). The retries add load. Load adds slowness.
+
+## Containing the damage
+
+You cannot prevent every failure. You can limit how far it spreads.
+
+- **Keep headroom.** The throughput lesson said to plan for 50 to 70% utilization at peak. Here is the reason: the headroom is what a failure's load lands on.
+- **Remove the right nodes.** Use health signals from real traffic, not only a shallow probe. But do not remove too fast: a false positive that evicts a healthy node pushes more load onto the rest.
+- **Fail fast and shed load.** Reject extra work early instead of queuing it. Lessons 7.2 to 7.4 give the tools: timeouts, circuit breakers, and rate limits.
+- **Limit the blast radius.** The AWS article describes **cells**: "identical and independent partitions" of a service. A fault or a bad deploy hits one cell, not the fleet. It also describes **shuffle sharding**, a technique that makes sure "no two servers in the fleet see the same exact workload", so one bad customer cannot take down everyone.
+- **Change things slowly.** Roll out to one cell first. A change that touches every server at once is a correlated failure you scheduled yourself.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| One server fails on a given day | 0.01% | AWS Builders' Library (example) |
+| Two independent servers both fail the same day | 0.000001% | Same |
+| Service healthy at / fails at | 10,000 / 11,000 requests per second | Google SRE book |
+| Load needed to recover, with 10% healthy servers | about 1,000 requests per second | Same |
+| 5% of requests never complete | 80.4% error rate | Same |
+| Cluster A when cluster B fails | 1,000 to 1,200 requests per second | Same |
+| Survivors after one of 4 servers at 70% fails | 93% (derived: 4 x 70 / 3) | Derived |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Fast failure detection | Short error window after a crash | False positives that evict healthy nodes and move load | The cost of errors is above the cost of a spurious eviction |
+| Spare capacity (N+1 or more) | The survivors can absorb a loss | Idle hardware you pay for | Always, sized to the failures you must survive |
+| Cells | A failure or bad deploy hits a fraction | Routing layer, more to operate | Large fleets, or when one tenant can hurt others |
+| Shed load early | The healthy part keeps serving | Some real requests are refused | Overload where queuing would make everything slow |
+| More replicas | Tolerates more independent failures | Cost, plus coordination (lesson 4.11) | Failures are independent. It does nothing for correlated ones |
+
+## In practice
+
+<Callout type="tip">
+Start a reliability answer by naming the failure mode. Say "a crash is easy, the LB sees it. The risky ones are a slow node and a gray failure, because the health check stays green." Then say what you would watch: error rate and latency per server, not only up or down. Interviewers listen for the difference between failing loudly and failing quietly.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we have three replicas, so we are safe". Ask what they share: the same zone, the same deploy, the same config, the same certificate. Do not treat a slow server as a dead one, because it holds callers and drags the fleet. And do not say "a partition means a node is down". Both sides can be alive.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A server answers its /health probe with 200, but 3 in 10 real requests that reach it fail. Which failure mode is this?',
+      options: [
+        'A crash, because the server is failing many requests',
+        'Gray failure: the monitor sees health, the apps see errors',
+        'A network partition, because some calls do not arrive',
+        'A correlated failure, because several requests fail',
+      ],
+      answer: 1,
+      explain: 'The detector says healthy and the apps say unhealthy. That mismatch is the defining feature of gray failure. A crash would fail the probe. A partition would cut the probe off too.',
+    },
+    {
+      q: 'Four servers each run at 70% of capacity. One crashes and the load balancer removes it. What load does each of the other three carry?',
+      options: ['70%, because the load balancer fixes it', '80%', 'About 93%', '140%'],
+      answer: 2,
+      explain: 'Total load is 4 x 70 = 280 units. Three servers share it: 280 / 3 is about 93 units, or 93% of one server. At 80% each, the survivors would have little room. A second failure would push them over 100%.',
+    },
+    {
+      q: 'Two servers each have a 0.01% chance of failing on a given day. The chance both fail on the same day is 0.000001%. When does that number hold?',
+      options: [
+        'Only when the failures are independent of each other',
+        'Always, because probabilities multiply',
+        'Only when both servers are in different countries',
+        'Only when the servers run different software versions',
+      ],
+      answer: 0,
+      explain: 'Multiplying 0.01% by 0.01% is valid only for independent events. A shared deploy, power feed, or certificate makes the events move together, and the real chance can be far higher. Different countries or versions may help, but only independence makes the arithmetic true.',
+    },
+    {
+      q: 'Why can a slow node hurt a fleet more than a dead node?',
+      options: [
+        'It uses more power and more network bandwidth than a dead node',
+        'Its answers are always wrong, so callers retry forever',
+        'Slow nodes are never replaced by autoscaling or by the load balancer',
+        'It stays in the pool and holds callers\' threads until they time out',
+      ],
+      answer: 3,
+      explain: 'A dead node refuses connections, so callers fail fast and move on. A slow node accepts calls and keeps each caller waiting. Callers run out of threads and then fail themselves. The delay spreads upward.',
+    },
+    {
+      q: 'The load balancer is cut off from server S3 by a network fault. S3 is still running and can reach the database. What is true?',
+      options: [
+        'S3 is down, because the load balancer cannot reach it',
+        'S3 must shut itself down at once',
+        'S3 is alive, and the two sides may disagree on who is healthy',
+        'The partition fixes itself within one health check interval',
+      ],
+      answer: 2,
+      explain: 'A partition splits the network, not the machines. Each side sees the other as silent. S3 may keep working on its own. If it holds a role such as leader, that disagreement is dangerous. Nothing guarantees the partition heals fast.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="failure-modes-config-push"
+  title="Three replicas, one outage"
+  scenario="A payments API runs 3 replicas in 3 availability zones, so the team calls it redundant. At 09:00 a deploy pushes a new config to all 3 replicas within 2 minutes."
+  facts={[
+    '09:01  replica a: crash loop (config parse error)',
+    '09:02  replica b: crash loop (config parse error)',
+    '09:02  replica c: crash loop (config parse error)',
+    'zone health: all 3 zones up, network normal',
+    'error rate: 100% until rollback at 09:20',
+  ]}
+  steps={[
+    {
+      prompt: 'Why did the redundancy not help?',
+      options: [
+        'One shared cause: the same change reached all three replicas',
+        'Three replicas are too few, because five would have survived',
+        'The zones are physically too close together',
+        'The load balancer was slow to detect the crash',
+      ],
+      answer: 0,
+      explain: 'The failure was correlated. The zones were independent, but the config was shared. More replicas that receive the same bad config would crash the same way. Detection speed did not matter, because there was no healthy replica to route to.',
+    },
+    {
+      prompt: 'Which change best limits the damage of the next bad deploy?',
+      options: [
+        'Add two more replicas in a fourth zone for extra capacity',
+        'Shorten the health check interval to 1 second',
+        'Roll out to one cell first, and roll back if its errors rise',
+        'Run the deploy at night',
+      ],
+      answer: 2,
+      explain: 'A staged rollout makes the change reach a small blast radius first. A bad config then breaks one cell, and the rest keep serving. Extra replicas still get the same bad config. A faster probe only reports the outage sooner. A night deploy changes who sees it, not how far it spreads.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Google SRE book: Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/): the 10,000 and 11,000 requests per second example, the 80.4% example, and how overload spreads.
+- [AWS Builders' Library: Minimizing correlated failures in distributed systems](https://builder.aws.com/content/3Ev2H7t3l2eZa9xBXiZcAjz12JK/minimizing-correlated-failures-in-distributed-systems): cells, shuffle sharding, and the redundancy math.
+- [Huang et al., "Gray Failure: The Achilles' Heel of Cloud-Scale Systems" (HotOS 2017)](https://www.microsoft.com/en-us/research/wp-content/uploads/2017/06/paper-1.pdf): the definition of gray failure and differential observability.
+- [Google SRE book: Handling Overload](https://sre.google/sre-book/handling-overload/): how to reject excess load early.
