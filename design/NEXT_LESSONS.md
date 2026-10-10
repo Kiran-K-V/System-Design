@@ -8,8 +8,10 @@ Site: **Uptime** (brand constant `SITE` in `src/layouts/Layout.astro`). Subject:
 
 | Module | State |
 |---|---|
-| 0 Orientation, 1 One Machine, 2 Networking, 3 API Design, 4 Data, 5 Caching | Done. 36 lessons. |
-| 6 Asynchronous Systems (5), 7 Reliability (5), 8 Key Technologies (11), 9 Patterns (7), 10 Advanced Topics (5), 11 Case Studies (24), 12 In the Wild (4) | **To write. 61 lessons.** |
+| 0 Orientation, 1 One Machine, 2 Networking, 3 API Design, 4 Data, 5 Caching, 6 Asynchronous Systems, 7 Reliability, 8 Key Technologies | Done. 57 lessons. |
+| 9 Patterns (7), 10 Advanced Topics (5), 11 Case Studies (24), 12 In the Wild (4) | **To write. 40 lessons.** |
+
+Module 6 to 8 reusable components: `AsyncQueueViz`, `AsyncPartitionViz` (queue and consumer-group visuals), `Rel*` (retry, breaker, token bucket, trace waterfall), `TechParts`. Prefix new components per module to avoid collisions between parallel writers. Lessons in Modules 6 to 8 link back with `/learn/<id>/` markdown links; never link forward to an unwritten lesson (write "lesson 9.5" as plain text).
 
 `src/lib/syllabus.ts` is the single source of truth for lesson ids, titles, and order. Do not rename, add, or reorder lessons without the orchestrator's approval.
 
