@@ -1,6 +1,6 @@
 import { HandText, SketchArrow, SketchBox, SketchSvg, Badge, seedOf } from '../sketch';
 
-/** Static infographic: the seven parts of a Groundwork lesson. No client JS. */
+/** Static infographic: the seven parts of a Load Bearing lesson. No client JS. */
 
 const parts = [
   { t: 'The problem', s: 'a real pain,\nwith numbers' },
