@@ -5,6 +5,7 @@ requires: ['02-networking/http-tls', '02-networking/load-balancing']
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
 import VarintWalk from '../../../components/anim/lessons/VarintWalk.tsx';
 import WireCompare from '../../../components/anim/lessons/WireCompare.tsx';
 import GrpcFrames from '../../../components/anim/lessons/GrpcFrames.tsx';
@@ -47,7 +48,7 @@ message User {
 
 The numbers (`= 1`, `= 2`) are **field numbers**. They, not the names, go on the wire. Each field is written as a **tag** followed by a value. The tag packs the field number and a **wire type** (how to read the value): `(field_number << 3) | wire_type`. Wire type 0 means a variable-length integer. Wire type 2 means a length followed by bytes, used for strings.
 
-An integer uses a **varint**: 7 bits of number per byte, and the top bit says "more bytes follow". Small numbers cost one byte. Step through how 150 becomes three bytes.
+An integer uses a **varint**: 7 bits of number per byte, and the top bit says "more bytes follow". Small numbers cost one byte. Step through how 150 becomes two bytes. With the one-byte field tag in front, the field costs three.
 
 <VarintWalk client:visible />
 
@@ -148,12 +149,14 @@ A server can start a streaming response, send many messages, and only then find 
   client:visible
   questions={[
     {
+      id: 'rpc-grpc-message-m-int32-id',
       q: 'In `message M { int32 id = 1; }`, id is set to 300. How many bytes does the field take on the wire?',
       options: ['2', '3', '4', '8'],
       answer: 1,
       explain: '300 in binary is 100101100: 9 bits, so it needs two 7-bit groups and two varint bytes (AC 02). The tag for field 1 with wire type 0 is one byte (08). Total: 1 + 2 = 3 bytes.',
     },
     {
+      id: 'rpc-grpc-service-has-3-grpc',
       q: 'A service has 3 gRPC backends behind an L4 load balancer. One busy client sends all the traffic. You scale to 6 backends and backend 1 stays at 100% CPU. Why?',
       options: [
         'The new backends are slower',
@@ -165,6 +168,7 @@ A server can start a streaming response, send many messages, and only then find 
       explain: 'The balancer decides per connection. One connection carries every call as a stream, so every call goes to the same backend. Balance per call with an L7 proxy or in the client.',
     },
     {
+      id: 'rpc-grpc-want-drop-nickname-4',
       q: 'You want to drop the `nickname = 4` field from a message and later add an `email` field. What is the safe plan?',
       options: [
         'Delete nickname and give email the number 4',
@@ -176,6 +180,7 @@ A server can start a streaming response, send many messages, and only then find 
       explain: 'Old data and old clients may still hold field 4 with the old meaning. Reusing 4 makes them read nickname bytes as an email. Reserving the number stops anyone from doing it later.',
     },
     {
+      id: 'rpc-grpc-client-calls-service-300',
       q: 'A client calls service A with a 300 ms deadline. A works for 100 ms, then calls service B. What time limit should B see, and why is it sent as a duration and not a clock time?',
       options: [
         '300 ms, a fresh limit for each hop',
@@ -187,6 +192,7 @@ A server can start a streaming response, send many messages, and only then find 
       explain: 'The client stops waiting at 300 ms. Any work B does after that is wasted. So B gets what is left (about 200 ms). Sending a remaining duration means no machine needs to agree on the time of day.',
     },
     {
+      id: 'rpc-grpc-server-streaming-call-sends',
       q: 'A server-streaming call sends 1,000 messages and then fails on the server. The HTTP status the client saw was 200. How does the client learn it failed?',
       options: [
         'It cannot. A 200 means success',
@@ -196,6 +202,41 @@ A server can start a streaming response, send many messages, and only then find 
       ],
       answer: 1,
       explain: 'The 200 was sent with the response headers, before the failure. gRPC adds the final status in trailers after the last message. Clients must read grpc-status, not only the HTTP status.',
+    },
+  ]}
+/>
+
+## Prove it
+
+No lesson text covers these cases. Use what you learned.
+
+<Diagnose
+  client:visible
+  id="grpc-rename-field"
+  title="The renumbered field"
+  scenario="A team changes the message from  string user_id = 3  to  string account_id = 5  and deletes field 3. The server ships first. Old mobile apps still send field 3."
+  steps={[
+    {
+      prompt: 'What happens when an old app calls the new server?',
+      options: [
+        'The server reads field 5, finds nothing, and sees an empty account_id',
+        'The call fails with a schema mismatch error',
+        'The server maps field 3 to account_id by name',
+        'The old app crashes when it parses the response',
+      ],
+      answer: 0,
+      explain: 'Field numbers go on the wire, not names. Field 3 is now unknown, so the server skips it. Field 5 never arrived, so account_id takes its default.',
+    },
+    {
+      prompt: 'Which rollout is safe?',
+      options: [
+        'Add field 5, keep reading field 3 until old apps are gone, then mark 3 as reserved',
+        'Reuse number 3 for account_id',
+        'Rename the field back and ship at night',
+        'Version the whole service as v2 and drop v1 now',
+      ],
+      answer: 0,
+      explain: 'Support both numbers during the overlap. Reserve 3 afterwards so nobody reuses it for a different meaning.',
     },
   ]}
 />
