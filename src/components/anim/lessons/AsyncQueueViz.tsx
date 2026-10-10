@@ -100,7 +100,7 @@ export default function AsyncQueueViz({
   const workerTop = 74;
   const workerPitch = 56;
   const meterY = trayY + 60;
-  const dlqY = meterY + 78;
+  const dlqY = meterY + 100;
   const workersBottom = workerTop + (workers.length - 1) * workerPitch + 30;
   const leftBottom = (dlq ? dlqY + 30 : meter ? meterY + 40 : trayY + 30) + 10;
   const H = Math.max(workersBottom, leftBottom) + 14;

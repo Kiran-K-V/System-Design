@@ -17,11 +17,11 @@ export function Cell({ cx, cy, w = 30, h = 30, label, tone = 'fg', dashed, sk }:
   );
 }
 
-/** A labeled box. Two lines (label and sub) use height 60. One line uses height 44. */
-export function Panel({ cx, cy, w, h = 44, label, sub, tone = 'fg', dashed, strong, sk }: { cx: number; cy: number; w: number; h?: number; label: string; sub?: string; tone?: TT; dashed?: boolean; strong?: boolean; sk: string }) {
+/** A labeled box. A ghost box is an empty placeholder: dashed, no fill. Two lines (label and sub) use height 60. One line uses height 44. */
+export function Panel({ cx, cy, w, h = 44, label, sub, tone = 'fg', dashed, strong, ghost, sk }: { cx: number; cy: number; w: number; h?: number; label: string; sub?: string; tone?: TT; dashed?: boolean; strong?: boolean; ghost?: boolean; sk: string }) {
   return (
     <g>
-      <SketchBox cx={cx} cy={cy} w={w} h={sub ? 60 : h} seed={seedOf(sk)} stroke={tv(tone)} strokeWidth={strong ? 2.2 : 1.4} dashed={dashed} fill={tone === 'fg' ? undefined : tv(tone)} fillStyle="solid" />
+      <SketchBox cx={cx} cy={cy} w={w} h={sub ? 60 : h} seed={seedOf(sk)} stroke={ghost ? 'var(--muted)' : tv(tone)} strokeWidth={strong ? 2.2 : 1.4} dashed={dashed || ghost} fill={ghost || tone === 'fg' ? undefined : tv(tone)} fillStyle="solid" />
       <HandText x={cx} y={sub ? cy - 10 : cy} size={TEXT_SIZES.label}>
         {label}
       </HandText>

@@ -48,7 +48,8 @@ export function simulate(p: LabParams): Tick[] {
   for (let t = 0; t < p.seconds; t++) {
     const offered = rateAt(p, t) + held;
     held = 0;
-    const room = p.policy === 'unbounded' ? Infinity : Math.max(0, p.cap - depth);
+    // Workers free space during the second, so a full queue still takes what they remove.
+    const room = p.policy === 'unbounded' ? Infinity : Math.max(0, p.cap - depth + Math.min(depth, cap));
     const accepted = Math.min(offered, room);
     const rest = offered - accepted;
     if (p.policy === 'block') held = rest;

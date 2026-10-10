@@ -42,6 +42,11 @@ const captions = [
 ].map((caption) => ({ caption }));
 
 const x = (ts: number) => 80 + ts * 18;
+/** Keep an event dot inside its own window box, even right next to a window edge. */
+const dotX = (ts: number) => {
+  const left = 85 + Math.floor(ts / SIZE) * 180;
+  return Math.max(left + 17, Math.min(left + 170 - 17, x(ts)));
+};
 
 export default function FlinkWindows() {
   return (
@@ -50,7 +55,7 @@ export default function FlinkWindows() {
         const r = replay(i);
         const last = i > 0 ? r.events[i - 1] : null;
         const counts = [0, 1, 2].map((w) => r.events.filter((e) => e.win === w && !e.late).length);
-        const wmX = Math.max(52, Math.min(648, x(r.wm)));
+        const wmX = i === 0 ? 80 : Math.max(52, Math.min(648, x(r.wm)));
         return (
           <SketchSvg width={720} height={380} label="Events placed on an event-time axis, with a watermark and three tumbling windows">
             <HandText x={360} y={18} size={TEXT_SIZES.label} color="var(--accent)">
@@ -73,12 +78,12 @@ export default function FlinkWindows() {
               if (e.late) return null;
               const isNew = k === i - 1;
               const tone: TT = r.fired.has(e.win) ? 'ok' : isNew ? 'accent' : 'fg';
-              return <Cell key={k} cx={x(e.ts)} cy={146} w={30} h={30} label={String(e.ts)} tone={tone} sk={`fe${k}`} />;
+              return <Cell key={k} cx={dotX(e.ts)} cy={146} w={30} h={30} label={String(e.ts)} tone={tone} sk={`fe${k}`} />;
             })}
             {last?.late && (
               <g>
-                <Cell cx={x(last.ts)} cy={66} w={30} h={30} label={String(last.ts)} tone="bad" dashed sk="fe-late" />
-                <HandText x={x(last.ts) + 24} y={66} size={TEXT_SIZES.note} anchor="start" color="var(--bad)">
+                <Cell cx={dotX(last.ts)} cy={66} w={30} h={30} label={String(last.ts)} tone="bad" dashed sk="fe-late" />
+                <HandText x={dotX(last.ts) + 24} y={66} size={TEXT_SIZES.note} anchor="start" color="var(--bad)">
                   late: window already fired, dropped
                 </HandText>
               </g>
@@ -88,7 +93,7 @@ export default function FlinkWindows() {
               <HandText key={t} x={x(t)} y={238} size={TEXT_SIZES.note} color="var(--muted)">{`${t} s`}</HandText>
             ))}
             <Arr from={[wmX, 290]} to={[wmX, 250]} tone="accent" sk={`fw-wm-${i}`} />
-            <HandText x={wmX} y={306} size={TEXT_SIZES.note} color={tv('accent')}>{`watermark ${r.wm}`}</HandText>
+            <HandText x={wmX} y={306} size={TEXT_SIZES.note} color={tv('accent')}>{i === 0 ? 'no watermark yet' : `watermark ${r.wm}`}</HandText>
             <HandText x={360} y={332} size={TEXT_SIZES.note} color="var(--muted)">Arrival order (event time of each event)</HandText>
             {ARRIVALS.map((ts, k) => (
               <Cell key={k} cx={110 + k * 83} cy={358} w={60} h={30} label={`ts ${ts}`} tone={k === i - 1 ? (r.events[k].late ? 'bad' : 'accent') : 'fg'} dashed={k >= i} sk={`fa${k}`} />

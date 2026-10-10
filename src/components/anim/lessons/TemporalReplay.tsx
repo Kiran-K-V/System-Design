@@ -67,7 +67,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Worker A crashes. Its memory is gone: the position in the code and every local variable. The history is on the server and survives. The reserve activity runs on another worker and finishes, so event 5 is recorded. The server does not detect the crash by itself. It notices when a workflow task is not answered in time and hands it to another worker.',
+      'Worker A crashes. Its memory is gone: the position in the code and every local variable. The history is on the server and survives. The reserve activity runs on another worker and finishes, so event 5 is recorded. The server does not detect the crash by itself. It relies on a timeout: when the task is not answered in time, it can go to another worker.',
     msg: 'Worker A crashes. Event 5 arrives from an activity worker.',
     worker: 'Worker A: crashed',
     workerTone: 'bad',
@@ -108,7 +108,7 @@ const steps: Step[] = [
     caption:
       'Now suppose someone deploys code that reserves stock before it charges. Replay emits "schedule reserve" first. The history says event 2 is "charge scheduled". They differ, so the SDK raises a non-determinism error and the workflow stops. A stopped workflow is safer than one that charges twice or skips a step. This is why workflow code must be deterministic, and why changes need versioning.',
     msg: 'Changed code does not match the history.',
-    worker: 'Worker B: non-determinism error',
+    worker: 'Worker B: mismatch',
     workerTone: 'bad',
     events: 6,
     lines: ['bad', 'fg', 'fg'],
@@ -140,7 +140,7 @@ export default function TemporalReplay() {
             k < s.events ? (
               <Panel key={k} cx={540} cy={EV_Y[k]} w={290} h={40} label={label} tone={s.badEvent === k ? 'bad' : s.newEvent === k ? 'accent' : 'ok'} sk={`th${k}`} />
             ) : (
-              <Panel key={k} cx={540} cy={EV_Y[k]} w={290} h={40} label="" tone="muted" dashed sk={`th-empty${k}`} />
+              <Panel key={k} cx={540} cy={EV_Y[k]} w={290} h={40} label="" ghost sk={`th-empty${k}`} />
             ),
           )}
           {s.link && <Arr from={[220, LINE_Y[s.link.line]]} to={[390, EV_Y[s.link.event]]} tone={s.link.tone} dashed={s.link.tone === 'bad'} sk={`tl-${i}`} />}

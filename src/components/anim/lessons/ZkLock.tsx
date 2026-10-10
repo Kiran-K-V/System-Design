@@ -84,7 +84,7 @@ const steps: Step[] = [
 
 export default function ZkLock() {
   return (
-    <AnimFrame title="ZooKeeper: an ephemeral-node lock freed by session expiry" steps={steps} interval={5200}>
+    <AnimFrame title="ZooKeeper: a lock freed by session expiry" steps={steps} interval={5200}>
       {(i, s) => (
         <SketchSvg width={720} height={370} label="Three clients, their znodes under /locks/job7, and the watches between them">
           <HandText x={360} y={18} size={TEXT_SIZES.label} color="var(--accent)">
@@ -97,7 +97,7 @@ export default function ZkLock() {
             <g key={k}>
               <Panel cx={90} cy={cy} w={120} label={NAMES[k]} sub={s.clients[k].sub} tone={s.clients[k].tone} dashed={s.clients[k].tone === 'bad'} sk={`zc${k}`} />
               {s.nodes[k].hidden ? (
-                <Panel cx={380} cy={cy} w={170} label="" tone="muted" dashed sk={`zn-empty${k}`} />
+                <Panel cx={380} cy={cy} w={170} label="" ghost sk={`zn-empty${k}`} />
               ) : (
                 <Panel cx={380} cy={cy} w={170} label={s.nodes[k].label} tone={s.nodes[k].tone} dashed={s.nodes[k].dashed} sk={`zn${k}`} />
               )}

@@ -104,10 +104,10 @@ export default function FlinkCheckpoint() {
           { id: 'src', x: 100, y: 150, w: 150, label: 'Source', sub: s.src[0], tone: s.src[1] ?? 'default' },
           { id: 'op', x: 360, y: 150, w: 170, label: 'Operator', sub: s.op[0], tone: s.op[1] ?? 'default' },
           { id: 'sink', x: 620, y: 150, w: 150, label: 'Sink', sub: s.sink[0], tone: s.sink[1] ?? 'default' },
-          { id: 'store', x: 360, y: 272, w: 210, h: 64, label: 'Storage', sub: s.storage[0], shape: 'db', tone: s.storage[1] ?? 'default' },
+          { id: 'store', x: 360, y: 274, w: 210, h: 88, label: 'Storage', sub: s.storage[0], shape: 'db', tone: s.storage[1] ?? 'default' },
         ];
         const edges: FlowEdge[] = [{ from: 'src', to: 'op' }, { from: 'op', to: 'sink' }, ...(s.extra ?? [])];
-        return <FlowDiagram width={720} height={320} nodes={nodes} edges={edges} packets={s.packets} active={[s.active]} stepKey={i} travel={1.1} label="A Flink pipeline with a checkpoint barrier moving from the source to the sink" />;
+        return <FlowDiagram width={720} height={336} nodes={nodes} edges={edges} packets={s.packets} active={[s.active]} stepKey={i} travel={1.1} label="A Flink pipeline with a checkpoint barrier moving from the source to the sink" />;
       }}
     </AnimFrame>
   );

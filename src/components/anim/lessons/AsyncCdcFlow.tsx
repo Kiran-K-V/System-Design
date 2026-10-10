@@ -112,7 +112,7 @@ const steps: Step[] = [
 
 const edges: FlowEdge[] = [
   { from: 'app', to: 'db' },
-  { from: 'db', to: 'connector', label: 'reads log', labelAt: [0, -18] },
+  { from: 'db', to: 'connector' },
   { from: 'connector', to: 'stream' },
   { from: 'stream', to: 'search' },
   { from: 'stream', to: 'cache' },
