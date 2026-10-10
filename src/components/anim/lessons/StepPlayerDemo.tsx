@@ -13,7 +13,7 @@ function Ctl({ cx, w, label, on, seed }: { cx: number; w: number; label: string;
   return (
     <g>
       <SketchBox cx={cx} cy={210} w={w} h={44} r={10} seed={seedOf(seed)} stroke={on ? 'var(--accent)' : 'var(--muted)'} strokeWidth={on ? 2.4 : 1.2} fill={on ? 'var(--accent)' : undefined} fillStyle="solid" />
-      <HandText x={cx} y={211} size={15} color={on ? '#fff' : 'var(--muted)'}>{label}</HandText>
+      <HandText x={cx} y={211} size={15} color={on ? 'var(--fg)' : 'var(--muted)'}>{label}</HandText>
     </g>
   );
 }
@@ -25,7 +25,7 @@ export default function StepPlayerDemo() {
         <SketchSvg width={720} height={300} label="A miniature step player with a three-box flow and a drawn control bar">
           {flow.map((f, k) => (
             <g key={f}>
-              <SketchBox cx={150 + k * 210} cy={55} w={130} h={56} seed={seedOf('f' + k)} stroke={k === i ? 'var(--accent)' : 'var(--muted)'} strokeWidth={k === i ? 2.6 : 1.2} fill={k === i ? 'var(--accent)' : undefined} fillStyle="hachure" />
+              <SketchBox cx={150 + k * 210} cy={55} w={130} h={56} seed={seedOf('f' + k)} stroke={k === i ? 'var(--accent)' : 'var(--muted)'} strokeWidth={k === i ? 2.6 : 1.2} fill={k === i ? 'var(--accent)' : undefined} />
               <HandText x={150 + k * 210} y={56} size={17} halo weight={k === i ? 700 : 400} color={k === i ? 'var(--fg)' : 'var(--muted)'}>{f}</HandText>
             </g>
           ))}

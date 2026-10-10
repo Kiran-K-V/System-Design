@@ -123,7 +123,7 @@ function Bar({ seg, rowY }: { seg: Seg; rowY: number }) {
       r={5}
       stroke={COLOR[seg.kind]}
       fill={COLOR[seg.kind]}
-      fillStyle={seg.kind === 'stall' ? 'cross-hatch' : seg.kind === 'setup' ? 'zigzag' : 'hachure'}
+      fillStyle={seg.kind === 'stall' ? 'cross-hatch' : undefined}
       seed={seedOf(`${seg.kind}${seg.row}${seg.from}`)}
     />
   );

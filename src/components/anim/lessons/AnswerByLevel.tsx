@@ -24,7 +24,7 @@ export default function AnswerByLevel() {
         <SketchSvg width={720} height={330} label={`${s.level}: ${s.lines.join(' ')}`}>
           {steps.slice(1, 4).map((x, k) => (
             <g key={x.level}>
-              <SketchBox cx={100 + k * 260} cy={34} w={160} h={36} r={18} seed={seedOf('tab' + k)} stroke={x.color} strokeWidth={i === k + 1 ? 2.6 : 1.1} fill={i === k + 1 ? x.color : undefined} fillStyle="hachure" />
+              <SketchBox cx={100 + k * 260} cy={34} w={160} h={36} r={18} seed={seedOf('tab' + k)} stroke={x.color} strokeWidth={i === k + 1 ? 2.6 : 1.1} fill={i === k + 1 ? x.color : undefined} />
               <HandText x={100 + k * 260} y={35} size={15} halo weight={i === k + 1 ? 700 : 400} color={i === k + 1 ? 'var(--fg)' : 'var(--muted)'}>{['Mid-level', 'Senior', 'Staff'][k]}</HandText>
             </g>
           ))}

@@ -132,7 +132,7 @@ function Drawing({ shape }: { shape: Shape }) {
                   {k}
                 </HandText>
                 <SketchArrow points={[[150, y], [180, y]]} seed={seedOf(`ka${k}`)} />
-                <SketchBox cx={320} cy={y} w={270} h={42} r={8} seed={seedOf(`v${k}`)} fill="var(--surface)" fillStyle="hachure" dashed />
+                <SketchBox cx={320} cy={y} w={270} h={42} r={8} seed={seedOf(`v${k}`)} fill="var(--surface)" dashed />
                 <HandText x={320} y={y} size={14} mono halo>
                   {v}
                 </HandText>

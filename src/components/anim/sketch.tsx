@@ -30,7 +30,26 @@ export function seedOf(key: string): number {
   return (Math.abs(h) % 2_000_000) + 1;
 }
 
-const BASE: Options = { roughness: 1.1, bowing: 1, strokeWidth: 1.4, stroke: INK };
+/**
+ * Diagram standard (design/DIAGRAMS.md). The primitives enforce it, so a diagram cannot drift:
+ * - Text uses one of five sizes. Any other size snaps to the nearest step.
+ * - The hand font has no bold cut, so hand text is always weight 400. Show emphasis with color.
+ * - Strokes are 1.4 (normal) or 2.2 (emphasis). Wider values (rings, tracks) pass through.
+ * - Colored fills render as a soft tint, so text on top stays readable in both themes.
+ */
+export const TEXT_SIZES = { note: 14, label: 16, heading: 18, title: 22, display: 28 } as const;
+const SIZE_STEPS = Object.values(TEXT_SIZES);
+const snapSize = (s: number) => SIZE_STEPS.reduce((best, step) => (Math.abs(step - s) < Math.abs(best - s) ? step : best));
+
+export const STROKE = { normal: 1.4, emphasis: 2.2 } as const;
+const snapStroke = (w: number) => (w > 3 ? w : w >= 1.8 ? STROKE.emphasis : STROKE.normal);
+
+/** Neutral fills stay as they are. Any other color becomes a tint of itself over the page background. */
+const NEUTRAL_FILL = /^var\(--(bg|surface|node|accent-soft)\)$/;
+const TINT = 20;
+const tint = (fill: string) => (NEUTRAL_FILL.test(fill) ? fill : `color-mix(in srgb, ${fill} ${TINT}%, var(--bg))`);
+
+const BASE: Options = { roughness: 0.9, bowing: 0.7, strokeWidth: STROKE.normal, stroke: INK };
 
 /** Server and browser math can differ in the last float digits. Rounding keeps hydration stable. */
 function roundPath(d: string) {
@@ -68,19 +87,22 @@ interface ShapeStyle {
   strokeWidth?: number;
   dashed?: boolean;
   fill?: string;
-  fillStyle?: 'solid' | 'hachure' | 'cross-hatch' | 'zigzag';
+  /** Omit for a flat tint. Cross-hatch is for small badges only. */
+  fillStyle?: 'solid' | 'cross-hatch';
 }
 
 function opts(s: ShapeStyle): Options {
+  // Cross-hatch is kept for small badges. Every other fill is a flat tint: hatching behind text is noise.
+  const hatched = s.fillStyle === 'cross-hatch';
   return {
     ...BASE,
     seed: s.seed,
     stroke: s.stroke ?? INK,
-    strokeWidth: s.strokeWidth ?? BASE.strokeWidth,
+    strokeWidth: snapStroke(s.strokeWidth ?? STROKE.normal),
     strokeLineDash: s.dashed ? [8, 7] : undefined,
     disableMultiStroke: s.dashed,
-    fill: s.fill,
-    fillStyle: s.fillStyle ?? 'hachure',
+    fill: s.fill && !hatched ? tint(s.fill) : s.fill,
+    fillStyle: hatched ? 'cross-hatch' : 'solid',
     hachureGap: 5,
     fillWeight: 1,
   };
@@ -171,7 +193,9 @@ export function HandText({
   halo?: boolean;
 }) {
   const boost = useContext(TextBoost);
-  size = Math.max(size * boost, MIN_BOOST_PX * boost);
+  size = Math.max(snapSize(size), MIN_BOOST_PX) * boost;
+  // Faux bold on the hand font smears. Mono text may go to 500, no further.
+  weight = mono ? Math.min(weight, 500) : 400;
   const lines = children.split('\n');
   const first = y - ((lines.length - 1) * size * lineHeight) / 2;
   return (

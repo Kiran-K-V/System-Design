@@ -150,7 +150,7 @@ function Node({ i, s }: { i: number; s: NodeState }) {
         return (
           <g key={k}>
             <SketchBox cx={bx} cy={by} w={26} h={26} r={4} seed={seedOf(`ent-${i}-${k}`)} stroke={committed ? 'var(--ok)' : 'var(--warn)'} fill={committed ? 'var(--ok)' : undefined} fillStyle="solid" dashed={!committed} />
-            <HandText x={bx} y={by + 1} size={14} weight={700} color={committed ? '#fff' : 'var(--fg)'}>
+            <HandText x={bx} y={by + 1} size={14} weight={700} color="var(--fg)">
               {e.replace('*', '')}
             </HandText>
           </g>
