@@ -8,7 +8,7 @@ import FlowDiagram, { type FlowEdge, type FlowNode, type FlowNote, type Tone } f
 
 const IDS = ['a', 'b', 'c', 'd', 'e', 'db'];
 const NAMES = ['Service A', 'Service B', 'Service C', 'Service D', 'Service E', 'Database'];
-const X = [60, 190, 320, 450, 580];
+const X = [56, 168, 280, 392, 504];
 
 interface Step {
   caption: string;
@@ -58,7 +58,7 @@ export default function RelRetryChain() {
             id,
             x: isDb ? 650 : X[k],
             y: 100,
-            w: isDb ? 100 : 104,
+            w: isDb ? 110 : 88,
             h: 56,
             label: isDb ? 'Database' : NAMES[k].replace('Service ', 'Svc '),
             shape: isDb ? 'db' : 'box',

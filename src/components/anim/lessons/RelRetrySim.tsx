@@ -55,8 +55,8 @@ export default function RelRetrySim() {
         </label>
         <label className="block text-sm">
           <span className="flex justify-between">
-            <span>Server can answer (your assumption)</span>
-            <span className="font-mono tabular-nums">{capacity} per s</span>
+            <span>Server capacity (assumed)</span>
+            <span className="font-mono tabular-nums">{capacity}/s</span>
           </span>
           <input type="range" min={100} max={400} step={50} value={capacity} onChange={(e) => setCapacity(+e.target.value)} aria-label="Server capacity per second" className="mt-1 w-full accent-[var(--accent)]" />
         </label>
@@ -90,7 +90,7 @@ export default function RelRetrySim() {
         <text x={(P.l + W - P.r) / 2} y={H - 6} textAnchor="middle" fontSize={15} fill="var(--muted)">
           time after the first failure (retries only)
         </text>
-        <text x={P.l + 4} y={P.t + 4} fontSize={15} fill="var(--muted)">
+        <text x={P.l + 40} y={P.t + 4} fontSize={15} fill="var(--muted)">
           retry calls per 100 ms
         </text>
       </svg>

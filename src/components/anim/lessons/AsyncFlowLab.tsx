@@ -13,7 +13,7 @@ import type { Tone } from '../FlowDiagram';
 
 const BASE = 30;
 const PER_WORKER = 5;
-const SECONDS = 180;
+const SECONDS = 300;
 const BURST_START = 5;
 
 interface Props {
@@ -135,7 +135,7 @@ export default function AsyncFlowLab({ policies = false, initial = {}, title = '
         <dt className="text-muted">Worst wait</dt>
         <dd className="font-mono">{Number.isFinite(sum.peakWait) ? `${fmt(sum.peakWait)} s` : 'never'}</dd>
         <dt className="text-muted">Queue empty at</dt>
-        <dd className="font-mono">{sum.drainedAt === null ? 'never' : `${sum.drainedAt} s`}</dd>
+        <dd className="font-mono">{sum.drainedAt === null ? (sum.keepsUp ? 'after 300 s' : 'never') : `${sum.drainedAt} s`}</dd>
         <dt className="text-muted">Dropped</dt>
         <dd className="font-mono" style={{ color: sum.dropped > 0 ? 'var(--bad)' : undefined }}>{fmt(sum.dropped)} msgs</dd>
       </dl>
@@ -182,12 +182,12 @@ function DepthChart({ ticks, t, cap }: { ticks: { t: number; depth: number; held
       <line x1={L} x2={L} y1={T} y2={y(0)} stroke="var(--border)" />
       <HandText x={L - 8} y={y(0)} size={TEXT_SIZES.note} anchor="end" color="var(--muted)">0</HandText>
       <HandText x={L - 8} y={y(peak)} size={TEXT_SIZES.note} anchor="end" color="var(--muted)">{fmt(peak)}</HandText>
-      {[0, 60, 120, 179].map((s) => (
-        <HandText key={s} x={x(s)} y={H - 16} size={TEXT_SIZES.note} color="var(--muted)">{`${s === 179 ? 180 : s} s`}</HandText>
+      {[0, 100, 200, 299].map((s) => (
+        <HandText key={s} x={x(s)} y={H - 16} size={TEXT_SIZES.note} color="var(--muted)">{`${s === 299 ? 300 : s} s`}</HandText>
       ))}
       <HandText x={W - R} y={12} size={TEXT_SIZES.note} anchor="end" color="var(--muted)">messages waiting</HandText>
       {cap !== null && <line x1={L} x2={W - R} y1={y(cap)} y2={y(cap)} stroke="var(--bad)" strokeDasharray="5 5" />}
-      {cap !== null && <HandText x={L + 8} y={y(cap) - 12} size={TEXT_SIZES.note} anchor="start" color="var(--bad)">queue limit</HandText>}
+      {cap !== null && <HandText x={W - R} y={y(cap) - 12} size={TEXT_SIZES.note} anchor="end" color="var(--bad)">queue limit</HandText>}
       {showHeld && <HandText x={L} y={12} size={TEXT_SIZES.note} anchor="start" color="var(--warn)">orange: queue plus messages held by producers</HandText>}
       {showHeld && <polyline points={line((k) => k.depth + k.held)} fill="none" stroke="var(--warn)" strokeWidth={2} />}
       <polyline points={line((k) => k.depth)} fill="none" stroke="var(--accent)" strokeWidth={2.2} />

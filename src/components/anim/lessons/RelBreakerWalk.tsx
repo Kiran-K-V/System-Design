@@ -69,9 +69,9 @@ function replay(upto: number): { b: Breaker; rows: Row[] } {
 }
 
 const POS = {
-  closed: { x: 120, y: 92 },
-  open: { x: 600, y: 92 },
-  half: { x: 360, y: 218 },
+  closed: { x: 110, y: 80 },
+  open: { x: 610, y: 80 },
+  half: { x: 360, y: 236 },
 };
 
 export default function RelBreakerWalk() {
@@ -93,19 +93,19 @@ export default function RelBreakerWalk() {
           w: 150,
           h: 60,
           label: STATE_LABEL[s],
-          sub: s === 'closed' ? `failures: ${b.failures} of ${CFG.threshold}` : s === 'open' ? 'calls fail at once' : 'one trial call',
+          sub: s === 'closed' ? (shown === 'closed' ? `failures: ${b.failures} of ${CFG.threshold}` : 'calls pass through') : s === 'open' ? 'calls fail at once' : 'one trial call',
           tone: shown === s ? STATE_TONE[s] : 'muted',
         }));
         const edges: FlowEdge[] = [
           { from: 'closed', to: 'open', label: '5 failures in a row', labelAt: [0, -16], tone: shown === 'closed' ? 'default' : 'muted' },
-          { from: 'open', to: 'half-open', label: '10 s pass', labelAt: [40, -10], bend: 36, tone: shown === 'open' ? 'default' : 'muted' },
-          { from: 'half-open', to: 'closed', label: 'trial ok', labelAt: [-34, 4], tone: shown === 'half-open' ? 'ok' : 'muted' },
-          { from: 'half-open', to: 'open', label: 'trial fails', labelAt: [-6, 20], bend: 36, tone: shown === 'half-open' ? 'bad' : 'muted' },
+          { from: 'open', to: 'half-open', label: '10 s pass', labelAt: [48, 6], tone: shown === 'open' ? 'default' : 'muted' },
+          { from: 'half-open', to: 'closed', label: 'trial ok', labelAt: [-40, 6], tone: shown === 'half-open' ? 'ok' : 'muted' },
+          { from: 'half-open', to: 'open', label: 'trial fails', labelAt: [-40, -4], bend: 46, tone: shown === 'half-open' ? 'bad' : 'muted' },
         ];
         const notes: FlowNote[] = [{ x: 24, y: 24, anchor: 'start', size: 14, text: `time: ${st.now} s` }];
         return (
           <>
-            <FlowDiagram width={720} height={270} nodes={nodes} edges={edges} notes={notes} active={[shown]} label={`Circuit breaker state: ${shown}`} />
+            <FlowDiagram width={720} height={300} nodes={nodes} edges={edges} notes={notes} active={[shown]} label={`Circuit breaker state: ${shown}`} />
             <div className="mt-2 flex flex-wrap items-center gap-1.5 px-2 text-xs">
               <span className="mr-1 text-muted">Calls:</span>
               {rows.length === 0 && <span className="text-muted">none yet</span>}
