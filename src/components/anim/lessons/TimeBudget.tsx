@@ -18,7 +18,7 @@ export default function TimeBudget() {
   return (
     <figure className="not-prose my-8 overflow-hidden rounded-2xl border border-line bg-surface/40">
       <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
-        <span className="mr-auto text-[15px] font-semibold">A 45-minute budget (approximate, varies)</span>
+        <span className="mr-auto text-[15px] font-semibold">A 45-minute design session (approximate, varies)</span>
         {Object.keys(PRESETS).map((k) => (
           <button key={k} type="button" onClick={() => setM(PRESETS[k])} className="rounded-lg border border-line px-3 py-1.5 text-[13px] text-muted hover:border-accent/50 hover:text-fg">
             {k}

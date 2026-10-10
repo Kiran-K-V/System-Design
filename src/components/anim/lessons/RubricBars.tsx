@@ -8,15 +8,15 @@ const LEVELS: { id: Level; label: string }[] = [
   { id: 'staff', label: 'Staff' },
 ];
 
-/** Emphasis 1-5. An illustrative synthesis of public guidance, not an official rubric. */
+/** Emphasis 1-5. An illustrative guide to how expectations grow with experience. Not a formal rubric. */
 const DIMS: { name: string; w: Record<Level, number>; look: Record<Level, string> }[] = [
   { name: 'Scope and requirements', w: { mid: 4, senior: 4, staff: 5 }, look: { mid: 'Asks the standard questions. Lists features and basic quality goals.', senior: 'Finds what makes this problem hard and cuts scope to match.', staff: 'Negotiates scope as a peer. Says what is out and why.' } },
   { name: 'Breadth of fundamentals', w: { mid: 5, senior: 3, staff: 2 }, look: { mid: 'Knows the core building blocks and what each one is for.', senior: 'Fundamentals are assumed. Moves through them fast.', staff: 'Assumed. Coverage is narrow and aimed at the hard parts.' } },
-  { name: 'Depth', w: { mid: 2, senior: 4, staff: 5 }, look: { mid: 'Solid on concepts. Hands-on detail is not required.', senior: 'Goes deep in about two areas with real specifics.', staff: 'Deep across several areas. Can teach the interviewer something.' } },
-  { name: 'Driving the conversation', w: { mid: 3, senior: 4, staff: 5 }, look: { mid: 'Leads the early phases. Interviewer leads the late ones.', senior: 'Steers with confidence. Picks the next topic.', staff: 'Leads almost the whole session, like a peer.' } },
+  { name: 'Depth', w: { mid: 2, senior: 4, staff: 5 }, look: { mid: 'Solid on concepts. Hands-on detail is not required.', senior: 'Goes deep in about two areas with real specifics.', staff: 'Deep across several areas. Can teach the team something.' } },
+  { name: 'Driving the discussion', w: { mid: 3, senior: 4, staff: 5 }, look: { mid: 'Leads the early phases. A senior colleague leads the late ones.', senior: 'Steers with confidence. Picks the next topic.', staff: 'Leads almost the whole discussion, as a peer.' } },
   { name: 'Trade-offs', w: { mid: 2, senior: 4, staff: 5 }, look: { mid: 'Names options when asked. Does not need to find flaws alone.', senior: 'Points out limits in own design and offers alternatives.', staff: 'Sees problems coming and fixes them before they are raised.' } },
-  { name: 'Communication', w: { mid: 4, senior: 4, staff: 5 }, look: { mid: 'Clear, organized, easy to follow.', senior: 'Clear, and checks in with the interviewer.', staff: 'Frames decisions so a team could act on them.' } },
-  { name: 'Handling ambiguity', w: { mid: 2, senior: 3, staff: 5 }, look: { mid: 'Asks questions when stuck.', senior: 'Makes labelled assumptions and moves on.', staff: 'Turns a vague prompt into a clear problem statement.' } },
+  { name: 'Communication', w: { mid: 4, senior: 4, staff: 5 }, look: { mid: 'Clear, organized, easy to follow.', senior: 'Clear, and checks in with the team.', staff: 'Frames decisions so a team could act on them.' } },
+  { name: 'Handling ambiguity', w: { mid: 2, senior: 3, staff: 5 }, look: { mid: 'Asks questions when stuck.', senior: 'Makes labelled assumptions and moves on.', staff: 'Turns a vague request into a clear problem statement.' } },
   { name: 'Quantitative reasoning', w: { mid: 2, senior: 3, staff: 4 }, look: { mid: 'Can do rough math if asked.', senior: 'Uses numbers to pick between designs.', staff: 'Numbers drive every major decision.' } },
   { name: 'Ops and failure thinking', w: { mid: 1, senior: 3, staff: 5 }, look: { mid: 'Happy path works.', senior: 'Covers failures, retries, monitoring.', staff: 'Covers rollout, recovery, and how the system evolves.' } },
 ];
@@ -55,7 +55,7 @@ export default function RubricBars() {
         ))}
       </ul>
       <figcaption className="border-t border-line px-4 py-3 text-[13px] text-muted">
-        Illustrative weights from typical public guidance. Companies differ. This is not any company's official rubric.
+        Illustrative weights. Teams differ. Read this as a rough guide to how the same skills deepen with experience.
       </figcaption>
     </figure>
   );

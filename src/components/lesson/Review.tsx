@@ -117,7 +117,7 @@ export default function Review() {
       {reasons.length > 0 && (
         <section>
           <h2 className="text-lg font-semibold">Wrong ideas you wrote down</h2>
-          <p className="mt-1 text-sm text-muted">Each time, you were sure and wrong. Read them before an interview.</p>
+          <p className="mt-1 text-sm text-muted">Each time, you were sure and wrong. Read them again before you design something.</p>
           <ul className="mt-3 space-y-3 text-sm">
             {reasons.map(([id, e]) => (
               <li key={id} className="rounded-lg border border-line p-3">

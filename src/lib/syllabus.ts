@@ -18,8 +18,8 @@ export const syllabus: ModuleOutline[] = [
     title: 'Orientation',
     lessons: [
       { slug: 'how-to-use', title: 'How to Use This Site' },
-      { slug: 'interview-game', title: 'The Interview Game' },
-      { slug: 'delivery-framework', title: 'Delivery Framework' },
+      { slug: 'judging-designs', title: 'How Designs Are Judged' },
+      { slug: 'design-method', title: 'A Method for Any Design' },
     ],
   },
   {
@@ -150,7 +150,7 @@ export const syllabus: ModuleOutline[] = [
   },
   {
     slug: '11-breakdowns',
-    title: 'Question Breakdowns',
+    title: 'Case Studies',
     lessons: [
       { slug: 'bitly', title: 'URL Shortener' },
       { slug: 'rate-limiter', title: 'Rate Limiter' },

@@ -1,6 +1,6 @@
 import { HandText, SketchArrow, SketchBox, SketchSvg, Badge, seedOf } from '../sketch';
 
-/** Static infographic: the seven parts of a Load Bearing lesson. No client JS. */
+/** Static infographic: the seven parts of an Uptime lesson. No client JS. */
 
 const parts = [
   { t: 'The problem', s: 'a real pain,\nwith numbers' },
@@ -8,7 +8,7 @@ const parts = [
   { t: 'Mechanism', s: 'built step by\nstep, animated' },
   { t: 'Numbers', s: 'latency, QPS,\nsizes' },
   { t: 'Trade-offs', s: 'gain / pay /\nwhen to choose' },
-  { t: 'Interview lens', s: 'tip and\ncommon mistake' },
+  { t: 'In practice', s: 'tip and\ncommon mistake' },
   { t: 'Quiz', s: 'predict or\ncompute' },
 ];
 
@@ -16,7 +16,7 @@ const pos = (i: number): [number, number] => (i < 4 ? [90 + i * 180, 72] : [180 
 
 export default function HowLessonBuilt() {
   return (
-    <SketchSvg width={720} height={330} label="The seven parts of a lesson, in order: problem, naive fix, mechanism, numbers, trade-offs, interview lens, quiz">
+    <SketchSvg width={720} height={330} label="The seven parts of a lesson, in order: problem, naive fix, mechanism, numbers, trade-offs, in practice, quiz">
       {parts.map((p, i) => {
         const [cx, cy] = pos(i);
         const last = i === 6;

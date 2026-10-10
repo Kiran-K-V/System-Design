@@ -21,7 +21,7 @@ const edges: FlowEdge[] = [
 const order = ['dau', 'day', 'avg', 'peak', 'reads', 'store'];
 
 const steps = [
-  { caption: 'Start with users. Assume 100 million daily active users (DAU). State the number out loud. The interviewer can correct it.' },
+  { caption: 'Start with users. Assume 100 million daily active users (DAU). State the number out loud so anyone can correct it.' },
   { caption: 'Each user posts 2 times a day. 100M × 2 = 200M writes per day.' },
   {
     caption:

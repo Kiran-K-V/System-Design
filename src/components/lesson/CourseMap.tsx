@@ -14,7 +14,7 @@ interface Layer {
 
 // Plain ink everywhere. Only the layer a new reader starts on carries the accent.
 const layers: Layer[] = [
-  { href: '#module-0', cx: 430, cy: 205, w: 540, h: 52, label: 'Delivery framework' },
+  { href: '#module-0', cx: 430, cy: 205, w: 540, h: 52, label: 'Design method' },
   { href: '#module-8', cx: 292, cy: 278, w: 264, h: 56, label: 'Key technologies' },
   { href: '#module-9', cx: 568, cy: 278, w: 264, h: 56, label: 'Patterns' },
   { href: '#module-2', cx: 430, cy: 352, w: 540, h: 52, label: 'Core concepts' },
@@ -29,7 +29,7 @@ export default function CourseMap() {
       <a href="#module-11" className="map-layer">
         <SketchBox cx={430} cy={92} w={500} h={140} r={22} seed={seedOf('practice')} />
         <HandText x={430} y={45} size={22}>
-          Practice common problems
+          Case studies
         </HandText>
         {problems.map((p, i) => (
           <g key={p}>
