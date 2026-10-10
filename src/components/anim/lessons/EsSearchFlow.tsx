@@ -82,7 +82,7 @@ const steps: Step[] = [
     noteTone: 'ok',
   },
   {
-    caption: 'One catch. Each shard scored its documents with its own local statistics, such as how rare a word is inside that shard. Scores from different shards are then compared. The default search type, query_then_fetch, does exactly this, and is usually faster but less accurate. dfs_query_then_fetch first collects global statistics, which is usually slower but more accurate.',
+    caption: 'One catch. Each shard scored its documents with its own local statistics, such as how rare a word is inside that shard. Scores from different shards are then compared. The search type query_then_fetch does exactly this, and is usually faster but less accurate. dfs_query_then_fetch first collects global statistics, which is usually slower but more accurate.',
     coord: {},
     shards: [S1, S2, S3],
     active: [],
@@ -112,7 +112,6 @@ export default function EsSearchFlow() {
             y: 55 + k * 95,
             w: 230,
             h: 68,
-            shape: 'db' as const,
             label: `Shard ${k + 1}`,
             sub: s.shards[k],
             tone: s.shardTone?.[k],

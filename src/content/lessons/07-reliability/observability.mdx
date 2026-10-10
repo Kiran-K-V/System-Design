@@ -1,0 +1,242 @@
+---
+summary: 'Metrics, logs, and traces answer different questions about a running system. SLOs say what "good enough" means, and burn-rate alerts page you only when the error budget is truly at risk.'
+requires: ['01-one-machine/throughput-vs-latency', '07-reliability/failure-modes']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import RelTraceWaterfall from '../../../components/anim/lessons/RelTraceWaterfall.tsx';
+import RelBurnRate from '../../../components/anim/lessons/RelBurnRate.tsx';
+
+## The problem
+
+A user says "checkout is slow". Your system has 40 services. One checkout touches 7 of them. You cannot attach a debugger to a fleet. You cannot read one machine's screen. All you have is the data the system chose to record.
+
+Two questions come up again and again.
+
+1. **What happened inside this one request?** (to debug a failure)
+2. **Is the service good enough right now, and should anyone be woken up?** (to run the service)
+
+**Observability** is the ability to answer such questions about a running system from the data it emits. The data comes in a few kinds. The rest of the lesson is which kind answers which question, and how to turn the data into a decision.
+
+## Naive solutions
+
+**Read the logs on each server.** With 40 services on many machines, you would search dozens of log files and try to match lines that belong to one request. Nothing joins them.
+
+**Watch the average latency.** Averages hide the pain. The Google SRE book gives an example: a service with a 100 ms average at 1,000 requests per second. In that case, 1% of requests "might easily take 5 seconds". That is 10 users every second with a 5-second wait. The mean looks fine. The book calls the belief that most requests sit near the mean "just hopeful thinking". The SRE book says "we generally prefer to work with percentiles rather than the mean". A percentile such as p99 is the value that 99% of requests beat. [Lesson 1.3](/learn/01-one-machine/throughput-vs-latency/) introduced the tail.
+
+**Alert on every error.** A single failed request is normal in a big system. If every error pages someone, people learn to ignore pages.
+
+## Three signals
+
+OpenTelemetry, the open standard for this data, lists several **signals**. Three matter most.
+
+| Signal | What it is | Answers | Weakness |
+|---|---|---|---|
+| **Metrics** | Numbers measured over time, such as requests per second or error count | "Is something wrong? Is it getting worse?" | No detail about one request |
+| **Logs** | A record of an event, with a time and details | "What exactly happened on this machine?" | Large volume. Hard to join across services |
+| **Traces** | The path of one request across services | "Where did this request spend its time?" | You cannot keep every trace, so you sample |
+
+OpenTelemetry also lists **baggage** (context passed along between signals) and **profiles** (code-level resource use), which it describes as still in development.
+
+The three work as a team. A metric alert says "p99 latency for checkout doubled". A trace shows that the payment call is the slow part. A log line inside the payment service says why. Traces do not replace metrics: a trace shows one request, and a metric shows the trend across all of them.
+
+### Traces and spans
+
+A **span** is one timed unit of work. It has a name, a start time, an end time, and a **parent span ID**. The parent ID is empty for the first span, the **root**. A **trace** is all the spans that share one trace ID. They form a tree.
+
+How do spans from different services end up in one tree? The caller passes the trace ID and its own span ID in a header on each call. The callee opens a new span whose parent is that ID. Span attributes, which are key-value tags, should be set when the span is created, so that a sampler can use them to decide what to keep.
+
+Watch a trace build, one span at a time.
+
+<RelTraceWaterfall client:visible />
+
+Reading the finished waterfall tells you what no average can. The bank call is the widest leaf. Time spent inside a span but not inside any child is its own work, its **self time**. Here the payment span is 120 ms, its one child is 100 ms, and so 20 ms is its own.
+
+## What to measure
+
+You cannot record everything. Three checklists tell you where to start.
+
+**The four golden signals** (Google SRE book): latency, traffic, errors, saturation. The book says to track the latency of successful and failed requests separately, because a fast error can make latency look better than it is. Saturation is how full a service is. The book notes that "many systems degrade in performance before they achieve 100% utilization", so set a target for it.
+
+**RED** (Tom Wilkie, Grafana): Rate, Errors, Duration. Use it for each service that handles requests. It is a stand-in for what users feel.
+
+**USE** (Brendan Gregg): for each resource, check Utilization, Saturation, and Errors. Use it for the things a service runs on: CPUs, disks, thread pools, connections.
+
+The SRE book adds a rule about alerts. A monitoring system should answer two questions: "what's broken, and why?" The "what" is a **symptom**. The "why" is a cause. **Page on symptoms**, for example users seeing 500 errors. Use causes, such as a full disk, to find the problem once it has paged you. A cause alert makes sense only when the cause is certain to turn into a symptom soon.
+
+## SLI, SLO, SLA, and the error budget
+
+"Good enough" needs a number. Three terms, as the SRE book defines them:
+
+- An **SLI** (service level indicator) is "a carefully defined quantitative measure of some aspect of the level of service". For example: the share of requests that complete in under 100 ms.
+- An **SLO** (service level objective) is "a target value or range of values for a service level that is measured by an SLI". For example: "99% of Get RPC calls will complete in less than 100 ms", the book's own example.
+- An **SLA** (service level agreement) is "an explicit or implicit contract with your users that includes consequences of meeting (or missing) the SLOs they contain". An SLA usually has money attached. An SLO is an internal goal.
+
+An SLO below 100% leaves room for failure. That room is the **error budget**. The book puts it this way: "An error budget is just an SLO for meeting other SLOs!"
+
+Do the sum. A 99.9% SLO over 30 days gives a budget of 0.1% of requests. If the service were fully down, that budget is gone in 0.001 x 43,200 min = 43.2 minutes. Google's published target for Compute Engine, to give a sense of scale, is 99.95%, which the book calls three and a half nines.
+
+The budget is useful because it can be spent. A team with budget left can ship risky changes. A team that has spent it should slow down and fix reliability.
+
+## Alerting on burn rate
+
+How do you alert on a budget? Not by alerting on each error. The SRE workbook rates a rule like "alert when the error rate over a short window passes the SLO threshold". It has good recall and a fast response, but low precision: it "fires on many events that do not threaten the SLO".
+
+The better signal is the **burn rate**: how fast, relative to the SLO, the service consumes the error budget. A constant 0.1% error rate on a 99.9% SLO uses exactly all the budget in 30 days. That is a burn rate of 1. A burn rate of 10 uses it in 3 days. A burn rate of 1,000 uses it in 43 minutes. These are from the workbook.
+
+The workbook recommends **multiwindow** alerts. An alert fires only when the burn rate is over a threshold in both a long window and a short window:
+
+| Severity | Burn rate | Long window | Short window | Budget used |
+|---|---|---|---|---|
+| Page | 14.4 | 1 hour | 5 minutes | 2% |
+| Page | 6 | 6 hours | 30 minutes | 5% |
+| Ticket | 1 | 3 days | 6 hours | 10% |
+
+The long window makes sure the problem has consumed enough budget to matter. The short window (about 1/12 of the long one, the workbook's guideline) makes the alert stop soon after the errors stop: the 5-minute window drops below the threshold 5 minutes after the errors end, where the 1-hour window would take 60 minutes.
+
+Play with it. Choose an error rate and see which rules fire, and when.
+
+<RelBurnRate client:visible />
+
+What to notice:
+
+1. **Each rule fires after the same budget loss, however big the incident.** The fast rule fires when 2% of the monthly budget is gone. A total outage reaches that in 52 seconds. A 5% error rate takes about 17 minutes. At 1% (burn 10) the fast rule never fires, because 10 is under 14.4. The slower page rule fires after 3.6 hours, when 5% of the budget is gone.
+2. **A slow leak never pages.** An error rate of 0.1% burns at 1, so only the ticket rule fires, after 3 days. That is right: nobody needs waking for a leak that the budget can absorb.
+3. **An error rate under 0.1% fires nothing.** The budget covers it.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Burn 1 exhausts a 30-day budget in | 30 days | SRE workbook |
+| Burn 2 / 10 / 1,000 exhaust it in | 15 days / 3 days / 43 minutes | Same |
+| Page rule 1 | burn 14.4, 1 h and 5 min, 2% of budget | Same |
+| Page rule 2 | burn 6, 6 h and 30 min, 5% of budget | Same |
+| Ticket rule | burn 1, 3 days and 6 h, 10% of budget | Same |
+| Short window is | 1/12 of the long window | Same (guideline) |
+| 99.9% over 30 days, full outage uses the budget in | 43.2 min | Derived: 0.001 x 43,200 |
+| Mean 100 ms, 1,000 requests per second, 1% take 5 s | 10 slow requests per second | SRE book, derived count |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Short alert window | Fast detection and fast reset | Pages on noise | Paired with a long window that confirms the burn |
+| Long alert window | Stable, few false pages | Slow to notice a real outage | Slow burns, tickets |
+| Metrics | Cheap, long history, good for alerts | No per-request detail | Always, as the base |
+| Traces | Per-request detail across services | Cost, so you must sample | Finding where time goes |
+| Logs | Full detail of an event | Volume, and hard to join | Explaining a specific failure |
+| Tight SLO | Users get higher reliability | Little budget for releases and cost | Critical paths |
+| Loose SLO | Room to ship and to fail | Real problems can hide inside it | Non-critical features |
+
+## In practice
+
+<Callout type="tip">
+In an interview, close a design with its operations story. Say: "I would track rate, errors, and p99 duration per service, with traces across services. The checkout SLO is 99.9% of requests succeeding, over 30 days. I would page on a fast budget burn, at a 14.4 burn rate, and open a ticket on a slow one." That is a complete answer and it uses the vocabulary of the SRE workbook.
+</Callout>
+
+<Callout type="mistake">
+Do not alert on every error or on CPU alone: alert on symptoms and burn rate. Do not use average latency as the SLO, use a percentile. Do not call an SLA and an SLO the same thing: an SLA has consequences. Do not say "traces replace metrics", because a trace shows one request and a metric shows trends. And do not treat the error budget as a bill to avoid. It is room to take risk, until it runs out.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A dashboard shows an average latency of 100 ms. What can the p99 latency still be?',
+      options: [
+        'About 100 ms, because the mean and the p99 must always be close',
+        'Never above 200 ms, because the mean would rise past 100 ms',
+        'Several seconds: 1% of requests can be slow while the mean looks fine',
+        'Always lower than the 100 ms mean, because it is a percentile',
+      ],
+      answer: 2,
+      explain: 'A mean can sit near the typical value while a small share of requests is very slow. The SRE book gives 1% taking 5 s at a 100 ms average. That is why SLOs use percentiles.',
+    },
+    {
+      q: 'In a trace, one span has an empty parent span ID. What is it?',
+      options: [
+        'The root span: the first span of the trace',
+        'The slowest span in the trace',
+        'A span that failed',
+        'A log line that was attached to the trace',
+      ],
+      answer: 0,
+      explain: 'Every span except the root names its parent. The root has none. The slowest or failed span can be anywhere in the tree and still has a parent.',
+    },
+    {
+      q: 'Which of these is a symptom that is a good reason to page someone?',
+      options: [
+        'CPU is at 85% on one host',
+        'About 3% of checkout requests are failing for users',
+        'A disk is 70% full',
+        'A worker queue is slightly deeper than usual',
+      ],
+      answer: 1,
+      explain: 'A symptom is what users feel, such as failing requests. The other three are causes or resource states. They help you find the problem, and they may never hurt a user. Page on the symptom.',
+    },
+    {
+      q: 'The SLO is 99.9% over 30 days. For a while 1% of requests fail. What is the burn rate, and how long until the budget is gone at that rate?',
+      options: [
+        'Burn 1, in 30 days',
+        'Burn 100, in 7 hours',
+        'Burn 0.1, never',
+        'Burn 10, in 3 days',
+      ],
+      answer: 3,
+      explain: 'The budget rate is 0.1%. An error rate of 1% is 10 times that, so the burn rate is 10. At burn 10 the 30-day budget lasts 3 days, a figure from the SRE workbook table.',
+    },
+    {
+      q: 'Why do burn rate alerts check a long window and a short window together?',
+      options: [
+        'The long window proves enough budget is gone to matter, and the short window lets the alert clear soon after the errors stop',
+        'The short window finds the cause of the problem and the long window finds the fix for it',
+        'Two windows double the number of alerts so that no incident is missed',
+        'The long window is for logs and the short window is for traces and metrics',
+      ],
+      answer: 0,
+      explain: 'With only a 1-hour window the alert would keep firing for up to an hour after the errors end. The 5-minute window falls below the threshold 5 minutes after the errors stop. The long window keeps the alert from firing on events that do not threaten the budget.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="A stricter SLO"
+  scenario="A payments API has an SLO of 99.99% of requests succeeding, measured over 30 days (43,200 minutes). A bad release makes 2% of requests fail, for 3 hours, before it is rolled back."
+  steps={[
+    {
+      prompt: 'How many minutes of full outage does the 30-day error budget allow?',
+      unit: 'minutes',
+      answer: 4.32,
+      within: 1.2,
+      explain: 'The budget is 1 - 0.9999 = 0.01% = 0.0001. 0.0001 x 43,200 minutes = 4.32 minutes.',
+    },
+    {
+      prompt: 'What was the burn rate during the bad release?',
+      unit: 'x',
+      answer: 200,
+      within: 1.2,
+      explain: 'The error rate was 2% = 0.02. The budget rate is 0.0001. 0.02 / 0.0001 = 200.',
+    },
+    {
+      prompt: 'What percent of the whole 30-day budget did the 3 hours use? (100 means all of it.)',
+      unit: '%',
+      answer: 83,
+      within: 1.2,
+      explain: 'The month has 720 hours. Budget used = burn x hours / 720 = 200 x 3 / 720, about 0.83, so 83%. Even a short incident can use most of a strict budget.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Google SRE book: Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/): the four golden signals, symptoms and causes.
+- [Google SRE book: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/): SLI, SLO, SLA, percentiles, and the error budget.
+- [Google SRE workbook: Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/): burn rate and the multiwindow alert table.
+- [OpenTelemetry: Signals](https://opentelemetry.io/docs/concepts/signals/) and [Traces](https://opentelemetry.io/docs/concepts/signals/traces/): metrics, logs, traces, and spans.
+- [The RED Method (Grafana)](https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/) and [The USE Method (Brendan Gregg)](https://www.brendangregg.com/usemethod.html).

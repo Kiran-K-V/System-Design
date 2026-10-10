@@ -83,7 +83,7 @@ const steps: Step[] = [
 const PW = 200;
 const PH = 128;
 const PX = [110, 340, 570];
-const PCY = 108;
+const PCY = 96;
 const FLAT_X = [214, 290, 392];
 
 function rowText(x: number, y: number, row: Row, anchor: 'start' | 'middle' | 'end', text: string, muted: boolean) {
@@ -101,19 +101,19 @@ export default function DdbKeyLayout() {
         <SketchSvg width={680} height={392} label="Items placed in partitions by hashing the partition key, sorted by sort key, and copied into a global secondary index">
           {s.flat && (
             <g>
-              <SketchBox cx={340} cy={116} w={300} h={188} r={12} seed={seedOf('ddbflat')} stroke="var(--muted)" dashed />
-              <HandText x={340} y={34} size={TEXT_SIZES.heading}>Orders, in write order</HandText>
+              <SketchBox cx={340} cy={140} w={320} h={232} r={12} seed={seedOf('ddbflat')} stroke="var(--muted)" dashed />
+              <HandText x={340} y={46} size={TEXT_SIZES.heading}>Orders, in write order</HandText>
               {['userId', 'orderDate', 'status'].map((h, c) => (
-                <HandText key={h} x={FLAT_X[c]} y={62} size={TEXT_SIZES.note} anchor="start" color="var(--muted)" mono>{h}</HandText>
+                <HandText key={h} x={FLAT_X[c]} y={80} size={TEXT_SIZES.note} anchor="start" color="var(--muted)" mono>{h}</HandText>
               ))}
               {s.flat.map((row, k) => (
                 <g key={k}>
                   {[row.u, row.d, row.st].map((t, c) => (
-                    <HandText key={c} x={FLAT_X[c]} y={90 + k * 24} size={TEXT_SIZES.note} anchor="start" mono>{t}</HandText>
+                    <HandText key={c} x={FLAT_X[c]} y={108 + k * 24} size={TEXT_SIZES.note} anchor="start" mono>{t}</HandText>
                   ))}
                 </g>
               ))}
-              <HandText x={340} y={226} size={TEXT_SIZES.note} color="var(--muted)">partition key: userId · sort key: orderDate</HandText>
+              <HandText x={340} y={276} size={TEXT_SIZES.note} color="var(--muted)">partition key: userId · sort key: orderDate</HandText>
             </g>
           )}
           {s.parts &&
@@ -134,9 +134,9 @@ export default function DdbKeyLayout() {
               );
             })}
           {s.parts && (
-            <HandText x={340} y={184} size={TEXT_SIZES.note} color="var(--muted)">partition key userId · sort key orderDate</HandText>
+            <HandText x={340} y={180} size={TEXT_SIZES.note} color="var(--muted)">partition key userId · sort key orderDate</HandText>
           )}
-          {s.note && !s.gsi && <HandText x={340} y={208} size={TEXT_SIZES.label} color={TONE[s.noteTone ?? 'muted']}>{s.note}</HandText>}
+          {s.note && !s.gsi && <HandText x={340} y={202} size={TEXT_SIZES.label} color={TONE[s.noteTone ?? 'muted']}>{s.note}</HandText>}
 
           {!s.gsi && !s.flat && (
             <g>
@@ -146,8 +146,8 @@ export default function DdbKeyLayout() {
           )}
           {s.gsi && (
             <Fade step={i} born={4}>
-              <SketchArrow points={[[340, 196], [340, 216]]} stroke="var(--muted)" seed={seedOf('ddbgsiarrow')} dashed />
-              <HandText x={420} y={206} size={TEXT_SIZES.note} anchor="start" color={TONE[s.noteTone ?? 'muted']}>{s.note ?? ''}</HandText>
+              <SketchArrow points={[[340, 190], [340, 216]]} stroke="var(--muted)" seed={seedOf('ddbgsiarrow')} dashed />
+              <HandText x={420} y={202} size={TEXT_SIZES.note} anchor="start" color={TONE[s.noteTone ?? 'muted']}>{s.note ?? ''}</HandText>
               <SketchBox cx={340} cy={308} w={640} h={166} r={12} seed={seedOf('ddbgsi')} stroke={i === 5 ? 'var(--warn)' : 'var(--accent)'} dashed={i === 5} />
               <HandText x={340} y={238} size={TEXT_SIZES.heading}>GSI: partition key status, sort key orderDate</HandText>
               {(['pending', 'shipped'] as const).map((st, c) => {

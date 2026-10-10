@@ -49,21 +49,21 @@ const steps: Step[] = [
     write: 'write 7 = Ana',
     log: [e(7, 'Ana')],
     mem: [],
-    arrows: [{ id: 'log', points: [[78, 196], [136, 238]], tone: 'accent' }],
+    arrows: [{ id: 'log', points: [[78, 196], [136, 240]], tone: 'accent' }],
   },
   {
     caption: 'Second, the write goes into the memtable. The memtable keeps keys in sorted order and lives in memory. No SSTable is read or changed.',
     write: 'write 7 = Ana',
     log: [e(7, 'Ana')],
     mem: [e(7, 'Ana')],
-    arrows: [{ id: 'mem', points: [[78, 150], [136, 112]], tone: 'accent' }],
+    arrows: [{ id: 'mem', points: [[78, 150], [136, 110]], tone: 'accent' }],
   },
   {
     caption: 'Both steps are done, so the replica answers OK. This replica did one sequential disk append and one memory insert. It did not wait for any SSTable. That is why Cassandra writes are fast.',
     write: 'ok',
     log: [e(7, 'Ana')],
     mem: [e(7, 'Ana')],
-    arrows: [{ id: 'ack', points: [[136, 132], [78, 172]], tone: 'ok' }],
+    arrows: [{ id: 'ack', points: [[136, 134], [78, 172]], tone: 'ok' }],
   },
   {
     caption: 'Two more writes: key 3 and key 9. The commit log keeps them in arrival order: 7, 3, 9. The memtable keeps them sorted: 3, 7, 9. The memtable stores writes in sorted order until it reaches a configurable limit. Our limit is three entries, and it is now full.',
@@ -76,7 +76,7 @@ const steps: Step[] = [
     log: [],
     mem: [],
     sst1: SST1,
-    arrows: [{ id: 'flush1', points: [[291, 108], [319, 108]], tone: 'accent', label: 'flush', at: [305, 90] }],
+    arrows: [{ id: 'flush1', points: [[291, 106], [319, 106]], tone: 'accent', label: 'flush', at: [305, 88] }],
   },
   {
     caption: 'Key 5 arrives, and key 7 is updated to Ana2. Nothing is changed in place. The memtable fills again and is flushed to a second SSTable. Key 7 now exists in two files. A read for key 7 must find the newer one. The read may have to check several SSTables.',
@@ -84,7 +84,7 @@ const steps: Step[] = [
     mem: [],
     sst1: SST1,
     sst2: SST2,
-    arrows: [{ id: 'flush2', points: [[280, 170], [322, 214]], tone: 'accent', label: 'flush', at: [330, 186] }],
+    arrows: [{ id: 'flush2', points: [[280, 174], [322, 214]], tone: 'accent', label: 'flush', at: [330, 186] }],
   },
   {
     caption: 'Compaction. A background job combines several SSTables into one. For key 7 it keeps the newest value, Ana2. Cassandra then removes the old SSTables once the new one is written. Reads touch fewer files. The cost is that the data is rewritten (write amplification).',
@@ -94,14 +94,14 @@ const steps: Step[] = [
     sst2: { ...SST2, old: true },
     sst3: { entries: [e(3, 'Bo', 'ok'), e(5, 'Di', 'ok'), e(7, 'Ana2', 'ok'), e(9, 'Cy', 'ok')] },
     arrows: [
-      { id: 'm1', points: [[471, 108], [509, 108]], tone: 'ok' },
-      { id: 'm2', points: [[471, 232], [528, 171]], tone: 'ok' },
+      { id: 'm1', points: [[471, 106], [509, 106]], tone: 'ok' },
+      { id: 'm2', points: [[471, 236], [528, 173]], tone: 'ok' },
     ],
   },
 ];
 
 const BW = 140;
-const BH = 114;
+const BH = 124;
 
 function EntryBox({ cx, cy, title, entries, dashed, stroke = 'var(--fg)', seed }: { cx: number; cy: number; title: string; entries: Entry[]; dashed?: boolean; stroke?: string; seed: string }) {
   const top = cy - BH / 2;
@@ -113,7 +113,7 @@ function EntryBox({ cx, cy, title, entries, dashed, stroke = 'var(--fg)', seed }
       <line x1={cx - BW / 2 + 8} x2={cx + BW / 2 - 8} y1={top + 31} y2={top + 31} stroke="var(--border)" />
       {entries.length === 0 && <HandText x={cx} y={top + 72} size={TEXT_SIZES.note} color="var(--muted)">empty</HandText>}
       {entries.map((en, i) => (
-        <HandText key={`${en.k}-${i}`} x={cx - BW / 2 + 16} y={top + 48 + i * 22} size={TEXT_SIZES.note} mono anchor="start" color={en.tone === 'ok' ? 'var(--ok)' : muted}>
+        <HandText key={`${en.k}-${i}`} x={cx - BW / 2 + 16} y={top + 48 + i * 20} size={TEXT_SIZES.note} mono anchor="start" color={en.tone === 'ok' ? 'var(--ok)' : muted}>
           {`${en.k} = ${en.v}`}
         </HandText>
       ))}
@@ -125,9 +125,9 @@ export default function CassWritePath() {
   return (
     <AnimFrame title="Cassandra write path on one replica" steps={steps} interval={4200}>
       {(i, s) => (
-        <SketchSvg width={680} height={332} label="A write goes to the commit log and the memtable, the memtable is flushed to SSTables, and SSTables are compacted">
-          <SketchBox cx={395} cy={168} w={548} h={300} r={14} dashed stroke="var(--muted)" seed={seedOf('cassnode')} />
-          <HandText x={132} y={32} size={TEXT_SIZES.note} anchor="start" color="var(--muted)">One replica node</HandText>
+        <SketchSvg width={680} height={338} label="A write goes to the commit log and the memtable, the memtable is flushed to SSTables, and SSTables are compacted">
+          <SketchBox cx={395} cy={168} w={548} h={310} r={14} dashed stroke="var(--muted)" seed={seedOf('cassnode')} />
+          <HandText x={132} y={30} size={TEXT_SIZES.note} anchor="start" color="var(--muted)">One replica node</HandText>
 
           <SketchBox cx={45} cy={168} w={70} h={56} r={8} seed={seedOf('casscl')} stroke={s.write === 'ok' ? 'var(--ok)' : 'var(--fg)'} />
           <HandText x={45} y={168} size={TEXT_SIZES.label}>Client</HandText>
@@ -135,21 +135,21 @@ export default function CassWritePath() {
             <HandText x={45} y={222} size={TEXT_SIZES.note} mono color={s.write === 'ok' ? 'var(--ok)' : 'var(--accent)'}>{s.write === 'ok' ? 'OK' : s.write.replace('write ', 'put ')}</HandText>
           )}
 
-          <EntryBox cx={215} cy={108} title="Memtable (RAM)" entries={s.mem} seed="cassmem" stroke={s.mem.length === 3 ? 'var(--warn)' : 'var(--fg)'} />
-          <EntryBox cx={215} cy={248} title="Commit log (disk)" entries={s.log} seed="casslog" />
+          <EntryBox cx={215} cy={106} title="Memtable (RAM)" entries={s.mem} seed="cassmem" stroke={s.mem.length === 3 ? 'var(--warn)' : 'var(--fg)'} />
+          <EntryBox cx={215} cy={250} title="Commit log (disk)" entries={s.log} seed="casslog" />
           {s.sst1 && (
             <Fade step={i} born={5}>
-              <EntryBox cx={395} cy={108} title="SSTable 1" entries={s.sst1.entries} dashed={s.sst1.old} seed="casssst1" />
+              <EntryBox cx={395} cy={106} title="SSTable 1" entries={s.sst1.entries} dashed={s.sst1.old} seed="casssst1" />
             </Fade>
           )}
           {s.sst2 && (
             <Fade step={i} born={6}>
-              <EntryBox cx={395} cy={248} title="SSTable 2" entries={s.sst2.entries} dashed={s.sst2.old} seed="casssst2" />
+              <EntryBox cx={395} cy={250} title="SSTable 2" entries={s.sst2.entries} dashed={s.sst2.old} seed="casssst2" />
             </Fade>
           )}
           {s.sst3 && (
             <Fade step={i} born={7}>
-              <EntryBox cx={585} cy={108} title="SSTable 3" entries={s.sst3.entries} stroke="var(--ok)" seed="casssst3" />
+              <EntryBox cx={585} cy={106} title="SSTable 3" entries={s.sst3.entries} stroke="var(--ok)" seed="casssst3" />
             </Fade>
           )}
           {i === 0 && <HandText x={520} y={248} size={TEXT_SIZES.label} color="var(--muted)">{'SSTables appear\nhere after a flush'}</HandText>}

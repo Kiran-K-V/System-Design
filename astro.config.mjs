@@ -4,6 +4,7 @@ import react from '@astrojs/react';
 import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
+  site: 'https://kiran-system-design.vercel.app',
   integrations: [react(), mdx()],
   vite: { plugins: [tailwindcss()] },
 });

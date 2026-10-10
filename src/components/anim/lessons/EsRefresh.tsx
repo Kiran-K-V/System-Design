@@ -87,7 +87,12 @@ export default function EsRefresh() {
 
           {s.doc === 'buffer' && <Fade step={i} born={1}><Doc cx={105} cy={134} /></Fade>}
           {s.doc === 'segment' && <Fade step={i} born={3}><Doc cx={340} cy={134} tone="ok" /></Fade>}
-          {s.doc === 'committed' && <Fade step={i} born={5}><Doc cx={575} cy={134} tone="ok" /></Fade>}
+          {s.doc === 'committed' && (
+            <>
+              <Doc cx={340} cy={134} tone="ok" />
+              <Fade step={i} born={5}><Doc cx={575} cy={134} tone="ok" /></Fade>
+            </>
+          )}
           {s.translog && <Doc cx={105} cy={280} />}
           {!s.translog && i === 5 && <HandText x={105} y={282} size={TEXT_SIZES.note} color="var(--muted)">new generation</HandText>}
 

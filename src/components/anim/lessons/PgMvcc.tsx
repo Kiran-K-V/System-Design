@@ -111,7 +111,7 @@ function VerRow({ v }: { v: Ver }) {
   );
 }
 
-const ACTOR_Y = { r: 112, w: 172, n: 232 } as const;
+const ACTOR_Y = { r: 98, w: 172, n: 246 } as const;
 
 export default function PgMvcc() {
   return (

@@ -81,11 +81,11 @@ export default function RedisEventLoop() {
             <HandText x={16} y={30} size={TEXT_SIZES.heading} anchor="start">Waiting, in arrival order</HandText>
             <HandText x={16} y={192} size={TEXT_SIZES.heading} anchor="start">Finished</HandText>
             <SketchBox cx={560} cy={112} w={150} h={104} r={12} seed={seedOf('rthread')} dashed stroke={TONE[s.threadTone]} strokeWidth={s.threadTone === 'muted' ? 1.4 : 2.2} />
-            <HandText x={560} y={52} size={TEXT_SIZES.heading}>Command thread</HandText>
+            <HandText x={560} y={42} size={TEXT_SIZES.heading}>Command thread</HandText>
             {!running && (
               <HandText x={560} y={112} size={TEXT_SIZES.label} color="var(--muted)">idle</HandText>
             )}
-            <HandText x={560} y={176} size={TEXT_SIZES.note} color={TONE[s.threadTone]}>{s.thread}</HandText>
+            {running && <HandText x={560} y={176} size={TEXT_SIZES.note} color={TONE[s.threadTone]}>{s.thread}</HandText>}
             {s.chips.map((c) => {
               const [cx, cy] = pos(c);
               const color = TONE[c.tone];

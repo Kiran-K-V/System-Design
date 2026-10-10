@@ -12,7 +12,7 @@ const Cell = ({ cx, cy, text, color = 'var(--fg)', dashed = false, fill }: { cx:
 );
 
 export default function AsyncQueueVsLog() {
-  const qx = (i: number) => 150 - i * 30;
+  const qx = (i: number) => 226 - i * 32;
   const lx = (i: number) => 410 + i * 30;
   return (
     <div className="not-prose my-8 overflow-hidden rounded-xl border border-line bg-bg px-2 py-4 sm:px-4">
@@ -20,11 +20,11 @@ export default function AsyncQueueVsLog() {
         <HandText x={110} y={26} size={TEXT_SIZES.title}>Queue</HandText>
         <HandText x={546} y={26} size={TEXT_SIZES.title}>Log</HandText>
 
-        <SketchBox cx={150} cy={84} w={184} h={44} r={8} seed={seedOf('qvl-tray')} />
+        <SketchBox cx={150} cy={84} w={196} h={44} r={8} seed={seedOf('qvl-tray')} />
         {[0, 1, 2, 3, 4].map((i) => (
-          <Cell key={i} cx={qx(i) + 30} cy={84} text={String.fromCharCode(69 - i)} />
+          <Cell key={i} cx={qx(i)} cy={84} text={String.fromCharCode(66 + i)} />
         ))}
-        <SketchArrow points={[[246, 84], [300, 84]]} seed={seedOf('qvl-take')} stroke="var(--muted)" />
+        <SketchArrow points={[[254, 84], [298, 84]]} seed={seedOf('qvl-take')} stroke="var(--muted)" />
         <SketchBox cx={340} cy={84} w={78} h={44} seed={seedOf('qvl-w1')} />
         <HandText x={340} y={84} size={TEXT_SIZES.label}>Worker</HandText>
         <Cell cx={236} cy={150} text="A" dashed color="var(--bad)" />
@@ -35,15 +35,15 @@ export default function AsyncQueueVsLog() {
 
         <SketchArrow points={[[360, 20], [360, 262]]} head="none" dashed stroke="var(--muted)" strokeWidth={1.4} seed={seedOf('qvl-div')} />
 
-        <SketchBox cx={540} cy={84} w={252} h={44} r={8} seed={seedOf('qvl-log')} />
+        <SketchBox cx={526} cy={84} w={236} h={44} r={8} seed={seedOf('qvl-log')} />
         {[0, 1, 2, 3, 4, 5, 6].map((i) => (
           <Cell key={i} cx={lx(i) + 18} cy={84} text={String.fromCharCode(65 + i)} color={i < 5 ? 'var(--ok)' : 'var(--muted)'} fill={i < 5 ? 'var(--ok)' : undefined} />
         ))}
         <HandText x={428} y={52} size={TEXT_SIZES.note} color="var(--muted)">offset 0</HandText>
-        <SketchArrow points={[[505, 190], [505, 120]]} stroke="var(--accent)" seed={seedOf('qvl-r1')} />
-        <HandText x={505} y={212} size={TEXT_SIZES.label} color="var(--accent)">billing: at 5</HandText>
-        <SketchArrow points={[[433, 190], [433, 120]]} stroke="var(--warn)" seed={seedOf('qvl-r2')} />
-        <HandText x={433} y={234} size={TEXT_SIZES.label} color="var(--warn)">audit: at 1</HandText>
+        <SketchArrow points={[[578, 190], [578, 120]]} stroke="var(--accent)" seed={seedOf('qvl-r1')} />
+        <HandText x={578} y={212} size={TEXT_SIZES.label} color="var(--accent)">billing: at 5</HandText>
+        <SketchArrow points={[[458, 190], [458, 120]]} stroke="var(--warn)" seed={seedOf('qvl-r2')} />
+        <HandText x={458} y={234} size={TEXT_SIZES.label} color="var(--warn)">audit: at 1</HandText>
         <HandText x={560} y={262} size={TEXT_SIZES.label}>Records stay until retention ends.</HandText>
       </SketchSvg>
     </div>

@@ -75,13 +75,13 @@ export default function AsyncPartitionViz({ partitions, members, groupName = 'Co
         return (
           <g key={i}>
             <SketchArrow
-              points={[[98, mid], [STRIP_X - 38, y]]}
+              points={[[98, mid], [STRIP_X - 48, y]]}
               head="end"
               stroke={p.incoming ? 'var(--accent)' : 'var(--muted)'}
               strokeWidth={p.incoming ? 2.2 : 1.4}
               seed={seedOf(`pv-in-${i}`)}
             />
-            <HandText x={STRIP_X - 28} y={y} size={TEXT_SIZES.note} color="var(--muted)">
+            <HandText x={STRIP_X - 20} y={y} size={TEXT_SIZES.note} color="var(--muted)">
               {`P${i}`}
             </HandText>
             <SketchBox cx={STRIP_X + (CELLS * PITCH) / 2 - 2} cy={y} w={CELLS * PITCH + 4} h={34} r={6} seed={seedOf(`pv-strip-${i}`)} dashed={orphan} stroke={orphan ? 'var(--bad)' : 'var(--fg)'} />
@@ -142,7 +142,7 @@ export default function AsyncPartitionViz({ partitions, members, groupName = 'Co
         );
       })}
       <HandText x={STRIP_X} y={H - 14} size={TEXT_SIZES.note} anchor="start" color="var(--muted)">
-        green: read and committed · blue border: read next · grey: not read yet
+        green: committed · bold outline: read next · grey: unread
       </HandText>
     </SketchSvg>
   );
