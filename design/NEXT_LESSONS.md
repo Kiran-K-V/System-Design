@@ -62,7 +62,7 @@ Length: 900 to 1800 words of prose plus visuals.
 - `/review` and `src/pages/questions.json.ts` extract every `questions={[...]}` from the raw MDX and run it as JavaScript. So each quiz must be a **plain literal**: no imports, variables, template-literal expressions, or function calls inside it.
 - Question text must be **unique across all lessons**. A duplicate fails the build ("Duplicate question id"). You may set a stable `id: 'slug'` on a question.
 - Shape: `{ q, options: string[], answer: index, explain }`. Test understanding (predict, compute, choose). `explain` says why the right answer is right and why a tempting wrong one is wrong.
-- Spread the correct `answer` index across questions. Make the right option no longer than the others.
+- Spread the correct `answer` index across questions (positions 0 to 3 about equally). Make the right option no longer than the others: the correct option must not be the single longest, and must not be more than 1.5 times the average wrong option. Run `python3 scripts/quiz-audit.py` before you report; `--strict` exits 1 on any flag.
 - `Diagnose` needs a unique `id`. `Ballpark` takes `answer` and `within` (factor tolerance; use 1.1 to 1.3 for small exact integers).
 
 ## 4. Visual contract

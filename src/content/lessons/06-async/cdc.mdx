@@ -111,25 +111,25 @@ Do not say "write to the DB, then publish to Kafka, and retry on failure". A cra
   questions={[
     {
       q: 'An app saves an order and then publishes "order placed", in two steps. It crashes between them. How does the outbox pattern change that?',
-      options: ['It retries the publish forever', 'The event row commits with the order, so after a crash the event still exists and the relay sends it', 'It makes the broker part of the database transaction', 'It publishes first, then saves the order'],
+      options: ['It retries the publish forever, from the same process that just crashed', 'The event row commits with the order, so a crash cannot drop the event', 'It makes the broker part of the database transaction, so the two commit together', 'It publishes first, then saves the order, so the event is never lost'],
       answer: 1,
       explain: 'The order and the outbox row are written in one transaction, so both exist or neither does. A crash after the commit leaves a row for the relay to publish. The broker is not part of the transaction. Publishing first moves the failure to the other side.',
     },
     {
       q: 'A CDC connector on Postgres is stopped for a week, but its replication slot still exists. What does the primary do with the WAL?',
-      options: ['Deletes it on schedule', 'Sends it to the replicas only', 'Keeps it for the slot, so disk use grows: the default limit is none', 'Compresses it'],
+      options: ['Deletes it on schedule, since no reader is connected to need it', 'Sends it to the replicas, then recycles the segments at once', 'Keeps it for the slot, so disk use grows: no default cap', 'Compresses it in place, so the disk use stays flat over time'],
       answer: 2,
       explain: 'A slot keeps the WAL its reader has not confirmed, even with nobody connected. max_slot_wal_keep_size defaults to -1, so there is no cap, and the disk can fill. You alert on slot lag and drop slots you do not need.',
     },
     {
       q: 'A connector publishes an event, then crashes before it saves its position. After the restart, what do consumers see?',
-      options: ['The event is lost', 'The connector refuses to restart', 'Nothing, because the position is stored in the event', 'The event again, so consumers must tolerate duplicates'],
+      options: ['The event is lost, because the saved position already moved past it', 'The connector refuses to restart until an operator resets it', 'Nothing, because the position is stored in the event itself', 'The event again, so consumers must tolerate duplicates'],
       answer: 3,
       explain: 'The connector resumes from its last saved position. That position is behind the event it already published, so the event is read and published again. CDC is at-least-once. Consumers dedupe or apply idempotent updates.',
     },
     {
       q: 'Why does a new CDC connector take a snapshot before it starts streaming?',
-      options: ['Because the log no longer holds every row: PostgreSQL purges old WAL', 'To compress the database', 'To check that the schema has no DDL', 'Because streaming is not allowed on an empty topic'],
+      options: ['Because the log no longer holds every row, as old WAL is purged', 'To compress the database files, since large tables take less space', 'To check that the schema has no DDL changes since the last run', 'Because streaming is not allowed on a topic that starts empty'],
       answer: 0,
       explain: 'The WAL holds changes, and old segments are purged. Rows that never changed are in no log. The snapshot copies the existing rows, and streaming starts from that point so no change is missed.',
     },
@@ -151,10 +151,10 @@ Do not say "write to the DB, then publish to Kafka, and retry on failure". A cra
     {
       prompt: 'Why does the order flip?',
       options: [
-        'The database committed the changes in the wrong order',
-        'The events of one order sit in different partitions, and order holds only inside a partition',
-        'The connector reads the log backwards',
-        'Kafka sorts records by size',
+        'The database committed the changes in the wrong order, so the log is out of sequence',
+        'The events of one order sit in several partitions, and order is per partition',
+        'The connector reads the log backwards, starting from the newest record',
+        'Kafka sorts records by payload size before it delivers them to consumers',
       ],
       answer: 1,
       explain: 'The database log has the right order. With no key, the producer spreads one order’s events over partitions. Two consumers read them at different speeds, so the shipping service can see them in a different order.',
@@ -162,12 +162,12 @@ Do not say "write to the DB, then publish to Kafka, and retry on failure". A cra
     {
       prompt: 'What should you change?',
       options: [
-        'Use one partition and give up parallelism for every order',
+        'Use one partition, which gives up parallelism for every single order',
+        'Add more consumers to the shipping service, so events are read faster in parallel',
         'Key each event by the order id, so one order always lands in one partition',
-        'Add more consumers to the shipping service',
-        'Reduce the connector’s poll interval',
+        'Reduce the connector’s poll interval so events arrive in less time',
       ],
-      answer: 1,
+      answer: 2,
       explain: 'The same key always lands in the same partition, which keeps the events of one order in sequence while different orders still run in parallel. A single partition also fixes order but removes parallelism. More consumers cannot fix a split across partitions.',
     },
   ]}
