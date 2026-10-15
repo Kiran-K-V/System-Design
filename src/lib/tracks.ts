@@ -7,6 +7,10 @@ export type TrackId = TrackKey;
 export interface Part {
   title: string;
   modules: number[];
+  /** Checkpoint note after the part: three skills the reader can test on themselves. */
+  can: string[];
+  /** The gap the next part fills. On the last part, what to do after the track. */
+  next: string;
 }
 
 export interface Track {
@@ -35,11 +39,21 @@ export const tracks: Record<TrackId, Track> = {
     outline: syllabus,
     numberPrefix: '',
     parts: [
-      { title: 'Foundations', modules: [0, 1, 2] },
-      { title: 'Building blocks', modules: [3, 4, 5] },
-      { title: 'Distributed systems', modules: [6, 7, 8] },
-      { title: 'Patterns and advanced', modules: [9, 10] },
-      { title: 'Practice', modules: [11, 12] },
+      { title: 'Foundations', modules: [0, 1, 2],
+        can: ['Trace a request from DNS to the server and back.', 'Estimate QPS, storage and bandwidth on paper.', 'Pick TCP, UDP, WebSockets or gRPC and say why.'],
+        next: 'Where the data lives, and how an API exposes it.' },
+      { title: 'Building blocks', modules: [3, 4, 5],
+        can: ['Design a clean API with safe retries.', 'Choose a database, index and shard key, and defend it.', 'Put a cache in front of it without serving stale data by accident.'],
+        next: 'What happens when the parts talk to each other, and fail.' },
+      { title: 'Distributed systems', modules: [6, 7, 8],
+        can: ['Move slow work onto a queue and keep delivery correct.', 'Survive timeouts, retries and overload without a cascade.', 'Name the right tool (Kafka, Redis, Cassandra) for each job.'],
+        next: 'Repeatable answers for hard, recurring problems.' },
+      { title: 'Patterns and advanced', modules: [9, 10],
+        can: ['Scale reads and writes past one database.', 'Handle contention, large files and long jobs.', 'Reach for geo, time-series or vector stores when they fit.'],
+        next: 'Put it all together under a clock.' },
+      { title: 'Practice', modules: [11, 12],
+        can: ['Drive a full design from requirements to deep dives.', 'Trade off cost, latency and consistency out loud.', 'Compare your design with how real companies built it.'],
+        next: 'Teach a design to someone else. That is the real test.' },
     ],
     bullets: [
       'Size a system on the back of an envelope.',
@@ -56,12 +70,24 @@ export const tracks: Record<TrackId, Track> = {
     outline: aiSyllabus,
     numberPrefix: 'A',
     parts: [
-      { title: 'Foundations', modules: [0, 1, 2] },
-      { title: 'Models and training', modules: [3, 4] },
-      { title: 'Serving and retrieval', modules: [5, 6] },
-      { title: 'Applications and agents', modules: [7, 8] },
-      { title: 'Running it in production', modules: [9, 10, 11] },
-      { title: 'Frontier and practice', modules: [12, 13, 14] },
+      { title: 'Foundations', modules: [0, 1, 2],
+        can: ['Explain what a model does from tokens to output.', 'Say why it hallucinates and what the context window costs.', 'Estimate GPU memory and cost for a model on paper.'],
+        next: 'How models are built, trained and tuned.' },
+      { title: 'Models and training', modules: [3, 4],
+        can: ['Turn a business goal into an ML objective and metrics.', 'Plan a training run across many GPUs.', 'Choose between prompting, RAG and fine-tuning.'],
+        next: 'Serve the model fast and give it the right facts.' },
+      { title: 'Serving and retrieval', modules: [5, 6],
+        can: ['Explain the KV cache, batching and where latency goes.', 'Pick quantization or speculative decoding for a latency goal.', 'Build retrieval that finds the right chunk, with permissions.'],
+        next: 'Turn the model into a product people use.' },
+      { title: 'Applications and agents', modules: [7, 8],
+        can: ['Get structured output and safe tool calls from a model.', 'Add caching, routing and fallbacks across providers.', 'Design an agent loop that you can stop, resume and audit.'],
+        next: 'Prove it works, and keep it working.' },
+      { title: 'Running it in production', modules: [9, 10, 11],
+        can: ['Build an eval set and catch a regression before users do.', 'Trace, cost and roll back a model or prompt change.', 'Threat-model prompt injection and lock down tools.'],
+        next: 'Media models, and full designs end to end.' },
+      { title: 'Frontier and practice', modules: [12, 13, 14],
+        can: ['Budget latency for a voice or image pipeline.', 'Drive a full AI design from goal to evals.', 'Compare your design with how real teams built it.'],
+        next: 'Ship something small and measure it. That is the real test.' },
     ],
     bullets: [
       'Work out GPU memory and cost per request.',
