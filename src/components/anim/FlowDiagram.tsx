@@ -194,6 +194,8 @@ export default function FlowDiagram({
         const stroke = isActive && (!n.tone || n.tone === 'default') ? 'var(--accent)' : TONE[n.tone ?? 'default'];
         const seed = seedOf(n.id);
         const strokeWidth = isActive ? 2.2 : 1.4;
+        // A cylinder's top rim takes 2 * ry; center text on the body below it (ry matches SketchCylinder).
+        const dy = n.shape === 'db' ? Math.min(10, h / 6) : 0;
         return (
           <g key={n.id} opacity={n.tone === 'muted' ? 0.45 : 1}>
             <motion.rect
@@ -223,11 +225,11 @@ export default function FlowDiagram({
                 dashed={n.shape === 'dashed'}
               />
             )}
-            <HandText x={n.x} y={n.sub ? n.y - 9 : n.y} size={18}>
+            <HandText x={n.x} y={(n.sub ? n.y - 9 : n.y) + dy} size={18}>
               {n.label}
             </HandText>
             {n.sub && (
-              <HandText x={n.x} y={n.y + 14} size={13} color="var(--muted)">
+              <HandText x={n.x} y={n.y + 14 + dy} size={13} color="var(--muted)">
                 {n.sub}
               </HandText>
             )}

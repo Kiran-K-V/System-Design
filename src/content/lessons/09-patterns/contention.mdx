@@ -1,0 +1,259 @@
+---
+summary: 'When many requests fight for one row or one seat, pick a strategy: an atomic update, a lock, a version check, a hold with a TTL, or a queue. Distributed locks also need fencing tokens.'
+requires: ['04-data/transactions', '08-technologies/postgresql', '08-technologies/zookeeper']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import PatternsBuildsOn from '../../../components/anim/lessons/PatternsBuildsOn.tsx';
+import ContentionRace from '../../../components/anim/lessons/ContentionRace.tsx';
+import ContentionFencing from '../../../components/anim/lessons/ContentionFencing.tsx';
+
+## The problem
+
+Seat 12A has one place left. Two people press "Book" at the same moment. Both servers read "1 seat left". Both write. Two tickets are sold for one seat.
+
+Nothing crashed. Each request did a correct thing by itself. The bug is in the gap between the **read** and the **write**. Any code of the form "read a value, decide, write" has this gap. It shows up with inventory counts, ticket sales, bank balances, username claims, rate limits, and job leases.
+
+The gap is small, but the chance of hitting it is not. If a check-then-write takes 5 ms, any two requests for the same row within 5 ms of each other collide. For a normal row that is rare. For a hot row in a sale, it happens all the time. This is **contention**: many writers fight for the same item.
+
+Lesson [4.4](/learn/04-data/transactions/) gave the tools: row locks, version checks, and isolation levels. This lesson shows when to pick each, and what to do when the fight spans more than one database.
+
+<PatternsBuildsOn
+  pattern="Contention"
+  parts={[
+    { n: '4.4', title: 'Transactions and isolation', href: '/learn/04-data/transactions/', job: 'Lost updates, row locks, and version checks.' },
+    { n: '8.1', title: 'PostgreSQL', href: '/learn/08-technologies/postgresql/', job: 'FOR UPDATE, row versions, and one process per connection.' },
+    { n: '8.8', title: 'ZooKeeper and etcd', href: '/learn/08-technologies/zookeeper/', job: 'Locks and leases with an agreed order.' },
+    { n: '4.11', title: 'Consensus', href: '/learn/04-data/consensus/', job: 'Why a lock service must itself agree.' },
+    { n: '6.1', title: 'Queues', href: '/learn/06-async/queues/', job: 'One worker per key turns a race into a line.' },
+  ]}
+/>
+
+## Naive solution, and the cheapest fix
+
+The naive code reads the count, checks it, and writes the new count in a separate statement. The race above is the result.
+
+Try the cheapest fix first. Let the database do the check and the write as one step:
+
+```
+UPDATE seats SET left = left - 1 WHERE id = 7 AND left > 0;
+```
+
+If one row changed, you got the seat. If zero rows changed, it is sold out. Lesson [4.4](/learn/04-data/transactions/) explains why this works at Read committed: a second updater waits for the first one, then checks the `WHERE` clause against the new version of the row. For a single row and a single comparison, stop here. The strategies below are for cases where the decision needs more than one statement, or more than one resource, or a long wait for the user.
+
+## The race, five ways
+
+Pick a strategy. Step through the same race each time. Watch who waits, who loses, and what the database holds.
+
+<ContentionRace client:visible />
+
+### Pessimistic lock: `SELECT ... FOR UPDATE`
+
+Lock first, then read, decide, and write. The PostgreSQL manual says `FOR UPDATE` locks the selected rows so other transactions cannot lock, change, or delete them until the current transaction ends. A second buyer waits, then sees the committed result. There is never a wrong write, so there are no retries.
+
+The costs are all about waiting.
+
+- **Throughput on one row is one over the hold time.** If the transaction holds the lock for 5 ms, one row serves at most 200 transactions per second. If it also makes a 200 ms payment call inside the lock, the ceiling is 5 per second. Never call slow things while holding a lock. (Arithmetic, from the assumed times.)
+- **Deadlocks.** Two transactions that lock rows in opposite order wait for each other forever. PostgreSQL detects this and aborts one of them. The manual's best defence is to lock rows in a consistent order in every code path.
+- **Wait control.** Add `NOWAIT` to fail at once if the row is locked. Add `SKIP LOCKED` to skip locked rows. The manual says `SKIP LOCKED` gives an inconsistent view of the data and is not for general use, but fits queue-like tables with many consumers, where each worker should grab a different row.
+
+Reach for it when conflicts are frequent, the transaction is short, and everything is in one database.
+
+### Optimistic version check
+
+Do not lock. Read the row with its version. Write with `WHERE version = <the version you read>`. If zero rows change, someone else won: re-read and retry. This is cheap when conflicts are rare, and the user can think for as long as they like between read and write, because nothing is held.
+
+When conflicts are frequent it wastes work. Say 10 buyers each try to take one unit from one stock row and each loser retries at once. Round 1 has 10 attempts and 1 win. Round 2 has 9 attempts. In total, 10 + 9 + ... + 1 = 55 attempts for 10 sales. That is the worst case when everyone retries in step. Add jitter (lesson [7.2](/learn/07-reliability/timeouts-retries/)) and a cap on retries.
+
+### Reservation with a TTL
+
+A checkout may take minutes: pick a seat, enter a card, pass a bank check. You cannot hold a database lock for that long. Instead, write a **hold**: a record that says "seat 12A is held by buyer A until 14:05". Others see it as taken. The hold has a **TTL** (time to live): when the time passes, the seat is free again. Payment then **confirms** the hold into a booking.
+
+Three details make a hold safe:
+
+- **Take the hold atomically.** It is a write only one buyer can win, such as an `UPDATE ... WHERE hold IS NULL OR hold_expires < now()`. Or `SET key value NX PX 300000` in Redis (lesson [8.2](/learn/08-technologies/redis/)): set only if absent, with an expiry.
+- **Free expired holds.** Check the expiry when reading, or run a sweeper. Otherwise abandoned holds hide seats.
+- **Confirm re-checks.** The hold may have expired and been taken by someone else. A unique constraint on the final booking, such as one row per `(event, seat)`, is the last line of defence. If the hold store is lost or wrong, the constraint still refuses the second booking.
+
+You trade a little fairness (someone sits on a seat) for no waiting and no long locks.
+
+### Serialize through a queue
+
+Send every request for the same key to a queue partition (lesson [6.1](/learn/06-async/queues/)). One worker handles that partition in order. There is no concurrent writer, so there is no race. The order of arrival decides who wins.
+
+This turns a lock fight into a line. It scales across keys, since each seat has its own line. It does not scale within one key: a hot seat is handled at one worker's speed. And the user gets the answer later, through the queue, so the API needs to return a ticket and let the client poll or listen (lesson [9.3](/learn/09-patterns/real-time-updates/)).
+
+## When one database is not enough: distributed locks
+
+Sometimes the contested thing is not one row. It is a cron job that must run on one machine, a file in object storage, or a resource in another service. You then use a **distributed lock**: a lock held in a shared service such as ZooKeeper, etcd, or Redis (lesson [8.8](/learn/08-technologies/zookeeper/)).
+
+Locks in such systems are **leases**: they expire on their own, so a crashed client cannot hold one forever. That solves crashes. It opens a worse problem: a client that is slow, not dead.
+
+Martin Kleppmann's article "How to do distributed locking" describes it. Client 1 gets the lease. It pauses for a long time: a garbage-collection stop, a slow network. The lease expires. Client 2 gets the lock and writes. Client 1 wakes up, still believes it holds the lock, and writes too. No check inside client 1 can catch this, because from its point of view no time has passed.
+
+The fix is a **fencing token**: a number that goes up with every grant of the lock. The client sends the token with every write. The storage service remembers the highest token it has seen and rejects anything lower.
+
+<ContentionFencing client:visible />
+
+Two consequences:
+
+- The final check must be **in the resource**, not in the lock holder. If the resource cannot compare tokens, the lock cannot protect it.
+- The lock service must hand out increasing numbers. Kleppmann notes that ZooKeeper can supply one (the `zxid` or the znode version). He also argues that Redlock, the multi-node Redis lock algorithm, has no facility to generate fencing tokens. Lesson [8.2](/learn/08-technologies/redis/) records that Redis's own docs advise fencing tokens too.
+
+Kleppmann's other test is the useful one. Ask what happens if the lock fails. If two clients doing the same work wastes some CPU, the lock is for **efficiency**, and a simple single-node lock is fine. If two clients doing the work corrupts data, the lock is for **correctness**, and you need a fencing token or a system that agrees (lesson [4.11](/learn/04-data/consensus/)).
+
+PostgreSQL has a lighter option inside one database: **advisory locks**. The manual says they have application-defined meaning, the database does not enforce them, they avoid table bloat, and a session lock is released when the session ends.
+
+## Choosing a strategy
+
+| Situation | Reach for |
+|---|---|
+| One row, one comparison | Atomic `UPDATE ... WHERE` |
+| Short transaction, frequent conflicts, one database | `SELECT FOR UPDATE` |
+| Rare conflicts, long think time | Version check and retry |
+| The user takes minutes to finish | Hold with a TTL, then confirm |
+| One hot key, answer can be async | Queue per key |
+| Work across services or machines | Distributed lock with fencing, or avoid the need |
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Throughput of one locked row | 1000 / hold time in ms per second | Derived: transactions line up one behind another |
+| Hold 5 ms vs 205 ms (with a 200 ms call inside) | 200 vs about 5 per second | Derived |
+| 10 buyers, lockstep retries, one version | 55 attempts for 10 successes | Derived: 10 + 9 + ... + 1 |
+| Deadlock | The database aborts one transaction | PostgreSQL manual |
+| Redis hold | `SET key value NX PX <ms>` | Redis docs, via lesson 8.2 |
+
+## Trade-offs
+
+| Strategy | You gain | You pay | Choose when |
+|---|---|---|---|
+| Atomic update | Simplest, no extra moving parts | Only fits one-statement decisions | Counters, stock |
+| Row lock | No wrong writes, no retries | Waiting, deadlocks, a low hot-row ceiling | Frequent conflicts, short work |
+| Version check | No waiting, tolerates think time | Wasted work and retries under load | Rare conflicts |
+| Hold with TTL | No long lock, good user flow | Expiry logic, seats hidden by abandoned holds | Multi-minute checkout |
+| Queue per key | No race, clear order | Async answer, one-worker ceiling per key | Hot key, work can wait |
+| Distributed lock | Works across machines | Pauses and clock problems, needs fencing | Cross-service mutual exclusion |
+
+## Interview lens
+
+<Callout type="tip">
+Start by naming the bug: "read, decide, write has a gap". Then give the ladder: "First an atomic update. If the decision needs more, a row lock for short transactions, or a version check if conflicts are rare. For checkout I hold the seat with a TTL and confirm on payment, and keep a unique constraint as the last line of defence." If the interviewer says "distributed lock", answer: "I would add a fencing token that the resource checks, because a paused client can still write after its lease expires."
+</Callout>
+
+<Callout type="mistake">
+Do not say "use a Redis lock" for a correctness problem and stop there. A lease can expire during a pause. Do not hold a database lock across a payment call. Do not forget what releases an abandoned hold. And do not use optimistic retries on a row that a thousand users hit at once: most of the work is thrown away.
+</Callout>
+
+<Callout type="deep" title="Isolation levels do not replace this">
+At Repeatable read, PostgreSQL stops a lost update by failing the second writer with a serialization error. That is a version check done for you. You still must catch the error and retry. At Read committed the same bug passes silently. Write skew, where two transactions read the same rows and write different ones, needs Serializable or a lock on the rows the decision depends on. Lesson 4.4 shows both.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Ten buyers each take one unit from one stock row with a version check. Every loser retries at once, in step. In the worst case, how many update attempts happen until all ten succeed?',
+      options: [
+        '10 attempts, because each buyer succeeds exactly once',
+        '20 attempts, because each loser retries a single time',
+        '55 attempts, because one buyer wins in each round',
+        '100 attempts, because every buyer retries ten times',
+      ],
+      answer: 2,
+      explain: 'Round 1 has 10 attempts and 1 winner. Round 2 has 9 attempts, and so on: 10 + 9 + ... + 1 = 55. Under high contention a version check wastes most of its work. Jitter and a retry cap soften it, and a lock or queue avoids it.',
+    },
+    {
+      q: 'A checkout calls a payment API for 200 ms inside a transaction that holds SELECT FOR UPDATE on the hot seat row. About how many bookings per second can that one row serve, at most?',
+      options: [
+        '200 per second, as the lock only blocks other writers briefly',
+        'No limit, because MVCC lets every transaction run at once',
+        '50 per second, because each lock is held for about 20 ms',
+        '5 per second, because they run one at a time',
+      ],
+      answer: 3,
+      explain: 'Writers that want the row queue behind the lock holder. With 200 ms per hold, 1000 / 200 = 5 per second. MVCC stops readers and writers from blocking each other, not two writers of one row. Move the payment call outside the lock.',
+    },
+    {
+      q: 'A seat hold lives in Redis with a 5-minute expiry. Why still keep a unique constraint on (event_id, seat_id) in the booking table?',
+      options: [
+        'The hold can expire or vanish, so the table still refuses doubles',
+        'Redis cannot store seat ids, so the table is the only place to keep them',
+        'The constraint makes the hold expire sooner than five minutes',
+        'It lets two buyers book one seat when the hold has expired',
+      ],
+      answer: 0,
+      explain: 'A hold is a convenience that keeps buyers from fighting. It can expire before the buyer pays or be lost in a failover. The unique constraint is the correctness backstop: whatever happens upstream, the database refuses a second row for the same seat.',
+    },
+    {
+      q: 'Client A holds a lock with fencing token 33 and pauses. Its lease expires. Client B gets token 34 and writes. A wakes and writes with token 33. What must the storage service do?',
+      options: [
+        'Accept the write, because A held the lock first',
+        'Reject it, because 33 is lower than 34, the highest seen',
+        'Ask the lock service whether A still holds the lock, then accept',
+        'Accept the write and then overwrite it when B writes again',
+      ],
+      answer: 1,
+      explain: 'The storage service remembers the highest token and refuses any lower one. A cannot know it is stale, and a lock check in A comes too late. The final check must live in the resource. Asking the lock service adds a race of its own.',
+    },
+    {
+      q: 'Which design fits a ticket checkout where the buyer has ten minutes to enter a card and pay?',
+      options: [
+        'A row lock held for the whole ten minutes',
+        'A version check done when the page first opens',
+        'A hold with a TTL, confirmed by payment',
+        'A queue that makes every other buyer wait ten minutes',
+      ],
+      answer: 2,
+      explain: 'A lock held for minutes blocks everyone behind it and ties up a database connection. A version check at page open protects nothing ten minutes later. A hold with a TTL reserves the seat without a lock, frees it if the buyer leaves, and the constraint backs it up.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="contention-lock-double-run"
+  title="The job that ran twice"
+  scenario="A nightly job takes a Redis lock with a 30-second expiry and updates a ledger. Twice a month the ledger shows doubled totals."
+  facts={[
+    'job runtime: normally ~10 s',
+    'on the bad nights: a 45 s pause is logged on one worker',
+    'both workers report "lock acquired" within 40 s of each other',
+  ]}
+  steps={[
+    {
+      prompt: 'What explains the doubled totals?',
+      options: [
+        'The Redis server lost the lock key during a failover',
+        'The lock expired mid-pause, so a second worker took it',
+        'The job is too slow, so it must be rewritten to run in 5 s',
+        'Redis cannot hold a lock key for longer than 30 seconds',
+      ],
+      answer: 1,
+      explain: 'The pause (45 s) is longer than the lease (30 s). The lock expired, worker 2 took it, and worker 1 woke up still believing it held the lock. Both wrote. A faster job helps this night and fails the next pause.',
+    },
+    {
+      prompt: 'What is the right fix?',
+      options: [
+        'Raise the expiry to 10 minutes so pauses never outlast it',
+        'Run three Redis servers and take the lock on all of them',
+        'Send a fencing token that the ledger checks on every write',
+        'Let each worker check the lock again just before its final write',
+      ],
+      answer: 2,
+      explain: 'A longer lease only moves the failing pause length. More Redis servers do not stop a paused client. A check just before the write still leaves a gap, since a pause can happen right after it. A token checked by the ledger closes the hole. Making the write idempotent is a second good defence.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [PostgreSQL manual: explicit locking](https://www.postgresql.org/docs/current/explicit-locking.html): row locks, deadlocks, and advisory locks.
+- [PostgreSQL manual: SELECT, the locking clause](https://www.postgresql.org/docs/current/sql-select.html): `FOR UPDATE`, `NOWAIT`, `SKIP LOCKED`.
+- [Martin Kleppmann, "How to do distributed locking"](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html): leases, pauses, and fencing tokens.
+- [Redis docs: distributed locks](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/): the single-node lock and Redlock.

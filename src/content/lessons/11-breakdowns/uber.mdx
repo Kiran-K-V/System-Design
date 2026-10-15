@@ -1,0 +1,270 @@
+---
+summary: 'Uber matches riders to nearby drivers. Millions of location pings go to an in-memory geo index, and a time-limited lock stops two riders from getting one driver.'
+requires: ['08-technologies/redis', '09-patterns/contention', '10-advanced/proximity-search']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import UberBuild from '../../../components/anim/lessons/UberBuild.tsx';
+import UberLock from '../../../components/anim/lessons/UberLock.tsx';
+
+## The problem
+
+A rider taps "request". Within a minute the system must find a free driver who is close, offer the ride, and confirm one match. Meanwhile every driver phone reports its position again and again.
+
+Two things make this hard.
+
+- **Location writes are huge.** Positions change all the time, and the system needs the latest one.
+- **Matching is a race.** Many riders want the same few nearby drivers. One driver must never get two rides.
+
+This case adds three ideas: high-rate location updates, proximity search for nearby drivers, and matching under contention. The proximity mechanism is in lesson [10.1](/learn/10-advanced/proximity-search/). The contention patterns are in lesson [9.4](/learn/09-patterns/contention/). Redis is lesson [8.2](/learn/08-technologies/redis/).
+
+All company-scale claims about Uber are left out here. They are unverified. Every number below is an interview assumption we derive.
+
+## Requirements
+
+**Functional.**
+
+1. A rider enters pickup and destination and gets a fare estimate.
+2. A rider requests a ride from that estimate.
+3. The system matches the rider with a nearby, available driver.
+4. The driver accepts or declines, then goes to pickup and drop-off.
+
+**Below the line.** Ratings, scheduled rides, ride categories, payments, and abuse checks. Name them and move on.
+
+**Non-functional.**
+
+- Match within 1 minute, or tell the rider it failed.
+- Strong consistency for assignment: one driver, at most one ride at a time.
+- Handle a burst, such as many requests from one place after a big event.
+- Location data may be a few seconds stale. A driver moves 50 meters in a few seconds, so slightly old data is fine.
+
+### Derive the load
+
+Assume 10 million drivers are online at peak (assumption). Each sends a position every 5 seconds.
+
+- Writes: 10,000,000 / 5 s = **2,000,000 per second**. Per day that is 2,000,000 x 86,400 = about 173 billion writes.
+- Payload: driver id 8 B, latitude 8 B, longitude 8 B, time 8 B. That is 32 B. So 2,000,000 x 32 B = **64 MB per second** of raw payload (assumption: ignore headers).
+- Memory for the latest position of every driver: 10,000,000 x about 100 B = **about 1 GB** (assumption of 100 B per entry with overhead). It fits in RAM on one machine.
+
+A database that stores history for every ping would need 2 million durable writes a second. We do not need history to match a rider. We need only the latest position. That one fact shapes the design.
+
+## Core entities
+
+- **Rider**: asks for rides.
+- **Driver**: has a vehicle and a status (available or busy).
+- **Fare**: an estimate with pickup, destination, price, and arrival time.
+- **Ride**: a trip from request to completion, with a state and timestamps.
+- **Location**: a driver's latest latitude, longitude, and time.
+
+## API
+
+```
+POST  /fare               { pickup, destination }        -> Fare
+POST  /rides              { fareId }                     -> Ride
+POST  /drivers/location   { lat, long }                  -> ok
+PATCH /rides/:rideId      { action: "accept" | "decline" } -> Ride
+```
+
+The driver's id comes from the session token (lesson [3.5](/learn/03-api-design/auth/)), not from the body. A caller must not be able to move another driver. Make `POST /rides` safe to retry with an idempotency key (lesson [3.4](/learn/03-api-design/idempotency/)). Otherwise a double tap books two cars.
+
+## High-level design
+
+<UberBuild client:visible />
+
+The last two steps are where the interview lives. The earlier steps are ordinary services and one database. Spend your time on location, search, and assignment.
+
+## Deep dives
+
+### Location writes
+
+The naive design runs `UPDATE drivers SET lat=?, long=? WHERE id=?` on a relational database for each ping. At 2 million writes per second it fails. Each write also leaves a new row version and a log record that nobody needs.
+
+The better design keeps only the latest position in memory. Redis `GEOADD` stores a position under a member name (the driver id). The docs give its cost as O(log N) per item. A second `GEOADD` on the same member **replaces** the old position, so the store never grows past one entry per driver.
+
+One Redis instance is not enough for 2 million writes per second. Lesson [8.2](/learn/08-technologies/redis/) shows that a single instance does tens of thousands of commands per second without pipelining and more with it. So we split the index. **Shard by place, not by driver id.** A search needs the neighbors of one point. If neighbors sit on different shards, every search becomes a scatter-gather over all shards (lesson [4.7](/learn/04-data/sharding/)). With a shard per city or region, one search touches one shard.
+
+Drivers near a region border are a corner case. Query the neighbor region too when the search circle crosses the border. That is a known cost of space-based sharding.
+
+You can also cut the write rate. A parked driver can ping less often than a moving one. Say it as an option, with the trade-off: stale positions for slow drivers.
+
+<Callout type="deep" title="Redis GEO has no per-driver expiry">
+`GEOADD` keeps its data in a sorted set. A sorted set member has no time-to-live of its own. A driver who closes the app stays in the index forever. Fix it with a second sorted set that maps driver id to last-seen time. A sweeper removes drivers older than, say, 15 seconds from both sets. Without this, riders get matched to drivers who left minutes ago.
+</Callout>
+
+### Proximity search
+
+Lesson [10.1](/learn/10-advanced/proximity-search/) explained **geohash** [mid]: a code that turns a latitude and longitude into a short string so that nearby points share a prefix. Redis GEO stores each point as a geohash score in a sorted set, so a range scan on the score finds points in one area. A B-tree on two plain columns cannot do this well, because a range on latitude and a range on longitude do not combine into one scan.
+
+The matching service runs `GEOSEARCH` with `FROMLONLAT`, `BYRADIUS`, and `ASC`. Redis added `GEOSEARCH` in version 6.2.0. The docs give its complexity as O(N + log M), where N is the number of items in the grid cells that cover the circle and M is the number of items inside the shape. It is fast when the radius is small. Use a radius of about 2 km in a city and widen it in steps if nothing is found.
+
+The search returns nearby drivers in distance order. Distance in a straight line is not the same as drive time. A driver 300 m away across a river may be 20 minutes away. Real systems re-rank the top few candidates with a routing source. Say this as an extension.
+
+### Matching and double assignment
+
+<UberLock client:visible />
+
+Reach for the contention toolbox from lesson [9.4](/learn/09-patterns/contention/). The naive "read status, then write" fails because the check and the write are separate steps. An in-process lock does not help, because two matchers run on two servers.
+
+A lock with a time limit works. Create `driver:17` only if it does not exist, with an expiry of 10 seconds. One matcher wins. If the winner crashes, the key expires and the driver is free again. A lock that ends by itself is a **lease** [senior].
+
+Be honest about the limit. Lesson [8.2](/learn/08-technologies/redis/) warns that a Redis lock is safe for efficiency but not proof against pauses and clock jumps. If a matcher pauses past the expiry, a second matcher may take the lock while the first still thinks it holds it. The final write to the driver or ride record should therefore carry a **fencing token**: a number that grows with each lock grant, which the record rejects if it is too old (lesson [4.11](/learn/04-data/consensus/)). A conditional update on the ride row, such as "set driver only if the ride is still unassigned", gives the same protection with no extra system.
+
+**Unresponsive drivers.** The offer waits about 10 seconds. If the matching service holds that timer in memory, a restart loses it and the rider waits forever. A durable timer (Temporal, lesson [8.9](/learn/08-technologies/temporal/)) survives restarts. With a 1 minute budget and 10 seconds per offer, one rider can try at most about 6 drivers one after another. That is why offers to the nearest few drivers are sometimes sent at once, with the extra offers cancelled when one driver says yes. It trades driver annoyance for speed.
+
+**Bursts.** If 100,000 requests arrive from one place, put requests on a queue (lesson [8.6](/learn/08-technologies/kafka/)) and match them in order. Commit the offset only after a match, so a crashed matcher does not lose the request. Say the policy aloud: first come, first served, or nearest driver first.
+
+## Numbers
+
+| Quantity | Value | Where it comes from |
+|---|---|---|
+| Location writes | 2,000,000 per second | 10M drivers / 5 s (assumed) |
+| Writes per day | ~173 billion | 2,000,000 x 86,400 |
+| Raw payload | 64 MB per second | 2,000,000 x 32 B |
+| Latest-position memory | ~1 GB | 10M x ~100 B (assumed) |
+| Offers per rider in 60 s | ~6 in sequence | 60 s / 10 s |
+| `GEOADD` cost | O(log N) per item | Redis docs |
+| `GEOSEARCH` cost | O(N + log M) | Redis docs; added in 6.2.0 |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Latest position in memory | 2M writes per second is possible | A crash loses recent positions | History is not needed to match |
+| Shard the index by place | One search hits one shard | Border queries, uneven load | Search needs neighbors |
+| Shard the index by driver id | Even load | Every search scatters | Rarely right for proximity |
+| Lock with expiry | No double assignment, no stuck lock | Needs fencing for full safety | Short, hot critical section |
+| Offer to one driver at a time | Simple, fair to drivers | Up to 10 s per attempt | Normal demand |
+| Offer to several at once | Faster match | Cancel extra offers | Tight latency budget |
+
+## Interview lens
+
+<Callout type="tip">
+Say the key fact first: "I only need each driver's latest position, so the index lives in memory and each ping replaces the last". Do the load math out loud. Then name the contention risk before the interviewer asks: "two matchers can pick one driver, so I lock the driver with an expiry and make the final ride write conditional".
+</Callout>
+
+<Callout type="mistake">
+Do not put latitude and longitude in two SQL columns and call it proximity search. Do not shard the geo index by driver id. Do not say a lock is "safe" and skip the crash case. Do not keep the offer timer only in process memory.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why does the Uber geo index shard by region instead of by driver id?',
+      options: [
+        'Hashing by driver id would put one driver on many shards',
+        'A search needs neighbors, so one region maps to one shard',
+        'Regions have the same number of drivers, so load stays even',
+        'Redis cannot store two drivers with the same hash on one shard',
+      ],
+      answer: 1,
+      explain: 'A radius search wants every driver near one point. Sharded by driver id, those drivers are spread over all shards and each search scatters. Regions are not evenly loaded, which is a cost, not a benefit.',
+    },
+    {
+      q: 'A driver closes the app. Ten minutes later a rider is offered that driver. Which Redis detail explains it?',
+      options: [
+        'GEOSEARCH only reads the replica, which lags the primary by minutes',
+        'A GEOADD entry cannot be updated after it is created',
+        'The lock key for the driver was never created for that ride',
+        'A geo member sits in a sorted set and has no expiry of its own',
+      ],
+      answer: 3,
+      explain: 'Redis can expire a key, not one member of a sorted set. The stale driver stays until something removes them. A last-seen set and a sweeper fix it. GEOADD on an existing member does replace the position, so the first option is wrong.',
+    },
+    {
+      q: 'Two matchers both read driver 17 as free, then both write "offered". Which change removes the race?',
+      options: [
+        'Create a key for driver 17 only if absent, with a 10 s expiry',
+        'Read the driver row twice so the second read catches a change',
+        'Run each matcher on a bigger machine to finish before the other',
+        'Add a process-level lock inside each matcher server',
+      ],
+      answer: 0,
+      explain: 'The fix must make check and write one atomic step for all servers. A set-if-absent key does that. A second read still leaves a gap. Faster machines only narrow the window. A lock inside one process cannot see the other server.',
+    },
+    {
+      q: 'A matcher takes a 10 s lock, pauses for 15 s, then writes the assignment. A second matcher took the lock at second 10. What protects the data?',
+      options: [
+        'The Redis expiry, because it removed the first lock on time',
+        'A shorter offer timeout, because it reduces the pause window',
+        'A fencing token that the record checks on each write',
+        'A larger lock time limit of 60 s, because it outlasts the pause',
+      ],
+      answer: 2,
+      explain: 'The expiry is what let the second matcher in. A longer limit only moves the problem. The record must reject the older holder. A token that grows with each grant, or a conditional update on the ride row, does that.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Size the location path"
+  scenario="10 million drivers are online. Each sends a position every 5 seconds. A position is 32 bytes of payload. The latest position of a driver takes about 100 bytes in the index."
+  steps={[
+    {
+      prompt: 'How many location writes per second?',
+      unit: 'writes per second',
+      answer: 2000000,
+      within: 1.1,
+      explain: '10,000,000 drivers / 5 seconds is 2,000,000 writes per second.',
+    },
+    {
+      prompt: 'How many MB per second of raw payload?',
+      unit: 'MB per second',
+      answer: 64,
+      within: 1.2,
+      explain: '2,000,000 x 32 bytes is 64,000,000 bytes per second, which is 64 MB per second.',
+    },
+    {
+      prompt: 'How many GB of memory hold the latest position of every driver?',
+      unit: 'GB',
+      answer: 1,
+      within: 1.3,
+      explain: '10,000,000 x 100 bytes is 1,000,000,000 bytes, about 1 GB. The index fits in memory. The write rate, not the size, is why you shard it.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="uber-stale-drivers"
+  title="Ghost drivers"
+  scenario="Riders are matched to drivers who then never answer. Support says these drivers closed the app earlier."
+  facts={['index:               one geo sorted set per city', 'ping interval:       5 s per online driver', 'sample ghost driver:  last ping 11 minutes ago', 'cleanup job:          none']}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'Offline drivers keep their last position in the index, and nothing removes them',
+        'The ping interval of 5 s is too long to track a moving driver',
+        'The lock key for these drivers has expired before the offer went out',
+        'Radius search sorts by driver id, so old drivers come out first',
+      ],
+      answer: 0,
+      explain: 'A geo entry stays until you remove it. The ghost driver was never removed. The search ranks by distance, so a ghost near the rider wins. The ping interval and the lock are not involved.',
+    },
+    {
+      prompt: 'Which fix is best?',
+      options: [
+        'Keep a last-seen time per driver and sweep entries older than about 15 seconds',
+        'Ping every second, so every driver is always fresh in the index',
+        'Check the driver row in SQL after every search, and drop ghosts then',
+        'Restart the Redis shard every night to clear all old positions',
+      ],
+      answer: 0,
+      explain: 'A last-seen set plus a sweeper keeps the index honest at low cost. Pinging more often raises the write rate and still leaves ghosts. A SQL check on each search adds load and still returns too few results. A nightly restart leaves ghosts all day.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Redis: GEOSEARCH](https://redis.io/docs/latest/commands/geosearch/), options, version, and complexity.
+- [Redis: GEOADD](https://redis.io/docs/latest/commands/geoadd/), how positions are stored and replaced.
+- [Redis: Distributed locks](https://redis.io/docs/latest/develop/use/patterns/distributed-locks/), the single-instance lock and the fencing warning.
+- [Geohash (Wikipedia)](https://en.wikipedia.org/wiki/Geohash), the encoding behind Redis GEO.

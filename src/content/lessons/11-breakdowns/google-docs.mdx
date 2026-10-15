@@ -1,0 +1,295 @@
+---
+summary: 'A collaborative editor turns every keystroke into an operation, orders them on one collaboration server per document, merges concurrent edits with operational transform or a CRDT, and bounds storage with snapshots plus an operation log.'
+requires: ['02-networking/real-time-transport', '04-data/consistent-hashing', '09-patterns/real-time-updates']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import DocsBuild from '../../../components/anim/lessons/DocsBuild.tsx';
+import DocsMerge from '../../../components/anim/lessons/DocsMerge.tsx';
+
+## The problem
+
+Two people open the same document. Alice types a word at the start. Bob deletes a sentence at the end. Both press keys at the same moment, from two continents.
+
+Both must see both changes within a fraction of a second. The two screens must end with identical text. Nobody's edit may vanish.
+
+Real-time delivery is solved (lesson [9.3](/learn/09-patterns/real-time-updates/)). The new problem is **merging**: edits made at the same time, on copies that have not yet seen each other. This case study covers two ways to merge, **operational transform** (OT) and **CRDTs**, and the server design around them. We keep to plain text. Rich formatting and permissions are below the line.
+
+## Requirements
+
+**Functional.**
+
+1. Create a document.
+2. Several users edit the same document at once.
+3. Each user sees the others' edits in real time.
+4. Each user sees the others' cursors and who is present.
+
+**Below the line.** Rich text, comments, sharing and permissions. Version history is an add-on question. We cover it in the storage deep dive.
+
+**Non-functional.** The numbers are assumptions. No company source gave us scale figures, so we state ours and do the math.
+
+- An edit shows on other screens within about 100 ms.
+- All copies end with the same text. No confirmed edit is lost.
+- Storage for a long document stays bounded.
+- At peak, 10M open connections (our assumption).
+
+## Core entities
+
+- **Document**: id, title, latest snapshot, head sequence number.
+- **Operation**: document, sequence number, client, payload, the version it was based on.
+- **Snapshot**: document, version, full text, time.
+- **Presence**: document, user, cursor, last seen. This lives in memory and is never stored.
+
+## API
+
+| Call | Purpose |
+|---|---|
+| `POST /v1/docs` | Create. Returns the document id. |
+| `GET /v1/docs/{id}` | Latest snapshot and head version. |
+| `WS /v1/docs/{id}/session` | Operations up, operations down, presence both ways. |
+| `GET /v1/docs/{id}/versions` | List of snapshots, for history. |
+
+Opening a document is two steps. Fetch the snapshot over HTTP, then open the WebSocket (lesson [2.5](/learn/02-networking/real-time-transport/)) and ask for everything after the snapshot's version.
+
+## High-level design
+
+Step through the build.
+
+<DocsBuild client:visible />
+
+Two choices carry the design.
+
+- **One collaboration server owns each active document.** All its editors connect to that server. It gives every operation a **sequence number**, so there is one agreed order. How a document finds its server is routing by a hash of the document id (lesson [4.8](/learn/04-data/consistent-hashing/)).
+- **Edits are operations, not whole documents.** An operation is a small change: "insert X at position 1", "delete the character at position 2". Small changes can be merged. Whole texts cannot.
+
+## Numbers
+
+Our assumptions: 10M open connections at peak, 50,000 connections per collaboration server, 10% of users typing at any moment, and 3 operations per second from a typing user (the client batches keystrokes).
+
+| Quantity | Math | Result |
+|---|---|---|
+| Collaboration servers | 10M / 50,000 | 200 |
+| Typing users | 10M x 10% | 1M |
+| Operations in | 1M x 3 per second | 3M per second |
+| Per server | 3M / 200 | 15,000 per second |
+| Log per editor-hour | 3 x 3,600 s x 50 B | 540 KB |
+
+The 50,000 connections per server is an assumption. Measure it for your own stack. The point of the math is the shape. The load splits cleanly by document, because one document never needs two servers. So you scale by adding servers.
+
+<Ballpark
+  client:visible
+  title="Sizing the collaboration tier"
+  scenario="Assume 10M open WebSocket connections at peak and 50,000 connections per server. 10% of users are typing, each sending 3 operations per second. One operation is 50 bytes."
+  steps={[
+    {
+      prompt: 'How many collaboration servers do we need for the connections?',
+      unit: 'servers',
+      answer: 200,
+      within: 1.3,
+      explain: '10,000,000 / 50,000 = 200 servers. Add some spare for failover.',
+    },
+    {
+      prompt: 'How many operations per second arrive across the system?',
+      unit: 'ops per second',
+      answer: 3_000_000,
+      within: 1.3,
+      explain: '10% of 10M = 1M typing users. 1M x 3 = 3M operations per second.',
+    },
+    {
+      prompt: 'How many KB of operation log does one editor create in one hour of typing?',
+      unit: 'KB',
+      answer: 540,
+      within: 1.3,
+      explain: '3 operations x 3,600 seconds = 10,800 operations. 10,800 x 50 B = 540,000 B, or 540 KB.',
+    },
+  ]}
+/>
+
+## Deep dive: merging concurrent edits
+
+Look at the failure first. The naive design has each editor send its whole text and keeps the last arrival. Switch to the second design to see the fix, and step through both.
+
+<DocsMerge client:visible />
+
+### Operational transform, by hand
+
+**Operational transform** (OT) changes an incoming operation so that it still means the same thing after other operations have been applied. The server holds the order. Each operation is transformed against the operations that came before it and that its author had not seen.
+
+Work the example. The text is `ABC`. Positions count from 0: A is 0, B is 1, C is 2.
+
+| Step | Alice | Bob | Server |
+|---|---|---|---|
+| Start | ABC | ABC | ABC |
+| Each edits | `insert(1, "X")` gives AXBC | `delete(2)` gives AB | ABC |
+| Server takes Alice first | | | AXBC |
+| Transform Bob against Alice | | `delete(2)` becomes `delete(3)` | |
+| Server applies Bob | | | AXB |
+| Alice receives `delete(3)` | AXBC becomes AXB | | |
+| Bob receives `insert(1, "X")` | | AB becomes AXB | |
+
+Why did `delete(2)` become `delete(3)`? Alice's insert went in at position 1, before position 2. Everything at position 1 or after moved one place right. Bob's C moved from 2 to 3. The transform rule for this pair: if the insert position is at or before the delete position, add 1 to the delete position.
+
+Why does Bob's side keep `insert(1, "X")` unchanged? Bob's delete was at position 2, after position 1, so it does not move the insert.
+
+Try the wrong way to see the point. If the server applied `delete(2)` to `AXBC` without the transform, it would delete B and give `AXC`. Alice's screen and the server would disagree with Bob's.
+
+Two inserts at the same position are a tie. The rule is to break it the same way everywhere, for example by client id, so every copy picks the same order.
+
+### CRDT, the other way
+
+A **CRDT** (conflict-free replicated data type) builds the merge into the data. For text, every character gets a unique id, for example a pair of client id and a counter. An insert says "put this new character after the character with id *(A, 4)*", not "at position 1". A delete marks the character as deleted, with a **tombstone**, and does not remove it. Since each operation names its neighbor by id, the operations can be applied in any order and every copy ends the same. This property is called **commutative**.
+
+The cost is metadata. Each character carries an id, and tombstones stay until a cleanup. The gain is that no central server needs to order the edits, so replicas can merge while offline.
+
+| | OT | CRDT |
+|---|---|---|
+| How edits are placed | By position, then transformed | By unique ids of neighbors |
+| Needs a server to order | Yes, in the classic design | No. Any order works |
+| Extra data | Small | An id per character, tombstones |
+| Hard part | Transform rules for every pair of operation types | Memory growth and cleanup |
+| Offline editing | Harder | Natural |
+
+Neither one removes the need for a server. You still need storage, authentication, permissions, and fan-out. Do not say "CRDTs need no server". Figma's engineers wrote that they chose not to use OT, which they called the standard multiplayer algorithm popularized by apps like Google Docs. That is their claim and their reasons for their own problem. We cover their approach in the In the Wild module. In an interview, pick one, say why, and state its price.
+
+## Deep dive: one owner per document
+
+If two servers both accept operations for the same document, each makes its own order. The copies diverge. So one server must own a document at a time.
+
+Route by hash of document id (lesson [4.8](/learn/04-data/consistent-hashing/)), and record the owner with a lease in a coordination service such as ZooKeeper or etcd (lesson [8.8](/learn/08-technologies/zookeeper/)). When the owner dies, the lease expires and another server takes over. The new owner loads the latest snapshot, replays the log after it, and clients reconnect. A client reports the last sequence number it saw and resends operations that were never acknowledged. The server drops repeats by client id and operation number.
+
+The operation log is written before the server confirms. A server that confirms first and writes later loses confirmed edits when it crashes. The Diagnose below shows this.
+
+## Deep dive: cursors and presence
+
+Cursors change many times a second and nobody needs them after a restart. So:
+
+- Keep them in memory on the owning server. Do not write them to a database.
+- Throttle: a client sends a cursor update at most every 50 to 100 ms (our assumption).
+- Send them only to other sessions on that document.
+- Expire them. If no heartbeat arrives for about 30 seconds (assumption), drop the user.
+
+A cursor is a position, so it has the same problem as an edit. If Alice's cursor is at position 5 and Bob inserts 2 characters at position 1, Alice's cursor moves to 7. Transform cursors with the same rule as operations.
+
+## Deep dive: storage stays bounded
+
+An operation log grows forever. Replaying a year of edits to open a document would be slow. So a **snapshot job** saves the full text every N operations. Take N = 1,000 as an assumption.
+
+To open a document or recover, load the latest snapshot and replay at most about 1,000 operations. At 50 bytes each that is about 50 KB. To read an old version, take the nearest snapshot before it and replay up to that point. Old log entries before a kept snapshot can be trimmed or moved to cold storage (lesson [8.11](/learn/08-technologies/blob-storage/)), depending on how much history you promise.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| OT with a central server | Compact operations, simple ordering | Transform rules are hard to get right | You already run a central server |
+| CRDT | Any-order merge, offline editing | Metadata and tombstones | Offline or peer-to-peer matters |
+| One owner per document | One order, simple merge | Failover and routing work | Always |
+| Cursors in memory | No database load | Lost on restart, which is fine | Always |
+| Snapshot every N operations | Bounded replay and storage | A background job | Long documents |
+| Whole-document last write wins | Trivial | Edits are lost | Never for co-editing |
+
+<Callout type="tip">
+Give the merge as a tiny example: "Alice inserts at 1, Bob deletes at 2, so Bob's delete becomes position 3." One worked example shows more understanding than a page of definitions. Then name the price of your pick: OT needs a central order, a CRDT carries an id per character.
+</Callout>
+
+<Callout type="mistake">
+Do not say "lock the paragraph" or "last write wins". The first blocks people from editing. The second drops edits. Also do not write every cursor move to the database.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'The text is CAT. Bob deletes position 0 (the C). At the same moment Alice appends S with insert(3, "S"). The server applies Bob first. What is Alice\'s insert after the transform?',
+      options: [
+        'insert(3, "S"), because her operation was valid when she made it',
+        'insert(2, "S"), because later text moved one place left',
+        'insert(4, "S"), because the delete made the text one longer',
+        'insert(0, "S"), because the delete happened at the start of the text',
+      ],
+      answer: 1,
+      explain: 'Bob removed one character before Alice\'s position, so all later characters shifted left. Position 3 becomes 2. The text AT becomes ATS. Applying insert(3) to AT would be past its end.',
+    },
+    {
+      q: 'Alice\'s cursor is at position 5 in a shared text. Bob inserts 2 characters at position 1. Where should Alice\'s cursor be afterward?',
+      options: [
+        'Position 5, because Alice herself did not type anything',
+        'Position 6, because Bob made a change in one place',
+        'Position 7, because 2 new characters came before it',
+        'Position 3, because the cursor follows the place of Bob\'s edit',
+      ],
+      answer: 2,
+      explain: 'A cursor is a position, so it moves with edits before it. Two characters inserted before position 5 push it to 7. This is the same rule that transforms an insert operation.',
+    },
+    {
+      q: 'Why are all editors of one document sent to the same collaboration server?',
+      options: [
+        'WebSocket connections cannot be shared across servers',
+        'One server per document keeps memory use lowest across the fleet',
+        'The database accepts writes for a document from one server only',
+        'One server gives every operation a single agreed order',
+      ],
+      answer: 3,
+      explain: 'Merging needs one order of operations. Two servers would each build their own order, and copies would diverge. The load still splits across documents, so the tier scales by adding servers.',
+    },
+    {
+      q: 'Which statement about a CRDT for text is correct?',
+      options: [
+        'Each character has a unique id, so edits merge in any order, with more metadata',
+        'Edits are placed by position, so a server must transform each one before use',
+        'It needs no storage, authentication, or server, because peers merge among themselves',
+        'It stores only the final text, so the history of edits cannot be rebuilt later',
+      ],
+      answer: 0,
+      explain: 'The unique ids make the merge order-independent, and the ids plus tombstones are the cost. Position-based transforms describe OT. A real product still needs storage, auth, and fan-out.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="google-docs-lost-confirmed-edits"
+  title="Confirmed edits vanished after a deploy"
+  scenario="Collaboration server collab-3 was restarted during a deploy. When clients reconnected, some users found that text they had typed a few seconds earlier, and had seen confirmed, was gone."
+  facts={[
+    'time      event',
+    '12:00:00  collab-3 restarted',
+    '12:00:04  new owner loads snapshot v812 and log to seq 5,140',
+    '12:00:04  clients had seen confirmations up to seq 5,163',
+    'config:   log flush every 5 s; server acks each op on receipt',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The server confirmed operations before they were stored, so the last 23 were lost in the restart',
+        'The snapshot v812 was corrupt, so the new owner started from an old text',
+        'Clients sent operations in the wrong order after they reconnected',
+        'The transform step changed the position of the lost operations to zero',
+      ],
+      answer: 0,
+      explain: 'Clients saw seq 5,163 but the log ends at 5,140. That is 23 operations that were confirmed and never written. The flush runs every 5 seconds and the ack came on receipt. The snapshot is older than the log, so it is not the problem.',
+    },
+    {
+      prompt: 'Which change fixes it?',
+      options: [
+        'Append to the durable log before the ack. Clients resend unconfirmed operations and the server drops repeats',
+        'Flush the log every second instead of every five seconds, and keep confirming each operation on receipt',
+        'Make clients wait for the next snapshot to be taken before they show any edit as saved to the user',
+        'Keep operations in memory on two servers, and confirm to the client as soon as either one has them',
+      ],
+      answer: 0,
+      explain: 'Confirm only what is stored. A shorter flush interval shrinks the loss window but does not close it. Waiting for snapshots is slow. Memory on two servers can still be lost together. Resend plus dedupe covers operations that were in flight when the server died.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Figma: How Figma\'s multiplayer technology works](https://www.figma.com/blog/how-figmas-multiplayer-technology-works/) (a company that chose not to use OT, with its reasons)
+- [crdt.tech](https://crdt.tech) (an overview of CRDTs, with papers and implementations)
+- [Wikipedia: Operational transformation](https://en.wikipedia.org/wiki/Operational_transformation) (the history of OT and its transform properties)

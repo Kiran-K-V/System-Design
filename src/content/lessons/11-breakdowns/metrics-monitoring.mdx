@@ -1,0 +1,240 @@
+---
+summary: 'A metrics system pulls millions of points a second into a time-series store, rolls old data up so long graphs stay fast, caps label cardinality, and evaluates alert rules with a pending window.'
+requires: ['07-reliability/observability', '06-async/pubsub-logs', '10-advanced/time-series']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import MetricsBuild from '../../../components/anim/lessons/MetricsBuild.tsx';
+import MetricsRollup from '../../../components/anim/lessons/MetricsRollup.tsx';
+
+Every large company runs a system that answers one question: is everything healthy right now? Lesson [7.5](/learn/07-reliability/observability/) explained what to measure and how to alert on it. This lesson builds the system that stores the measurements. The new ideas are four: a very high write rate, pull versus push, rollups with retention, and a limit on label cardinality.
+
+## Requirements
+
+**Functional.** The system must:
+
+1. Ingest metrics (CPU, memory, latency, custom counters) from services.
+2. Let people query and graph metrics with filters, aggregation, and time ranges.
+3. Evaluate alert rules, such as "p99 latency above 500 ms for 5 minutes".
+4. Send alerts to email, Slack, or a pager.
+
+**Below the line.** Log search, distributed tracing, and anomaly detection by machine learning. They are different systems with different storage. Say so and move on.
+
+**Non-functional.** These numbers are my assumptions for a very large fleet, not data from a company.
+
+- 500,000 servers. Each exposes 100 series. Each series gives one point every 10 seconds.
+- Dashboards return in seconds, even for weeks of data.
+- An alert condition reaches the evaluator within 1 minute of the event.
+- Alerts are reliable. Dashboards may be a few seconds stale.
+
+## Core entities
+
+- **Series.** One metric name plus one set of labels, for example `cpu_seconds{host="a1", region="eu"}`.
+- **Sample.** A timestamp and a number, belonging to one series.
+- **Rollup.** Min, max, sum, and count of one series over one time window.
+- **Alert rule.** An expression, a `for` duration, a severity, and a route.
+- **Alert instance.** One rule firing for one label set, in state inactive, pending, or firing.
+
+## API
+
+- `GET /metrics` on every service. The collector calls it. This is the pull path.
+- `POST /v1/write` on a push gateway, for jobs too short to be scraped.
+- `GET /v1/query?expr=...&start=...&end=...&step=...` for dashboards.
+- `POST /v1/rules` and `GET /v1/alerts` for alert rules and their state.
+
+## High-level design
+
+Step through the build. Each step names the requirement it serves.
+
+<MetricsBuild client:visible />
+
+### Pull or push
+
+The collector in step 1 pulls. Prometheus works this way: its overview says time series collection "happens via a pull model over HTTP". Its FAQ lists the gains: you can reliably tell when a target is down, you can open a target in a browser to see its health, and you can start a second collector on a laptop. The FAQ's own verdict is mild: pulling is "slightly better" and "should not be considered a major point". That is the project's opinion, so repeat it as an opinion.
+
+The strongest gain is the down signal. A scrape that fails is data. With push, silence is ambiguous: the service may be dead, or the network may be cut, or the service may have nothing to say.
+
+Push still has a place. A batch job may live for only 5 seconds, so no scrape will catch it. Prometheus offers the Pushgateway for the outcome of such jobs, and its own docs warn about three costs. The gateway becomes a single point of failure. You lose the automatic `up` health signal. And it keeps old series forever, until someone deletes them.
+
+## Deep dives
+
+### Slow long-range queries
+
+A dashboard panel asks for average CPU of 1,000 servers over 30 days, one dot per hour. Toggle the two designs and step through.
+
+<MetricsRollup client:visible />
+
+The fix is the one that lesson [10.2](/learn/10-advanced/time-series/) described for time series: write coarser copies of old data. The query service picks the coarsest resolution that still gives the step the user asked for. Prometheus has a related tool, recording rules. They "precompute frequently needed or computationally expensive expressions" and save the result as new series. That is the same trade: do the work once, at write time.
+
+Keep min, max, sum, and count in each rollup, not only the average. The average hides a 30-second spike. Sum and count let you combine windows correctly.
+
+Retention follows the same logic. A plan, as an assumption: raw points for 15 days, 1-minute rollups for 90 days, 1-hour rollups for 2 years. Old data is not read often, and its detail matters less. For reference, Prometheus keeps raw samples for 15 days by default.
+
+### Absorbing 5 million points a second
+
+The rate is 500,000 servers x 100 series / 10 s = 5,000,000 points per second. A single database node cannot take it. The design has three parts.
+
+- **Many collectors.** Each owns a slice of the targets. A target is assigned by hashing its name, so a collector that dies hands its slice to the others (lesson [4.8](/learn/04-data/consistent-hashing/)).
+- **A buffer.** Collectors write batches to a log (lesson [6.2](/learn/06-async/pubsub-logs/)). Writes to the store come from the log at the store's pace. A short spike becomes lag, not loss.
+- **A partitioned store.** Partition by a hash of the series, so one series always lands on one node, and by time, so old partitions can be dropped or rolled up as a unit (lesson [4.7](/learn/04-data/sharding/)).
+
+Series are replicated for safety (lesson [4.6](/learn/04-data/replication/)). A metric point is cheap to lose. A lost alert is not. So metrics may use a weaker replication than the alert path.
+
+### Alert evaluation
+
+An alert rule has two timers that people confuse. The **evaluation interval** is how often the rule runs, for example every 15 seconds. The **`for` duration** is how long the condition must stay true before the alert fires. Prometheus puts an active alert that has not yet lasted that long in the **pending** state.
+
+The `for` window stops flapping. Without it, one slow request at 500.1 ms would page someone. With `for: 5m`, the condition must hold at every evaluation for 5 minutes.
+
+The 1-minute target in our requirements is the delay before the evaluator sees the data. It is not the `for` window. Budget it: 10 s scrape interval, a few seconds in the buffer and the write, and up to 15 s until the next evaluation. About 30 seconds worst case, inside the minute.
+
+Two failures matter here.
+
+- **One evaluator dies.** Its alerts go quiet, and nobody notices. Run evaluators as a pair that both evaluate every rule, and let the alert manager remove duplicates. A silent monitoring system is worse than a loud one.
+- **Rules are expensive.** Evaluating every rule against raw history every few seconds does not scale. Have rules read recent data only, from the store's hot tier or straight off the buffer. Pre-aggregate expensive expressions with recording rules.
+
+### Cardinality
+
+The number of series is the cost driver. It is the product of the label values. A counter with 20 routes, 4 status codes, and 100 hosts has up to 20 x 4 x 100 = 8,000 series. Add a `customer_id` label with 50,000 values, and the bound becomes 8,000 x 50,000 = 400 million.
+
+Each series costs memory in the ingester and an entry in the index. A single careless label can double the bill or crash the store. The Prometheus instrumentation guide advises keeping metric cardinality below 10 for most metrics, and treating anything over 100 as a reason to rethink.
+
+The control belongs at ingest. The collector counts the series each service owns, and drops new ones past a limit. It reports the drop as a metric of its own. The owning team gets paged about its own label, not the whole company about the store.
+
+## Numbers
+
+Treat every figure here as a worked assumption. Work the next steps yourself.
+
+<Ballpark
+  client:visible
+  title="Size the ingest"
+  scenario="500,000 servers. Each exposes 100 series. The collector scrapes every 10 seconds."
+  facts={['One point = 8 bytes timestamp + 8 bytes value, before compression', 'After compression, assume 2 bytes per point (Prometheus documents 1 to 2)']}
+  steps={[
+    { prompt: 'How many points arrive per second?', unit: 'points/s', answer: 5000000, within: 1.1, explain: '500,000 x 100 = 50 million series. One point each per 10 seconds is 5 million points per second.' },
+    { prompt: 'How many GB per day after compression, at 2 bytes per point?', unit: 'GB/day', answer: 864, within: 1.2, explain: '5,000,000 x 86,400 s = 432 billion points. At 2 bytes that is 864 billion bytes, about 864 GB. Uncompressed at 16 bytes it would be 6.9 TB.' },
+    { prompt: 'One series makes 8,640 raw points a day. An hourly rollup keeps 4 values (min, max, sum, count) per hour. How many times fewer values is the rollup?', unit: 'x', answer: 90, within: 1.1, explain: 'The rollup has 24 x 4 = 96 values a day. 8,640 / 96 = 90. A 1-minute rollup with 4 values would give 1,440 x 4 = 5,760 values: not much saving. That is why the long tier uses hours.' },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Pull (scrape) | A free "target down" signal. Central control of rate and targets | Collectors must reach every target. Short jobs slip through | Long-running services in one network |
+| Push | Works for short jobs and across firewalls | Silence is ambiguous. A gateway can bottleneck | Batch jobs, edge devices |
+| Rollups | Fast long graphs, cheap storage | Old data loses detail | Any retention over a few days |
+| Label limits | Bounded memory and cost | Some series are dropped | Always, at ingest |
+| Long `for` window | Fewer false pages | Slower alert | Noisy signals. Use a short window for hard outages |
+
+<Callout type="tip">
+Name the two rates first: "5 million points a second in, a few thousand queries a second out." Then say why the design is split: writes go through a buffer into a partitioned store, reads go through a query service that picks a rollup. Finish with the alert path as its own small system with a pair of evaluators.
+</Callout>
+
+<Callout type="mistake">
+Do not say "pull is always better". Short jobs need push. Do not keep all data at full resolution forever, and do not alert on one sample over a threshold. Do not forget cardinality: an interviewer who asks "what if a team adds a user id label?" is checking exactly that.
+</Callout>
+
+<Callout type="deep" title="Why not a plain SQL table?">
+A row per sample works at small scale, with an index on series and time. It fails for three reasons. Each row carries overhead that dwarfs the 16 bytes of payload. A time-ordered index on a table that takes millions of inserts a second is expensive to maintain. And dropping old data means deleting rows, not dropping a partition. Time-series stores keep points in time-ordered blocks with compressed deltas, so a series costs a couple of bytes per point and expiry is cheap.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A scrape-based collector gets no answer from a payment service for 3 intervals. What does the collector know that a push-based gateway would not?',
+      options: [
+        'The payment service is only slow, because slow services stop answering sometimes',
+        'The payment service sent bad data, which is the reason the scrape failed',
+        'The target is down: the scrape itself failed',
+        'The payment service has no traffic, so there is nothing new to report',
+      ],
+      answer: 2,
+      explain: 'A failed scrape is a fact the collector observed. With push, the same silence could mean a dead service, a cut network, or an idle service. That is the main reason pull is popular for long-running services.',
+    },
+    {
+      q: 'An alert rule is "p99 above 500 ms, for 5 minutes", evaluated every 15 seconds. The p99 is 600 ms for 4 minutes and then drops to 400 ms. What happens?',
+      options: [
+        'The alert fires after 5 minutes, because it was active at some point earlier',
+        'The alert fires at once, because 600 ms is above the threshold of 500',
+        'It stays pending, never fires, and goes inactive',
+        'The alert fires after 4 minutes, once the rule has run 16 times in a row',
+      ],
+      answer: 2,
+      explain: 'The condition must hold at every evaluation for the full 5 minutes. It held for 4, so the rule sat in the pending state and went back to inactive. This is what stops short spikes from paging anyone.',
+    },
+    {
+      q: 'A 90-day graph with one dot per day is slow. Raw points arrive every 10 seconds and a 1-hour rollup exists. Which read is best?',
+      options: [
+        'Read all the raw points and average them in the dashboard code',
+        'Read the hour rollup, 24 hours per dot',
+        'Add more query servers so that the raw scan finishes much sooner',
+        'Cache the raw points in the browser for the next view of the graph',
+      ],
+      answer: 1,
+      explain: 'The query needs one dot per day, so hourly detail is already finer than needed. 90 x 24 = 2,160 rollup points per series replace 777,600 raw ones. More servers still read all the raw data, and the browser cannot cache what it has never loaded.',
+    },
+    {
+      q: 'A counter has 20 routes, 4 status codes, and 100 hosts. A deploy adds a customer_id label with 50,000 values. What is the upper bound on series for this one counter?',
+      options: [
+        'About 8,000, because labels do not multiply',
+        'About 50,100, because the new label adds its values',
+        'About 400 million, because label values multiply',
+        'About 200 thousand, because only busy hosts count',
+      ],
+      answer: 2,
+      explain: 'Series count is the product of label values: 20 x 4 x 100 x 50,000 = 400 million. Not every combination occurs, so real counts are lower, but the bound shows the danger. This is why the collector caps series per service.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="metrics-monitoring-series-jump"
+  title="Ingesters run out of memory"
+  scenario="After a Tuesday deploy, the ingester nodes climb in memory and one restarts every few hours. Dashboards still load, but writes lag."
+  facts={[
+    'time     active series   ingest lag',
+    'Mon 17h  50,000,000      2 s',
+    'Tue 10h  50,400,000      2 s',
+    'Tue 11h  71,000,000      40 s',
+    'Tue 14h  96,000,000      9 min',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The collector scrape interval was shortened, which doubles the data',
+        'A service started attaching an unbounded value, such as a user id, as a label',
+        'The rollup job fell behind, so raw data piled up in memory',
+        'Dashboard users sent more queries, which filled the ingesters',
+      ],
+      answer: 1,
+      explain: 'The series count rose by 46 million in 4 hours, while the rate of points per series did not change. Rate changes would move points per second, not the series count. New series appear when new label values appear. Queries do not create series.',
+    },
+    {
+      prompt: 'What is the right fix, in order?',
+      options: [
+        'Add ingesters now, then find the label later during the next incident',
+        'Raise the ingester memory limit so restarts stop',
+        'Delete the oldest raw data to free memory, and wait for the next deploy',
+        'Drop the label at the collector, add a per-service series limit, and tell the owning team',
+      ],
+      answer: 3,
+      explain: 'Dropping the label stops the growth. The per-service limit stops the next one. Telling the owner fixes the code. More memory only delays the failure, and deleting old data does not touch the live series.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Prometheus overview](https://prometheus.io/docs/introduction/overview/): the pull model and the data model.
+- [Prometheus FAQ](https://prometheus.io/docs/introduction/faq/): why pull, and when to use the Pushgateway.
+- [Prometheus alerting rules](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/): the `for` clause and the pending state.
+- [Prometheus instrumentation practices](https://prometheus.io/docs/practices/instrumentation/): the guidance on label cardinality.

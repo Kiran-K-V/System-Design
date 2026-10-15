@@ -1,0 +1,169 @@
+---
+summary: 'Discord stored chat in MongoDB, moved to Cassandra in 2017, then to ScyllaDB behind Rust data services in 2022. Here is what each step fixed and what it cost.'
+requires: ['08-technologies/cassandra', '05-caching/invalidation-stampede', '04-data/sharding']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import DiscordCompare from '../../../components/anim/lessons/DiscordCompare.tsx';
+import DiscordBucket from '../../../components/anim/lessons/DiscordBucket.tsx';
+
+This lesson reads two engineering posts from Discord. The first is from 2017. The second is from 2023. We separate **what Discord says** from **our reading**. The posts give facts about one company. They do not prove a rule for every company.
+
+## The problem
+
+A chat product stores every message and reads the latest ones all day. Reads and writes arrive in about equal numbers. Each read asks for the recent messages of one channel. Storage grows without end.
+
+Discord's 2017 post gives the starting point. Around November 2015 the service reached 100 million stored messages. The post says "the data and the index could no longer fit in RAM and latencies started to become unpredictable." It adds that reads were "extremely random" and the read/write ratio was about 50/50.
+
+## Before: MongoDB, then Cassandra
+
+**What Discord says (2017).** Messages sat in one MongoDB collection with one compound index on channel and creation time. Once the index left RAM, reads went to disk. The post gives an example: returning 50 messages can cause "many random seeks on disk causing disk cache evictions". The team listed its needs and states that "Cassandra was the only database that fulfilled all of our requirements."
+
+The new key followed the read pattern (lesson [4.7](/learn/04-data/sharding/) on choosing a shard key). The channel became the partition key, "since all queries operate on a channel". Message IDs are Snowflakes, which sort by time, so they became the clustering key. Cassandra's storage model is in lesson [8.3](/learn/08-technologies/cassandra/).
+
+Pure channel partitions can grow without limit. So Discord added a time bucket to the partition key. The post says about 10 days of messages fit in a bucket the team "could comfortably stay under 100MB". Play with the idea below. The message sizes are our assumption, not Discord's data.
+
+<DiscordBucket client:visible />
+
+The 2017 numbers: a 12 node cluster with a replica factor of 3, nearly 1 TB of compressed data per node, writes under a millisecond and reads under 5 ms.
+
+**What Discord says (2023).** By the start of 2022 the cluster had 177 nodes and trillions of messages. The post calls it "a high-toil system". The on-call team was "frequently paged", and latency was unpredictable. Three causes are named:
+
+- **Hot partitions.** "Lots of concurrent reads" on one channel could hotspot a partition. The post says a hot partition "frequently affected latency across our entire database cluster".
+- **Garbage collection pauses.** Cassandra runs on the JVM. "GC pauses would cause significant latency spikes."
+- **Compaction debt.** Operators did the "gossip dance": take a node out of rotation so it can compact without taking traffic.
+
+## After: ScyllaDB and data services
+
+<DiscordCompare client:visible />
+
+**What Discord says.** Two changes happened together.
+
+1. The database became ScyllaDB, "a Cassandra-compatible database written in C++". It has no garbage collector. The post reports 72 ScyllaDB nodes instead of 177 Cassandra nodes, and 9 TB of disk per node, up from an average of 4 TB.
+2. A new layer of **data services**, written in Rust, sits between the API monolith and the database. "The big feature our data services provide is request coalescing." If many users ask for the same row at the same moment, "we'll only query the database once." Requests are routed by consistent hashing (lesson [4.8](/learn/04-data/consistent-hashing/)), so all requests for one channel reach one instance. That makes coalescing work.
+
+Reported results: fetching historical messages went from a p99 of 40 to 125 ms to 15 ms. Message inserts went from 5 to 70 ms p99 to a steady 5 ms. The cutover was in May 2022. Moving the data ran at up to 3.2 million messages per second. A first estimate of three months dropped to nine days after the team rewrote its migration tool in Rust.
+
+<Callout type="deep" title="Our reading">
+Coalescing is the same idea as the request collapsing that protects a cache from a stampede (lesson [5.5](/learn/05-caching/invalidation-stampede/)). Here it protects the database itself.
+
+The post does not split the gain between ScyllaDB and the data services. Do not credit one with the other's result.
+
+Raw disk did not shrink much. 177 nodes at about 4 TB is roughly 708 TB. 72 nodes at 9 TB is roughly 648 TB. The saving is fewer machines to run, and no JVM pauses. The numbers come from the post. The sums are ours.
+</Callout>
+
+## Where it maps to earlier lessons
+
+| Idea in the story | Lesson |
+|---|---|
+| Partition key from the read pattern, bounded by a time bucket | [4.7 Sharding](/learn/04-data/sharding/), [8.3 Cassandra](/learn/08-technologies/cassandra/) |
+| Compaction and tombstones cost I/O | [8.3 Cassandra](/learn/08-technologies/cassandra/) |
+| One channel to one instance | [4.8 Consistent Hashing](/learn/04-data/consistent-hashing/) |
+| One query for many identical requests | [5.5 Invalidation and Stampede](/learn/05-caching/invalidation-stampede/) |
+
+## Trade-offs
+
+| Choice | Gain | Cost |
+|---|---|---|
+| Time bucket in the key | Bounded partition size | A read that crosses buckets does more than one query |
+| Data services layer | Coalescing, one place to own queries | One more hop and one more service to run |
+| Routing by channel | Same-row requests meet at one instance | A very hot channel concentrates on one instance |
+| ScyllaDB in place of Cassandra | No GC, fewer nodes | A large migration project |
+
+## Interview takeaways
+
+<Callout type="tip">
+Say: "I would partition by channel plus a time bucket, so a read touches one partition and no partition grows forever." Then name the hot channel problem, and answer it: "coalesce identical reads in a service layer and route by channel."
+</Callout>
+
+<Callout type="mistake">
+Do not say "ScyllaDB is faster because it is written in Rust". The post says C++. Rust is the data services layer. Do not say "Cassandra is wrong for chat". The 2017 choice fitted the access pattern. The 2023 move fixed operating pain at a far larger scale.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In Discord\'s 2017 Cassandra design, why does the partition key include a time bucket and not only the channel?',
+      options: [
+        'It stops an old channel growing into one huge partition',
+        'It lets every message in a channel share one single clustering value',
+        'It makes Cassandra sort messages in the order that users sent them',
+        'It spreads each message to a random node, so write load stays even',
+      ],
+      answer: 0,
+      explain: 'A partition lives on one set of replicas and is read as a unit. Without a bucket, a channel that lives for years would grow without bound. The Snowflake message ID already sorts messages, so sorting is not the reason.',
+    },
+    {
+      q: 'Five users load the same channel at once. What does the Rust data service do before it queries the database?',
+      options: [
+        'It sends five queries in parallel so that the page finishes faster',
+        'It keeps one query in flight for that row and shares the answer',
+        'It rejects four of the requests and asks those clients to retry later',
+        'It caches the row for a whole day and then skips the database',
+      ],
+      answer: 1,
+      explain: 'Request coalescing means one database query per row at a time. The other callers wait for that answer. Consistent hash routing by channel makes sure all five requests reach the same instance, so they can meet.',
+    },
+    {
+      q: 'A teammate says the 2022 move to ScyllaDB cut p99 fetch latency from 40 to 125 ms to 15 ms, so ScyllaDB alone explains it. What is the best reply?',
+      options: [
+        'Correct, because the post measured only the database change alone',
+        'Correct, because a C++ engine always beats a JVM engine',
+        'Wrong, because the post says Cassandra was never slow at all',
+        'Not proven: the data services layer changed in the same project',
+      ],
+      answer: 3,
+      explain: 'Discord shipped ScyllaDB and the coalescing data services together. The post reports one combined result and does not split the gain. Claiming a single cause goes beyond what the evidence supports.',
+    },
+    {
+      q: 'Which problem from the 2023 post would a second, bigger Cassandra cluster NOT fix by itself?',
+      options: [
+        'One hot partition slowing queries across the whole cluster',
+        'A cluster that is running out of disk space for new messages',
+        'A cluster whose nodes hold too much data for one machine',
+        'A write rate higher than the cluster can currently absorb',
+      ],
+      answer: 0,
+      explain: 'More nodes add disk and write capacity. A hot partition is one key getting too many concurrent reads, so the load stays on the same replicas. Coalescing and routing address that directly.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="What did the node count save?"
+  scenario="Discord's 2023 post reports 177 Cassandra nodes at an average of 4 TB each, and 72 ScyllaDB nodes at 9 TB each."
+  steps={[
+    {
+      prompt: 'About how much raw disk did the Cassandra cluster have?',
+      unit: 'TB',
+      answer: 708,
+      within: 1.1,
+      explain: '177 nodes times 4 TB is 708 TB.',
+    },
+    {
+      prompt: 'About how much raw disk does the ScyllaDB cluster have?',
+      unit: 'TB',
+      answer: 648,
+      within: 1.1,
+      explain: '72 nodes times 9 TB is 648 TB. Raw disk is close to the old figure. The gain is machines, not terabytes.',
+    },
+    {
+      prompt: 'About how many Cassandra nodes did each ScyllaDB node replace?',
+      unit: 'nodes',
+      answer: 2.46,
+      within: 1.1,
+      explain: '177 divided by 72 is about 2.5. Fewer nodes means fewer machines to patch, repair, and watch.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [How Discord Stores Billions of Messages (2017)](https://discord.com/blog/how-discord-stores-billions-of-messages)
+- [How Discord Stores Trillions of Messages (2023)](https://discord.com/blog/how-discord-stores-trillions-of-messages)

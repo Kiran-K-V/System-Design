@@ -1,0 +1,167 @@
+---
+summary: 'Shopify moved inventory reservations from Redis counters to a bounded pool of MySQL rows, so a reservation and the inventory ledger share one transaction.'
+requires: ['09-patterns/contention', '04-data/transactions', '08-technologies/redis']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import ShopifyCompare from '../../../components/anim/lessons/ShopifyCompare.tsx';
+import ShopifyRows from '../../../components/anim/lessons/ShopifyRows.tsx';
+
+The main source is Shopify's engineering post "We replaced Redis with MySQL for inventory reservations—and it scaled" (May 12, 2026). Two older posts add context on isolation by pod and on moving shops between shards. **What Shopify says** and **our reading** are kept apart.
+
+## The problem
+
+At checkout the shop holds a unit for a buyer for a short time, "several minutes" in the post. Two buyers must never get the last unit. During a flash sale many buyers ask for the same item together, so one item becomes a hot spot (lesson [9.4](/learn/09-patterns/contention/)).
+
+Shopify gives its scale as context. It says it handled a record $5.1 million in sales per minute at peak on Black Friday 2025. That is a company claim. The post gives no reservation rate.
+
+## Before: a Redis counter beside a ledger
+
+**What Shopify says.** Each item had a quantity key in Redis. "Reserving meant `DECR`, releasing meant `INCR`." Redis "handled concurrency fine". The trouble was elsewhere. Claiming a unit at purchase had to update MySQL and clean up Redis, and "those two operations couldn't be wrapped in a single atomic step". Redis also "had no multi-location awareness" and it was a separate cluster to run.
+
+**Our reading.** Redis `DECR` is atomic by itself (lesson [8.2](/learn/08-technologies/redis/)). The risk was the gap between two stores. If a process dies between the MySQL update and the Redis cleanup, the two disagree. The post names the lack of atomicity. It does not describe specific oversell incidents.
+
+## After: rows in a bounded pool
+
+<ShopifyCompare client:visible />
+
+**What Shopify says.** Instead of one row per item with a quantity column, the design uses "one row per sellable unit". A full row per unit would not scale: "an item with 50,000 units across 10 locations would mean 500,000 rows". So Shopify keeps "a bounded pool of available rows, capped at 1,000 per item/location combination". A replenishment process refills the pool from the inventory ledger.
+
+Reserving locks rows with `SKIP LOCKED`. "If another transaction has locked some rows, MySQL skips them and returns other available rows." Buyers do not queue behind one hot row. If the pool is empty, the reserve path triggers a refill inline, and a lock lets "only one transaction replenish at a time".
+
+The reservation and the ledger sit in one database, so one ACID transaction covers both (lesson [4.4](/learn/04-data/transactions/)). The post also moved to a composite primary key, because it saw "two row locks per reservation instead of one". The cap was sized from "observed peak reservation rates per item/location during flash sales".
+
+Try the row arithmetic. It follows the post's sums: units per location times locations.
+
+<ShopifyRows client:visible />
+
+**Rollout, per the post.** Shadow mode first: every reservation was written to both stores with Redis as the source of truth. Then MySQL became the source, with a kill switch to go back to Redis while dual writes still ran. The rollout went pod by pod, "starting with low-traffic pods and working up".
+
+**Results, per the post.** Cleaning up the checkout path "removed 50% of reads and 33% of transactions on the primary database". During high-volume flash sales, "writer CPU stayed under 50% and reader CPU under 16%". Reservation latency "(e.g. P90) was acceptable". The post gives no latency numbers.
+
+## The pod context
+
+Shopify's 2018 post defines a pod as "a set of shops that live on a fully isolated set of datastores". A flash sale on one merchant can overload that merchant's pod. Shopify's 2021 post describes moving shops between shards to rebalance. It reports that the busiest and least busy shard differed "by almost four times" and expected "closer to two times" after simulated moves. Cutover happens in "on the order of seconds".
+
+<Callout type="deep" title="Our reading">
+The cap trades row count for refill work. A smaller pool means fewer rows to scan and more refills. A hot item still refills through one transaction at a time. That is a serial step under heavy demand. The post gives no refill timing, so we cannot say how close it comes to a limit.
+
+The inventory post does not say how reservations move when a shop moves pods. Do not assume the two posts describe one mechanism.
+</Callout>
+
+## Where it maps to earlier lessons
+
+| Idea in the story | Lesson |
+|---|---|
+| Hot row under many writers | [9.4 Dealing with Contention](/learn/09-patterns/contention/) |
+| Reserve and ledger in one transaction | [4.4 Transactions and Isolation](/learn/04-data/transactions/) |
+| Redis counters and their limits | [8.2 Redis](/learn/08-technologies/redis/) |
+| Isolating tenants into pods, moving a hot shard | [4.7 Sharding](/learn/04-data/sharding/) |
+
+## Trade-offs
+
+| Choice | Gain | Cost |
+|---|---|---|
+| Counter in Redis | Fast, simple | Second store, so no single atomic claim with the ledger |
+| Row per unit in MySQL | One transaction with the ledger, no hot counter | More rows, more storage |
+| Capped pool | Bounded rows and a fast scan | Refill logic, and a serial refill when empty |
+| Dual-write rollout with a kill switch | Safe, reversible migration | Extra writes while both stores run |
+
+## Interview takeaways
+
+<Callout type="tip">
+For a limited-stock problem, say: "Model stock so the database enforces it. Put the reservation and the ledger in one transaction. For a hot item, use one row per unit, skip locked rows, and bound the hot pool." Then add the rollout: "shadow write first, then switch with a kill switch."
+</Callout>
+
+<Callout type="mistake">
+Do not say "Redis DECR is atomic, so there is no overselling". The post's problem was the second store, not the counter. Do not say Shopify abandoned Redis everywhere. This post covers inventory reservations only.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'What did Shopify say made the Redis counter design hard to keep correct for inventory reservations?',
+      options: [
+        'Redis DECR was not atomic when two buyers sent it together at once',
+        'Redis could not store a separate key for each item and location',
+        'The MySQL update and Redis cleanup could not be one atomic step',
+        'Redis lost every reservation on each full restart of the whole cluster',
+      ],
+      answer: 2,
+      explain: 'The post says Redis handled concurrency fine. The gap was between two stores. A claim touched both, and no single transaction could cover them. Moving reservations into MySQL put both in one ACID transaction.',
+    },
+    {
+      q: 'Two buyers reserve the same item at the same moment. Buyer A holds a lock on row 17. What does SKIP LOCKED do for buyer B?',
+      options: [
+        'It makes B wait until A commits, and then gives B row 17 as well',
+        'It cancels A so that B can lock row 17 and finish first',
+        'It returns another available row, so B does not queue behind A',
+        'It fails B with an error so the client must retry at once',
+      ],
+      answer: 3,
+      explain: 'MySQL skips rows another transaction has locked and returns other available rows. That removes the queue on a single hot row. Waiting on row 17 is the default behavior that SKIP LOCKED avoids.',
+    },
+    {
+      q: 'Why does Shopify cap the pool of available rows at 1,000 per item and location, and not keep one row for every unit?',
+      options: [
+        'MySQL cannot store more than 1,000 rows for any one single item',
+        'It keeps the scan fast and bounds the number of rows',
+        'It stops any two buyers from ever reserving at the same moment',
+        'It lets Redis hold the rest of the stock for faster reads',
+      ],
+      answer: 1,
+      explain: 'The post says the pool must absorb bursts but stay small enough to keep the scan fast. Without the cap, 50,000 units over 10 locations would be 500,000 rows. The ledger keeps the rest of the stock.',
+    },
+    {
+      q: 'The post reports writer CPU under 50% during flash sales after the change. Which conclusion does that support?',
+      options: [
+        'The new design is faster than Redis at every single request',
+        'Reservations no longer need any row locks on the database',
+        'The primary had CPU headroom during those sales',
+        'Refills never wait for each other under any heavy demand',
+      ],
+      answer: 2,
+      explain: 'CPU under 50% shows headroom on the primary. It says nothing about speed against Redis, and it does not remove locks. The post also gives no refill timing, so it cannot support a claim about refill waits.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Why cap the pool"
+  scenario="An item has 50,000 units at each of 10 locations. The pool is capped at 1,000 rows per item and location."
+  steps={[
+    {
+      prompt: 'How many rows would a row-per-unit design need with no cap?',
+      unit: 'rows',
+      answer: 500000,
+      within: 1.1,
+      explain: '50,000 units times 10 locations is 500,000 rows. This matches the arithmetic in the post.',
+    },
+    {
+      prompt: 'How many rows does the capped pool hold at most?',
+      unit: 'rows',
+      answer: 10000,
+      within: 1.1,
+      explain: '1,000 rows times 10 locations is 10,000 rows.',
+    },
+    {
+      prompt: 'By what factor does the cap reduce the row count?',
+      unit: 'times',
+      answer: 50,
+      within: 1.1,
+      explain: '500,000 divided by 10,000 is 50. The ledger still holds the other units, and the pool refills from it.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [We replaced Redis with MySQL for inventory reservations (2026)](https://shopify.engineering/scaling-inventory-reservations)
+- [A Pods Architecture To Allow Shopify to Scale (2018)](https://shopify.engineering/a-pods-architecture-to-allow-shopify-to-scale)
+- [Shard Balancing: Moving Shops Confidently with Zero-Downtime at Terabyte-scale (2021)](https://shopify.engineering/mysql-database-shard-balancing-terabyte-scale)

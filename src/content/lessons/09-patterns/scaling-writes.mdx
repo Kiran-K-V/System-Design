@@ -1,0 +1,235 @@
+---
+summary: 'Scale writes in four moves: do less work per write, absorb bursts in a queue, split the keys across shards, and break up hot keys with salts.'
+requires: ['04-data/sharding', '04-data/storage-engines', '06-async/queues']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import PatternsBuildsOn from '../../../components/anim/lessons/PatternsBuildsOn.tsx';
+import ScalingWritesWalk from '../../../components/anim/lessons/ScalingWritesWalk.tsx';
+import ScalingWritesLab from '../../../components/anim/lessons/ScalingWritesLab.tsx';
+
+## The problem
+
+Reads are easy to copy. Writes are not. Every write must reach the one place that owns the data, and read replicas do not help: each replica has to apply every write too (lesson [4.6](/learn/04-data/replication/)). So a cache and replicas lift the read ceiling and leave the write ceiling where it was.
+
+Lesson [1.5](/learn/01-one-machine/numbers-to-know/) puts one database node at about 5K to 20K simple writes per second. Now picture a ticket sale, a flash sale, or a game event. Writes jump to 30,000 per second for a minute. One primary cannot take that. Its queue grows, latency climbs, and clients time out.
+
+Writes have two different problems, and they need different fixes:
+
+- **Too much total volume** for one node. The fix is to do less work per write, or to spread the writes.
+- **Too much volume on one key.** The fix is to split that key.
+
+This lesson puts four earlier ideas in the right order.
+
+<PatternsBuildsOn
+  pattern="Scaling writes"
+  parts={[
+    { n: '4.2', title: 'How a database stores data', href: '/learn/04-data/storage-engines/', job: 'Append-only storage turns random writes into sequential ones.' },
+    { n: '4.7', title: 'Sharding', href: '/learn/04-data/sharding/', job: 'Split the keys so each node takes a share of the writes.' },
+    { n: '6.1', title: 'Queues', href: '/learn/06-async/queues/', job: 'A buffer that turns a burst into a backlog.' },
+    { n: '6.4', title: 'Backpressure and dead-letter queues', href: '/learn/06-async/backpressure-dlq/', job: 'What to do when the backlog keeps growing.' },
+    { n: '8.3', title: 'Cassandra', href: '/learn/08-technologies/cassandra/', job: 'A write path built on a log and a memtable.' },
+    { n: '8.4', title: 'DynamoDB', href: '/learn/08-technologies/dynamodb/', job: 'Per-partition limits and the hot partition.' },
+  ]}
+/>
+
+## Naive solutions
+
+**A bigger primary.** It buys time, and then it hits the same wall as for reads.
+
+**More replicas.** They do nothing for write volume. Each one replays the same stream of writes.
+
+**Write to two databases from the app.** Lesson [4.6](/learn/04-data/replication/) showed how this goes wrong: the two copies disagree after a crash.
+
+**Retry harder.** When a database is saturated, retries add load. Lesson [7.2](/learn/07-reliability/timeouts-retries/) explains why that makes it worse.
+
+## The mechanism
+
+Work through the walk below. It follows one burst through the four moves, in the order you should try them.
+
+<ScalingWritesWalk client:visible />
+
+### Move 1: less work per write
+
+**Batch.** Every commit has a fixed part, the flush of the log to disk, and a per-row part. If a worker commits 100 rows together, it pays the fixed part once. The PostgreSQL manual says this directly for bulk loads: do one commit at the end, because letting each row commit separately makes the database do a lot of work per row. It also says `COPY` is optimized for loading many rows with much less overhead than separate `INSERT` statements.
+
+Batching has a cost. A batch is acknowledged together, so each row waits for the batch to fill. A bad row can fail the whole transaction. And a bigger batch gives smaller gains each time, because the fixed part shrinks next to the per-row part. The lab below shows the curve.
+
+**Use a store built for writes.** A B-tree updates pages in place (lesson [4.2](/learn/04-data/storage-engines/)). A **log-structured merge tree** (LSM tree) appends. Cassandra's write path is the standard example (lesson [8.3](/learn/08-technologies/cassandra/)). A write goes to the commit log, a sequential append, and to the memtable, a sorted structure in memory. When the memtable is full it is flushed to an immutable SSTable file. A write is never an in-place edit. The cost moves to reads, which may check several files, and to compaction, which merges files in the background. Pick this kind of store when writes dominate and reads are by key or by a known range.
+
+### Move 2: absorb bursts with a queue
+
+Put a durable queue (lesson [6.1](/learn/06-async/queues/)) between the API and the database. The API appends the write and answers. A worker drains the queue at the speed the database allows. A burst becomes a backlog. The database sees a steady load.
+
+This is **write-behind**: the write is acknowledged before it lands in its final home. Know what you gave up:
+
+- The ack means "accepted", not "readable". A reader who checks at once may see nothing. That is the read-your-writes problem again (lesson [4.10](/learn/04-data/consistency-models/)). Return the new value from the write path, or read through the queue's state.
+- The queue must be durable, such as a replicated log. A write-behind cache in volatile memory loses acknowledged writes on a crash.
+- Delivery is at-least-once (lesson [6.3](/learn/06-async/delivery-semantics/)), so the worker may apply a write twice. Make writes idempotent (lesson [3.4](/learn/03-api-design/idempotency/)).
+- The queue must drain. If the average write rate is above the drain rate, the backlog grows without end, and you need backpressure (lesson [6.4](/learn/06-async/backpressure-dlq/)).
+
+### Move 3: shard
+
+When the sustained rate is above one node's ceiling, split the data (lesson [4.7](/learn/04-data/sharding/)). A hash of the shard key picks the node. With an even spread, N shards take about N times the writes. That is the only way to raise the write ceiling for good.
+
+The shard key decides everything. It sets how well writes spread, and which queries stay on one shard. Choose a key with many values and even traffic, such as a user id. Do not choose a key such as the date, because all of today's writes share one value.
+
+### Move 4: break up hot keys
+
+Sharding spreads keys, not one key. If a single key takes a large share of writes, the shard that holds it saturates while the others idle. DynamoDB documents each partition as designed for 1,000 write units per second (lesson [8.4](/learn/08-technologies/dynamodb/)). A hot key hits that limit no matter how many partitions the table has.
+
+The fix is **key salting**. Add a suffix to the key: `hot#0`, `hot#1`, up to `hot#k`. The writes for one logical key now go to `k` physical keys, which usually live on different shards. DynamoDB's guide describes two ways to pick the suffix:
+
+- **Random suffix.** Choose a random number for each write. Writes spread evenly. The guide's example adds a number from 1 to 200 to a date key. To read the day back, you must query every suffix and merge.
+- **Calculated suffix.** Derive the suffix from another field, such as a hash of the order id. Writes still spread, and you can find one item because you can recompute its suffix. Reading the whole day still needs every suffix.
+
+So salting trades a cheap write for an expensive read: `k` lookups. For counters, keep `k` partial counters and add them when you read.
+
+## The lab: before and after
+
+Set a hot key to 20% of writes with 8 shards and no salts. Then raise the salts.
+
+<ScalingWritesLab client:visible />
+
+**The model.** One commit costs 0.08 ms fixed plus 0.02 ms per row, so one row per commit gives 1000 / 0.10 = 10,000 rows per second. A batch of 100 costs 0.08 + 2.0 = 2.08 ms for 100 rows, which is about 48,000 rows per second. The ceiling is 1 / 0.02 ms = 50,000. With `N` shards and a hot key that takes a share `p`, spread over `k` salts, the hottest shard gets `p / k + (1 - p) / N` of all writes, and the cluster limit is one shard's capacity divided by that share.
+
+**Assumptions.** The two costs are illustrative round numbers, not measurements of any database. Other keys spread evenly. Shards are equal. Salts land on different shards. There are no cross-shard transactions and no network cost. The burst numbers use 4,000 writes per second of normal traffic.
+
+Check it by hand. With 8 shards, batches of 100, and a hot key at 20%: one shard handles 48,077. Unsalted, the hottest shard gets 0.2 + 0.8 / 8 = 0.3 of all writes, so the cluster takes 48,077 / 0.3 = about 160,000 per second, not the 8 x 48,077 = 385,000 an even spread would give. With 8 salts the hot share is 0.2 / 8 + 0.1 = 0.125, so the cluster takes about 385,000 again.
+
+## Numbers
+
+| Item | Value | Source |
+|---|---|---|
+| One database node, simple writes | ~5K to 20K per second | Lesson 1.5 |
+| DynamoDB, one partition | designed for 1,000 write units per second | DynamoDB docs, via lesson 8.4 |
+| DynamoDB salting example | suffix 1 to 200 on a date key | DynamoDB developer guide |
+| Batch of 1, 10, 100 rows in the model | 10,000 / 35,714 / 48,077 rows per second | Derived from the cost model above |
+| Hottest shard, 8 shards, 20% hot key | 30% of writes unsalted, 12.5% with 8 salts | Derived above |
+| Backlog after a burst | (arrival - drain) x seconds. 25K/s for 20 s with a 10K/s drain leaves 300,000 writes | Derived |
+
+## Trade-offs
+
+| Technique | You gain | You pay | Choose when |
+|---|---|---|---|
+| Batching | Several times more rows per second per node, no new parts | Added latency, all-or-nothing batches | Bulk or stream ingestion |
+| LSM store | Cheap sequential writes | Costlier reads, compaction work | Write-heavy, key-based reads |
+| Queue (write-behind) | Bursts flatten into a backlog | Ack is not "readable", duplicates, a queue to run | Spiky load, work that can wait |
+| Sharding | Write ceiling grows with node count | Resharding, no cross-shard joins or transactions | Sustained load above one node |
+| Key salting | Hot key spreads across shards | Reads need `k` lookups and a merge | A few keys take a large share |
+
+## Interview lens
+
+<Callout type="tip">
+Say which problem you have before you pick a fix. "Is it total volume or one hot key?" Then give the order: "Batch first, since it is free. A queue to absorb the sale spike. Shard by user id for the sustained rate. If one key is hot, salt it and sum the partial counts on read." Give a number: "30K writes per second is 3x one node, so I need at least 4 shards with headroom."
+</Callout>
+
+<Callout type="mistake">
+Do not say "add replicas" for a write problem. Do not shard by a low-cardinality key such as country or date. Do not put a queue in front and call it done: say what the ack means, and what happens when the backlog does not drain. And do not forget that salting breaks the simple read.
+</Callout>
+
+<Callout type="deep" title="Sharded counters">
+A like counter for a viral post is a hot key by design. One row updated thousands of times a second is also slow on its own, because every update makes a new row version in PostgreSQL (lesson 8.1). Split the counter into `k` rows. A like increments a random one. A read adds them all, or a background job adds them into one cached total. The count is a little late and never lost.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A table has 8 shards. One key receives 50% of all writes. The other 50% spread evenly. What share of all writes lands on the shard that holds the hot key?',
+      options: [
+        '12.5%, since 8 shards split the writes evenly',
+        '50%, since only the hot key matters to that shard',
+        '56.25%, which is 50% plus a fair share of the rest',
+        '43.75%, which is the evenly spread half minus the hot key',
+      ],
+      answer: 2,
+      explain: 'The hot shard gets all of the hot key (50%) plus its fair share of the remaining 50%: 50% / 8 = 6.25%. That is 56.25%. The shard saturates when total writes reach its capacity divided by 0.5625, so the cluster scales poorly even with 8 shards.',
+    },
+    {
+      q: 'You batch inserts so each commit carries 100 rows instead of 1. Which statement about the result is correct?',
+      options: [
+        'Throughput rises about 100 times, because 100 rows share one commit',
+        'Less than 100 times faster, since the per-row cost stays',
+        'Throughput stays the same, but durability improves for each row',
+        'Throughput rises, and each row is acknowledged faster than before',
+      ],
+      answer: 1,
+      explain: 'Batching removes the fixed per-commit cost from 99 of 100 rows. The per-row work stays. In the lab model the gain is about 4.8x, from 10,000 to about 48,000 rows per second. Each row also waits for its batch, so single-row latency does not improve.',
+    },
+    {
+      q: 'An API acknowledges a write as soon as it is in a durable queue. A user writes a comment and the page reloads one second later. What may the user see?',
+      options: [
+        'The comment, because the queue is durable and the ack is final',
+        'An error, because queue writes cannot be read by a client',
+        'The comment twice, because the queue always delivers two copies',
+        'No comment yet, because the worker may not have stored it',
+      ],
+      answer: 3,
+      explain: 'The ack means "accepted", not "stored and readable". Until the worker commits the row, a read finds nothing. Fixes: return the new row from the write path, or add the pending write to the page.',
+    },
+    {
+      q: 'A hot key is salted with 10 suffixes, hot#0 to hot#9. What does a read of the whole key cost now?',
+      options: [
+        'Ten lookups whose results the app must merge',
+        'One lookup, because the database merges the ten rows',
+        'Ten lookups, but only the newest result is kept',
+        'One lookup on the shard that owns the unsalted name',
+      ],
+      answer: 0,
+      explain: 'Each suffix is a separate key, often on a separate shard. The database does not know they belong together. The app queries all ten and merges them. Salting makes writes cheaper and reads costlier.',
+    },
+    {
+      q: 'Writes arrive at 25,000 per second for 20 seconds. The store drains 10,000 per second. Normal traffic of 4,000 per second continues. About how long after the burst ends does the backlog clear?',
+      options: ['About 30 s', 'About 75 s', 'About 50 s', 'It never clears'],
+      answer: 2,
+      explain: 'Backlog = (25,000 - 10,000) x 20 = 300,000 writes. After the burst the store drains 10,000 per second while 4,000 per second still arrive, so the backlog shrinks by 6,000 per second. 300,000 / 6,000 = 50 s. Dividing by 10,000 (30 s) forgets the normal traffic. Dividing by 4,000 (75 s) uses the wrong rate.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="scaling-writes-hot-shard"
+  title="One shard at 100%"
+  scenario="A game stores match events in a 6-shard cluster, sharded by match id. During a final, one match gets most of the writes."
+  facts={[
+    'shard 1: CPU 98%, write latency p99 900 ms',
+    'shards 2 to 6: CPU 12%, write latency p99 8 ms',
+    'match 4471: ~70% of all writes',
+  ]}
+  steps={[
+    {
+      prompt: 'What explains the numbers?',
+      options: [
+        'Shard 1 has a slower disk than the other shards in the cluster',
+        'The queue in front of the cluster is dropping writes at random',
+        'Every write for match 4471 maps to one shard through the hash',
+        'Six shards are too few, so each one is over its limit',
+      ],
+      answer: 2,
+      explain: 'The shard key is the match id, and one match is hot. Hashing sends all of its writes to one shard. The other five idle, so adding shards would not help.',
+    },
+    {
+      prompt: 'Which fix goes after the cause?',
+      options: [
+        'Move the cluster to 12 shards and rehash the keys of every match',
+        'Salt the hot match: write to 4471#0 to 4471#5 and merge on read',
+        'Add a read replica to shard 1 so that it can serve more traffic',
+        'Raise the batch size on shard 1 until its CPU drops below 50%',
+      ],
+      answer: 1,
+      explain: 'Salting spreads one logical key over several shards. Resharding to 12 still maps match 4471 to one shard. A replica adds nothing for writes. Larger batches help a little but cannot fix 70% on one node.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [DynamoDB developer guide: write sharding](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-sharding.html): random and calculated suffixes, and the cost on reads.
+- [PostgreSQL manual: populating a database](https://www.postgresql.org/docs/current/populate.html): one transaction for many inserts, and `COPY`.
+- [Apache Cassandra docs: storage engine](https://cassandra.apache.org/doc/latest/cassandra/architecture/storage-engine.html): commit log, memtable, SSTable.

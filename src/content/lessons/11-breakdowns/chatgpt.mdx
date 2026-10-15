@@ -1,0 +1,243 @@
+---
+summary: 'A chat app streams tokens over server-sent events from scarce GPUs. A queue with continuous batching keeps GPUs busy, token budgets keep users fair, and a run id lets a dropped stream resume.'
+requires: ['02-networking/real-time-transport', '07-reliability/rate-limiting', '09-patterns/long-running-tasks']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import ChatgptBuild from '../../../components/anim/lessons/ChatgptBuild.tsx';
+import ChatgptBatching from '../../../components/anim/lessons/ChatgptBatching.tsx';
+
+A chat assistant is unlike most web services. A request does not take 20 milliseconds. It takes 10 seconds or more, and it produces its answer one piece at a time. The machine that does the work is a GPU, which is costly and in short supply. The new ideas: streaming tokens over SSE, GPU inference as a scarce resource with queues and batching, limits per user tier, conversation storage, and a request that outlives its connection.
+
+A **token** is a chunk of text, roughly three-quarters of an English word. A model makes one token per step, and each step needs the whole conversation so far as input. Cost, time, and limits are all counted in tokens.
+
+## Requirements
+
+**Functional.**
+
+1. A user sends a prompt and gets a generated answer.
+2. A user opens past chats and continues them. Earlier messages go into the prompt.
+
+**Below the line.** Editing or branching messages, images, audio, tool calls, web browsing, sharing, and searching history.
+
+**Non-functional.** The scale below is my assumption. I do not use any company's user count here, because I could not get a figure I could verify and date. If you quote one in an interview, say where and when it was published.
+
+- **Time to first token** matters more than total time. The user sees words in about a second, then reads as they arrive.
+- GPUs are the scarce, costly resource. Allocate them on purpose.
+- A dropped connection must not lose the answer. The user can reconnect and continue.
+- A heavy user must not starve the others. Paid tiers get more.
+
+## Core entities
+
+- **Conversation.** Id, owner, model, created time.
+- **Message.** Conversation, role (`user` or `assistant`), text, token count. Append-only.
+- **Run.** One generation: conversation, state (`queued`, `running`, `done`, `cancelled`), the GPU worker.
+- **Tier.** Per user: request and token budgets.
+
+## API
+
+- `POST /v1/conversations/{id}/messages` with the prompt. Returns a stream of events, then the message id.
+- `GET /v1/runs/{id}/stream` with `Last-Event-ID`. Resumes a stream.
+- `POST /v1/runs/{id}/cancel` stops a generation.
+- `GET /v1/conversations/{id}` and `GET /v1/conversations` return messages and the chat list.
+
+## High-level design
+
+<ChatgptBuild client:visible />
+
+### Why SSE and not a WebSocket
+
+Data flows one way: tokens go from server to client. The client sends one prompt, then waits. Server-sent events (lesson [2.5](/learn/02-networking/real-time-transport/)) fit this. It is plain HTTP, it passes through proxies and load balancers, and it has a built-in resume: each event may carry an `id`, and a browser that reconnects sends `Last-Event-ID`. OpenAI's API docs describe streaming over server-sent events with `stream=true`. They also say that without it, the API generates the whole output before it sends anything.
+
+A WebSocket works too, but you must build reconnect and resume yourself. Choose it only if the client sends frequent messages in the middle of a run.
+
+## Deep dives
+
+### GPU scheduling
+
+A GPU runs a model one **iteration** at a time. Each iteration makes one token for every request in the current batch. Batching matters because the cost of an iteration grows slowly with batch size: the GPU reads the model weights once and uses them for many requests. A bigger batch means more tokens per second per GPU.
+
+The simple way is **static batching**: fill a batch, run it until every request finishes, then start the next. It wastes capacity, because requests differ in length. Step through both ways.
+
+<ChatgptBatching client:visible />
+
+The Orca paper (OSDI 2022) named the better scheme **iteration-level scheduling**. The scheduler decides again after every iteration, so a finished request leaves at once and a waiting one joins. Other systems call it continuous batching. The paper describes the static problem in the same terms: requests that finish early cannot return to the client, and new requests wait for the whole batch.
+
+Memory is the second limit. For each running request the GPU holds a cache of the attention data for every token so far, called the **KV cache**. Long conversations use more of it. So the number of requests a GPU can hold at once depends on memory and context length, not just on speed. The scheduler admits a request only if there is room.
+
+Three more rules finish the picture.
+
+- **Priority by tier, with aging.** Paid requests go first, but a free request that has waited long moves up. Otherwise the free tier starves.
+- **Shed load on purpose.** If the queue wait would pass a limit, answer a free-tier request with a polite "busy" and a retry time. A user told "try in 30 seconds" is better off than one who stares at a spinner for two minutes.
+- **Cancel frees the slot.** When the user presses stop, or the connection stays gone past a grace period, the worker stops that request. Otherwise a closed tab keeps burning a GPU slot.
+
+### Streaming that survives a drop and a deploy
+
+If the stream is tied to one connection and one process, then a phone that changes network, or a deploy that restarts a gateway, kills the answer, and the GPU time is wasted.
+
+Separate the **run** from the **connection**. This is the long-running task pattern of lesson [9.7](/learn/09-patterns/long-running-tasks/).
+
+1. The API creates a run with an id and returns it.
+2. The GPU worker writes each token to a buffer under that run id, with an increasing sequence number. A log or a Redis stream serves.
+3. The stream gateway reads the buffer and sends each token as an SSE event, with the sequence number as the event `id`.
+4. The connection dies. The run does not. The worker keeps writing.
+5. The client reconnects, to any gateway, with `Last-Event-ID: 212`. The gateway reads the buffer from 213 and continues.
+6. When the run ends, the final message is written once to the conversation store, keyed by the run id, so a retry cannot store it twice (lesson [3.4](/learn/03-api-design/idempotency/)).
+
+A gateway deploy now costs a reconnect, not an answer. Keep the buffer for some minutes after the run ends, so a late reconnect still gets the tail.
+
+### Limits per tier
+
+Counting requests is not enough. One request with a 100,000-token prompt costs a thousand times more than one with 100. OpenAI's rate-limit guide lists limits in requests per minute, requests per day, and tokens per minute, and says you can hit any of them first. These are API limits, but the lesson is general: limit what costs money.
+
+Use two token buckets per user (lesson [7.4](/learn/07-reliability/rate-limiting/)), one for requests and one for tokens. The token cost is unknown until the answer ends. So charge a worst-case amount at admission, which is prompt tokens plus the maximum answer length, and refund the unused part when the run ends. The buckets live in Redis, which can answer in a millisecond. An empty bucket gets `429` with a `Retry-After` header, as OpenAI's guide describes.
+
+### Conversation storage and context cost
+
+Messages are written once and read in order. The access pattern fits a wide-column or key-value store (lessons [8.3](/learn/08-technologies/cassandra/) and [8.4](/learn/08-technologies/dynamodb/)). Use the conversation id as the partition key and a sequence number as the sort key. The chat list is a second table keyed by user, sorted by last activity.
+
+The model has no memory. Each turn, the context builder sends the history again. That is the cost driver. Suppose 20 turns, each adding about 300 tokens (a question and an answer). Turn n sends about 300 x n tokens. The total over 20 turns is 300 x (1 + 2 + ... + 20) = 300 x 210 = 63,000 tokens, but only 6,000 are new. That is 10.5 times the new text.
+
+Keep the history inside a budget. Drop the oldest turns, or replace them with a short summary. Say the price out loud: the model forgets what you trimmed, and a summary can lose detail.
+
+## Numbers
+
+Every figure below is an assumption, so you can change it and redo the math.
+
+<Ballpark
+  client:visible
+  title="Size the GPU fleet"
+  scenario="Assume 100 million daily users, 10 prompts each. Peak load is 3 times the daily average. An answer is 400 tokens, streamed at 50 tokens per second."
+  facts={['One 8-GPU server holds 256 streams at once (an assumption: it depends on model size and context length)']}
+  steps={[
+    { prompt: 'How many prompts per second at peak?', unit: 'prompts/s', answer: 34700, within: 1.2, explain: '100 million x 10 = 1 billion prompts a day. 1,000,000,000 / 86,400 is about 11,570 per second on average. Three times that is about 34,700 at peak.' },
+    { prompt: 'How long does one answer take to stream, in seconds?', unit: 's', answer: 8, within: 1.1, explain: '400 tokens / 50 tokens per second = 8 seconds. Time to first token is separate, and should be under about a second.' },
+    { prompt: 'How many streams run at once at peak? Use prompts per second x seconds per answer (Little\'s law, lesson 1.3).', unit: 'streams', answer: 277600, within: 1.2, explain: '34,700 x 8 is about 278,000 concurrent streams. Little\'s law: concurrency = arrival rate x time in system.' },
+    { prompt: 'How many 8-GPU servers does that need?', unit: 'servers', answer: 1085, within: 1.2, explain: '278,000 / 256 is about 1,085 servers, or about 8,700 GPUs. If continuous batching doubles the streams per server, the fleet halves. That is why scheduling is the first thing you tune.' },
+  ]}
+/>
+
+Storage is small next to compute. At 1 billion prompts and 1 billion answers a day, that is 2 billion messages. At 2 KB each, that is 4 TB a day, or about 1.5 PB a year. It is large, but it is cold, append-only data.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| SSE | Plain HTTP, built-in resume | One-way only | Server-to-client streams |
+| WebSocket | Two-way messages in a run | Build reconnect and resume yourself | The client interrupts or steers mid-run |
+| Static batching | Simple scheduler | Idle slots, long waits | Small, uniform jobs |
+| Continuous batching | High GPU use, short waits | A scheduler that tracks memory | Variable-length generation |
+| Charge worst case, refund later | Cannot overspend a budget | Brief over-counting | Cost unknown until the end |
+| Summarize old turns | Lower cost per turn | The model may forget detail | Long conversations |
+
+<Callout type="tip">
+Lead with the scarce resource: "The GPU is the bottleneck, so the design is a queue and a scheduler in front of it." Then the user-facing parts: SSE for tokens, a run id for resume, token buckets for fairness. Quote the Little's law step: concurrency equals rate times time.
+</Callout>
+
+<Callout type="mistake">
+Do not answer "add more GPUs" first. Queue and batching come before that. Do not count only requests in the limiter, because cost follows tokens. Do not tie the generation to one HTTP connection. And do not call a WebSocket necessary for streaming just because it sounds more real-time.
+</Callout>
+
+<Callout type="deep" title="Time to first token and the prompt">
+The first token is slow because the model must read the whole prompt before it can write anything. This step is called prefill. After it, each new token needs one iteration. A 60,000-token prompt makes prefill long, and a prefill running on a GPU can slow the decode iterations of other requests in the same batch. Some systems run the two phases on different machines for this reason. For an interview, one sentence is enough: first-token time grows with prompt length, and long prompts are the expensive ones.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A browser streaming an answer loses Wi-Fi at token 212 and reconnects 3 seconds later. Which design returns tokens 213 onward without running the model again?',
+      options: [
+        'The gateway restarts the prompt from the start and sends the whole answer again to the client',
+        'The client keeps its own copy of the model and finishes the answer on the device',
+        'The worker pauses at token 212 and waits until the same gateway accepts a new connection',
+        'Tokens go to a run-id buffer, and the gateway replays from Last-Event-ID',
+      ],
+      answer: 3,
+      explain: 'The run is separate from the connection, so the worker keeps writing tokens to a buffer. The reconnect carries the last event id, and any gateway reads on from there. Running the prompt again costs GPU time twice and may give a different answer.',
+    },
+    {
+      q: 'Static batch of 2: request A needs 2 tokens, B needs 8, and C (6 tokens) waits. After which iteration does C start, and with continuous batching after which iteration does it start?',
+      options: [
+        'Static after 8, continuous after 2',
+        'Static after 2, continuous after 8',
+        'Both after 2, because a slot is free',
+        'Static after 8, continuous after 6',
+      ],
+      answer: 0,
+      explain: 'A static batch runs until its longest request ends, so C waits for 8 iterations. With iteration-level scheduling, A leaves after iteration 2 and C joins at once. All three then finish by iteration 8 instead of 14.',
+    },
+    {
+      q: 'A user sends a 50,000-token prompt every few seconds, and stays under a limit of 60 requests per minute. Why does the service still slow down for others?',
+      options: [
+        'Redis cannot count requests correctly at a rate this high, so the limit never trips',
+        'It counts requests, but cost follows tokens, so add a token budget',
+        'The gateway always rejects a prompt this large, so the GPU is idle',
+        'The user opened too many SSE connections from one browser tab',
+      ],
+      answer: 1,
+      explain: 'Fifty thousand tokens costs about a thousand times more than fifty. A limit on requests per minute lets one user take a large share of GPU time. A tokens-per-minute budget, charged at admission and refunded at the end, caps the real cost.',
+    },
+    {
+      q: 'A 20-turn chat adds about 300 tokens per turn and resends the full history each turn. About how many tokens does the model read over the whole chat?',
+      options: [
+        'About 6,000, because only the new text of each turn is read',
+        'About 63,000: turn n reads about 300 x n',
+        'About 120,000, because each turn is read twice by the model',
+        'About 300,000, because 300 tokens are read about 1,000 times',
+      ],
+      answer: 1,
+      explain: 'Turn n sends the history of n turns, about 300 x n tokens. The sum for 20 turns is 300 x 210 = 63,000. The new text is only 6,000, so history is about 10 times the new content. That is why old turns are trimmed or summarized.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="chatgpt-gateway-deploy"
+  title="Answers vanish during deploys"
+  scenario="Every time the stream gateway is deployed, users report that long answers stop in the middle. GPU utilization stays at 95%, but support sees many duplicate prompts right after each deploy."
+  facts={[
+    'time      event',
+    '14:00:00  deploy starts, 1 of 10 gateways restarted every minute',
+    '14:00:30  gateway 3 stops, 9,000 open streams reset',
+    '14:00:31  9,000 clients send the same prompt again',
+    '14:00:31  queue wait rises from 1 s to 40 s',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the design flaw?',
+      options: [
+        'The queue is too small to hold the prompts',
+        'The deploy is too slow, so it should restart all gateways at once',
+        'The run lives and dies with one stream connection, so a reset loses the answer',
+        'The rate limiter allows too many prompts for each user',
+      ],
+      answer: 2,
+      explain: 'When the connection is the only handle on the run, a reset kills the stream and the client can only start over. The retry doubles the GPU work. The queue size and the limiter are fine. A faster deploy would reset more streams.',
+    },
+    {
+      prompt: 'Which change fixes it?',
+      options: [
+        'Give each run an id, buffer its tokens, and let the client reconnect with Last-Event-ID',
+        'Raise the rate limit so that retries are never refused',
+        'Add GPUs until the queue wait returns to 1 second',
+        'Drain connections slowly by closing them one by one after 10 minutes',
+      ],
+      answer: 0,
+      explain: 'With a run id and a token buffer, the worker keeps going and a client resumes on any gateway. Draining helps a little but still cuts long answers. More GPUs would absorb the duplicates without fixing the cause.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [OpenAI: streaming API responses](https://developers.openai.com/api/docs/guides/streaming-responses): streaming over server-sent events.
+- [OpenAI: rate limits](https://developers.openai.com/api/docs/guides/rate-limits): requests and tokens per minute, 429 and Retry-After.
+- [Orca: a distributed serving system for transformer-based generative models (OSDI 2022)](https://www.usenix.org/conference/osdi22/presentation/yu): iteration-level scheduling.
+- [Using server-sent events (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events): event ids and reconnection.

@@ -1,0 +1,225 @@
+---
+summary: 'A time series database stores huge streams of (metric, tags, timestamp, value) samples. It wins by compressing each series to a byte or two per point, cutting data into time blocks, and deleting old blocks whole.'
+requires: ['04-data/storage-engines', '07-reliability/observability']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import TsGorilla from '../../../components/anim/lessons/TsGorilla.tsx';
+import TsCardinality from '../../../components/anim/lessons/TsCardinality.tsx';
+
+## The problem
+
+Lesson [7.5](/learn/07-reliability/observability/) said to measure everything. Do the arithmetic on "everything".
+
+A company runs 20,000 servers. Each exposes 50 metrics. A collector reads each metric every 10 seconds.
+
+- Series: 20,000 × 50 = **1,000,000**.
+- Samples per second: 1,000,000 / 10 = **100,000**.
+- Samples per day: 100,000 × 86,400 = **8.64 billion**.
+
+Each sample is a 64-bit timestamp and a 64-bit value: 16 bytes. That is 8.64 billion × 16 B = **~138 GB per day**. Nobody wants to store that, or to scan it.
+
+The workload has an unusual shape.
+
+- Writes are **appends**. New samples always carry the newest time. Old samples never change.
+- Reads ask for **one series over a time window**, or an aggregate over many series: "p99 latency of the checkout service, last 6 hours".
+- Old data is not wanted. You delete it **by age**.
+
+## The data model
+
+A **time series** is a stream of values for one thing over time. A sample has four parts.
+
+| Part | Example |
+|---|---|
+| Metric name | `http_requests_total` |
+| Tags (also called labels) | `host=web-17`, `endpoint=/pay`, `status=200` |
+| Timestamp | `2026-10-14T02:01:02Z` |
+| Value | `1873` |
+
+One metric name plus one exact set of tags is one **series**. Change one tag value, or add a tag, and you have a new series. Prometheus describes it this way: a sample is a float64 value and a millisecond timestamp, and each unique label combination is a new series.
+
+## Naive solution: a SQL table
+
+Make a table `(metric, tags, ts, value)` with a B-tree index on `(metric, tags, ts)`. Lesson [4.3](/learn/04-data/indexing/) showed how that index works. It fits the read pattern. It fails on cost.
+
+- **Space.** 16 bytes of data for every sample, plus a row header and index entries.
+- **Write path.** 1 million series interleave. New samples land in a million places in the index. Each insert is a random page write (lesson [4.2](/learn/04-data/storage-engines/)).
+- **Deletes.** Dropping data older than 15 days means deleting billions of rows one by one. Then the database must reclaim the space.
+
+A log-structured design (lesson 4.2) fixes the write path. We still pay 16 bytes per sample. We still delete row by row. We need to use what we know about the data.
+
+## The mechanism
+
+Three ideas make a time series database.
+
+1. **Group by series, in time order.** Samples of one series arrive at regular intervals. Neighbors in a series look alike.
+2. **Compress using that similarity.** Store the difference to the previous point, not the point.
+3. **Cut time into blocks.** A block holds a fixed window of time. Reads open only the blocks that overlap the window. Deleting old data means deleting whole blocks.
+
+### Compression: the Gorilla scheme
+
+Facebook's Gorilla paper (VLDB 2015) describes two tricks. Both rest on the same observation: a series moves slowly.
+
+**Timestamps: delta of delta.** A series scraped every 60 seconds has deltas of 60, 60, 59, 61. The **delta of delta** is the change in the delta: 0, −1, 2. It is zero most of the time. The encoding is:
+
+| Delta of delta D | Bits stored |
+|---|---|
+| 0 | `0` (1 bit) |
+| −63 to 64 | `10` + 7 bits = 9 |
+| −255 to 256 | `110` + 9 bits = 12 |
+| −2047 to 2048 | `1110` + 12 bits = 16 |
+| anything else | `1111` + 32 bits = 36 |
+
+The paper reports that about 96% of timestamps compress to a single bit.
+
+**Values: XOR.** Take the value as a 64-bit float. XOR it with the previous value. If the values match, the result is all zeros: store a single `0` bit. If they differ only a little, the XOR has long runs of zero bits at both ends. Store only the middle part ("the meaningful bits") with two small numbers that say where it starts and how long it is. About 51% of values in the paper's sample cost one bit.
+
+Step through the paper's own example. Three samples go in. A block comes out.
+
+<TsGorilla client:visible />
+
+The total is 167 bits for 3 samples, from 384. That is only 2.3 times, because a tiny block pays for its header and its first raw value. A long block pays them once. The paper's production average is **1.37 bytes per point**, against 16 bytes raw: a 12-fold reduction (16 / 1.37 = 11.7).
+
+The cost of this trick: **decoding is sequential**. To read point 500 of a block you decode points 1 to 499. That is why blocks are short.
+
+### Blocks, the head, and retention
+
+Prometheus shows the layout (its TSDB is one real example).
+
+- New samples go to the **head**, a block in memory. A write-ahead log on disk (lesson 4.2) protects it from a crash. The WAL is kept in 128 MB segments.
+- Every 2 hours, the head is written to disk as an immutable **block**. A block holds chunks of compressed samples, an index from series to chunks, and metadata.
+- **Compaction** merges small blocks into bigger ones. It stops at the smaller of 10% of retention or 31 days.
+- **Retention** is a rule such as "keep 15 days", the Prometheus default. Blocks older than that are deleted as files. No row-by-row delete runs.
+
+Gorilla itself uses the same two-hour block and keeps 26 hours in memory as a cache in front of slower storage.
+
+### Downsampling
+
+A graph of 90 days with one point every 10 seconds has 90 × 8,640 = 777,600 points per series. A screen shows about a thousand. Old data rarely needs full detail.
+
+**Downsampling** (also called a **rollup**) replaces old raw samples with fewer points. For example, keep one point per 5 minutes, holding the count, sum, min, and max of the raw points in that window. Then you can still compute an average or a maximum. A plain average alone hides spikes.
+
+A typical policy is "raw data for a few weeks, rolled-up data for a year". The exact windows are your choice. Do not quote a default: it differs by product.
+
+## Cardinality explosion
+
+Cost follows the **number of series**, not the number of samples you think about. Each unique tag combination is a series. Tag values multiply.
+
+The Prometheus naming guide warns: do not use labels for values with high cardinality, such as user IDs or email addresses. Try it. Start at 10 hosts × 5 endpoints = 50 series. Then turn on a `user_id` label.
+
+<TsCardinality client:visible />
+
+With one million user IDs the same 50 series become 50 million. That is 288 billion samples per day. At 1.5 bytes each it is about 432 GB per day. The tag that "made per-user graphs possible" costs more than the whole rest of the system. Put per-user data in logs or events, not in tags.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Raw sample | 16 bytes (64-bit time + 64-bit value) | Gorilla paper |
+| Gorilla average | 1.37 bytes per point, 12× smaller | Gorilla paper |
+| Gorilla scale, spring 2015 | over 2 billion series, about 12 million points per second | Gorilla paper (a company claim) |
+| Prometheus average | 1 to 2 bytes per sample | Prometheus docs |
+| Prometheus head block | 2 hours, WAL in 128 MB segments | Prometheus docs |
+| Prometheus default retention | 15 days | Prometheus docs |
+| 100,000 samples/s for 15 days at 1.5 B | 194 GB | Derived: 100,000 × 1,296,000 s × 1.5 |
+| The same at 16 B raw | 2.07 TB | Derived |
+
+The Prometheus docs give the capacity formula: disk = retention seconds × samples per second × bytes per sample.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Plain SQL table | One system, joins with other data | 16+ bytes per sample, row-by-row deletes | Under a few thousand samples per second |
+| SQL table partitioned by time | Drop a partition to expire data | Still no sample compression | Moderate volume, you want SQL |
+| Purpose-built TSDB | 1 to 2 bytes per sample, block deletes, range reads | Another system, limited joins, cardinality limits | High volume metrics |
+| Rollups for old data | Small storage, fast long graphs | Lost detail, no exact p99 from averages | Dashboards over weeks or months |
+
+## Interview lens
+
+<Callout type="tip">
+Describe the workload first: "append-only, newest timestamps, read by series and window, deleted by age". Then give the design: "group by series, compress with delta-of-delta timestamps and XOR values, cut into 2-hour blocks, drop whole blocks at retention". Quote the number: "Gorilla gets about 1.37 bytes per point instead of 16". Raise cardinality before the interviewer does: "I would keep user IDs out of the tags".
+</Callout>
+
+<Callout type="mistake">
+Do not say "1.37 bits per point". The paper says bytes. Do not use `user_id` or `request_id` as a tag so you can graph one user: it makes one series per user. And do not say delta-of-delta is always small. It is small only when samples arrive at regular intervals. A collector that scrapes at jittery times pays 9 to 36 bits per timestamp, as the table shows.
+</Callout>
+
+<Callout type="deep" title="Why not compress each value alone?">
+A float64 has 64 bits of detail, and a gauge such as CPU temperature rarely uses them. Two successive readings share the sign, the exponent, and often the first digits of the fraction. XOR turns "shares the top bits" into "starts with many zeros", which a short control code can describe. A general-purpose compressor does not know that the fields line up like this. Gorilla's compression is **lossless**: you get exactly the same doubles back.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A sensor reports every 30 s. The timestamps are 0, 30, 60, 90, and 120. What does Gorilla store for the delta of delta at the last two points?',
+      options: ['One bit each: both are 0', 'Nine bits each: both are 30', 'Thirty-six bits each, because 120 is large', 'Zero bits, because regular points need no record'],
+      answer: 0,
+      explain: 'The deltas are all 30. The delta of delta is 30 − 30 = 0, which costs one "0" bit. The size of the timestamp itself does not matter. Even a perfect series still needs that one bit per point to say "no change".',
+    },
+    {
+      q: 'The previous value was 12.0 and the new value is 12.0 too. How many bits does the Gorilla value encoding use for the new one?',
+      options: ['64 bits, a full double', '14 bits for the control codes', '1 bit', '9 bits'],
+      answer: 2,
+      explain: 'The XOR is all zeros, so Gorilla writes a single "0" bit. A changed value costs control bits plus its meaningful bits. 14 bits is the cost of 24.0 after 12.0 in the example.',
+    },
+    {
+      q: 'A team adds a `customer_id` tag to a request counter. There are 200,000 customers, 20 endpoints, and 5 hosts. About how many series does that counter make?',
+      options: ['About 225 series, the sum of the three counts', 'About 200,000 series, one per customer', 'About 20 million series, the product of the counts', 'About 1,000 series, the number of hosts times endpoints'],
+      answer: 2,
+      explain: 'Each unique combination of tag values is a series: 200,000 × 20 × 5 = 20,000,000. Series multiply, they do not add.',
+    },
+    {
+      q: 'Why do Prometheus-style stores delete old data by dropping 2-hour blocks, not rows?',
+      options: [
+        'Rows can never be deleted from compressed data under any setting',
+        'Rows are deleted later, but only by a job that runs once a week',
+        'It saves space by merging all the old blocks into one before the delete',
+        'Each block is an immutable file, so expiry is one cheap file delete',
+      ],
+      answer: 3,
+      explain: 'A block holds a fixed time window. When the whole window is older than retention, the file goes away at once. A row-by-row delete would have to rewrite compressed chunks and rebuild the index.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Sizing a metrics store"
+  scenario="A fleet has 5,000 hosts. Each host exposes 200 series. A collector scrapes every 10 seconds. A time series database stores each sample in about 1.5 bytes."
+  steps={[
+    {
+      prompt: 'How many series does the fleet have?',
+      unit: 'series',
+      answer: 1000000,
+      within: 1.1,
+      explain: '5,000 × 200 = 1,000,000 series.',
+    },
+    {
+      prompt: 'How many samples arrive per second?',
+      unit: 'samples/s',
+      answer: 100000,
+      within: 1.1,
+      explain: 'Each series gives one sample per 10 s, so 1,000,000 / 10 = 100,000 samples per second.',
+    },
+    {
+      prompt: 'How many GB per day does it take to store them at 1.5 bytes each?',
+      unit: 'GB/day',
+      answer: 13,
+      within: 1.3,
+      explain: '100,000 × 86,400 = 8.64 billion samples per day. At 1.5 bytes that is 12.96 GB, about 13 GB. Raw at 16 bytes it would be about 138 GB.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Pelkonen et al., "Gorilla: A Fast, Scalable, In-Memory Time Series Database" (VLDB 2015)](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf) (the delta-of-delta and XOR scheme, Figure 2)
+- [Prometheus: Storage](https://prometheus.io/docs/prometheus/latest/storage/) (blocks, WAL, retention, bytes per sample)
+- [Prometheus: Data model](https://prometheus.io/docs/concepts/data_model/) (series, labels, samples)
+- [Prometheus: Metric and label naming](https://prometheus.io/docs/practices/naming/) (the cardinality warning)

@@ -1,0 +1,217 @@
+---
+summary: 'Scale reads in rungs: replicas, then a cache, then a CDN. Each rung removes load from the one behind it and brings its own staleness and hot-key problems.'
+requires: ['04-data/replication', '05-caching/why-cache', '02-networking/cdn-proxies']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import PatternsBuildsOn from '../../../components/anim/lessons/PatternsBuildsOn.tsx';
+import ScalingReadsWalk from '../../../components/anim/lessons/ScalingReadsWalk.tsx';
+import ScalingReadsMeter from '../../../components/anim/lessons/ScalingReadsMeter.tsx';
+
+## The problem
+
+Most products read far more than they write. A feed is opened many times for each post. A product page is viewed far more often than it is edited. So the first scaling problem is usually reads.
+
+Say the product has one PostgreSQL database. Lesson [1.5](/learn/01-one-machine/numbers-to-know/) gives about 10K to 50K simple indexed reads per second for one node. Traffic grows to 25,000 reads per second at peak. The database CPU sits at 100%, queries queue, and pages time out.
+
+This is a pattern, not one trick. You will not need a new database. You combine four things you already know, in a fixed order, and you stop as soon as the numbers fit.
+
+<PatternsBuildsOn
+  pattern="Scaling reads"
+  parts={[
+    { n: '4.6', title: 'Replication', href: '/learn/04-data/replication/', job: 'Copies of the data on followers that answer reads.' },
+    { n: '5.1 to 5.3', title: 'Why cache, placement, strategies', href: '/learn/05-caching/why-cache/', job: 'A fast copy in front of the database, filled on a miss.' },
+    { n: '5.4 and 5.5', title: 'Eviction, invalidation and stampede', href: '/learn/05-caching/invalidation-stampede/', job: 'Keeping the copy fresh and surviving a hot key.' },
+    { n: '2.7', title: 'CDN and proxies', href: '/learn/02-networking/cdn-proxies/', job: 'Answers shared content at the edge, before your servers.' },
+    { n: '4.1', title: 'Data modeling', href: '/learn/04-data/data-modeling/', job: 'Denormalize so one read returns one answer.' },
+    { n: '4.10', title: 'Consistency models', href: '/learn/04-data/consistency-models/', job: 'Read-your-writes, the guarantee replicas break.' },
+  ]}
+/>
+
+## Naive solution: a bigger machine
+
+The first reflex is a larger database server. It works for a while and it is simple. It has three limits. The largest machine you can rent is a hard ceiling. The price climbs faster than the capacity. And a bigger machine is still one machine, so one failure takes reads and writes down together.
+
+Before any new component, check the cheap things. Add the missing index (lesson [4.3](/learn/04-data/indexing/)). Fix the query that scans a million rows. A 1 ms read that you make 100 times faster is worth more than a new server. Scale out only when the work per read is already small.
+
+## The mechanism: a ladder
+
+Each rung takes a share of reads away from the rung behind it. Step through all of them. The first step shows the problem. The last step shows the full stack.
+
+<ScalingReadsWalk client:visible />
+
+**Rung 1: read replicas.** The primary keeps all writes. Followers copy its log (lesson [4.6](/learn/04-data/replication/)) and answer reads. Read capacity grows about linearly with the number of replicas. Writes do not grow at all. This is the simplest rung because the app still speaks SQL.
+
+**Rung 2: a cache.** A cache holds the answers to the most common reads in memory (lessons [5.1](/learn/05-caching/why-cache/) to [5.3](/learn/05-caching/cache-strategies/)). With a hit ratio `h`, only a share `1 - h` of reads reaches the database. At 90% the database sees one read in ten. That is the largest single gain in the ladder, and it costs staleness (lesson [5.5](/learn/05-caching/invalidation-stampede/)).
+
+**Rung 3: a CDN.** A CDN answers requests for content that is the same for every user, at a server close to the user (lesson [2.7](/learn/02-networking/cdn-proxies/)). Those requests never reach your data center. It only helps for shared, cacheable responses: images, scripts, public pages, and API responses that are identical for everyone.
+
+Order matters. You add the rungs in this order because each one is cheaper to run per request than the one behind it, and each one hides load from it.
+
+## The meter: before and after
+
+The chart shows how many reads per second each stage can serve. Move the sliders. Watch which tier becomes the limit.
+
+<ScalingReadsMeter client:visible />
+
+**The model.** Requests go from the edge inward. A tier answers a share of what it receives. The share that reaches a tier is the product of (1 - hit ratio) of every tier in front. A tier with capacity `C` that sees a share `r` saturates at a demand of `C / r`. The system limit is the smallest of those numbers.
+
+**Assumptions.** Reads only. One database node serves 10,000 reads per second (an assumption inside the 10K to 50K range of lesson 1.5, on the low side). One cache node serves 100,000 operations per second (lesson 5.1 gives 100K to 1M). Hit ratios do not change with load. The CDN has no limit. Replicas share load evenly and have no lag. These are round numbers for reasoning. Measure your own.
+
+Try this. At the defaults (3 replicas, 2 cache nodes, 90% hit, CDN 50%), the stages give 10K, 30K, 200K, and 400K reads per second. Now drop the cache hit ratio to 50%. The cache stage falls to 60K, because the three replicas now see half of all reads. The hit ratio decides how much the cache is worth.
+
+## Read-your-writes after replica lag
+
+Replicas are slightly behind the primary. A user posts a comment, the page reloads from a replica, and the comment is gone. Lesson [4.10](/learn/04-data/consistency-models/) names this: read-your-writes. Lesson [4.6](/learn/04-data/replication/) has a simulator for lag.
+
+Three fixes, from simple to exact:
+
+- **Read from the primary for a short window after a write.** Track the time of the user's last write. If it is recent, send that user's reads to the primary. Pick a window longer than normal lag.
+- **A position token.** The write returns a log position. A replica may answer only once it has applied that position. Otherwise the read goes to the primary.
+- **Pin by data, not by user.** Read the primary only for the rows this user just changed.
+
+The cost is load on the primary, so keep the window short. Caches have the same problem. If a write only deletes the cached key, a read that arrives before the replica has caught up can refill the cache with the old value. Facebook's memcache paper describes this for replicas in other regions. Its fix is a remote marker: a key that says "this data was just written, read it from the primary region". The paper says the marker trades extra latency on a miss for a lower chance of reading stale data. Your system may not need a marker. The idea still applies: after a write, remember that the replica is not trusted yet.
+
+## Hot keys
+
+A cache spreads keys over nodes by hash (lesson [4.8](/learn/04-data/consistent-hashing/)). One key still lives on one node. When a post goes viral, the node that holds it takes most of the traffic while the others idle. Adding nodes does not help, because the key does not move.
+
+Options, cheapest first:
+
+- **A small in-process cache** in every app server for the hottest keys, with a TTL of a few seconds. The cache node sees one read per app server per TTL, not one per user.
+- **Copy the key to several cache nodes** and read from any copy. The memcache paper does this for keys that are fetched in large groups and fit on one or two servers. Its example: a server holds 100 items and answers 500K requests per second, and each request asks for all 100. To serve 1M requests per second, splitting the items across two servers sends every request to both, so each still handles 1M. Replicating all 100 items on two servers lets each request go to either one, so each handles 500K. The price is that every write must invalidate every copy.
+- **Coalesce misses.** When many requests miss on the same key at once, let one go to the database and make the others wait (lesson [5.5](/learn/05-caching/invalidation-stampede/)). The memcache paper's lease does this: the server hands out one token per key at most once every 10 seconds by default and tells other clients to wait briefly.
+
+## Denormalize so a read is one read
+
+A normalized schema is good for writes and awkward for reads. Say a feed page shows 20 posts, each with the author's name and a like count. Normalized, that is 1 query for the post ids, 20 for authors, and 20 for counts: 41 queries. Denormalized, each post row stores `author_name` and `like_count`, and the page is 1 query.
+
+You pay on the write side. A like now updates two places. A rename updates every post by that author. And the copies can drift, so you need a way to repair them. Lesson [4.1](/learn/04-data/data-modeling/) gives the rule: copy a fact only when reads far outnumber writes and the copy is stable. Counters are the common case. Keep `like_count` as a column or in a cache instead of counting rows on every view.
+
+## Numbers
+
+| Item | Value | Source |
+|---|---|---|
+| One database node, simple indexed reads | ~10K to 50K+ per second | Lesson 1.5 |
+| One cache node | ~100K to 1M simple ops per second | Lesson 5.1 |
+| Replica lag, asynchronous streaming | Typically under 1 second, but spikes | PostgreSQL manual, via lesson 4.6 |
+| Facebook's memcache fleet | "over a billion requests per second" | Facebook memcache paper (their claim) |
+| Memcache lease rate limit | One token per key per 10 s, by default | Facebook memcache paper |
+| Feed page, normalized vs denormalized | 41 queries vs 1 | Derived above: 1 + 20 + 20 |
+
+## Trade-offs
+
+| Rung | You gain | You pay | Choose when |
+|---|---|---|---|
+| Read replicas | Linear read capacity, same SQL | Lag, no write scaling, replica cost | Reads exceed one node and need fresh-ish data |
+| Cache | Largest cut in database load, sub-millisecond reads | Staleness, invalidation, hot keys, cold start | A small set of keys takes most reads |
+| CDN | Offloads shared content, lower latency worldwide | Only for shared responses, purge delay | Public, identical-for-all content |
+| Denormalization | One read per view | Slower writes, copies that can drift | Read-heavy, stable fields |
+| Bigger machine | No code change | Ceiling, price, one failure domain | Buying time |
+
+## Interview lens
+
+<Callout type="tip">
+Say the order and the reason. "I would first check indexes, then add read replicas, then a cache with a short TTL in front, and a CDN for static and public content. Each step cuts load on the one behind it." Then use numbers: "25K reads per second at peak. A 90% cache hit leaves 2.5K for the database, which one replica handles." End with the cost: "Users who just wrote read the primary, to avoid stale reads."
+</Callout>
+
+<Callout type="mistake">
+Do not add a cache to cure a slow query. You hide the problem and add a staleness bug. Do not say "replicas scale writes". They do not. Do not forget the hot key: a cache hit ratio of 99% says nothing about one node taking 40% of the traffic. And do not cache personal data in a CDN without a cache key that includes the user.
+</Callout>
+
+<Callout type="deep" title="Why a cache can make an outage worse">
+A cache that runs at 95% hit ratio protects a database that could not serve all reads on its own. If the cache is flushed, or a node dies, the database suddenly sees up to 20 times its normal read load. It fails, and the cache cannot refill because the database is down. Plan for this. Warm the cache before sending traffic, rate-limit misses, and keep replicas sized for some miss traffic, not for zero. Lesson 5.5 covers the stampede in detail.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Peak reads are 60,000 per second. A 90% cache is placed in front of 3 replicas that each serve 10,000 reads per second. What do the replicas see, and are 3 enough?',
+      options: [
+        '6,000 per second, so 3 replicas have plenty of room',
+        '54,000 per second, which is more than 3 replicas can serve',
+        '30,000 per second, which is exactly the limit of 3 replicas',
+        '6,000 per second, so 2 replicas are wasted and should be removed',
+      ],
+      answer: 0,
+      explain: 'A 90% hit ratio sends 10% of 60,000 = 6,000 reads on to the database. Three replicas can take 30,000, so they run at 20%. The last option sounds thrifty, but you keep headroom for cache misses after a restart and for a replica failure.',
+    },
+    {
+      q: 'After a user renames their profile, the page still shows the old name for about a second. Reads go to replicas. What fix adds the least load to the primary?',
+      options: [
+        'Send every read in the app to the primary',
+        'Send reads of recent writers to the primary briefly',
+        'Add three more replicas so that lag is spread thinner',
+        'Raise the cache TTL on the profile so the old name goes away later',
+      ],
+      answer: 1,
+      explain: 'Lag is a property of how a replica catches up, not how many replicas there are. Routing only the writer\'s own reads to the primary, for longer than normal lag, fixes the user\'s view and leaves almost all reads on replicas. Reading the primary for everything gives up the whole rung.',
+    },
+    {
+      q: 'One product page takes 40% of all cache reads. The cache has 10 nodes. You add an 11th node. What happens to the node that holds that page?',
+      options: [
+        'Its load drops by about one eleventh, because keys are rehashed over 11 nodes',
+        'Its load halves, because the new node takes over half of its keys',
+        'Nothing changes, because that one key still lives on a single node',
+        'Its load drops to zero, because the new node now serves the page',
+      ],
+      answer: 2,
+      explain: 'A key maps to one node. More nodes spread different keys, not one key. That one node keeps its load. The fixes are an in-process copy, several copies of the key, or coalescing misses.',
+    },
+    {
+      q: 'You normalize a feed so each of 20 posts needs one author lookup and one like-count lookup after the first query for post ids. How many queries does one page view run, and what fixes it?',
+      options: [
+        '21 queries. Cache the author names for ten minutes.',
+        '40 queries. Add two more read replicas to spread them.',
+        '22 queries. Batch the lookups into two big queries.',
+        '41 queries. Store both values on each post row.',
+      ],
+      answer: 3,
+      explain: '1 + 20 authors + 20 counts = 41. Replicas spread the queries but do not remove them. Storing the two values on the post row makes the view one query, at the cost of updating the copies when a name changes or a like arrives.',
+    },
+    {
+      q: 'Which response is safe to put in a shared CDN cache with no per-user cache key?',
+      options: [
+        'The signed-in user\'s inbox list, because it is read often',
+        'A product image that is the same for every visitor',
+        'A JSON profile that includes the visitor\'s email address',
+        'The cart total, because the same user reloads it',
+      ],
+      answer: 1,
+      explain: 'A shared cache returns one stored response to many users. That is right for identical content like an image. Anything personal, such as an inbox, email, or cart, would be served to the wrong user without a key that includes the user.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="How many replicas?"
+  scenario="Peak reads are 200,000 per second. A cache answers 95% of them. One database replica serves 10,000 reads per second, and you want each replica to run at no more than half of that."
+  steps={[
+    {
+      prompt: 'How many reads per second reach the database after the cache?',
+      unit: 'reads/s',
+      answer: 10_000,
+      within: 1.1,
+      explain: '5% of 200,000 is 10,000 reads per second.',
+    },
+    {
+      prompt: 'How many replicas do you need, so that each runs at half capacity?',
+      unit: 'replicas',
+      answer: 2,
+      within: 1.1,
+      explain: 'Half of 10,000 is 5,000 reads per second per replica. 10,000 / 5,000 = 2 replicas. Add one more in practice, so that one failure does not push the other past half.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Nishtala et al., "Scaling Memcache at Facebook" (NSDI 2013)](https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf): leases, replicating hot keys within a pool, remote markers for stale reads from replicas.
+- [PostgreSQL manual: high availability, load balancing, and replication](https://www.postgresql.org/docs/current/high-availability.html): streaming replication and hot standby.
+- [Redis docs: client-side caching](https://redis.io/docs/latest/develop/clients/client-side-caching/): in-process copies and invalidation.

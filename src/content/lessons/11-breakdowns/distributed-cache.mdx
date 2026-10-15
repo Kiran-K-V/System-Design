@@ -1,0 +1,254 @@
+---
+summary: 'A distributed cache spreads a key-value store over many nodes. Consistent hashing with virtual nodes places the keys, replicas keep data available, LRU frees memory, and hot keys need their own fix because adding nodes does not help.'
+requires: ['04-data/consistent-hashing', '05-caching/eviction', '04-data/replication']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import DistributedCacheBuild from '../../../components/anim/lessons/DistributedCacheBuild.tsx';
+import DistributedCacheCompare from '../../../components/anim/lessons/DistributedCacheCompare.tsx';
+
+Here the cache is the product, not a helper. You are asked to design the cache itself: a service that other teams use to store key-value pairs in memory. This case study follows the six steps of [lesson 0.3](/learn/00-orientation/design-method/). It adds little that is new in mechanism. It asks you to **combine** three earlier lessons and to find the one problem they do not solve: the hot key.
+
+## Requirements
+
+**Functional.**
+
+1. Set, get, and delete a key.
+2. Give each key an expiry time (TTL, time to live).
+3. When memory is full, evict by LRU (least recently used first).
+
+**Below the line.** Choosing the cache size, durability across restarts, strong consistency, complex queries, and transactions. Say these are out of scope. A cache is a copy. The source of truth is somewhere else.
+
+**Non-functional.** These are interview **assumptions**.
+
+- Highly available. Eventual consistency is fine.
+- Under 10 ms per get or set.
+- 1 TB of data and 100,000 requests per second.
+
+### Scale, derived
+
+- Nodes for the data. Assume a node has 64 GB of RAM and 50 GB of that holds data. Then 1 TB / 50 GB = 20 nodes (using 1 TB = 1,000 GB).
+- Replicas. With one copy of each range, that is 20 x 2 = 40 nodes.
+- Load per node. 100,000 / 20 = 5,000 requests per second per node, if keys spread evenly. That is small. Capacity is set by memory here, not by request rate.
+- Keys. At 1 KB per entry (assumption), 1 TB is 1 billion keys, about 50 million per node.
+- LRU overhead. A linked list adds two pointers per entry, 16 bytes. On 1 KB entries that is 1.6%. On 100-byte entries it is 16%. Small values make exact LRU costly.
+- Latency. A round trip inside one data center costs about 0.5 ms (lesson [1.2](/learn/01-one-machine/latency-numbers/)). One round trip from the client to the owning node leaves most of the 10 ms budget unused. A proxy in the middle adds a second hop. A client library that knows the ring avoids it.
+
+## Core entities
+
+- **Entry**: key, value, expiry time, last-access time.
+- **Node**: one cache server with a set of positions on the hash ring.
+- **Replica**: a copy of a node's key range, held on another node.
+
+## API
+
+```
+GET    /cache/{key}                -> value | 404
+PUT    /cache/{key}   { value, ttl }
+DELETE /cache/{key}
+```
+
+In practice the client library speaks a binary protocol. The HTTP shape above is only to show the contract.
+
+## High-level design
+
+Step through the build.
+
+<DistributedCacheBuild client:visible />
+
+### One node first
+
+Start with the hot path of one machine. A hash map gives constant-time access. A doubly linked list orders entries by last use. A get moves the entry to the front. When memory is full, the node removes the entry at the back. Lesson [5.4](/learn/05-caching/eviction/) walks through it.
+
+Exact LRU must update the list on every read, which means a lock on a shared structure. Real caches avoid that cost. Redis samples a few keys and evicts the least recently used of them. The default sample size is 5, and its docs report almost no loss on skewed access. Say you would take the approximation.
+
+**TTL** is two mechanisms. A **lazy** check on read: if the entry is past its expiry, delete it and answer "miss". A **background sweep** that samples entries and removes expired ones, so memory does not fill with dead data that nobody reads.
+
+## Deep dives
+
+### Placing keys: the ring
+
+With 20 nodes, `hash(key) % 20` sends each key to a node. Going to 21 nodes changes `hash % N` for nearly everyone: a share of N/(N+1), here 20/21 or about 95%, of the keys move. Each moved key is a miss, so the database behind the cache takes almost all the traffic at once. The ring of lesson [4.8](/learn/04-data/consistent-hashing/) moves only about 1/21, near 5%.
+
+Use **virtual nodes**: each physical node owns many points on the ring, such as 128 (assumption). Many points per node smooth out the load, so no node gets a much larger arc than the rest. They also spread the load of a failed node over many survivors, not just its single neighbor. With 40 nodes and 128 points, the ring has 5,120 points. A binary search finds the owner in about 13 steps.
+
+Where does the ring live? In the **client library**, loaded from a small config or consensus service (lesson [8.8](/learn/08-technologies/zookeeper/)). Clients refresh it when membership changes. A stale ring only sends a request to a node that no longer owns the key. That is a miss, not an error, which a cache can tolerate. Redis Cluster takes a related approach: 16,384 fixed hash slots assigned to nodes (lesson [8.2](/learn/08-technologies/redis/)).
+
+### Replication for availability
+
+If a node dies, its range is gone and its keys miss. Misses are survivable, but a whole range missing at once sends a spike to the database. Keep a copy: each key range is also stored on the next distinct node around the ring (lesson [4.6](/learn/04-data/replication/)). Skip virtual nodes that belong to the same machine.
+
+Copy **asynchronously**. A write is acknowledged by the primary, and the copy follows. If the primary dies before the copy arrives, you lose a recent write. For a cache that costs a stale value or a miss, never the only copy of the data. This is the trade that eventual consistency gives you: lower write latency and higher availability, in return for stale reads.
+
+When a node joins, it takes ranges from its neighbors, and those keys miss until they are filled. Warm it slowly, or accept a brief rise in database load of about 1/N.
+
+### The hot key
+
+Now the problem the ring cannot solve. A single key gets enormous traffic. A celebrity post, a flash-sale price, a global counter. All requests for one key hash to one node.
+
+<DistributedCacheCompare client:visible />
+
+**Adding nodes does not help**, because one key still lives on one node. Three tools:
+
+1. **Near cache.** Each app server keeps the hot value in its own memory for a second or two (lesson [5.2](/learn/05-caching/cache-placement/)). With 200 app servers (assumption), the owner then sees at most about 200 reads per second for that key, not 60,000. The price is a value that is up to two seconds old.
+2. **Read copies under suffixed names.** Store `hot#0` to `hot#3`. Names hash to different nodes. Readers pick one at random. A write updates every copy.
+3. **Split a write-hot key.** A counter becomes sub-counters that are summed on read.
+
+Detect hot keys by counting requests per key on each node over a short window. Treat only the top few as hot. A cache that treats every key this way pays the copy cost for no gain.
+
+## Numbers
+
+<Ballpark
+  client:visible
+  title="Cache cluster size"
+  scenario="Assume 1 TB of data (1,000 GB), 50 GB of usable data memory per node, 100,000 requests per second, and one replica of every range."
+  steps={[
+    {
+      prompt: 'How many primary nodes hold the data?',
+      unit: 'nodes',
+      answer: 20,
+      within: 1.1,
+      explain: '1,000 GB / 50 GB per node = 20 nodes.',
+    },
+    {
+      prompt: 'How many nodes in total, with one replica of every range?',
+      unit: 'nodes',
+      answer: 40,
+      within: 1.1,
+      explain: 'Each range is stored twice, so 20 x 2 = 40 nodes.',
+    },
+    {
+      prompt: 'If a 21st primary joins a ring, about what percent of keys move?',
+      unit: 'percent',
+      answer: 4.8,
+      within: 1.2,
+      explain: 'A new node takes its fair share, 1/21 of the keys, which is about 4.8%. With hash modulo N the share would be 20/21, about 95%.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| Modulo hashing | Trivial | Nearly all keys move on resize | Fixed-size cluster |
+| Ring with virtual nodes | About 1/N of keys move; even load | Ring state in every client | Default |
+| Smart client | No extra hop | Every language needs the library | Latency target is tight |
+| Proxy tier | Thin clients, one place to change | Extra hop and extra machines | Many client languages |
+| Async replicas | Fast writes, available reads | Stale reads, possible lost write | A cache |
+| Exact LRU | Textbook behavior | Lock and 16 bytes per entry | Small caches |
+| Sampled LRU | Cheap, nearly as good | Approximate | Large caches |
+| Near cache for hot keys | Absorbs huge read load | Values a few seconds old | Read-hot keys |
+
+## Interview lens
+
+<Callout type="tip">
+Name the combination: "Consistent hashing with virtual nodes places keys. Replicas on the next ring nodes give availability. Each node runs a hash map with an LRU list." Then raise the hot key yourself. "More nodes will not fix one hot key, so I would add a near cache and split write-hot keys." That shows you saw the limit of the ring.
+</Callout>
+
+<Callout type="mistake">
+Do not say "shard with modulo". Do not claim strong consistency across replicas and low latency at once. Do not say a cache is durable. And do not say "add more nodes" for a hot key.
+</Callout>
+
+<Callout type="deep" title="Why a cache can be sloppy">
+A cache holds copies. If a copy is lost or stale, the system falls back to the source of truth. That is why we can pick asynchronous replication, approximate LRU, and a stale ring. The same choices would be wrong for a database. Always say what lives behind your cache.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A cache cluster grows from 20 to 21 nodes and uses hash(key) % N. About what share of keys now map to a different node?',
+      options: [
+        'About 5%, which is the share that the new node takes',
+        'About 50%, because half of the nodes see a change in their range',
+        'About 95%, because the modulus changes for almost every key',
+        'Exactly 0%, because the hash of each key stays the same',
+      ],
+      answer: 2,
+      explain: 'A key stays only when hash % 20 equals hash % 21, which is true for about 1 key in 21. So about 20/21 move. The 5% figure belongs to the ring, not to modulo.',
+    },
+    {
+      q: 'One key gets 60,000 reads per second and its node handles 20,000. You add 10 nodes to the ring. What happens to the hot key?',
+      options: [
+        'The ring splits the key across all nodes, so the load drops',
+        'The key still lives on one node, so that node stays overloaded',
+        'The key moves to the newest node, which has the most spare capacity',
+        'The replicas share the reads automatically and the problem ends',
+      ],
+      answer: 1,
+      explain: 'A key hashes to a single place on the ring, whatever the number of nodes. Fixing it means making more copies under other names, or caching it near the client.',
+    },
+    {
+      q: 'Why is the ring held in the client library instead of a proxy tier?',
+      options: [
+        'A proxy is unable to compute a hash, but a client library can',
+        'It lets the nodes store their keys without needing expiry times',
+        'Clients can then write to every replica at the very same time',
+        'It saves a network hop, which matters against a 10 ms target',
+      ],
+      answer: 3,
+      explain: 'A proxy adds a hop in front of every request. A client that knows the ring goes straight to the owner. The price is that every client language needs the library.',
+    },
+    {
+      q: 'A node dies. Its asynchronous replica takes over. What can the callers see?',
+      options: [
+        'Some recent writes may be missing, so a read is stale or a miss',
+        'All writes in the last hour are gone, so the cache must be wiped',
+        'Every read fails until an operator promotes the replica by hand',
+        'Reads stay strongly consistent because the replica holds an exact copy',
+      ],
+      answer: 0,
+      explain: 'Asynchronous copying lags the primary a little. Writes that had not arrived are missing, and a cache can recover from that by reading the source of truth. The replica is not exact, and promotion does not need a manual step.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="distcache-hot-node"
+  title="One node is melting"
+  scenario="A 40-node cache cluster serves 100,000 requests per second. One node shows p99 latency of 400 ms, while the rest are near 2 ms. Adding two nodes to the ring changes nothing."
+  facts={[
+    'node        reqs/s   p99 ms',
+    'cache-17    58,000   400',
+    'cache-03     4,800   2',
+    'cache-31     5,200   2',
+    '(37 more nodes near 5,000 and 2 ms)',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The ring has too few virtual nodes, so cache-17 owns a very large arc',
+        'A single hot key hashes to cache-17 and takes most of its requests',
+        'Replication to the copy of cache-17 is slow and blocks every write',
+        'The LRU list on cache-17 is exact and locks on every single read',
+      ],
+      answer: 1,
+      explain: 'A load of 58,000 against about 5,000 for the others is far beyond what an uneven ring gives. And adding nodes did not help. Both fit one hot key. A large arc would hold many keys, and the load would drop when nodes were added.',
+    },
+    {
+      prompt: 'The hot key is a read-heavy product record. What do you do first?',
+      options: [
+        'Raise the number of virtual nodes on the ring from 128 to 512',
+        'Switch the cluster from asynchronous to synchronous replication',
+        'Cache the record in each app server for a second or two',
+        'Split the record into four sub-keys and sum them on every read',
+      ],
+      answer: 2,
+      explain: 'A short-lived copy in each app server takes the reads off the node completely and costs a few seconds of staleness. More virtual nodes do not move one key. Splitting suits counters that take writes, not a read-heavy record.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Redis: key eviction](https://redis.io/docs/latest/develop/reference/eviction/) (maxmemory policies, approximated LRU, sample size)
+- [Redis Cluster specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) (hash slots and node ownership)
+- [Dynamo: Amazon's highly available key-value store](https://www.allthingsdistributed.com/2007/10/amazons_dynamo.html) (consistent hashing with virtual nodes, replication on the ring)

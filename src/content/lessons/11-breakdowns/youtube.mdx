@@ -1,0 +1,272 @@
+---
+summary: 'YouTube takes a big upload through resumable multipart parts, turns it into short segments at several bitrates with a graph of jobs, and serves them through a CDN to players that adapt.'
+requires: ['08-technologies/blob-storage', '08-technologies/temporal', '02-networking/cdn-proxies']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import YoutubeBuild from '../../../components/anim/lessons/YoutubeBuild.tsx';
+import YoutubeDagCompare from '../../../components/anim/lessons/YoutubeDagCompare.tsx';
+import YoutubeAbrWalk from '../../../components/anim/lessons/YoutubeAbrWalk.tsx';
+
+## The problem
+
+A creator uploads a 5 GB file from a phone on a shaky connection. Minutes later, a viewer on a bus with a weak signal and another on fibre both press play. Both should see the video start quickly and keep playing.
+
+Three things break the obvious design of "save the file, serve the file":
+
+- A single upload of 5 GB fails near the end, and the creator starts over.
+- The file is in one format and one size. A viewer on a weak network stalls. A viewer on a phone downloads a picture far sharper than the screen needs.
+- Every viewer fetches from the same storage, so the busiest video overloads it.
+
+The three new ideas are in the fixes: **resumable upload**, a **transcoding pipeline** that is a graph of jobs, and **adaptive bitrate streaming** from a CDN.
+
+## Requirements
+
+Follow the six-step method from lesson [0.3](/learn/00-orientation/design-method/).
+
+**Functional, above the line:**
+
+1. Upload a video.
+2. Watch a video.
+
+**Below the line:** search, comments, recommendations, channels, exact view counts, copyright checks. Counting views, for instance, is its own design (see the Top-K case study, [11.9](/learn/11-breakdowns/top-k/)).
+
+**Non-functional.** The numbers are interview assumptions:
+
+- Availability over consistency (lesson [4.9](/learn/04-data/cap-pacelc/)). A video that turns up a minute late in some region is acceptable.
+- Uploads of tens of gigabytes must work, and must resume.
+- Playback starts fast and does not stall on weak networks.
+- Processing is asynchronous: the creator gets a status, not a held request.
+
+## Core entities
+
+- **Video**: `video_id`, uploader, title, status (`uploading`, `processing`, `ready`, `failed`).
+- **Upload**: `upload_id`, `video_id`, the list of parts done (number and ETag).
+- **Rendition**: one version of the video at one bitrate and resolution.
+- **Segment**: a few seconds of one rendition, stored as an object.
+- **Manifest**: a text file that lists the renditions and their segments.
+
+The metadata is small and goes in a database partitioned by `video_id`. The bytes go in blob storage. Never put video in the database.
+
+## API
+
+- `POST /uploads` with `{title, size}` returns `{upload_id, part_urls}`, signed URLs for each part.
+- `PUT <part_url>` sends one part and returns an ETag.
+- `GET /uploads/{id}` lists the parts already stored. This is how a client resumes.
+- `POST /uploads/{id}/complete` starts processing.
+- `GET /videos/{id}` returns metadata and the manifest address. The manifest and segments themselves come from the CDN.
+
+The data-flow step matters here, because processing is a pipeline: raw file, segments, encodes, manifest. It is drawn in the deep dive below.
+
+## High-level design
+
+<YoutubeBuild client:visible />
+
+Look at where the bytes flow. They go from the client to blob storage, and from blob storage through the CDN to viewers. No application server carries a video byte. The services only handle small requests and metadata.
+
+## Deep dives
+
+### Resumable upload
+
+The mechanism is S3 multipart upload, which lesson [8.11](/learn/08-technologies/blob-storage/) covers, and the pattern is in lesson [9.6](/learn/09-patterns/large-blobs/). Here is what it buys at video scale. Say a file is 10 GB and the part size is 8 MB.
+
+- Parts: 10,000 MB / 8 MB = 1,250 parts.
+- Time at 100 Mbit/s: 10 GB is 80 Gbit. 80 Gbit / 0.1 Gbit/s = 800 s, about 13.3 minutes.
+- Fail after 1,000 parts: a single PUT restarts at zero and repeats 800 s of work. With parts, the client asks `GET /uploads/{id}`, sees 1,000 done, and sends the other 250: 2,000 MB, about 160 s.
+
+The upload row has a status. A cleanup job aborts uploads that stay `uploading` for too long, so stored parts do not cost money forever. The client may also compute a fingerprint of each part, so it can tell the server "I already have this one" after a restart.
+
+### Transcoding as a graph of jobs
+
+**Transcoding** means re-encoding a video into other sizes and bitrates. It is slow and heavy on CPU. The design question is how to structure it. Compare the two shapes.
+
+<YoutubeDagCompare client:visible />
+
+A **DAG** (directed acyclic graph) is a graph of jobs where arrows mean "must finish first" and there are no loops. The pipeline has these stages: split into segments; encode every (segment, rung) pair; extract audio and thumbnails (also independent); build the manifest after all encodes are done. A job can start the moment its parents are done.
+
+Three rules make it robust:
+
+- **Idempotent jobs.** The output key is `(video_id, rung, segment)`. A retry overwrites the same object (lesson [3.4](/learn/03-api-design/idempotency/)).
+- **A durable orchestrator.** Temporal (lesson [8.9](/learn/08-technologies/temporal/)) keeps the graph state and retries a failed node. A queue with workers and visibility timeouts (lesson [6.1](/learn/06-async/queues/)) is the simpler alternative when the graph is fixed. The patterns are in lesson [9.7](/learn/09-patterns/long-running-tasks/).
+- **A status the creator can see.** `processing` moves to `ready`, or to `failed` after retries run out. The creator never waits on an HTTP request.
+
+### Adaptive bitrate streaming
+
+**Adaptive bitrate** (ABR) means the player changes quality while the video plays. It needs the video in several versions, cut into short segments.
+
+HLS is one standard, and it is public as RFC 8216. A **master playlist** lists **variant streams**, each with a `BANDWIDTH` value. Each variant points to a **media playlist**, a list of segment URLs with their durations. DASH works the same way with a different file format. The RFC says clients should switch between variants to adapt to the network, and says the switching algorithm itself is outside the spec. So the rule in the picture below, "highest rung at or below half the measured speed", is an illustrative rule of ours. Real players use more careful ones that also watch how much video is buffered.
+
+<YoutubeAbrWalk client:visible />
+
+Why segments? A segment that can be decoded without earlier segments (HLS has a tag for this, `EXT-X-INDEPENDENT-SEGMENTS`) lets the player switch rungs at any boundary. Why short ones? A short segment means a fast switch and a fast start, and each is a small, cacheable file. The price is more files and more requests.
+
+### CDN delivery and hot videos
+
+Segments are plain files, immutable once written. That is ideal for a CDN (lesson [2.7](/learn/02-networking/cdn-proxies/)): the first viewer in a region causes a miss, and the next thousand are hits. A viral video overloads nobody, because its segments sit on many edges. What hits the origin is the long tail: old, rarely watched videos that miss often. The metadata database, partitioned by `video_id`, sees a hot partition for a viral video, so put a cache in front of it (lesson [5.2](/learn/05-caching/cache-placement/)) and let replicas absorb reads.
+
+## Numbers
+
+All inputs are assumptions. The method is lesson [1.4](/learn/01-one-machine/estimation/).
+
+**Upload side**
+
+- 1M uploads per day. 1,000,000 / 86,400 ≈ 11.6 uploads per second.
+- Raw size 500 MB on average. Ingest ≈ 11.6 × 500 MB ≈ 5.8 GB per second, which is about 46 Gbit per second.
+- Ladder of four rungs at 5, 3, 1.5, and 0.4 Mbit/s: total 9.9 Mbit/s. A 10-minute video is 600 s. 9.9 Mbit/s × 600 s / 8 = 742 MB of renditions, close to the raw size.
+- Stored per day: 1M × 742 MB ≈ 742 TB of renditions, plus 500 TB of raw if you keep it.
+- Jobs per video: 600 s / 6 s = 100 segments × 4 rungs = 400 encode jobs.
+
+**Watch side**
+
+- 500M views per day, each 5 minutes (300 s) at 3 Mbit/s on average.
+- Bytes per view: 3 Mbit/s × 300 s / 8 = 112.5 MB. Per day: 500M × 112.5 MB ≈ 56 PB.
+- Average egress: 56 PB / 86,400 s ≈ 650 GB per second ≈ 5.2 Tbit per second. No origin can serve that. A CDN has to.
+- Average viewers at once: 500M × 300 s / 86,400 ≈ 1.7M. Each fetches one segment per 6 s: about 290,000 segment requests per second.
+- If the CDN hits 95% of the time (an assumption), the origin sees 5%: about 14,500 requests per second.
+
+The only company figure I can source is from YouTube's press page, which says over 20 million videos are uploaded daily. The page shows no date, so I use it only as a rough sanity check. It is about 20 times the upload rate above. I quote no hours-per-minute or hours-watched figure, since I found no current primary source.
+
+<Ballpark
+  client:visible
+  title="Size the pipes"
+  scenario="Assume 1M uploads per day at 500 MB each, and 500M views per day, each viewing 300 s at 3 Mbit/s. Use 86,400 seconds per day."
+  steps={[
+    {
+      prompt: 'What is the average upload ingest rate, in Gbit per second?',
+      unit: 'Gbit/s',
+      answer: 46,
+      within: 1.15,
+      explain: '1M × 500 MB = 500 TB per day. 500 TB / 86,400 s ≈ 5.8 GB per second. Times 8 bits is about 46 Gbit per second.',
+    },
+    {
+      prompt: 'What is the average viewing egress, in Tbit per second?',
+      unit: 'Tbit/s',
+      answer: 5.2,
+      within: 1.15,
+      explain: 'Average concurrent viewers = 500M × 300 / 86,400 ≈ 1.74M. Each draws 3 Mbit/s. 1.74M × 3 Mbit/s ≈ 5.2 Tbit/s.',
+    },
+    {
+      prompt: 'With 6-second segments and a 95% CDN hit ratio, how many segment requests per second reach the origin?',
+      unit: 'req/s',
+      answer: 14500,
+      within: 1.2,
+      explain: '1.74M viewers / 6 s ≈ 290,000 requests per second. 5% of that is about 14,500 per second.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Direct multipart upload | No app server in the byte path, resume | Part bookkeeping, orphan cleanup | Any large file |
+| Whole-file transcode | Simple | Slow, no partial retry | Tiny files only |
+| DAG of segment jobs | Parallel, retry one node | An orchestrator to run | Long videos, many rungs |
+| Few rungs | Less storage and compute | Coarser quality steps | Small catalogs |
+| Many rungs | Better fit for each network | More storage and encode cost | A big, varied audience |
+| Short segments | Fast start and switch | More requests and files | Interactive, mobile playback |
+| CDN in front | Egress and latency drop | Cache fill on cold videos | Always for video |
+
+## Interview lens
+
+<Callout type="tip">
+Say the three steps in order: "The client uploads directly in parts and can resume. An event starts a graph of jobs that cuts the video into segments and encodes each at several bitrates. The player reads a manifest and picks a bitrate per segment from the CDN." Then give the one number that justifies the CDN: average egress in the terabits per second.
+</Callout>
+
+<Callout type="mistake">
+Do not stream the raw upload to viewers. Do not transcode inside the upload request. Do not store video bytes in the database. Do not claim one file at one bitrate is enough for a weak network. And do not say exact real-time view counts are free: that is a different problem.
+</Callout>
+
+<Callout type="deep" title="Why not make segments longer?">
+Longer segments mean fewer files and fewer requests, which saves CDN and request cost. But the player can only switch rungs at a boundary and must download a whole segment before it knows the speed. With 10-second segments a bad network is noticed late, and a start takes longer. Many services choose a few seconds as the compromise. The exact value is a tuning choice, not a law.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why can an HLS player switch bitrate only at a segment boundary?',
+      options: [
+        'The server only sends data once a whole segment has ended',
+        'The manifest forbids any switch before the video has finished',
+        'Each segment decodes alone, so a new rung starts cleanly',
+        'The CDN holds segments, so switching mid-segment is not possible',
+      ],
+      answer: 2,
+      explain: 'A segment that can be decoded without earlier ones is a safe place to change rungs. The manifest allows switching, and the CDN serves any segment at any time.',
+    },
+    {
+      q: 'A 10 GB upload uses 8 MB parts, 1,250 in total. It fails after 1,000 parts are stored. How much data does a resuming client send?',
+      options: ['2,000 MB', '10,000 MB', '8 MB', '1,000 MB'],
+      answer: 0,
+      explain: 'The client lists the stored parts, finds 1,000 done, and sends the 250 that remain: 250 × 8 MB = 2,000 MB. A plain PUT would resend all 10,000 MB.',
+    },
+    {
+      q: 'A 5-minute video is cut into 5-second segments and encoded at 3 rungs. How many encode jobs does the DAG hold, not counting split or manifest?',
+      options: ['60', '15', '300', '180'],
+      answer: 3,
+      explain: '300 s / 5 s = 60 segments. 60 × 3 rungs = 180 independent encode jobs. 60 would be one rung only, and 300 would count each second as a job.',
+    },
+    {
+      q: 'One encode job in the DAG fails because its worker was reclaimed. What should the orchestrator do?',
+      options: [
+        'Restart the whole video from the split step',
+        'Retry that job, whose output key makes a retry safe',
+        'Mark the video failed at once and ask the creator to upload again',
+        'Skip the job, since the player can ignore one segment',
+      ],
+      answer: 1,
+      explain: 'Jobs are independent and write to a key made from video, rung, and segment, so a retry only overwrites its own output. Restarting everything wastes work. Skipping a segment leaves a hole in the playlist.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="youtube-upload-fails-late-and-slow-ready"
+  title="Fails at 95%, then ready too late"
+  scenario="Creators on mobile networks say large uploads fail near the end and start over. Videos that do upload take 40 minutes to become ready, even for short clips."
+  facts={[
+    'upload path:     one PUT through the app server',
+    'upload failures: 31% of files above 2 GB',
+    'transcode:       one worker, whole file, all rungs in order',
+    'worker count:    200, mostly idle',
+  ]}
+  steps={[
+    {
+      prompt: 'Why do large uploads fail late and restart?',
+      options: [
+        'One long request has no resume point, so any drop loses all of it',
+        'The CDN evicts the partial file when the connection pauses',
+        'The metadata database is too small for large file sizes',
+        'Adaptive bitrate needs the whole upload before it can start',
+      ],
+      answer: 0,
+      explain: 'A single request that carries the whole file cannot be continued. Multipart parts give a resume point. The CDN and the database are not in the upload path, and ABR is a playback matter.',
+    },
+    {
+      context: 'The upload fix is under way. Now the team looks at the 40-minute wait. 200 workers sit mostly idle.',
+      prompt: 'What change shortens the wait for a single video?',
+      options: [
+        'Buy larger machines for the one worker per video',
+        'Cache the finished renditions on the app servers',
+        'Re-encode only the highest rung and let the player scale it',
+        'Split into segments and run the (segment, rung) jobs in parallel',
+      ],
+      answer: 3,
+      explain: 'Only parallel jobs can use the idle workers on one video. A bigger machine helps a little. App-server caches are not part of encoding, and one rung loses adaptive playback.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RFC 8216: HTTP Live Streaming](https://www.rfc-editor.org/rfc/rfc8216) (master and media playlists, variant streams, independent segments)
+- [S3: Uploading and copying objects using multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html) (parts, ETags, resume)
+- [MDN: Media Source Extensions API](https://developer.mozilla.org/en-US/docs/Web/API/Media_Source_Extensions_API) (how a browser player feeds segments to a video element)
+- [YouTube press page](https://blog.youtube/press/) (the only company figure used above)

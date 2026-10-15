@@ -1,0 +1,256 @@
+---
+summary: 'A URL shortener is a read-heavy key-value store with one hard part: making short codes that never collide. Counter ranges and base62 solve it, a cache keeps redirects fast, and 302 keeps links controllable.'
+requires: ['00-orientation/design-method', '04-data/sharding', '05-caching/cache-strategies']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import BitlyBuild from '../../../components/anim/lessons/BitlyBuild.tsx';
+import BitlyIds from '../../../components/anim/lessons/BitlyIds.tsx';
+
+## The problem
+
+A user pastes a very long link, such as a product page with a long path and tracking parameters, into a chat. It is ugly and it may break across lines. A **URL shortener** turns it into `https://sho.rt/4c92`. When anyone opens the short link, the service sends them to the long one.
+
+This looks like a toy. It is a good interview problem because it has almost no features, so every mark goes to scale and detail. One question hides inside it: how do you make a short, unique code, many times a second, from many servers, with no two codes equal?
+
+This lesson follows the six steps from [lesson 0.3](/learn/00-orientation/design-method/). It adds three ideas: ID generation, a read-heavy cache path, and the choice between redirect status codes.
+
+## Requirements
+
+**Functional.** These come first, and each gets a box in the design.
+
+1. A user submits a long URL and gets a short URL.
+2. A user may pick a custom alias, such as `sho.rt/summer-sale`.
+3. A user may set an expiry date.
+4. Opening a short URL redirects to the long URL.
+
+**Below the line.** Accounts and login, click analytics, and malicious-link scanning. Say so aloud, and return to them if time remains.
+
+**Non-functional.** Each short code maps to exactly one long URL. A redirect takes about 100 ms or less. The service is highly available, and we prefer availability to consistency: a link created one second ago may take a moment to work everywhere.
+
+**Scale.** These are assumptions for the interview, not company data. Say them aloud and change them if the interviewer does.
+
+- 100 million daily active users, each following about 5 short links a day.
+- 1 new short link for every 1,000 redirects.
+- 1 billion short links stored in total.
+
+Now derive the load, as in [lesson 1.4](/learn/01-one-machine/estimation/).
+
+- Redirects per day: 100M × 5 = 500M. A day has about 86,400 seconds, so the average is 500M ÷ 86,400 ≈ **5,800 redirects per second**. Assume peak is 10 times average, so about 58,000 per second.
+- New links per day: 500M ÷ 1,000 = 500K. That is about **6 writes per second**.
+- Total links: at 500K a day, 1 billion links is 1B ÷ 500K = 2,000 days, about 5.5 years of data.
+- Storage: assume 500 bytes per row (code, long URL, dates). 1B × 500 B = **500 GB**. That fits on one modern disk. Size is not the problem. Reads are.
+
+So the system is read-heavy by 1,000 to 1, and the database size is small. Everything below follows from those two facts.
+
+<Ballpark
+  client:visible
+  title="Size the shortener"
+  scenario="100 million users follow 5 short links a day. Peak load is 10 times the average. The service stores 1 billion rows of 500 bytes. A day has 86,400 seconds."
+  steps={[
+    { prompt: 'Average redirects per second', unit: 'per s', answer: 5787, within: 1.3, explain: '100M × 5 = 500M a day. 500M ÷ 86,400 ≈ 5,787 a second.' },
+    { prompt: 'Peak redirects per second (10 times the average)', unit: 'per s', answer: 57870, within: 1.3, explain: 'Peak is 10 × 5,787 ≈ 57,900 a second. This is the number the cache and database must survive.' },
+    { prompt: 'Storage for 1 billion rows of 500 bytes', unit: 'GB', answer: 500, within: 1.3, explain: '1B × 500 B = 500 GB. One disk holds it, so the design needs read scaling, not a sharded store.' },
+  ]}
+/>
+
+## Core entities
+
+Two things are stored.
+
+- **Mapping:** `short_code` (primary key), `long_url`, `created_at`, `expires_at`, and a flag for custom alias.
+- **ID range:** a block of unused numbers that the counter hands to one server. It has no table of its own. It is one number in the counter service.
+
+A user table exists once login is in scope. It is below the line today.
+
+## API
+
+| Call | Meaning |
+|---|---|
+| `POST /urls` with `{ long_url, alias?, expires_at? }` | Returns `{ short_url }`. A taken alias returns 409 Conflict. |
+| `GET /{short_code}` | Redirects with a `Location` header. An unknown or expired code returns 404. |
+
+The redirect is a plain `GET` with no body and no login. This matters later, because it is the call that carries all the traffic.
+
+## High-level design
+
+Step through the build. Each step names the requirement it satisfies.
+
+<BitlyBuild client:visible />
+
+Two choices in this design deserve a closer look.
+
+**Reads and writes are separate services.** The write path makes about 6 calls a second. The read path makes 58,000 at peak. They need different numbers of servers, so split them (lesson [9.1](/learn/09-patterns/scaling-reads/)).
+
+**The cache is cache-aside.** The redirect service asks the cache first. On a miss it reads the table, then fills the cache ([lesson 5.3](/learn/05-caching/cache-strategies/)). A code never changes once created. So a cached entry is never stale, except when a link expires or is deleted. Give each cache entry a TTL no longer than the time to expiry. Pick LRU eviction ([lesson 5.4](/learn/05-caching/eviction/)). Link traffic is skewed: a few links are very popular and most are rarely opened. Assume the hot 10 million links make up most traffic. At 500 B each that is 5 GB, which fits in one cache machine, with a replica for safety.
+
+## Deep dive 1: making the short code
+
+How long must a code be? Base62 uses 10 digits, 26 lowercase and 26 uppercase letters. With 5 characters there are 62^5 = 916,132,832 codes, which is less than 1 billion. With 6 there are 62^6 = 56,800,235,584, about 56.8 billion. With 7 there are 62^7 ≈ 3.5 trillion. So 6 characters cover 1 billion links with room to grow. Seven gives extra room, which helps later.
+
+Now: where do the characters come from? Compare two designs. Switch between them.
+
+<BitlyIds client:visible />
+
+**Hashing** is the first idea. Hash the long URL and keep the first 7 characters. It needs no shared state. But a cut hash is a random number in a space of 62^7 values. The chance of a clash is the birthday problem. With n = 1 billion codes and a space of S ≈ 3.5 × 10^12, the expected number of colliding pairs is about n² ÷ (2S) = 10^18 ÷ 7 × 10^12 ≈ 142,000. So collisions are not rare. Each write must read first, and retry on a clash. Hashing also gives the same code to the same URL, which is wrong if two users want separate links with separate expiry dates.
+
+**A counter** is the second idea. A counter hands out 1, 2, 3, and so on. Base62 turns each number into a short string. ID 1,000,000 becomes `4c92`. No two numbers are equal, so no two codes are equal and nothing needs a check. The catch is that one shared counter, hit on every write, becomes a bottleneck and a single point of failure.
+
+**Range allocation** fixes the catch. Each server asks the counter for a block, say 1,000 IDs, and serves them from memory. The counter is called once per 1,000 writes. If a server dies, its unused IDs are lost. That is fine: a gap in codes costs nothing, since 1 billion is far below the space. With several regions, give each region a disjoint range, so regions never talk to each other to create a code. The counter itself can be a single row in a replicated database, or a key in a consensus store ([lesson 8.9](/learn/08-technologies/zookeeper/)), updated with `INCRBY 1000`.
+
+One cost remains. Counter codes come in order, so `4c93` follows `4c92`. A person can guess the next link. If links must be private, scramble the number with a reversible shuffle before encoding, or add a random suffix. Do not use random strings alone: they bring the collision problem back. Time-ordered IDs are a related topic in [lesson 10.5](/learn/10-advanced/ids-and-time/).
+
+**Custom aliases** need no counter. The alias is the code. The primary key enforces uniqueness, and a duplicate insert fails with 409. Reserve a few words, such as `api` or `admin`, so no one claims them.
+
+## Deep dive 2: redirect status, 301 or 302
+
+Both codes redirect. They differ in what a client may remember. RFC 9110 defines them.
+
+- **301 Moved Permanently** says the target now lives at a new URI. Responses with this code can be cached by default, so browsers and CDNs may skip your server on repeat visits.
+- **302 Found** says the target is temporary and the client should keep using the original URI for future requests.
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| 301 | Fewer requests to your servers. Faster repeat visits | You lose control: a changed or expired link keeps working from caches. You miss clicks for analytics | Links never change and you do not count clicks |
+| 302 | Every click reaches you: you can expire, edit, count, and block | All redirect traffic hits your cache path | Expiry, analytics, or abuse takedowns exist |
+
+We set expiry as a requirement, so use 302. A middle path is a 301 or 302 with a short `Cache-Control: max-age`. That lets clients cache for a few minutes only.
+
+## Deep dive 3: scaling beyond the first design
+
+Walk the numbers. At 58,000 peak redirects per second, the cache absorbs most of them. Say the hit rate is 95%. Then the table sees 5% × 58,000 = 2,900 reads a second, which one primary and a few replicas handle ([lesson 4.6](/learn/04-data/replication/)). If traffic grows 10 times, add replicas first. Shard the table by `short_code` ([lesson 4.7](/learn/04-data/sharding/)) only when the data no longer fits one machine. At 500 GB it does fit, so sharding is the last step, not the first.
+
+For worldwide users, put the redirect at the edge ([lesson 2.7](/learn/02-networking/cdn-proxies/)). A CDN or edge function can hold the hot codes. That is the same trade as 301: it saves trips and costs control, so keep edge TTLs short.
+
+Expired rows: check `expires_at` when reading, and return 404 if it has passed. A background job deletes old rows. The read check is what keeps the service correct. The job only saves space.
+
+## Trade-offs
+
+| Decision | Choice here | You gain | You pay |
+|---|---|---|---|
+| Code source | Counter ranges and base62 | No collisions, no read before write | Guessable codes. A counter service to run |
+| Alternative | Hash of the URL | No shared state | Collision checks and retries |
+| Redirect code | 302 | Expiry and analytics stay correct | Every click hits your servers |
+| Reads | Cache-aside and replicas | Redirects in about 100 ms | A cache to size, warm, and keep fresh |
+| Consistency | Availability first | Redirects survive a lost primary | A new link may take a moment to spread |
+
+<Callout type="tip">
+Lead with the numbers: "About 6,000 redirects a second, 58,000 at peak, 6 writes a second, 500 GB. So reads need scaling, the database does not." Then name the one hard part before the interviewer asks: "Short codes come from a counter. Each server takes a block of 1,000 IDs, so the counter is rarely touched, and base62 turns the number into a code."
+</Callout>
+
+<Callout type="mistake">
+Do not say "hash it and hope for no collisions". Do not use random UUIDs: at 128 bits they are far too long for a short link. Do not pick 301 for links that expire, since caches will keep serving the old target. And do not shard the table first. At 500 GB, caching and replicas come before sharding.
+</Callout>
+
+<Callout type="deep" title="Why a lost range is not a bug">
+A system with one global counter is easy to reason about, but it must be strict. Range allocation gives up strictness on purpose. Codes are unique, but they are not gap-free and they are not in global time order. For a shortener nobody needs either property. When a requirement does need order, such as a ledger, this trick does not apply. Always ask which properties the problem truly needs.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A shortener must hold 1 billion unique codes. What is the smallest base62 code length that has enough room?',
+      options: [
+        '5 characters, because 62^5 is about 916 million',
+        '6 characters, because 62^6 is about 56.8 billion',
+        '7 characters, because 62^7 is about 3.5 trillion',
+        '4 characters, because 62^4 is about 14.8 million',
+      ],
+      answer: 1,
+      explain: '62^5 is 916,132,832, which is under 1 billion, so 5 characters are not enough. 62^6 is about 56.8 billion, so 6 is the least that fits. Seven also works but is not the smallest.',
+    },
+    {
+      q: 'Why does each shortener server take a block of 1,000 counter values instead of asking for one value per new link?',
+      options: [
+        'It keeps codes short by using small numbers',
+        'It stops two servers from ever reading the same URL',
+        'It makes codes impossible for a user to guess',
+        'The counter is touched far less often',
+      ],
+      answer: 3,
+      explain: 'The block means the shared counter is touched rarely, so it is not a bottleneck. It does not shorten codes, and sequential codes in a block stay guessable. Uniqueness comes from ranges that never overlap.',
+    },
+    {
+      q: 'A short link was set to expire in 24 hours, but people still reach the long URL days later. What is the most likely cause?',
+      options: [
+        'The base62 code was reused by another link',
+        'The cache TTL for the table row is too long',
+        'A 301 reply was cached by browsers',
+        'The counter range was handed out twice by mistake',
+      ],
+      answer: 2,
+      explain: 'A 301 can be cached by browsers and CDNs, so repeat visits skip your server and never see the expiry check. A reused code would send people to a different site. A long cache TTL would be a server-side bug that still goes through the redirect service.',
+    },
+    {
+      q: 'With 1 billion codes cut to 7 base62 characters from a hash, about how many colliding pairs do we expect?',
+      options: [
+        'About 142 thousand, from n² ÷ 2S',
+        'Almost none, because 62^7 is far larger than 1 billion',
+        'About 1 billion, one for every stored link',
+        'Exactly zero, because a hash is unique for each input',
+      ],
+      answer: 0,
+      explain: 'The birthday estimate is n² ÷ (2S) with n = 10^9 and S = 3.5 × 10^12, which gives about 142,000. A big space is not enough: pairs grow with the square of n. A hash cut short is not unique.',
+    },
+    {
+      q: 'A redirect service has a 95% cache hit rate and sees 58,000 requests a second at peak. How many reads a second reach the database?',
+      options: [
+        'About 2,900, which is 5% of the peak load',
+        'About 55,100, which is 95% of the peak load',
+        'About 58,000, since every request checks the table',
+        'About 290, which is 0.5% of the peak load',
+      ],
+      answer: 0,
+      explain: 'Only misses reach the table, so the load is 5% of 58,000 = 2,900. The 55,100 figure is the hits, which the cache serves. A cache-aside design reads the table only on a miss.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="bitly-stale-redirect"
+  title="The link that would not die"
+  scenario="A marketing team sets a short link to expire at midnight after a sale. Two days later, support still gets reports that the link works. The redirect service checks expires_at on every read and returns 404 after expiry. Server logs show no hits on that code after midnight, though customers say it still redirects."
+  facts={[
+    'redirect status     : 301',
+    'expires_at check    : in the redirect service',
+    'hits after midnight : 0 in server logs',
+    'customers           : repeat visitors with the link saved',
+  ]}
+  steps={[
+    {
+      prompt: 'Why does the link still work if the server logs show no hits?',
+      options: [
+        'The browsers and CDN cached the 301, so requests never arrive',
+        'The cache-aside layer has a bug that skips the expiry check',
+        'The table kept the row, so the lookup still succeeds',
+        'Clocks on the servers are wrong, so expiry never fires',
+      ],
+      answer: 0,
+      explain: 'Zero hits in the logs means the requests never reached the service. A cacheable 301 lets browsers and CDNs answer on their own. If the service were wrong, it would still log the hits.',
+    },
+    {
+      prompt: 'What change makes expiry reliable for new links?',
+      options: [
+        'Shorten the base62 code so caches drop it sooner',
+        'Reply 302, or add a short max-age to the redirect response',
+        'Delete the row at midnight with a stronger background job',
+        'Add a second cache so the first one can be skipped',
+      ],
+      answer: 1,
+      explain: 'A 302, or a response with a short Cache-Control max-age, makes clients come back to the service, which can then check expiry. Deleting the row does nothing for a redirect that clients already hold. Code length has no effect on caching.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RFC 9110: 301 Moved Permanently and 302 Found](https://www.rfc-editor.org/rfc/rfc9110.html#name-301-moved-permanently) (what each code allows caches to do)
+- [Redis docs: INCRBY](https://redis.io/docs/latest/commands/incrby/) (an atomic counter that can hand out ranges)
+- [Birthday problem](https://en.wikipedia.org/wiki/Birthday_problem) (why a cut hash collides sooner than you expect)

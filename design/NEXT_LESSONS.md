@@ -8,8 +8,7 @@ Site: **Uptime** (brand constant `SITE` in `src/layouts/Layout.astro`). Subject:
 
 | Module | State |
 |---|---|
-| 0 Orientation, 1 One Machine, 2 Networking, 3 API Design, 4 Data, 5 Caching, 6 Asynchronous Systems, 7 Reliability, 8 Key Technologies | Done. 57 lessons. |
-| 9 Patterns (7), 10 Advanced Topics (5), 11 Case Studies (24), 12 In the Wild (4) | **To write. 40 lessons.** |
+| All modules 0 to 12 | Done. 97 lessons. |
 
 Module 6 to 8 reusable components: `AsyncQueueViz`, `AsyncPartitionViz` (queue and consumer-group visuals), `Rel*` (retry, breaker, token bucket, trace waterfall), `TechParts`. Prefix new components per module to avoid collisions between parallel writers. Lessons in Modules 6 to 8 link back with `/learn/<id>/` markdown links; never link forward to an unwritten lesson (write "lesson 9.5" as plain text).
 
@@ -93,7 +92,7 @@ Parallel writers must touch **only their own lesson files and their own new comp
 
 - `npx astro check` shows 0 errors.
 - Test build into a scratch folder: `npx astro build --outDir <scratch>`. Never build into `dist/` while others work. It must pass, including the `requires` order check and the duplicate-question check.
-- Use the dev server at http://localhost:4321. Only one `astro dev` can run per project. If it will not start, a lesson frontmatter or MDX error is usually the cause: read the log.
+- Use the dev server at http://localhost:4321. Only one `astro dev` can run per project. Astro 7 runs it as a daemon: `npx astro dev status`, `npx astro dev logs`. If islands fail with Vite "Outdated Optimize Dep" 504s, verify on a scratch build served statically (`python3 -m http.server <port> -d <outDir>`) instead. If it will not start, a lesson frontmatter or MDX error is usually the cause: read the log.
 - Screenshot the first, a middle, and the last step of every animation in light and dark. Look for overlapping text, clipped labels, arrows through boxes, wrong captions, empty areas. Fix and shoot again. Check one lesson at width 390.
 - Drive each interactive widget with a script and check the numbers against a hand calculation.
 - Sweep every lesson page at widths 1280 and 390. Pass means: no console or page errors, `scrollWidth` equals the viewport width, rendered SVG text at least 12px. Rendered size is `fontSize * (svgRenderedWidth / viewBoxWidth)`.
@@ -109,6 +108,8 @@ Parallel writers must touch **only their own lesson files and their own new comp
 - Hand font has no bold. Show emphasis with color.
 - Do not leave a quote or colon at the start of the `summary` unquoted.
 - Do not run a second dev server, and do not delete `node_modules/` or the `.astro/` cache while agents work.
+- `astro build --outDir` under `/tmp` fails with EXDEV (cross-device rename). Build into a folder on the repo's disk, such as `~/.cache/<name>-dist`, and delete it after.
+- Kill helper servers by PID. `pkill -f "http.server ..."` matches its own shell and kills it (exit 144).
 
 ## 8. Work queue
 
@@ -126,8 +127,8 @@ Work module by module, in syllabus order. Lessons in a module can be written in 
 
 ### Case study template (Module 11)
 Follow the six steps from `00-orientation/design-method.mdx` as h2 sections: Requirements (functional, below the line, non-functional with numbers), Core entities, API, Data flow (only if the problem needs it), High-level design, Deep dives. Then Trade-offs, Interview lens, Check yourself, Further reading.
-- Animation 1: the high-level design **builds up step by step**, one box per requirement, each step naming which requirement it satisfies.
-- Animation 2 or interactive: one deep dive (for example ID generation, fan-out, or the hot key) with a toggle between a naive design and the improved one.
+- Animation 1: the high-level design **builds up step by step**, one box per requirement, each step naming which requirement it satisfies. Use `DesignBuild` from `src/components/anim/DesignBuild.tsx`: give each node and edge a `step` (when it appears) and each step a `req` label such as `FR1: shorten a URL`. New nodes highlight and new edges draw in accent automatically. Wrap it in a small per-lesson component (e.g. `BitlyBuild.tsx`) that holds the data.
+- Animation 2 or interactive: one deep dive (for example ID generation, fan-out, or the hot key) with a toggle between a naive design and the improved one. Use `DesignCompare` from the same file (variants, each with its own nodes, edges, and steps; per-step `tones` recolor nodes).
 - Include a `Ballpark` for the scale numbers and one `Diagnose` for a failure.
 - Each case study adds 1 or 2 new ideas and **links back** to the lessons that taught the parts (`requires` and inline links). Do not re-teach a mechanism. Point to it.
 - Order and "new ideas" per case study are in section 2 of the plan: `/home/ll-kv-kirababu/.claude/plans/i-need-to-create-delightful-crescent.md`.

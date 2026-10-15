@@ -1,0 +1,155 @@
+---
+summary: 'Figma keeps one authoritative server per open file and resolves conflicts per property. A 2022 journal cut the crash loss window from about a minute to under a second.'
+requires: ['09-patterns/real-time-updates', '04-data/storage-engines', '02-networking/real-time-transport']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import FigmaCompare from '../../../components/anim/lessons/FigmaCompare.tsx';
+import FigmaLww from '../../../components/anim/lessons/FigmaLww.tsx';
+
+Two Figma posts matter here. "How Figma's multiplayer technology works" (2019) explains how edits sync. "Making multiplayer more reliable" (2022) explains how a file survives a server crash. We mark **what Figma says** and **our reading** apart.
+
+## The problem
+
+Many people edit one design file at once. Everyone must see the same result. Edits must feel instant. And a server crash must not eat work.
+
+Those are two separate problems. The first is **convergence**: after the same set of edits, every client shows the same file. The second is **durability**: an edit the user saw on screen should still exist after a failure.
+
+## Before: sync is solved, durability has a gap
+
+**What Figma says (2019).** Clients are web pages that "talk with a cluster of servers over WebSockets" (lesson [2.5](/learn/02-networking/real-time-transport/)). The servers "spin up a separate process for each multiplayer document". The server is "the ultimate authority on what the document looks like", so clients never need timestamps to order events.
+
+For conflicts Figma uses the simplest rule that works. If two clients change the same property of the same object, "the document will just end up with the last value that was sent to the server". Different properties never conflict. Figma says OT, operational transformation, was "unnecessarily complex for our problem space", and adds "Figma isn't using true CRDTs though". The server is a central point, which a true CRDT does not need.
+
+Step through the rule below.
+
+<FigmaLww client:visible />
+
+**What Figma says (2022).** The live file sits in server memory. About "every 30 to 60 seconds" the server writes a checkpoint. The post says "we could lose up to 60 seconds of work on the server-side if multiplayer crashes." A redeploy had a second cost. When multiplayer is redeployed, all files held in memory are closed. Each needs a checkpoint, so "a checkpoint-centric system causes large spikes in checkpoint load". For the worst 5% of files, the post says a checkpoint can take about 4 seconds or more.
+
+## After: add a journal
+
+<FigmaCompare client:visible />
+
+**What Figma says.** Each change gets a sequence number, "an incrementing integer associated with the file". Changes go to a journal, "a durable datastore that is asynchronously written to" in batches. The post contrasts the cadence: "every 0.5 seconds vs. every 60 seconds". Recovery loads the latest checkpoint, then queries for all entries newer than it and replays them.
+
+To keep two servers from writing one file's journal, multiplayer writes a (lock UUID, file key) entry to take ownership of the file. On a deploy, connections close and the server waits for any unsaved changes to reach the journal. The post says the p99 of that wait is under 1 second.
+
+Figma's stated goal was less than one second of data loss. It reports that 95% of edits get saved within 600 ms. Before rollout it ran about 400 thousand consecutive successful validations. The journal and checkpoints are "dual solutions": the journal holds small increments, and a checkpoint holds the whole file.
+
+One cost the post names: cross-region copying of data. Figma wanted file data replicated across regions within 30 minutes. It estimated that DynamoDB global tables for this would raise the cost of the feature 6x. It did not pick that route.
+
+<Callout type="deep" title="Our reading">
+The journal is a write-ahead log (lesson [4.2](/learn/04-data/storage-engines/)) applied to a live document. The checkpoint bounds replay time, like a database snapshot.
+
+Last writer wins is cheap because one server orders all edits. The price is that a simultaneous edit to one property silently loses one value. That is fine for a position. It would be a bad fit for merging two people's typing into one text value.
+
+The post does not say whether a client waits for the journal write before showing an edit. We therefore cannot say that no acknowledged edit is ever lost. The post claims a goal of under one second, not zero.
+</Callout>
+
+## Where it maps to earlier lessons
+
+| Idea in the story | Lesson |
+|---|---|
+| Live updates over a persistent connection | [9.3 Real-time Updates](/learn/09-patterns/real-time-updates/), [2.5 Real-time Transport](/learn/02-networking/real-time-transport/) |
+| Write-ahead log, then replay | [4.2 How a Database Stores Data](/learn/04-data/storage-engines/) |
+| One writer per file | [9.4 Dealing with Contention](/learn/09-patterns/contention/) |
+| Ordering and convergence | [4.10 Consistency Models](/learn/04-data/consistency-models/) |
+
+## Trade-offs
+
+| Choice | Gain | Cost |
+|---|---|---|
+| One authoritative server per file | One order, no timestamps, simple rules | A central point per document |
+| Property-level last writer wins | Few conflicts, easy to reason about | Same-property edits overwrite each other |
+| Checkpoints only | Simple | Loss window as long as the checkpoint gap |
+| Journal plus checkpoints | Loss window near the journal gap | Extra durable writes, a lock per file, more to operate |
+
+## Interview takeaways
+
+<Callout type="tip">
+For a collaborative editor, say: "One authoritative server per document orders edits. Conflicts resolve per property. I add a write-ahead journal with per-file sequence numbers, so a crash replays from the last checkpoint." Then name the cost: same-property overwrites and a single owner per file.
+</Callout>
+
+<Callout type="mistake">
+Do not say "Figma uses CRDTs" or "Figma uses OT". The post says it is not using true CRDTs and rejects OT. Do not say checkpoints alone make data safe. They leave a gap as wide as the gap between them.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Alice and Bob each set the x position of one Figma rectangle at nearly the same moment. What does the 2019 design produce?',
+      options: [
+        'Both values merge into one average position for the rectangle shape',
+        'The later value received by the server wins, and the other is dropped',
+        'The client with the lower ID wins and the other client is then told',
+        'Both clients keep their own value until the whole file is closed again',
+      ],
+      answer: 1,
+      explain: 'The server orders events and keeps the last value it received for that property. Both clients then receive that value, so they converge. Nothing is averaged. Figma says the document ends up with the last value sent to the server.',
+    },
+    {
+      q: 'The checkpoint covers up to change 7. The journal holds changes 8 and 9. The server crashes. What does recovery do?',
+      options: [
+        'Load the checkpoint and then discard 8 and 9 as unconfirmed',
+        'Replay the whole journal from the first entry that was ever written',
+        'Ask each connected client to resend every edit from the last minute',
+        'Load the checkpoint, then replay entries 8 and 9',
+      ],
+      answer: 3,
+      explain: 'The sequence numbers say where the checkpoint ends. Recovery queries only for newer entries and replays them. Replaying everything would work but would be slow. Clients are not the source of truth here.',
+    },
+    {
+      q: 'Why did a redeploy hurt the checkpoint-only design more than a normal minute of editing?',
+      options: [
+        'A redeploy deletes all of the checkpoints that were already stored',
+        'A redeploy changes every sequence number in all of the open files',
+        'A redeploy closes every open file at once, so checkpoints spike',
+        'A redeploy forces every client to use last writer wins on all properties',
+      ],
+      answer: 2,
+      explain: 'Each in-memory file must be saved before it closes. Closing all files together makes a burst of checkpoint work. The journal lets the server drain by waiting for pending journal writes instead.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="figma-journal-gap"
+  title="The lost minute"
+  scenario="A collaborative editor keeps each file in server memory and writes a full snapshot every 60 seconds. Users report that after a server crash, the last half minute of their edits is gone."
+  steps={[
+    {
+      prompt: 'What is the root cause?',
+      options: [
+        'The snapshot is the only durable copy, so edits after it live only in memory',
+        'Last writer wins is dropping edits that arrive close together in time',
+        'The WebSocket drops messages when the server process is under load',
+        'Clients send edits too slowly for the server to write them all',
+      ],
+      answer: 0,
+      explain: 'Edits since the last snapshot exist only in server memory. A crash erases them. The loss window equals the snapshot interval, which is the problem Figma described.',
+    },
+    {
+      prompt: 'Which fix shrinks the loss window without making each snapshot cheaper?',
+      options: [
+        'Take the snapshot every 5 seconds instead of every 60',
+        'Add a second server that holds the same file in memory',
+        'Append numbered changes to a durable journal, and replay it after the last snapshot',
+        'Have clients keep a local copy and re-upload it on every reconnect',
+      ],
+      answer: 2,
+      explain: 'A journal writes only small changes, in frequent batches, and replay rebuilds the state. A faster snapshot rewrites the whole file each time, which is slow for large files. A second memory copy can fail at the same time.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [How Figma's multiplayer technology works (2019)](https://www.figma.com/blog/how-figmas-multiplayer-technology-works/)
+- [Making multiplayer more reliable (2022)](https://www.figma.com/blog/making-multiplayer-more-reliable/)

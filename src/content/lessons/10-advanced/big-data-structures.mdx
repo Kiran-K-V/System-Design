@@ -1,0 +1,248 @@
+---
+summary: 'Three small structures answer huge questions with a little wrong. A Bloom filter says maybe or never, HyperLogLog counts unique items in 12 KB, and Count-Min Sketch counts frequencies and only ever overcounts.'
+requires: ['04-data/indexing', '01-one-machine/estimation']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import BigBloomWalk from '../../../components/anim/lessons/BigBloomWalk.tsx';
+import BigBloomLab from '../../../components/anim/lessons/BigBloomLab.tsx';
+
+## The problem
+
+Three questions come up again and again at scale.
+
+1. **Is this key in this file?** An LSM tree (lesson [4.3](/learn/04-data/indexing/)) holds many files. A read for a missing key would open each one. Each check is a disk read of about 100 µs.
+2. **How many unique visitors did we have today?** A set of 1 billion 64-bit IDs takes at least 8 GB. You want that number per page, per day.
+3. **Which items are most frequent?** A table of counters for every search query grows with the number of distinct queries.
+
+An exact answer costs memory that grows with the number of items. Give up a little accuracy and memory becomes **small and fixed**. These structures are called **probabilistic**. Each one trades a known, tunable error for a very small size.
+
+## Bloom filter: is it in the set?
+
+A **Bloom filter** answers "is X in the set?" with one of two replies.
+
+- **Definitely not.** Always correct.
+- **Possibly yes.** Usually correct. Sometimes wrong. This is a **false positive**.
+
+It has no **false negatives**.
+
+It is an array of **m** bits, all 0, and **k** hash functions. A hash function turns an item into a number. Take it modulo m and you get a bit position.
+
+- **Add** an item: compute its k positions and set those bits to 1.
+- **Query** an item: compute its k positions. If any bit is 0, the item is **definitely not** there. If all are 1, it is **possibly** there.
+
+Step through a tiny filter: 12 bits, 3 hashes.
+
+<BigBloomWalk client:visible />
+
+A bit is never reset to 0, so an item that was added always finds its bits set. That is why false negatives cannot happen. Bits are shared, so other items can set all of a new item's bits by accident. That is a false positive.
+
+### The formula
+
+After n items, the false-positive rate is about
+
+**ε ≈ (1 − e^(−kn/m))^k**
+
+For a fixed m and n, the best number of hashes is
+
+**k = (m / n) × ln 2**
+
+For a target rate ε, the bits needed per item are
+
+**m / n = −ln(ε) / (ln 2)²**
+
+Compute one by hand. You want ε = 1% for n = 1,000,000 items.
+
+- m / n = −ln(0.01) / 0.4805 = 4.605 / 0.4805 = **9.585 bits per item**.
+- m = 9.585 million bits, which is 1.198 MB. About **1.2 MB**.
+- k = 9.585 × 0.693 = 6.64. Hashes come in whole numbers, so use **k = 7**.
+- Check: ε = (1 − e^(−7/9.585))^7 = (1 − 0.4818)^7 = 0.5182^7 = **1.0%**.
+
+For ε = 0.1% the cost is 14.4 bits per item. Each 10× drop in error costs about 4.8 more bits per item. Memory grows slowly as you ask for accuracy.
+
+Now try it. Add words, ask about words, and change m and k. Watch the bits fill up and the expected error climb.
+
+<BigBloomLab client:visible />
+
+Two warnings.
+
+- **It cannot delete.** Clearing a bit might also clear it for other items, and then those items would get a false negative. (There are variants with counters that allow deletes.)
+- **It must be sized for n.** If you plan for 1 million items and add 2 million to the same filter, the rate with k = 7 is about 16%, not 1%.
+
+Lesson 4.3 showed the main use. Each SSTable file keeps a Bloom filter in memory. A read checks it first and skips files that say "definitely not". Cassandra and PostgreSQL also use Bloom filters to skip disk reads for rows that are not there, as the [Wikipedia article](https://en.wikipedia.org/wiki/Bloom_filter) lists.
+
+## HyperLogLog: how many unique items?
+
+**HyperLogLog** (HLL) estimates the number of **distinct** items in a stream. It uses a fixed memory, and it never stores the items.
+
+The idea is a coin game. Hash each item to a random bit string. A random string starts with 0 half the time, with 00 a quarter of the time, and with k zeros 1 time in 2^k. If you saw a hash with 10 leading zeros, you probably looked at around 2^10 = 1,000 distinct items.
+
+One lucky hash makes a noisy guess. So HLL keeps **m registers** and splits the items among them.
+
+1. Hash the item.
+2. The first p bits pick a register (m = 2^p registers).
+3. In the remaining bits, count the leading zeros and add 1. Call this the **rank**.
+4. The register keeps the **maximum** rank it has seen.
+
+Do it by hand with p = 2, so 4 registers, and 8-bit hashes.
+
+| Item | Hash | Register (first 2 bits) | Rest | Rank |
+|---|---|---|---|---|
+| a | `01 000101` | 1 | `000101` has 3 leading zeros | 4 |
+| b | `10 110000` | 2 | `110000` has 0 | 1 |
+| c | `01 100000` | 1 | `100000` has 0 | 1, register 1 stays 4 |
+| d | `00 001000` | 0 | `001000` has 2 | 3 |
+| a again | `01 000101` | 1 | same as before | 4, nothing changes |
+
+The registers end as **[3, 4, 1, 0]**. Adding "a" a second time changed nothing. A repeat gives the same hash and the same rank, so it never counts twice. The estimate combines all registers with a harmonic mean, which stops one lucky register from dominating (Flajolet et al., 2007).
+
+The error depends only on the number of registers. The standard error is **1.04 / √m**.
+
+| Registers m | Standard error |
+|---|---|
+| 64 | 13% |
+| 1,024 | 3.25% |
+| 16,384 | 0.81% |
+| 65,536 | 0.41% |
+
+Four times the registers halves the error. The Redis implementation uses 16,384 registers of 6 bits each. That is 16,384 × 6 / 8 = 12,288 bytes, the "up to 12 KB" in the Redis docs, with a standard error of 0.81%. It counts up to 2^64 items.
+
+Compare: exact counting of 1 billion IDs takes at least 8 GB. HLL takes 12 KB. That is about 650,000 times smaller (8 GB / 12 KB).
+
+Two more facts. Two HLLs merge by taking the **maximum** of each register pair. The result counts the union, with no loss of accuracy. Redis exposes this as `PFADD`, `PFCOUNT`, and `PFMERGE`. And HLL **cannot answer "did user X visit?"**. It keeps no items, only the maxima.
+
+## Count-Min Sketch: how often?
+
+A **Count-Min Sketch** (CMS) estimates how many times each item appeared. It is a grid of counters with **d** rows and **w** columns. Each row has its own hash function.
+
+- **Add** an item: in every row, add 1 to the counter its hash picks.
+- **Query** an item: read its counter in every row and take the **minimum**.
+
+Two different items can share a counter, which only adds to it. So every counter is at least the true count. The minimum is the least inflated one. The result **never underestimates**.
+
+Here is a tiny grid: w = 4, d = 2. We add a three times, b once, and c twice. The hashes put a, b in column 1 of row 1, and a, c in column 0 of row 2.
+
+| | col 0 | col 1 | col 2 | col 3 |
+|---|---|---|---|---|
+| Row 1 | 0 | 4 (a + b) | 0 | 2 (c) |
+| Row 2 | 5 (a + c) | 0 | 1 (b) | 0 |
+
+- Query a: min(4, 5) = **4**. The true count is 3. Over by 1.
+- Query b: min(4, 1) = **1**. Exact, because row 2 had no collision.
+- Query c: min(2, 5) = **2**. Exact.
+- Query an item never added, such as z, that hashes to row 1 column 1 and row 2 column 0: min(4, 5) = **4**. The true count is 0.
+
+The guarantee: with width w = ⌈e / ε⌉ and depth d = ⌈ln(1 / δ)⌉, the estimate is at most the true count plus **ε × N**, with probability at least 1 − δ. N is the total of all counts. For ε = 0.01 and δ = 0.01: w = ⌈271.8⌉ = 272 and d = ⌈4.6⌉ = 5. That is 1,360 counters.
+
+The error is relative to the **total** N, not to the item. With N = 1,000,000 the bound is ±10,000. An item seen 50,000 times is measured well. An item seen 50 times is swamped. So CMS is for **heavy hitters**, the items that are frequent. A common design keeps a CMS plus a small heap of the current top items.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Bloom, 1% error | 9.585 bits per item; 1,000,000 items ≈ 1.2 MB; k = 7 | Derived from the formulas |
+| Bloom, 0.1% error | 14.4 bits per item | Derived |
+| Bloom rate with k = 7 at twice its planned n | ~16% | Derived |
+| HLL standard error | 1.04 / √m | Flajolet et al. 2007 |
+| Redis HLL | up to 12 KB, 0.81% error, 16,384 registers of 6 bits | Redis docs and source |
+| CMS size for ε = δ = 0.01 | 272 × 5 = 1,360 counters | Derived from the Wikipedia formulas |
+| Exact set of 1 billion 64-bit IDs | at least 8 GB | Derived |
+
+## Trade-offs
+
+| Structure | You gain | You pay | Choose when |
+|---|---|---|---|
+| Exact hash set | Exact answer, can list and delete | Memory grows with n | n is small |
+| Bloom filter | ~10 bits per item, one-sided error | No delete, no list, must size for n | "Skip the lookup if surely absent" |
+| HyperLogLog | 12 KB for any count, mergeable | Distinct count only, ~1% error | Unique visitors, unique queries |
+| Count-Min Sketch | Fixed memory frequencies, never underestimates | Overcounts, weak for rare items | Heavy hitters, rate counting |
+
+## Interview lens
+
+<Callout type="tip">
+Match the structure to the question and name the error type: "Bloom filter for membership: it can say yes wrongly, never no wrongly. HyperLogLog for distinct counts: about 1% error in 12 KB. Count-Min Sketch for frequencies: it only overcounts". Give a size: "10 bits per item for a 1% false-positive rate". Say what happens on a false positive: "we do the real lookup and pay one wasted read, so it is safe".
+</Callout>
+
+<Callout type="mistake">
+Do not say a Bloom filter has false negatives. Do not use one where a false positive causes harm, for example "this username is taken". Check the real store when the filter says maybe. Do not claim HyperLogLog can tell whether one user visited. And do not forget that Count-Min Sketch never underestimates: the true count is at most the estimate.
+</Callout>
+
+<Callout type="deep" title="Why 6 bits per register is enough">
+A register holds a rank, which is a count of leading zeros plus 1. With a 64-bit hash and 14 bits used for the register choice, the rank is at most 51. A 6-bit field holds 0 to 63. The Redis source comments that 6 bits are "enough to count up to 63 leading zeroes". A register that stores a small number is why 16,384 of them fit in 12 KB.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A Bloom filter in front of a database answers "possibly present" for a key. What should the service do next?',
+      options: ['Return the key as found, since the filter is almost always right', 'Run the real lookup in the database to find out', 'Add the key to the filter again so the answer is certain', 'Run the filter again with a different hash to confirm'],
+      answer: 1,
+      explain: '"Possibly present" can be a false positive. Only the real store knows. The filter\'s job is to skip the lookup when it says "definitely not". Adding the key again changes nothing, and a second pass with the same hashes gives the same answer.',
+    },
+    {
+      q: 'You want 1% false positives for 100 million keys in a Bloom filter. About how much memory is that?',
+      options: ['About 12 MB', 'About 120 MB', 'About 1.2 GB', 'About 12 KB'],
+      answer: 1,
+      explain: '9.585 bits per item × 100 million = 958.5 million bits, which is about 120 MB. At 1 million keys it is 1.2 MB, so 100 million keys is 100 times that.',
+    },
+    {
+      q: 'A HyperLogLog uses 16,384 registers. You move to 65,536 registers. What happens to the standard error?',
+      options: ['It stays at 0.81%, because memory does not affect error', 'It drops to about 0.2%', 'It drops to about 0.41%, half as large', 'It rises, because more registers mean more noise'],
+      answer: 2,
+      explain: 'The error is 1.04 / √m. Four times the registers gives √4 = 2 times smaller error: 0.81% becomes about 0.41%. It is not 4 times smaller, because the square root is in the formula.',
+    },
+    {
+      q: 'A Count-Min Sketch reports that a search term was seen 4,200 times. What is the best conclusion about the true count?',
+      options: ['It is about 4,200, and could be a little more or a little less', 'It is exactly 4,200 with probability 1 − δ', 'It is at most 4,200, never above', 'It is at least 4,200, never below'],
+      answer: 2,
+      explain: 'Collisions only add to counters, so each counter is at least the true count, and the minimum of them is still at least the true count. So the estimate is an upper bound: the true count is at most 4,200.',
+    },
+    {
+      q: 'Why can a plain Bloom filter not remove an item?',
+      options: ['The hash functions are one-way, so the bit positions cannot be found again later', 'Clearing its bits could break other items and cause false negatives', 'Removed items stay in memory, and they must be garbage collected before a delete', 'It can, simply by setting the bits back to 0 for that one item'],
+      answer: 1,
+      explain: 'Bits are shared between items. If you reset the three bits of one item, another item that used one of those bits would now see a 0 and be reported as "definitely not". That is a false negative, which the structure promises never to give.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Bloom filters for an LSM tree"
+  scenario="A key-value store has 20 data files. Each file holds 50 million keys and has its own Bloom filter sized for a 1% false-positive rate (9.585 bits per key)."
+  steps={[
+    {
+      prompt: 'How many MB is the Bloom filter of one file?',
+      unit: 'MB',
+      answer: 60,
+      within: 1.1,
+      explain: '50 million × 9.585 bits = 479 million bits. Divide by 8 for bytes: about 59.9 million bytes, which is 60 MB.',
+    },
+    {
+      prompt: 'How many GB of memory do the filters of all 20 files take?',
+      unit: 'GB',
+      answer: 1.2,
+      within: 1.1,
+      explain: '20 × 60 MB = 1,200 MB, which is 1.2 GB.',
+    },
+    {
+      prompt: 'A read asks for a key that exists in none of the files. On average, how many file reads are wasted by false positives?',
+      unit: 'reads',
+      answer: 0.2,
+      within: 1.3,
+      explain: 'Each of the 20 filters wrongly says "maybe" 1% of the time. 20 × 0.01 = 0.2 wasted reads on average. Without filters it would be 20 reads.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Wikipedia: Bloom filter](https://en.wikipedia.org/wiki/Bloom_filter) (formulas, optimal k, uses in Bigtable and Cassandra)
+- [Flajolet, Fusy, Gandouet, Meunier, "HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm"](https://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf) (the 1.04 / √m error)
+- [Redis: HyperLogLog](https://redis.io/docs/latest/develop/data-types/probabilistic/hyperloglogs) (12 KB, 0.81%)
+- [Wikipedia: Count–min sketch](https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch) (width, depth, error bound)

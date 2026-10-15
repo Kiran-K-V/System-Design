@@ -1,0 +1,308 @@
+---
+summary: 'Top-K counts events in a stream and keeps a ranked list per time window. Batch writes in a stream job, precompute each list, and use a sketch when the key space is too big.'
+requires: ['06-async/pubsub-logs', '08-technologies/flink', '10-advanced/big-data-structures']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import TopkBuild from '../../../components/anim/lessons/TopkBuild.tsx';
+import TopkRead from '../../../components/anim/lessons/TopkRead.tsx';
+
+## The problem
+
+A video site wants a page that shows the most viewed videos right now. A product team asks for "top 1,000 videos in the last hour, the last day, the last month, and all time". Views arrive all day. The list must stay fresh.
+
+This is a **stream aggregation** problem. A stream is an endless flow of events. Aggregation turns many events into a few numbers. Here the numbers are one count per video, and a ranking on top of those counts.
+
+The case adds three ideas to what you already know.
+
+- Counts are kept per **time window**, so old views must leave the count.
+- Exact counts are the default. An **approximate count** trades a small error for much less memory.
+- The ranking is **precomputed**. Nobody sorts billions of rows on a request.
+
+The mechanisms come from earlier lessons. Kafka is lesson [8.6](/learn/08-technologies/kafka/). Flink and its windows are lesson [8.7](/learn/08-technologies/flink/). The sketch data structures are lesson [10.3](/learn/10-advanced/big-data-structures/). This page shows how they fit together.
+
+## Requirements
+
+**Functional.**
+
+1. A client asks for the top K videos, with K at most 1,000, for all time.
+2. A client asks for the top K for the last hour, the last day, and the last month.
+
+**Below the line.** Arbitrary time ranges, such as "last 37 minutes", and arbitrary start and end points. Say so out loud. They need a different design, such as a time-series database (lesson [10.2](/learn/10-advanced/time-series/)).
+
+**Non-functional.** Every number below is an interview assumption, not a measured fact.
+
+- Freshness: a view appears in the lists within about 1 minute.
+- Read latency: tens of milliseconds.
+- Precision: exact counts first. Approximation is a deep dive.
+- Scale: 70 billion views per day and 4 billion videos.
+
+### Derive the load
+
+Use the method from lesson [1.4](/learn/01-one-machine/estimation/). A day has 86,400 seconds.
+
+- Views per second: 70,000,000,000 / 86,400 = about **810,000 per second** on average. Peaks are higher. Plan for twice that.
+- Counter table, one row per video: 4,000,000,000 rows x 16 bytes (8-byte id and 8-byte count) = **64 GB**. That is small. One count row per video is cheap. The write rate is the hard part.
+- One database instance takes about 10,000 writes per second in this model (assumption). One write per view needs 810,000 / 10,000 = **81 instances**.
+
+The 70 billion figure is an assumption for a very large video site. We do not know the real number. The method matters more than the number.
+
+## Core entities
+
+- **Video**: the thing counted.
+- **View**: one event, with a video id and a timestamp.
+- **Window**: a time range: last hour, last day, last month, all time.
+
+## API
+
+One read endpoint. Writes arrive as events, not as API calls from the reader.
+
+```
+GET /views/top-k?window=1h&k=100   ->   [{ videoId, views }, ...]
+```
+
+Pagination (lesson [3.3](/learn/03-api-design/pagination/)) is not needed. K is capped at 1,000, so the answer is one small page.
+
+## Data flow
+
+This problem has a clear pipeline, so write it down first.
+
+1. A view event enters a durable log.
+2. A stream job sums events per video over short buckets.
+3. The sums go to a count store.
+4. A job ranks the counts and writes a list per window to a cache.
+5. The API reads the cache.
+
+## High-level design
+
+Build it one requirement at a time.
+
+<TopkBuild client:visible />
+
+Notice what the design avoids. The view path never waits on a counter. The read path never sorts. Each side scales by itself.
+
+## Deep dives
+
+### Write volume: batch in the stream
+
+The naive design runs `UPDATE counts SET views = views + 1` for every view. At 810,000 writes per second that needs 81 instances and wastes most of the work. Many views hit the same video inside one second.
+
+The stream job fixes this. It groups events by video id for one minute and writes one partial count per video. If 5 million different videos get a view in a minute (assumption), the store sees 5,000,000 / 60 = about **83,000 writes per second**. That needs 83,000 / 10,000, so about **9 instances**. Batching cut the write rate by about 10 times.
+
+The job keeps its sums in Flink state (lesson [8.7](/learn/08-technologies/flink/)). Checkpoints protect that state. If the job crashes, it restarts from the last checkpoint and replays from the Kafka offset stored with it. A late event, such as a view sent by a phone that was offline, is handled by the watermark rule in the same lesson. Choose a delay of a few seconds. Longer delay means better counts and a slower list.
+
+Shard the count store by video id (lesson [4.7](/learn/04-data/sharding/)). One video belongs to one shard, so its count never needs a cross-shard sum. One very hot video is still one hot key. A viral video may get far more writes than 10,000 per second. The stream job already merges its views into one write per minute, which is why batching also solves the hot key here.
+
+### Reading the top K
+
+<TopkRead client:visible />
+
+The better design gives up a little freshness. Readers see a list up to one refresh old. The assumption is 30 seconds, so the total delay stays inside the 1 minute goal.
+
+The job keeps a **min-heap** of size K: a structure whose smallest item is always at the top. For each count, compare it with the smallest item in the heap. If it is bigger, swap it in. One pass over N counts costs about N log K steps. Memory is only K entries.
+
+### Time windows
+
+Two kinds of window are easy to mix up.
+
+A **tumbling window** [mid] has a fixed size and no overlap. "10:00 to 11:00" is one. Each event belongs to exactly one window.
+
+A **sliding window** [mid] has a fixed size and moves by a smaller step. "The last 60 minutes, updated every minute" is one. Each event belongs to several windows. In Flink, an event falls into size / slide windows. With size 60 minutes and slide 1 minute that is 60 windows. At 810,000 views per second, naive sliding means about 48.6 million window updates per second. That is far too many.
+
+The cheap method uses buckets.
+
+1. The job writes one bucket per minute, as in the diagram.
+2. For the last-hour list, keep a running count per video. Each minute, **add** the newest bucket and **subtract** the bucket that just left the window.
+3. Do the same with hourly buckets for the day and month lists.
+
+You pay for subtraction: you must keep the old buckets until they expire. For one hour that is 60 minute-buckets, or about 60 x 5,000,000 x 16 bytes = 4.8 GB in our model.
+
+<Callout type="mistake" title="One sorted set for every window">
+A single sorted set of counts has no way to forget old views. Give each window its own key and let old buckets expire. Otherwise the last-hour list slowly turns into the all-time list.
+</Callout>
+
+### Approximate counts: heavy hitters
+
+Exact counts cost 64 GB here, which is fine. The trouble starts when the key space has no useful limit, such as every search query or every URL. Then exact counting does not fit in memory.
+
+A **heavy hitter** [mid] is an item that makes up a large share of the total count. Top-K asks for exactly these items. You do not need exact counts for the long tail of rare items.
+
+A **count-min sketch** [senior] is a grid of counters with `d` rows and `w` columns. Each row has its own hash function. To add an item, hash it once per row and add 1 to one counter in each row. To read an item, hash it the same way and return the **minimum** of its `d` counters. Lesson [10.3](/learn/10-advanced/big-data-structures/) built this; here is a tiny run with `d = 2` and `w = 3`.
+
+| Item | True views | Row 1 cell | Row 2 cell |
+|---|---|---|---|
+| A | 5 | 0 | 1 |
+| B | 2 | 0 | 2 |
+| C | 1 | 1 | 2 |
+
+Row 1 ends as [7, 1, 0]: cell 0 holds A and B together. Row 2 ends as [0, 5, 3]: cell 2 holds B and C. The estimates are:
+
+- A: min(7, 5) = 5. Correct.
+- B: min(7, 3) = 3. The truth is 2, so B is **overcounted**.
+- C: min(1, 3) = 1. Correct.
+
+Collisions only add. So the minimum can overcount and can never undercount. Choose the size from two knobs. With `w = ceil(e / epsilon)` and `d = ceil(ln(1 / delta))`, an estimate exceeds the truth by at most `epsilon x N` with probability at least `1 - delta`. Here `N` is the total count in the window.
+
+Take `epsilon = 0.00001` and `delta = 0.01`. Then `w` is about 271,829 and `d` is 5. That is 1.36 million counters. At 4 bytes each it is **about 5.4 MB**. For the one-hour window, `N` is about 70,000,000,000 / 24 = 2.9 billion. The error bound is 2.9 billion x 0.00001 = about **29,000 views**. A video in the top 1,000 must have more views than that to be ranked with confidence.
+
+A sketch answers "how many views for video X". It cannot list the top K by itself. So pair it with a small heap of K candidates. On each event, update the sketch, read the estimate, and push the item into the heap if the estimate beats the heap minimum.
+
+<Callout type="deep" title="Why not always use a sketch?">
+At this scale exact counts are affordable and give a ranking nobody can argue with. A sketch adds error and a second structure to explain. Use it when the key space, not the event rate, is the problem. Say the memory arithmetic when you propose it.
+</Callout>
+
+## Numbers
+
+| Quantity | Value | Where it comes from |
+|---|---|---|
+| Views per second, average | ~810,000 | 70B / 86,400 s (assumed 70B per day) |
+| Counter table | 64 GB | 4B rows x 16 B (assumed) |
+| Instances for one write per view | 81 | 810,000 / 10,000 (assumed 10,000 per instance) |
+| Instances after minute batching | ~9 | 83,000 / 10,000 (assumed 5M active videos per minute) |
+| Cached list | ~16 KB | 1,000 x 16 B per window |
+| Count-min sketch | ~5.4 MB | e / 0.00001 columns x 5 rows x 4 B |
+| Sliding naively, 60 min / 1 min | ~48.6M updates per second | 810,000 x 60 |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| One write per view | Simple, always current | 81 instances, hot keys | Small traffic |
+| Batch per minute in a stream job | About 10x fewer writes | Up to a minute of delay, a stream system to run | Large traffic, freshness of a minute is fine |
+| Precomputed cached list | Fast reads, cheap | Lists are a refresh old | Read-heavy, small K |
+| Exact counts | Exact ranking | Memory grows with keys | Keys fit in memory or on disk |
+| Count-min sketch plus heap | Fixed memory | Overcounts, tail is fuzzy | Huge or unbounded key space |
+| Bucket add and subtract | Cheap sliding windows | Keep old buckets | Rolling windows |
+
+## Interview lens
+
+<Callout type="tip">
+Start with "reads are rare compared to views, so I precompute". Then give the write math: "810,000 views per second, so I batch in a stream job and write one partial count per video per minute". Name the freshness cost out loud. Offer the sketch last, and only if the interviewer widens the key space.
+</Callout>
+
+<Callout type="mistake">
+Do not run `GROUP BY` and `ORDER BY` on every request. Do not say a count-min sketch can undercount. It can only overcount. Do not treat a sliding window as a tumbling window: the first overlaps, the second does not.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A site sees 70B views a day. A team proposes one counter update per view, at about 10,000 writes per second per instance. Roughly how many instances does that need?',
+      options: ['About 9', 'About 81', 'About 810', 'About 8,100'],
+      answer: 1,
+      explain: '70B / 86,400 s is about 810,000 views per second. Divided by 10,000 per instance gives about 81. About 9 is the number after batching per minute, not before it.',
+    },
+    {
+      q: 'In the Top-K design, what does the stream job write to the count store each minute?',
+      options: [
+        'One row per view, so the store keeps a full history',
+        'The complete top 1,000 list for every window',
+        'A copy of every Kafka record, for later replay',
+        'One partial count per active video for that minute',
+      ],
+      answer: 3,
+      explain: 'The job sums views per video inside the minute and writes one partial count per video. That is what cuts the write rate. Writing one row per view removes the benefit, and the ranked lists are built later by another job.',
+    },
+    {
+      q: 'A count-min sketch reports 5,000 views for a video. What can you say about the true count?',
+      options: [
+        'It is at most 5,000, as collisions only add to cells',
+        'It is exactly 5,000, as long as the sketch is wide enough',
+        'It is at least 5,000, since a hash cell cannot lose counts',
+        'It is above or below 5,000, with an equal chance of each',
+      ],
+      answer: 0,
+      explain: 'Collisions only add other items to a cell, so every counter is at least the true count, and the minimum is still at least the true count. The estimate can be too high, never too low. So the true count is at most 5,000.',
+    },
+    {
+      q: 'A last-hour list is built from 60 one-minute buckets. At the top of each minute, what keeps the running counts correct?',
+      options: [
+        'Reset every count to zero and rebuild from the newest bucket',
+        'Add the newest bucket and keep the old buckets in the sum',
+        'Add the newest bucket and subtract the bucket that just left',
+        'Subtract the newest bucket and add back the oldest bucket',
+      ],
+      answer: 2,
+      explain: 'A sliding window must forget the oldest minute and learn the newest. Adding without subtracting turns the list into the all-time list. Resetting loses the other 59 minutes.',
+    },
+    {
+      q: 'An event goes into a Flink sliding window of 60 minutes that slides every 1 minute. How many windows does the event belong to?',
+      options: ['1', '2', '60', '3,600'],
+      answer: 2,
+      explain: 'An event falls into size / slide windows. That is 60 / 1 = 60. A tumbling window would put it in exactly one.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Size the Top-K pipeline"
+  scenario="A site gets 70 billion views a day and holds 4 billion videos. A counter row takes 16 bytes. One database instance takes 10,000 writes per second."
+  steps={[
+    {
+      prompt: 'How many views per second, on average?',
+      unit: 'views per second',
+      answer: 810185,
+      within: 1.2,
+      explain: '70,000,000,000 / 86,400 is about 810,000 per second.',
+    },
+    {
+      prompt: 'How many instances to take one write per view at that average rate?',
+      unit: 'instances',
+      answer: 81,
+      within: 1.3,
+      explain: '810,000 / 10,000 is about 81. This is why one write per view fails.',
+    },
+    {
+      prompt: 'How many GB does a one-row-per-video counter table take?',
+      unit: 'GB',
+      answer: 64,
+      within: 1.1,
+      explain: '4,000,000,000 x 16 bytes is 64,000,000,000 bytes, about 64 GB. The table is small. The write rate was the problem.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="topk-sketch-overcount"
+  title="A sleepy video in the top 10"
+  scenario="The team swapped exact counts for a count-min sketch plus a heap to save memory."
+  facts={['sketch:           4 rows x 2,000 columns', 'events per hour:  2.9 billion', 'top-10 entry:    video 8841, estimate 410,000 views', 'exact recount:   video 8841 had 3,100 views']}
+  steps={[
+    {
+      prompt: 'Why does an unpopular video rank in the top 10?',
+      options: [
+        'The sketch is too narrow, so many videos share cells and the minimum is inflated',
+        'The sketch dropped views for 8841, so the heap kept an old figure for it',
+        'The heap has a bug that sorts by video id instead of by view count',
+        'The stream job wrote the same minute bucket twice for video 8841',
+      ],
+      answer: 0,
+      explain: '2.9 billion events in 2,000 columns means every cell holds a huge mix of videos. The error bound is about e / 2,000 x N, around 4 million views. A sketch cannot undercount, so a figure far below the truth is not the cause.',
+    },
+    {
+      prompt: 'What is the right fix?',
+      options: [
+        'Raise the number of columns so epsilon, and the error bound, shrink',
+        'Lower the number of rows so fewer hash functions disagree',
+        'Increase the heap size K so more videos fit in the list',
+        'Run the job once a day, when the collisions average out',
+      ],
+      answer: 0,
+      explain: 'The error bound is epsilon x N and the width is e / epsilon. A wider grid means a smaller bound. Fewer rows weaken the probability guarantee. A larger heap keeps more wrong entries. Collisions do not average out.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Apache Flink: Windows](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/), tumbling and sliding assigners.
+- [Count-min sketch (Wikipedia)](https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch), the width and depth formulas and the overestimate property.
+- [Misra-Gries heavy hitters (Wikipedia)](https://en.wikipedia.org/wiki/Misra%E2%80%93Gries_heavy_hitters_algorithm), a heavy-hitter algorithm that keeps a small fixed set of counters.

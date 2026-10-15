@@ -1,0 +1,297 @@
+---
+summary: 'A payment system never loses or repeats money: idempotency keys stop double charges, a pending row and a saga survive crashes, an immutable double-entry ledger is the truth, and reconciliation checks it against the PSP.'
+requires: ['03-api-design/idempotency', '04-data/transactions', '09-patterns/multi-step']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import PayBuild from '../../../components/anim/lessons/PayBuild.tsx';
+import PayCrash from '../../../components/anim/lessons/PayCrash.tsx';
+
+## The problem
+
+A customer clicks "Pay". The server calls a card network through a **payment service provider** (PSP): a company such as Stripe that talks to card networks and banks for you. The call takes two seconds. The customer's phone loses signal and the app retries.
+
+If the design is careless, the customer is charged twice. Or the PSP takes the money and our server crashes before it saves anything. Then money has moved and nobody has a record.
+
+Most systems can lose a like or show a stale count. A payment system cannot. This case study shows four ideas that make money safe: **idempotency keys**, a **state machine** with a saga, a **double-entry ledger**, and **reconciliation**. Each one is defined below, at first use.
+
+## Requirements
+
+**Functional.**
+
+1. A merchant starts a payment for an amount.
+2. A customer pays with a card.
+3. The merchant sees the status: pending, succeeded, or failed.
+
+**Below the line.** Saved cards, refunds, subscriptions, payouts to merchants, other payment methods, and reports.
+
+**Non-functional.** The numbers are our assumptions.
+
+- Peak load of 10,000 payments per second.
+- No money is lost and no customer is charged twice, even if a service crashes at any moment.
+- Every money movement is an auditable record that is never edited.
+- Raw card numbers never reach our servers. The PSP gives us a **token**, a stand-in for the card.
+- The status shown to a merchant may lag by a few seconds. The ledger must always be exact.
+
+Notice the shape of the trade-off. This is a consistency-first system. It accepts slower and more careful steps to avoid one wrong cent.
+
+## Core entities
+
+- **Payment**: id, merchant, amount in the smallest unit (cents), currency, status, idempotency key, PSP reference.
+- **Ledger entry**: id, payment, account, debit, credit, time. Entries are never updated.
+- **Webhook event**: PSP event id (unique), type, payload, time processed.
+
+Store money as an integer of cents plus a currency code. A float cannot hold 0.10 exactly, and errors add up over millions of payments.
+
+## API
+
+| Call | Purpose |
+|---|---|
+| `POST /v1/payments` | Amount, currency, merchant. Header `Idempotency-Key`. Returns 201 with status pending. |
+| `GET /v1/payments/{id}` | Current status. |
+| `POST /v1/webhooks/psp` | The PSP calls this with results. |
+
+## High-level design
+
+Step through the build.
+
+<PayBuild client:visible />
+
+The order of steps inside the payment API matters more than the boxes.
+
+1. Check the idempotency store. If this key was seen, return the saved response.
+2. Write the payment row with status `pending` and commit it.
+3. Call the PSP, passing the same idempotency key.
+4. On the answer, or on a webhook, move the row forward and write the ledger entries in one transaction.
+
+Write the row before you call the PSP. That single rule turns a crash from "money vanished" into "a pending row to resolve".
+
+## Deep dive: idempotency keys
+
+An **idempotency key** is a unique id the caller attaches to a request. The server stores the result under that key. A repeat with the same key returns the stored result and does not run the action again (lesson [3.4](/learn/03-api-design/idempotency/) built this).
+
+It is needed on two hops. The merchant sends a key to us, so the merchant's retries are safe. We send our own key to the PSP, so our retries are safe. Stripe's documentation says its idempotency layer saves the result of the first request for a key and compares the parameters of later requests to the original. It also says that for API v1 keys may be removed after at least 24 hours. Plan for that: do not rely on a PSP key for retries that can come days later. Your own payment row is the long-term record.
+
+Create the key once, when you create the payment row, and store it on the row. Never create a new key on a retry. A new key is a new payment.
+
+## Deep dive: a crash after the PSP call
+
+The worst moment is between "the PSP charged the card" and "we saved that". Compare two orders of work.
+
+<PayCrash client:visible />
+
+The better design is the pending-first rule plus a reused key. A **recovery job** scans for rows that are still `pending` after, say, one minute. For each one it repeats the PSP call with the stored key (or asks the PSP for the payment by its reference) and moves the row to its final state.
+
+### The state machine
+
+A payment moves in one direction. Allow only these moves, and reject the rest:
+
+| From | To | When |
+|---|---|---|
+| pending | succeeded | PSP says the card was charged |
+| pending | failed | PSP says the card was declined |
+| succeeded | refunded | A refund is made (below the line) |
+
+A **state machine** is a fixed set of states and allowed moves. Writing the moves down means a late or repeated message cannot send a payment backward.
+
+### Saga, not two-phase commit
+
+A payment touches our database and the PSP. Two-phase commit (lesson [4.4](/learn/04-data/transactions/)) would need the PSP to take part in our transaction. It does not, and it would block while it waits. Use a **saga** instead (lesson [9.5](/learn/09-patterns/multi-step/)): a list of local steps, each with an undo.
+
+| Step | Undo if a later step fails for good |
+|---|---|
+| Write pending row | Mark failed |
+| Charge the card at the PSP | Void or refund at the PSP |
+| Post ledger entries, mark succeeded | Post reversing entries |
+| Tell the merchant | Retry. Nothing to undo |
+
+An undo is a new action, not a rollback. A refund is a new money movement and gets its own ledger entries. A workflow engine such as Temporal (lesson [8.9](/learn/08-technologies/temporal/)) can run this list and remember where it stopped.
+
+## Deep dive: the double-entry ledger
+
+Do not keep one `balance` column and add to it. A bug or a crash leaves a number nobody can explain, and an update erases history.
+
+**Double-entry bookkeeping** records each movement as two or more entries across accounts. The debits and credits of one movement add up to the same amount. Entries are append-only. A balance is the sum of the entries of an account.
+
+Example. A customer pays 2,000 cents (20.00 in the currency). Assume we keep 59 cents as a fee. The fee is invented for the example.
+
+| Account | Debit | Credit |
+|---|---|---|
+| Cash held at PSP | 2,000 | |
+| Merchant balance | | 1,941 |
+| Fee revenue | | 59 |
+| **Total** | **2,000** | **2,000** |
+
+If the totals differ, something is wrong, and a check can find it. A refund adds the reverse entries. Nothing is deleted. The payment row and its entries commit in one local transaction (lesson [4.4](/learn/04-data/transactions/)). To keep that transaction on one machine, shard by payment id so a payment and its entries share a shard (lesson [4.7](/learn/04-data/sharding/)).
+
+## Deep dive: webhooks and reconciliation
+
+A **webhook** is an HTTP call from the PSP to us when something changes. It can arrive late, twice, or in a different order. Stripe's documentation says it retries delivery for up to three days with exponential backoff in live mode. So the handler must be safe against all three.
+
+- Verify the signature, so a stranger cannot fake a "paid" event.
+- Store the PSP event id in a table with a unique constraint. A repeat finds the id and does nothing.
+- Apply only forward moves of the state machine.
+- Answer 200 quickly. Put heavy work on a queue (lesson [6.1](/learn/06-async/queues/)). A slow or failing handler makes the PSP retry.
+
+**Reconciliation** is a job that compares two sources of truth. Each day it takes the PSP settlement report and our ledger and matches them by PSP reference. It flags three kinds of problem: money at the PSP with no ledger entry, a ledger entry with no PSP charge, and an amount that differs. Webhooks can be lost and code has bugs, so this job is the last net.
+
+## Numbers
+
+Assume 100M payments a day, 4 ledger rows per payment, and 400 bytes of rows per payment.
+
+| Quantity | Math | Result |
+|---|---|---|
+| Average rate | 100M / 100,000 s | ~1,000 per second |
+| Peak rate | given | 10,000 per second |
+| Ledger inserts at peak | 10,000 x 4 | 40,000 rows per second |
+| Storage per day | 100M x 400 B | 40 GB |
+| Storage per year | 40 GB x 365 | ~14.6 TB |
+
+Plan to shard by payment id, and size each shard from a limit you measure for your database. I give no per-node figure, because it depends on hardware and row size.
+
+<Ballpark
+  client:visible
+  title="Sizing the ledger"
+  scenario="A payment system handles 100M payments a day. Treat a day as 100,000 seconds. Peak is 10x the average. Each payment writes 4 ledger rows of 100 bytes."
+  steps={[
+    {
+      prompt: 'What is the peak number of payments per second?',
+      unit: 'payments per second',
+      answer: 10_000,
+      within: 1.3,
+      explain: '100M / 100,000 = 1,000 per second on average. Times 10 is 10,000 at peak.',
+    },
+    {
+      prompt: 'How many ledger rows per second at peak?',
+      unit: 'rows per second',
+      answer: 40_000,
+      within: 1.3,
+      explain: '10,000 payments x 4 rows = 40,000 rows per second. This is why the ledger is sharded.',
+    },
+    {
+      prompt: 'How many TB of ledger rows in one year?',
+      unit: 'TB',
+      answer: 14.6,
+      within: 1.3,
+      explain: '100M x 4 x 100 B = 40 GB a day. 40 GB x 365 = 14,600 GB, or about 14.6 TB.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Write pending row first | A crash leaves a record to resolve | One extra write before the call | Always |
+| Saga with undo steps | Works across the PSP | You write and test each undo | A step lives outside your database |
+| Append-only double-entry ledger | Audit trail, checkable totals | More rows, balances need a sum or cache | Money is involved |
+| One balance column | Simple, one write | No history, hard to audit | Never for real money |
+| Sync response only | Simple flow | Misses late and lost outcomes | Never. Use webhooks and recovery too |
+| Daily reconciliation | Finds drift that tests miss | Needs PSP reports, and people to fix mismatches | Always |
+
+<Callout type="tip">
+Say the crash story as a sequence: "I write pending first, call the PSP with the same key on every retry, and a recovery job resolves old pending rows." Then add: "The ledger is append-only double entry, and a daily reconciliation checks it against the PSP." That covers four ideas in two sentences.
+</Callout>
+
+<Callout type="mistake">
+Do not say "two-phase commit with the PSP". The PSP is outside your transaction. Also do not treat the synchronous reply as final. A reply can time out while the charge still goes through. Do not use floats for money.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A charge request with key K times out. The client retries the charge but makes up a new key K2. What happens at the PSP?',
+      options: [
+        'The PSP matches the amounts and treats K2 as a retry of K',
+        'It sees a new key, so it may charge the card a second time',
+        'The PSP rejects K2 because the request with K is still pending',
+        'The PSP waits for K to finish, then reuses the result for K2',
+      ],
+      answer: 1,
+      explain: 'Idempotency works by matching keys. A new key is a new request. The retry must reuse K. Create the key once, store it on the payment row, and reuse it on every retry.',
+    },
+    {
+      q: 'A customer pays 2,000 cents. We keep a 59 cent fee. Which set of ledger entries is a valid double entry?',
+      options: [
+        'Debit cash 2,000. Credit merchant 1,941.',
+        'Debit cash 2,000. Credit merchant 2,000. Credit fee 59.',
+        'Debit cash 1,941. Credit merchant 1,941. Credit fee 59.',
+        'Debit cash 2,000. Credit merchant 1,941. Credit fee 59.',
+      ],
+      answer: 3,
+      explain: 'Total debits must equal total credits. 2,000 equals 1,941 plus 59. The first set leaves 59 unrecorded. The second credits 2,059 against 2,000. The third debits 1,941 but credits 2,000.',
+    },
+    {
+      q: 'The PSP sends event evt_9 (payment succeeded) twice. The handler already processed the first. What should it do with the second?',
+      options: [
+        'Find the stored event id, change nothing, and answer 200',
+        'Process it again, since the ledger can absorb repeat entries',
+        'Answer 400 so that the PSP stops sending the event',
+        'Delete the first record and process the event from scratch',
+      ],
+      answer: 0,
+      explain: 'A unique event id makes the handler idempotent. Answering 200 tells the PSP the event arrived. A 4xx or 5xx makes it retry for days. Processing twice would post the money twice.',
+    },
+    {
+      q: 'The PSP charged the card, but our ledger write keeps failing. After retries are used up, what does the saga do?',
+      options: [
+        'Roll back the PSP charge with a normal database rollback',
+        'Leave the money charged and mark the payment succeeded',
+        'Run the undo: void or refund at the PSP, mark failed',
+        'Delete the pending row so that no record of it remains',
+      ],
+      answer: 2,
+      explain: 'A saga undoes with a new action, not a rollback. The PSP is outside our database, so only a void or refund can undo the charge. Marking it succeeded with no entries breaks the books. Deleting the row destroys the audit trail.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="payment-system-status-regression"
+  title="A paid order shows as pending again"
+  scenario="A customer paid. The merchant saw the status turn to succeeded, then a few seconds later the status went back to pending. The merchant did not ship, and the customer paid a second time."
+  facts={[
+    'time      event                         status after',
+    '10:00:01  charge sent to PSP            pending',
+    '10:00:03  evt_2 payment.succeeded       succeeded',
+    '10:00:05  evt_1 payment.pending         pending',
+    'handler: UPDATE payments SET status = :status WHERE id = :id',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The PSP sent a wrong status, so we need a different PSP',
+        'The PSP charged the card again, and a new pending payment was created',
+        'The handler wrote every event status, so a late old event overwrote a newer one',
+        'The merchant read an old cached copy of the payment and showed it to the customer',
+      ],
+      answer: 2,
+      explain: 'Events can arrive out of order. evt_1 was created earlier but delivered later. The handler wrote whatever arrived last, with no rule about order. Nothing in the facts shows a second charge, and the stored row itself went back to pending.',
+    },
+    {
+      prompt: 'Which change fixes it?',
+      options: [
+        'Allow only forward moves of the state machine, and drop events already seen by id',
+        'Process webhooks one at a time, so that events cannot overlap',
+        'Slow down the handler so that events arrive in sorted order',
+        'Ignore webhooks and trust the first synchronous reply',
+      ],
+      answer: 0,
+      explain: 'A succeeded payment can never move back to pending, so a late event is dropped. Single-threaded processing still lets a late event arrive last. A delay cannot order events from outside. The synchronous reply can time out, so it cannot be the only source.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Stripe: Idempotent requests](https://docs.stripe.com/api/idempotent_requests) (how a PSP stores results under a key, and when keys can be removed)
+- [Stripe: Webhooks](https://docs.stripe.com/webhooks) (signatures, retries, and duplicate delivery)
+- [Microservices.io: Saga pattern](https://microservices.io/patterns/data/saga.html) (steps and compensating actions across services)

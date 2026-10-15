@@ -1,0 +1,203 @@
+---
+summary: 'Large files should never pass through app servers. The server signs a short-lived URL, the client sends the bytes straight to blob storage, and a storage event marks the upload done.'
+requires: ['08-technologies/blob-storage', '06-async/queues', '03-api-design/idempotency']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import PatternsBuildsOn from '../../../components/anim/lessons/PatternsBuildsOn.tsx';
+import LargeBlobsDirect from '../../../components/anim/lessons/LargeBlobsDirect.tsx';
+
+## The problem
+
+Users upload videos, photos, and documents. A file can be gigabytes. The obvious design is `POST /videos` with the file as the request body. The API server receives it, then writes it to storage.
+
+Count what that costs. Take a 2 GB video and a user on a 20 Mbit/s home uplink. The transfer takes 2 × 8 × 1,000 Mbit ÷ 20 Mbit/s = 800 seconds, about 13 minutes. The API server holds that connection open for the whole 13 minutes. If 1,000 users upload at once, that is 1,000 open connections and 1,000 × 20 Mbit/s = 20 Gbit/s of inbound traffic. The server does nothing useful with the bytes. It only relays them.
+
+Three more problems follow.
+
+- **Gateways cap the body.** Amazon API Gateway rejects a body over 10 MB ([lesson 8.10](/learn/08-technologies/api-gateway/)).
+- **A failure restarts everything.** If the connection drops at 99%, the user starts at byte zero.
+- **The app tier scales with bytes.** You add servers because of file size, not because of logic.
+
+## What this pattern is made of
+
+<PatternsBuildsOn
+  pattern="Large blobs"
+  parts={[
+    { n: '8.11', title: 'Blob Storage and CDN', href: '/learn/08-technologies/blob-storage/', job: 'The store, pre-signed URLs, and multipart limits.' },
+    { n: '8.10', title: 'API Gateway', href: '/learn/08-technologies/api-gateway/', job: 'Why big bodies cannot pass through the gateway.' },
+    { n: '6.1', title: 'Queues', href: '/learn/06-async/queues/', job: 'Carry the upload-complete event to workers.' },
+    { n: '3.4', title: 'Idempotency', href: '/learn/03-api-design/idempotency/', job: 'Events can repeat, so handlers must be safe.' },
+    { n: '2.7', title: 'CDN and Proxies', href: '/learn/02-networking/cdn-proxies/', job: 'Serve downloads from the edge.' },
+  ]}
+/>
+
+[Lesson 8.11](/learn/08-technologies/blob-storage/) teaches the store itself: keys, prefixes, multipart limits, pre-signed URLs, and the numbers. This lesson does not repeat them. It shows how the whole upload and download flow fits together.
+
+## The mechanism: the server only signs
+
+The rule is simple. **Bytes never pass through your app servers.** The server decides who may upload and what. The client sends the bytes straight to the blob store.
+
+The store does not know your users, so the server hands the client a **pre-signed URL**: a URL that carries a signature made with the server's credentials. It allows one action on one key for a short time. The client needs no credentials of its own.
+
+<LargeBlobsDirect client:visible />
+
+The flow, in order:
+
+1. The client asks the API to upload a file and states its name, size, and checksum.
+2. The API checks auth and quota, and inserts a **metadata row** with status `PENDING`.
+3. The API returns signed URLs. For a big file it starts a multipart upload and signs one URL per part.
+4. The client sends the parts directly to the store, in parallel.
+5. The API completes the multipart upload.
+6. The store emits an event. A handler flips the row to `READY`.
+
+### Why a metadata database and a blob store
+
+Keep facts in the database and bytes in the store. The row holds the owner, name, size, checksum, status, and the object key. A query finds rows ("all of Ana's videos"). The key finds bytes. Blob storage cannot answer "where owner is Ana". A database should not hold a 2 GB value. Each system does the job it is good at.
+
+### Large files: multipart and resume
+
+A single PUT to S3 can carry at most 5 GB, per the S3 documentation. Beyond that you must use multipart upload, and AWS suggests it from about 100 MB. Lesson 8.11 gives the part limits. What matters for this pattern is what multipart buys you: parts go in parallel, and a failed part is sent again alone.
+
+**Resume** follows from that. The store knows which parts it holds. After a crash or an app restart, the client asks for the list of uploaded parts, then sends only the missing ones. The client does not need to keep perfect memory, because the store is the record. Abandoned multipart uploads keep costing money until you complete or abort them, so add a lifecycle rule that aborts old ones.
+
+### Checksums: trust but verify
+
+Networks and disks can corrupt bytes. A **checksum** is a short fingerprint computed from the bytes. The client computes it, and the store computes it again on arrival. S3 supports this: if the values do not match, it fails the request with a `BadDigest` error. Check the whole file too. A file that arrives intact is the only file worth marking `READY`. Store the expected checksum in the metadata row so a later audit can compare.
+
+### Done means "the store says so"
+
+How does the API learn the upload finished? There are two choices.
+
+- **The client says so.** The client calls `POST /videos/7/done`. This is easy, but a buggy or hostile client can claim success, or it can crash before it sends the call.
+- **The store says so.** Store event notifications go to a queue, a function, or an event bus. This is the proof that the bytes exist.
+
+Prefer the event, with the client call as a hint. S3 notifications are designed to be delivered at least once, typically within seconds but sometimes a minute or longer. So the handler must be idempotent: `UPDATE ... SET status='READY' WHERE id=7 AND status='PENDING'` does nothing the second time ([lesson 3.4](/learn/03-api-design/idempotency/)). Also add a cleanup job. A row that stays `PENDING` past a deadline means the user never finished. Delete the row and abort the upload.
+
+### Downloads: signed URLs and a CDN
+
+Reads need the same care. Do not stream a video through the API. There are two options.
+
+- **A signed GET URL** straight from the store. Good for private files and small read volume.
+- **A CDN with signed URLs** ([lesson 2.7](/learn/02-networking/cdn-proxies/)). CloudFront signs a URL with an expiry, using a canned policy for expiry only or a custom policy for more rules. Edge caches then serve the bytes close to the user. If anyone changes the query string after signing, the CDN returns 403.
+
+The pattern is the same as for uploads. The API makes the decision, a signature carries it, and the data path skips the API.
+
+## Numbers
+
+Use the lesson 8.11 table for S3 limits. Derived numbers for this flow, from the 2 GB example above:
+
+| Quantity | Calculation | Result |
+|---|---|---|
+| Parts at 64 MiB | 2 GiB = 2,048 MiB; 2,048 ÷ 64 | 32 parts |
+| Calls to store, in all | 1 create + 32 parts + 1 complete | 34 |
+| API calls for this upload | start, sign URLs, complete | about 3, whatever the file size |
+| Retry cost of one bad part | 64 MiB ÷ 2,048 MiB | about 3% of the file |
+| Single PUT, bad connection at 99% | the whole file again | 2 GB resent |
+
+The server work stays about constant as the file grows. That is the gain.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Upload through the API | One simple endpoint. Full inspection of bytes | Connections held for minutes. Body caps. Bandwidth on the app tier | Small files only |
+| Direct upload, one signed PUT | App tier off the data path | Two round trips. A leaked URL works until expiry | Files up to a few tens of MB |
+| Direct multipart with resume | Parallel parts. Cheap retries | Client logic. Orphaned parts to clean up | Large files and mobile networks |
+| Completion by storage event | Proof the bytes exist | At-least-once delivery. A short delay | Always, with the client call as a hint |
+| CDN with signed URLs for reads | Fast far reads. Less origin load | Cache and invalidation rules | Public or private read-heavy media |
+
+<Callout type="tip">
+Say: "The API never touches the bytes. It checks auth, inserts a PENDING row, and returns signed multipart URLs. The client uploads parts straight to the blob store and can resume by listing parts. A storage event flips the row to READY through an idempotent handler. Downloads go through a CDN with signed URLs. Metadata is in a database, bytes are in the store." If asked about abuse, add short expiry, a size check on the finished object, and a malware scan before READY.
+</Callout>
+
+<Callout type="mistake">
+Do not route large uploads through your servers "to validate them". You cannot hold that many connections. Do not mark a file ready because the client said so. And do not forget the stale states: rows stuck in PENDING and multipart uploads that were never finished.
+</Callout>
+
+<Callout type="deep" title="Two writes that cannot be one transaction">
+The database row and the object live in two systems, so no transaction covers both. That is the same problem as in [lesson 9.5](/learn/09-patterns/multi-step/). The status column is the answer. It turns a two-system write into a small state machine: PENDING, then READY, with cleanup for the failure paths. The upload is a tiny saga where the compensation is "delete the row and abort the parts".
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A user on a slow link uploads a 5 GB file through your API server. What is the main cost to the server?',
+      options: [
+        'A connection and bandwidth held for the upload',
+        'CPU needed to hash every byte with a strong algorithm',
+        'Disk space for a permanent copy of the uploaded file',
+        'Memory to keep the file in a cache for later reads',
+      ],
+      answer: 0,
+      explain: 'A slow link keeps the connection open for a long time, and the server only relays the bytes. CPU, disk, and cache needs are small or avoidable. Direct upload removes the held connection.',
+    },
+    {
+      q: 'The client uploads all parts to the store, then crashes before calling your "done" endpoint. How should the system learn that the file exists?',
+      options: [
+        'It cannot, so the row stays PENDING and is deleted by a timer',
+        'Through a storage event that an idempotent handler processes',
+        'By polling the client device until it comes back online',
+        'By trusting the next upload request from the same user',
+      ],
+      answer: 1,
+      explain: 'The store knows the object exists and can emit an event, so the system does not depend on the client. Deleting a finished upload loses user data. Polling a device or trusting a later request is unreliable.',
+    },
+    {
+      q: 'The same "object created" event reaches the handler twice. Which handler logic gives the right result?',
+      options: [
+        'Insert a new READY row for each event it receives',
+        'Increment a counter of ready files on every event',
+        'Set READY only where status is still PENDING',
+        'Drop events that arrive more than once in a minute',
+      ],
+      answer: 2,
+      explain: 'A conditional update changes the row once and ignores the repeat. A new row or a counter changes state on each delivery. A time window cannot tell a repeat from a real new event.',
+    },
+    {
+      q: 'A multipart upload dies after 20 of 32 parts. What does a resumable client do?',
+      options: [
+        'Starts a new upload and sends all 32 parts again',
+        'Asks the API for a bigger part size and starts over',
+        'Sends the last 12 parts to a new object and merges later',
+        'Lists stored parts and sends only the missing ones',
+      ],
+      answer: 3,
+      explain: 'The store keeps the uploaded parts under the same upload id, so the client lists them and fills the gaps. Restarting wastes the finished parts, and parts cannot be merged across separate objects.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Upload traffic through the app tier"
+  scenario="A video site gets 200 uploads at the same time. Each file is 500 MB. Each user uploads at 25 Mbit/s. Use 1 byte = 8 bits and 1 MB = 8 Mbit."
+  steps={[
+    {
+      prompt: 'How long does one upload take, in seconds?',
+      unit: 's',
+      answer: 160,
+      within: 1.1,
+      explain: '500 MB × 8 = 4,000 Mbit. At 25 Mbit/s that is 4,000 ÷ 25 = 160 seconds.',
+    },
+    {
+      prompt: 'If all 200 uploads go through the app tier, what inbound rate does it carry, in Gbit/s?',
+      unit: 'Gbit/s',
+      answer: 5,
+      within: 1.1,
+      explain: '200 users × 25 Mbit/s = 5,000 Mbit/s = 5 Gbit/s, for 160 seconds, with 200 connections open. With direct upload the app tier carries 200 small signing requests instead.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [S3: Uploading objects](https://docs.aws.amazon.com/AmazonS3/latest/userguide/upload-objects.html) (the 5 GB single PUT limit)
+- [S3: Download and upload objects with presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html) (expiry, bearer-token behavior)
+- [S3: Event notifications](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html) (destinations, at-least-once delivery)
+- [CloudFront: Serve private content with signed URLs](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-signed-urls.html) (canned and custom policies)

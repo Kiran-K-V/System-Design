@@ -1,0 +1,237 @@
+---
+summary: 'A trading app has two halves. Prices are a high-rate fan-out by symbol. Orders are a low-rate, high-stakes state machine where a buying-power hold keeps the balance correct.'
+requires: ['09-patterns/real-time-updates', '09-patterns/contention', '03-api-design/idempotency']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import RobinhoodBuild from '../../../components/anim/lessons/RobinhoodBuild.tsx';
+import RobinhoodHold from '../../../components/anim/lessons/RobinhoodHold.tsx';
+
+A stock trading app looks like one system. It is two. The price side moves a huge number of tiny messages and can lose some. The order side moves few messages and can lose none. Good answers treat them separately. The new ideas here: fan-out from one exchange feed to many clients, an order that crosses to a system you do not control, an order state machine, and buying power that stays correct.
+
+## Requirements
+
+**Functional.**
+
+1. Users see live prices for stocks.
+2. Users place market and limit orders, and cancel them. A market order buys at the best price now. A limit order buys only at or below a price the user sets.
+3. Users see the status of their orders.
+
+**Below the line.** Trading outside market hours, ETFs, options, crypto, and a live order book view. Name them and set them aside.
+
+**Non-functional.** I have found no public scale figure I can check for this design, so these are assumptions.
+
+- Prices on screen are fresh within about 1 second.
+- An order is never sent to the exchange twice.
+- Buying power never goes negative because of accepted orders.
+- Every change to an order is recorded for audit.
+
+## Core entities
+
+- **Account.** Cash and buying power.
+- **Order.** Symbol, side, type, quantity, limit price, state, an idempotency key, and the exchange's order id.
+- **Hold.** Money set aside for one open order.
+- **Position.** How many shares of a symbol an account owns.
+- **Execution.** One fill: quantity, price, time. An order can have several.
+- **Quote.** The latest price of a symbol. Kept in a cache, not stored per tick.
+
+## API
+
+- `GET /v1/quotes/{symbol}` for a snapshot.
+- `WS /v1/market/stream` to subscribe to symbols and receive ticks.
+- `POST /v1/orders` with an `Idempotency-Key` header. Returns `201` with the order in state `new`.
+- `DELETE /v1/orders/{id}` asks for a cancel. Returns `202`, because the exchange has not agreed yet.
+- `GET /v1/orders/{id}` returns the state and the fills.
+
+The key header comes from lesson [3.4](/learn/03-api-design/idempotency/). A phone on a weak signal will retry a `POST`. Without a key, a retry is a second purchase.
+
+## High-level design
+
+<RobinhoodBuild client:visible />
+
+### Prices: one feed, many clients
+
+An exchange sends a feed of trades. Each record names a symbol, a price, and a size. One reader consumes it. That is one stream in and, say, 2 million phones out. This is the "one to many" shape of lesson [9.3](/learn/09-patterns/real-time-updates/).
+
+Three choices keep it cheap.
+
+- **Subscribe by symbol.** A phone watches maybe 5 symbols. Sending it all 5,000 would waste 99.9% of the bytes. The gateway keeps a map from symbol to sessions, and sends a tick only to sessions in the map.
+- **Coalesce.** A busy symbol may trade many times a second. A human eye cannot use that. The gateway keeps the latest price per symbol and sends it once per second. Old ticks for the same symbol are dropped, not queued. The newest price is the only one that matters.
+- **Push over a persistent connection.** WebSocket or SSE (lesson [2.5](/learn/02-networking/real-time-transport/)). The alternative is each phone polling a database every second. That is 2 million reads a second, to learn nothing most of the time.
+
+A new phone must see a price at once, before the next tick. That is the job of the quote cache: on subscribe, the gateway reads the latest price and sends it.
+
+### Orders: the exchange is not yours
+
+The order service does not decide whether a trade happens. The exchange does. So an order passes through states, and the state changes when the exchange speaks.
+
+| State | Meaning | Next states |
+|---|---|---|
+| `new` | We stored it and placed a hold | `accepted`, `rejected`, `cancelled` |
+| `accepted` | The exchange has it | `partially_filled`, `filled`, `cancelled` |
+| `partially_filled` | Some shares traded | `partially_filled`, `filled`, `cancelled` |
+| `filled` | All shares traded | none |
+| `cancelled`, `rejected` | Over. The hold is released | none |
+
+Three rules make the machine safe.
+
+1. **Only legal moves.** A `filled` order cannot become `accepted`. The update is conditional on the current state, the same way as a conditional write in lesson [4.4](/learn/04-data/transactions/).
+2. **Messages repeat and arrive late.** The exchange gateway sees an acknowledgement twice, or sees a fill before the ack. Key every update by the exchange order id and fill id, so a repeat changes nothing. This is idempotency (lesson [3.4](/learn/03-api-design/idempotency/)) on the inbound side.
+3. **A timeout is not a failure.** If the gateway sends an order and the reply never comes, the order may be live. Never resend blindly. Look it up by the id you sent first. Only resend if the exchange has no record.
+
+A cancel follows the same path. It is a request, and the order is `cancelled` only when the exchange says so. A fill may win the race with the cancel. The user sees whichever one the exchange confirms.
+
+## Deep dives
+
+### Keeping buying power correct
+
+A user has $1,000 of buying power and sends two orders of $800 at the same time. Only one may pass.
+
+<RobinhoodHold client:visible />
+
+The conditional update is one case of the idea in lesson [9.4](/learn/09-patterns/contention/): turn check-then-act into one atomic step on the row that is the source of truth. In SQL it reads `UPDATE accounts SET power = power - 800 WHERE id = ? AND power >= 800`, and the service reads the number of changed rows. In PostgreSQL's default isolation level, a second update that waits for the first re-checks its `WHERE` clause against the new row, so the second order sees $200. The hold row and the order row are inserted in the same transaction. Either both exist, or neither does.
+
+The hold has a life cycle:
+
+- On `new`, subtract the cost from buying power and record the hold.
+- On `cancelled` or `rejected`, add it back and mark the hold released.
+- On a fill, turn that part of the hold into a real debit and update the position.
+
+A market order has no price. Hold an estimate: the last price plus a margin, say 5%. After the fill, release the difference. State that margin as your design choice.
+
+If one account is very busy, a single writer per account (a partition keyed by account id) is a second way to get one order at a time. For a retail app, row-level conditional updates are enough. One account rarely makes more than a few orders a second.
+
+### Where the load really is
+
+The two halves differ by orders of magnitude, and so do their designs. Work out the shape yourself.
+
+<Ballpark
+  client:visible
+  title="Prices versus orders"
+  scenario="Assume 2 million sessions are open at market peak. Each watches 5 symbols. Each symbol is sent once per second. Orders: 5 million a day, and the peak second is 10 times the daily average."
+  steps={[
+    { prompt: 'How many price messages per second leave the gateways?', unit: 'msg/s', answer: 10000000, within: 1.1, explain: '2,000,000 sessions x 5 symbols x 1 message per second = 10 million messages per second. This is why the price tier is its own set of stateless gateways, scaled by session count.' },
+    { prompt: 'If one gateway holds 100,000 sessions, how many gateways?', unit: 'gateways', answer: 20, within: 1.1, explain: '2,000,000 / 100,000 = 20. Each sends 100,000 x 5 = 500,000 messages per second. At about 100 bytes each that is 50 MB/s per gateway. Treat the 100,000 as an assumption to check by load test.' },
+    { prompt: 'What is the average order rate, in orders per second?', unit: 'orders/s', answer: 58, within: 1.2, explain: '5,000,000 / 86,400 is about 58 per second. Ten times that at peak is under 600 per second: one relational database can take it. The order side is hard because of correctness, not volume.' },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Coalesce ticks to 1 per second | Large cut in outbound messages | Short spikes are hidden | Retail display. Not for algorithmic traders |
+| Subscribe by symbol | Bytes only for watched symbols | Gateway keeps a subscription map | Always |
+| Hold before sending | No overdraft, simple reasoning | A held amount is unavailable until released | Any app with limited buying power |
+| One database for orders and cash | Hold and order commit together | One store to scale and fail over | Hundreds of orders a second |
+| Wait for exchange confirm on cancel | Truthful state | The user sees `pending cancel` for a moment | Always. The exchange has the last word |
+
+<Callout type="tip">
+Split the problem out loud: "Prices are a fan-out problem. Orders are a consistency problem." Then give one number for each side and one mechanism: "ticks coalesce to one a second and go to symbol subscribers; orders hold buying power with a conditional update." Say the exchange is the source of truth for order state.
+</Callout>
+
+<Callout type="mistake">
+Do not send every tick to every client. Do not treat the first HTTP response as the final order state. Do not read the balance, check it in code, and then write it. Do not retry an order after a timeout without an idempotency key and a lookup. And do not get pulled into building an order book unless the interviewer asks: it is below the line.
+</Callout>
+
+<Callout type="deep" title="Why a timeout is the worst case">
+A reply that says `rejected` is clear. A reply that never arrives is not. The order may have reached the exchange, been filled, and lost its acknowledgement on the way back. If you release the hold and let the user retry, they can buy twice. The safe state for an unknown order is "pending, hold kept". A reconciliation job later asks the exchange for its record, and moves the order to a final state.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A phone watches 5 stocks. The gateway holds 2 million sessions. Which design cuts outbound price traffic the most?',
+      options: [
+        'Compress every tick with a stronger algorithm before it is sent out',
+        'Send each session only its symbols, once a second at most',
+        'Poll the database from each phone once every second',
+        'Replicate the quote cache to every gateway and let phones read from it',
+      ],
+      answer: 1,
+      explain: 'Filtering by subscription removes 99.9% of the messages a phone cannot use, and coalescing caps the rest. Compression shrinks bytes but not message count. Polling creates 2 million reads a second and returns mostly unchanged data.',
+    },
+    {
+      q: 'The exchange gateway sends a buy order and the connection drops before any reply. What should the order service do next?',
+      options: [
+        'Resend the order with the same exchange order id after a short wait, then check',
+        'Release the hold and show the user a rejected order right away',
+        'Look it up at the exchange, keep the hold, resend only if unknown',
+        'Mark the order as filled at once, because most orders do get filled',
+      ],
+      answer: 2,
+      explain: 'The order may be live, so releasing the hold or resending can both cause a double buy. Looking it up first gives a fact. Resending with the same id is only safe after the lookup shows the exchange has no record.',
+    },
+    {
+      q: 'An account has $1,000. Two $800 orders run at once. Which statement stops the second one with no explicit lock?',
+      options: [
+        'SELECT the balance, check in code, then UPDATE it to the new value',
+        'UPDATE accounts SET power = power - 800 WHERE id = ? AND power >= 800',
+        'UPDATE accounts SET power = power - 800, then check for a negative value later',
+        'Insert two hold rows and add them up each morning',
+      ],
+      answer: 1,
+      explain: 'The condition and the subtraction happen in one statement on one row. The second statement finds 200 and changes zero rows. Reading first, in code, lets both orders see $1,000. Checking after the update lets the balance go negative first.',
+    },
+    {
+      q: 'A fill message for order 17 arrives twice, 40 ms apart, from the exchange gateway. What keeps the position correct?',
+      options: [
+        'Apply it twice, because the exchange never sends a fill that did not happen',
+        'Ignore every message that arrives within the same second as another',
+        'Apply each fill id once, so the repeat changes nothing',
+        'Lock the whole account until the exchange stops sending any messages',
+      ],
+      answer: 2,
+      explain: 'Network paths repeat messages. Each fill has an id from the exchange. Recording that id with the update makes the second copy a no-op. Ignoring by time can drop a real second fill. A whole-account lock does not stop the repeat.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="robinhood-double-fill"
+  title="A user bought twice"
+  scenario="A support ticket: a user tapped Buy once and holds 2 shares of a stock where they wanted 1. The app was on a train with weak signal."
+  facts={[
+    'time      event',
+    '10:00:01  POST /v1/orders  qty=1  (no key)',
+    '10:00:04  client timeout, no response shown',
+    '10:00:05  POST /v1/orders  qty=1  (retry, no key)',
+    '10:00:06  201 created, two orders in state new',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the root cause?',
+      options: [
+        'The exchange filled the same order twice',
+        'The order service accepted two requests that had no way to be matched as one',
+        'The quote cache showed an old price, so the user pressed twice',
+        'The hold was not released after the first order was rejected',
+      ],
+      answer: 1,
+      explain: 'Two POST requests had no shared key, so the service saw two separate orders. The first one was probably created, and its reply was lost on the way back. The exchange did what it was told. The fix lives at our API.',
+    },
+    {
+      prompt: 'Which change prevents it?',
+      options: [
+        'The client sends an Idempotency-Key. The server stores key and order together and returns the first order for a repeated key',
+        'The server refuses any second order for the same symbol within 10 seconds',
+        'The client waits 30 seconds before it retries any request',
+        'The server stops using holds, so there is nothing to double',
+      ],
+      answer: 0,
+      explain: 'The same key on both attempts lets the server answer the retry with the original order. A symbol-time rule blocks real second orders. A longer wait only delays the retry. Removing holds makes balance errors worse.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html): in Read Committed, a second `UPDATE` waits for the first, then re-checks its `WHERE` clause on the new row. This is why the conditional hold works.
+- [Server-sent events (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events): the one-way push used for prices.

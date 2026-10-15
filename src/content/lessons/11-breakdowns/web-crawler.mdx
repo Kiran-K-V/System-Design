@@ -1,0 +1,271 @@
+---
+summary: 'A web crawler fetches billions of pages without hurting any one site. Per-host queues give politeness, staged workers survive failures, and hashes stop repeat work.'
+requires: ['06-async/queues', '06-async/backpressure-dlq', '10-advanced/big-data-structures']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import CrawlerBuild from '../../../components/anim/lessons/CrawlerBuild.tsx';
+import CrawlerQueues from '../../../components/anim/lessons/CrawlerQueues.tsx';
+
+## The problem
+
+A search or AI team wants the text of a large part of the web. The job is simple to say: start from some pages, follow every link, and save the text.
+
+Three things make it hard at scale.
+
+- **Size.** Ten billion pages must be fetched in days, not years.
+- **Other people's servers.** Every fetch uses a site's bandwidth and CPU. A crawler that fetches too fast looks like an attack, and sites block it.
+- **Messy input.** Pages fail, time out, repeat, link in circles, and sometimes generate endless links on purpose.
+
+This case adds four ideas: a **URL frontier** [mid] (the list of URLs still to fetch) with a queue per host, politeness rules including `robots.txt`, dedupe by URL and by content hash, and DNS caching. It builds on queues (lesson [6.1](/learn/06-async/queues/)), retries and dead-letter queues (lesson [6.4](/learn/06-async/backpressure-dlq/)), and the Bloom filter from lesson [10.3](/learn/10-advanced/big-data-structures/).
+
+## Requirements
+
+**Functional.**
+
+1. Crawl the web starting from a set of seed URLs.
+2. Extract the text of each page and store it for later processing.
+
+**Below the line.** What happens to the text later (for example training a model or building an index), images and video, pages that need JavaScript to render, pages behind a login, and re-crawling for freshness. Name them and move on.
+
+**Non-functional.** Numbers are interview assumptions.
+
+- **Fault tolerance.** A failed fetch or a crashed worker must not lose work.
+- **Politeness.** Obey `robots.txt` and never overload a site.
+- **Efficiency.** Finish the crawl in under 5 days.
+
+### Derive the load
+
+Assume 10 billion pages. Assume the average page costs 2 MB of transfer with its inline resources, of which the HTML is about 30 KB (assumptions).
+
+- Total transfer: 10,000,000,000 x 2 MB = 20,000,000,000 MB = **20 PB**.
+- Time budget: 5 days x 86,400 s = 432,000 s.
+- Required rate: 10,000,000,000 / 432,000 = about **23,000 pages per second**.
+- Required bandwidth: 23,148 x 2 MB = about 46 GB per second, which is about **370 Gbit/s**.
+- Per machine: assume a 200 Gbit/s network card that we can use at 30%. That is 60 Gbit/s = 7.5 GB/s, so 7.5 GB / 2 MB = **3,750 pages per second**.
+- Machines: 23,148 / 3,750 = 6.2, so at least **7**. Use 8 for headroom. 10,000,000,000 / (8 x 3,750) = 333,333 s, about 3.9 days.
+- Stored HTML only: 10,000,000,000 x 30 KB = **300 TB**.
+
+Two lessons come out of this. First, one machine needs 10,000,000,000 / 3,750 = 2.7 million seconds, about 31 days. So the fetchers must be spread over many machines. Second, the limit that matters in practice is not bandwidth. It is politeness, as the deep dive shows.
+
+## Core entities
+
+- **URL**: address, depth, status, and a pointer to its stored page.
+- **Host**: a site name with its cached `robots.txt` rules and its last fetch time.
+- **Page**: raw HTML and extracted text, kept in blob storage (lesson [8.11](/learn/08-technologies/blob-storage/)).
+- **Content hash**: a fingerprint of a page's text.
+
+## Interface
+
+This system has no user-facing API. The input is a list of seed URLs. The output is the extracted text in blob storage, with one metadata row per URL.
+
+## Data flow
+
+1. Take a URL from the frontier.
+2. Check the host rules, then fetch the page.
+3. Save the raw HTML to blob storage.
+4. Parse it into text and a list of links.
+5. Save the text. Check each link against what is already seen.
+6. Put new links in the frontier. Repeat.
+
+## High-level design
+
+<CrawlerBuild client:visible />
+
+Notice that queues carry only small messages, such as a URL or a blob id. The big payloads stay in blob storage. This keeps queues fast and makes each stage safe to retry.
+
+## Deep dives
+
+### Politeness: one queue per host
+
+<CrawlerQueues client:visible />
+
+The naive frontier is one first-in-first-out queue. Pages link to pages on the same site, so the queue fills with runs of URLs from one host. Several workers then hit that host at once.
+
+The Stanford information retrieval book describes a common design. Front queues order URLs by priority. Back queues each hold URLs from a **single host**. A table maps hosts to back queues. A heap holds, for each back queue, the earliest time that host may be contacted again. A worker takes the queue with the earliest ready time, fetches one URL, and puts the host back with a new ready time. The book notes a rule of thumb: wait about ten times as long as the last fetch took.
+
+A simple version fits in Redis (lesson [8.2](/learn/08-technologies/redis/)): one key per host holds a rate limit or lock, set with an expiry of one second. Compare with the rate limiters of lesson [7.4](/learn/07-reliability/rate-limiting/). A fetcher that cannot take the key picks another host.
+
+Do the math on what politeness costs. At 1 request per second per host, the crawler needs at least 23,148 hosts in flight to reach 23,148 pages per second. A host with 10,000,000 pages needs 10,000,000 / 86,400 = about **116 days** by itself. So set a page budget per host, or crawl its pages at a lower priority.
+
+**`robots.txt`.** Before the first fetch from a host, download `/robots.txt` and cache the rules. RFC 9309 says a crawler should not use a cached copy for more than 24 hours unless the file is unreachable. It says a parser must read at least 500 kibibytes. If the file is unreachable because of server or network errors (status 500 to 599), the crawler must assume **complete disallow**. If the file is simply unavailable (a client error such as 404), the crawler may access any resource. Mix these up and you either crawl a site that said no, or skip a site that said yes. Note the order: a failing server blocks you, a missing file frees you.
+
+**DNS.** Each fetch needs the host's IP address (lesson [2.2](/learn/02-networking/dns/)). If a lookup takes about 20 ms (assumption) and you do 23,148 per second, that is 23,148 x 0.02 = about **463 lookups in flight** all the time. Cache the answer per host and honor its TTL. One lookup then serves thousands of pages on the same host. Run a local resolver cache so workers share the result.
+
+### Fault tolerance: stages, queues, retries
+
+The naive crawler fetches, parses, and stores in one process. A crash in parsing throws away a download that took time and used someone else's bandwidth.
+
+Split it into stages. The fetcher writes raw HTML to blob storage and hands over an id. The parser reads that id. Each stage reads from a queue with a visibility timeout (lesson [6.1](/learn/06-async/queues/)). If a worker dies, the message becomes visible again and another worker takes it. Delivery is at least once (lesson [6.3](/learn/06-async/delivery-semantics/)), so the stages must be **idempotent**: processing the same URL twice must give the same result, and not two copies.
+
+Retry a failed fetch with backoff and jitter (lesson [7.2](/learn/07-reliability/timeouts-retries/)). After 5 tries (assumption) move the URL to a dead-letter queue (lesson [6.4](/learn/06-async/backpressure-dlq/)). Retry some errors and not others. A timeout is worth another try. A 404 is not.
+
+### Dedupe: by URL and by content
+
+There are two different duplicates.
+
+**The same URL, seen twice.** Many pages link to the same page. Without a check, the crawl loops forever. First **normalize** the URL: lower-case the host, drop the fragment (the part after `#`), sort query parameters, and remove tracking parameters. Then check whether it has been seen.
+
+An in-memory set of 10 billion URLs does not fit on one machine. Hash each URL to 8 bytes and the hashes alone are 10,000,000,000 x 8 B = **80 GB**. Two ways to hold that:
+
+- A sharded key-value store, split by hash (lesson [4.7](/learn/04-data/sharding/)). Exact, but each check is a network call.
+- A **Bloom filter** (lesson [10.3](/learn/10-advanced/big-data-structures/)). With a 1% false positive rate it needs about 9.6 bits per item, so 10,000,000,000 x 9.6 bits = about **12 GB**. A Bloom filter never says "unseen" about a URL it has seen, so it never causes a repeat fetch. But 1% of new URLs are wrongly called "seen". That is about 100 million pages never crawled. For a crawl of the web that loss is often acceptable. State it as a choice.
+
+**Different URLs, the same page.** Mirrors, tracking links, and print versions have different URLs and the same content. Store a **content hash** [mid]: a fixed-size fingerprint of the page text, such as a 32-byte SHA-256. Index it, and skip pages whose hash is already known. 10,000,000,000 x 32 B = **320 GB**. This finds exact copies only. Pages that differ slightly need near-duplicate methods such as shingling; the Stanford book has a chapter on it.
+
+**Crawler traps.** Some sites build endless links, such as a calendar with a "next month" link forever. Limit link depth (15 to 20 hops is a common assumption) and the number of pages per host. Normalizing URLs removes many accidental traps.
+
+## Numbers
+
+| Quantity | Value | Where it comes from |
+|---|---|---|
+| Total transfer | 20 PB | 10B x 2 MB (assumed) |
+| Pages per second needed | ~23,000 | 10B / (5 x 86,400 s) |
+| Bandwidth needed | ~370 Gbit/s | 23,148 x 2 MB x 8 |
+| Pages per machine | 3,750 per second | 200 Gbit/s x 30% / 2 MB (assumed) |
+| Machines | 7 minimum, 8 used | 23,148 / 3,750 |
+| Raw HTML | 300 TB | 10B x 30 KB (assumed) |
+| URL hashes | 80 GB | 10B x 8 B |
+| Bloom filter, 1% false positives | ~12 GB | 10B x 9.6 bits |
+| Content hashes | 320 GB | 10B x 32 B |
+| 10M pages from one host | ~116 days | 10M / 86,400 at 1 per second |
+| `robots.txt` cache | 24 hours at most | RFC 9309 |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| One global queue | Simple | Bursts on one host | Never at scale |
+| Queue per host with timers | Politeness, spread load | A scheduler, hot big hosts | Any real crawler |
+| Staged workers and blob storage | No lost downloads | More moving parts | Fetches are costly |
+| Sharded store for seen URLs | Exact | A network call per check | Exactness matters |
+| Bloom filter for seen URLs | 12 GB instead of 80 GB | About 1% of new URLs skipped | A crawl may miss some pages |
+| Content hash | Skips copies | An extra index | Many mirrors |
+
+## Interview lens
+
+<Callout type="tip">
+Do the arithmetic early: "10 billion pages in 5 days is about 23,000 pages per second, which is 8 machines". Then say the real limit: "per-site politeness, so I keep one queue per host and a timer for each". Name the `robots.txt` rule for 5xx versus 4xx. Mention the Bloom filter trade-off with its false positive rate.
+</Callout>
+
+<Callout type="mistake">
+Do not use one global queue and breadth-first search. Do not keep all seen URLs in a language set. Do not say a Bloom filter is exact. Do not pass whole pages through queues. Do not forget a limit on depth and pages per host.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A crawl must fetch 10 billion pages in 5 days. Roughly how many pages per second is that?',
+      options: ['About 23,000', 'About 2,300', 'About 230,000', 'About 2,300,000'],
+      answer: 0,
+      explain: '5 days is 432,000 seconds. 10,000,000,000 / 432,000 is about 23,000. A value ten times lower comes from forgetting that the crawl is 5 days, not 50.',
+    },
+    {
+      q: 'A host answers the robots.txt request with a 503 error. What does RFC 9309 require of the crawler?',
+      options: [
+        'Treat the site as fully allowed, because no rules were received',
+        'Treat the site as fully disallowed until the file can be read',
+        'Use the rules from the last crawl, even if they are a week old',
+        'Crawl only pages that were linked from the seed URLs',
+      ],
+      answer: 1,
+      explain: 'A server error means the file is unreachable, so the rules are undefined and the crawler must assume complete disallow. A missing file (a 404) is the case that allows access.',
+    },
+    {
+      q: 'The seen-URL check uses a Bloom filter with a 1% false positive rate. What is the effect on a crawl of 10 billion URLs?',
+      options: [
+        'About 1% of already crawled pages are fetched again',
+        'The filter loses entries at random, so the crawl cannot resume',
+        'About 1% of URLs are stored twice, so the filter needs more memory',
+        'About 1% of new URLs are skipped, and none are fetched twice',
+      ],
+      answer: 3,
+      explain: 'A Bloom filter has no false negatives. A URL it has seen is always reported as seen. A false positive calls a new URL seen, so that page is never crawled. That is a loss of coverage, not a repeat fetch.',
+    },
+    {
+      q: 'Which design change stops four fetchers from hitting one site at once?',
+      options: [
+        'Raise the number of fetcher threads so the queue drains faster',
+        'Add a cache of the pages most recently downloaded from the site',
+        'Keep a queue per host and a ready time for each host',
+        'Compress the requests so that each one is smaller on the wire',
+      ],
+      answer: 2,
+      explain: 'The problem is runs of URLs from one host in a single queue. Separate queues with a ready time per host let a fetcher pick a different host while one waits. More threads make the burst worse, and caching or compression does not change request timing.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Size the crawl"
+  scenario="10 billion pages, 2 MB each. The crawl must end in 5 days. One machine moves 7.5 GB per second of page data. A Bloom filter at a 1% false positive rate takes about 9.6 bits per URL."
+  steps={[
+    {
+      prompt: 'How many pages per second are needed?',
+      unit: 'pages per second',
+      answer: 23148,
+      within: 1.2,
+      explain: '5 x 86,400 = 432,000 seconds. 10,000,000,000 / 432,000 is about 23,000.',
+    },
+    {
+      prompt: 'How many machines, at 7.5 GB per second each? A page is 2 MB.',
+      unit: 'machines',
+      answer: 6.2,
+      within: 1.2,
+      explain: 'One machine does 7.5 GB / 2 MB = 3,750 pages per second. 23,148 / 3,750 is about 6.2, so you need at least 7.',
+    },
+    {
+      prompt: 'How many GB does the Bloom filter for 10 billion URLs take?',
+      unit: 'GB',
+      answer: 12,
+      within: 1.2,
+      explain: '10,000,000,000 x 9.6 bits is 96,000,000,000 bits. Divide by 8 for bytes: 12,000,000,000 bytes, about 12 GB.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="crawler-calendar-trap"
+  title="The endless calendar"
+  scenario="A week into a crawl, one host takes most of the fetches and the frontier keeps growing."
+  facts={['host:               events.example', 'sample URL:         /calendar?month=2087-04', 'max depth seen:     4,100 hops', 'share of fetches:   95% from one host', 'new URLs per hour:  1,000,000']}
+  steps={[
+    {
+      prompt: 'What is happening?',
+      options: [
+        'A crawler trap: the site makes a new "next month" link for every page, forever',
+        'A cache poisoning attack that is filling the frontier with fake URLs',
+        'The retry policy resends failed URLs too fast, so the queue doubles',
+        'A Bloom filter overflow that is marking every new URL as unseen',
+      ],
+      answer: 0,
+      explain: 'A month parameter in the year 2087 and a depth of 4,100 hops show an endless URL space. Each page links to a new one. Retries and a Bloom filter do not produce new, distinct URLs like this.',
+    },
+    {
+      prompt: 'Which defense works best?',
+      options: [
+        'Cap link depth and the pages per host, and normalize or drop odd query parameters',
+        'Add more fetchers so the frontier drains faster than the site produces links',
+        'Lower the retry limit from 5 to 2 so that failures leave the queue sooner',
+        'Turn off dedupe for this host so that every page is fetched and stored',
+      ],
+      answer: 0,
+      explain: 'The space is endless, so only a limit can end it. More fetchers just crawl the trap faster and hit the site harder. Retries are not the cause. Turning off dedupe makes the loop worse.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RFC 9309: Robots Exclusion Protocol](https://www.rfc-editor.org/rfc/rfc9309), caching, size limit, and 4xx versus 5xx handling.
+- [Stanford IR book: the URL frontier](https://nlp.stanford.edu/IR-book/html/htmledition/the-url-frontier-1.html), front queues, back queues, and the host timing heap.
+- [Stanford IR book: crawler architecture](https://nlp.stanford.edu/IR-book/html/htmledition/crawler-architecture-1.html), modules of a crawler and DNS handling.
+- [Google: robots.txt introduction](https://developers.google.com/search/docs/crawling-indexing/robots/intro), how site owners write the file.

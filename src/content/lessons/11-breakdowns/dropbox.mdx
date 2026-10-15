@@ -1,0 +1,234 @@
+---
+summary: 'A file sync service keeps bytes in object storage and meaning in a metadata database. The client cuts files into hashed chunks, uploads only missing ones, and syncs by cursor.'
+requires: ['08-technologies/blob-storage', '09-patterns/large-blobs', '03-api-design/auth']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import DropboxBuild from '../../../components/anim/lessons/DropboxBuild.tsx';
+import DropboxChunks from '../../../components/anim/lessons/DropboxChunks.tsx';
+
+## The problem
+
+You edit a 2 GB video project on your laptop and save. Your phone and your teammate's computer must show the new version soon. The naive plan is to upload the whole file after each save and let every device download the whole file. That sends 2 GB for a change that may touch a few megabytes.
+
+A file sync service has to move large files, over weak links, to many devices, without sending bytes it already has. Lesson [8.11](/learn/08-technologies/blob-storage/) taught the storage parts: pre-signed URLs, multipart upload, and a CDN. Lesson [9.6](/learn/09-patterns/large-blobs/) turned them into a pattern. This lesson puts them together and adds three ideas: chunking by hash, content-based dedupe, and cursor-based sync.
+
+## Requirements
+
+**Functional.**
+
+1. Upload a file from any device.
+2. Download a file on any device.
+3. Share a file with another user, and list files shared with you.
+4. Sync changes to a user's other devices automatically.
+
+**Below the line.** Editing in place, previews, storage quotas, version history, and virus scanning.
+
+**Non-functional.** Files up to 50 GB. Highly available, and availability matters more than consistency. Secure: only people with access can read a file. Durable: recover from loss or corruption. Low latency for upload, download, and sync.
+
+**Scale numbers, as assumptions.** Take 50 GB to mean 50 GiB so the arithmetic is clean. Use 8 MiB chunks, since S3 multipart parts must be at least 5 MiB. Assume a 100 Mbit/s home upload link.
+
+- Chunks in a 50 GiB file: 50 × 1,024 MiB ÷ 8 MiB = **6,400 chunks**. That is under the 10,000-part limit of one S3 multipart upload, so one multipart upload can carry the file.
+- Upload time at 100 Mbit/s: 50 GB is 400 gigabits. 400 ÷ 0.1 = 4,000 seconds, about **67 minutes**. A link failure in that hour is likely. So uploads must resume, which is why chunks matter.
+- Chunk list size: each SHA-256 hash is 32 bytes. 6,400 × 32 B = 204,800 B, about **200 KB** of metadata for a 50 GiB file. Tiny next to the file.
+
+One company claim as context: Dropbox's engineering blog says every file is split into 4 MB blocks, each identified by a SHA-256 hash, and a file is the ordered list of those hashes. This is a claim from their article on streaming file synchronization, not our measurement. Our 8 MiB chunks are our own choice. The idea is the same.
+
+<Ballpark
+  client:visible
+  title="Size a big upload"
+  scenario="A user uploads a 50 GiB file in 8 MiB chunks over a 100 Mbit/s link. A SHA-256 hash is 32 bytes. Use 1 GiB = 1,024 MiB and 50 GB ≈ 400 gigabits."
+  steps={[
+    { prompt: 'Number of chunks', unit: 'chunks', answer: 6400, within: 1.1, explain: '50 GiB × 1,024 = 51,200 MiB. 51,200 ÷ 8 = 6,400 chunks.' },
+    { prompt: 'Upload time at 100 Mbit/s, in minutes', unit: 'min', answer: 67, within: 1.3, explain: '400 gigabits ÷ 0.1 gigabits a second = 4,000 seconds, about 67 minutes.' },
+    { prompt: 'Size of the chunk hash list in kilobytes (32 bytes each)', unit: 'KB', answer: 205, within: 1.3, explain: '6,400 × 32 B = 204,800 B, about 205 KB. The metadata is a tiny share of the file.' },
+  ]}
+/>
+
+## Core entities
+
+- **File:** `file_id`, `owner_id`, `name`, `size`, and an ordered list of chunk hashes.
+- **Chunk:** a block of bytes named by its SHA-256 hash. It lives in object storage. A metadata row records that the chunk exists. Several files can point to one chunk.
+- **Share:** `file_id`, `grantee_id`, `permission`.
+- **Device cursor:** the last change a device has seen.
+
+Metadata is rows in a database. Chunk bytes are objects in blob storage. Never put file bytes in the database.
+
+## API
+
+| Call | Purpose |
+|---|---|
+| `POST /uploads` with name, size, and chunk hashes | Returns an upload id and pre-signed URLs only for chunks the server lacks |
+| `PUT <pre-signed URL>` | Client sends one chunk straight to object storage |
+| `POST /uploads/{id}/complete` | Server checks the chunks exist, then publishes the file |
+| `GET /files/{id}/download` | Returns signed URLs for the file's chunks, after an access check |
+| `POST /files/{id}/share` with grantee and permission | Creates a share row |
+| `GET /changes?cursor=...` | Returns files changed since the cursor, and a new cursor |
+
+The user comes from the auth token ([lesson 3.5](/learn/03-api-design/auth/)), not from the request body.
+
+## High-level design
+
+Step through it. Note that the app servers never touch file bytes.
+
+<DropboxBuild client:visible />
+
+**Why direct upload.** Suppose file bytes went through the API servers. Each would hold a long connection for an hour, and an API gateway often caps a request at about 10 MB ([lesson 8.10](/learn/08-technologies/api-gateway/)). A pre-signed URL lets the client write to object storage directly. The service only signs the URL, and the signature expires quickly. Use a short expiry, such as minutes, so a leaked URL stops working soon.
+
+**Two writes can disagree.** The file row and the chunk objects are in two systems. Mark a file `pending` until `complete` succeeds and every chunk is confirmed present. A cleanup job aborts stale uploads so unused parts stop costing money. Lesson [8.11](/learn/08-technologies/blob-storage/) covers this.
+
+**Sharing.** A share row says who may open which file. The metadata service checks it before it signs any download URL. Never expose public object URLs. A download URL should name one object and expire.
+
+## Deep dive 1: big files and resume
+
+One `POST` of a whole 50 GiB file fails at once: it exceeds any gateway limit, and a drop at minute 66 restarts from zero. The fix is the multipart pattern from lesson [9.6](/learn/09-patterns/large-blobs/). The client cuts the file into chunks. Each chunk is its own request. Parts go in parallel. After a failure, the client asks which parts exist (S3 offers `ListParts`) and sends only the missing ones. Finally one `complete` call joins them.
+
+Resume is why 8 MiB beats 5 GB: a failed chunk costs a few seconds, not an hour. Too small is also bad. At 8 KiB there would be 6.5 million chunks for 50 GiB, a metadata row for each, and a request for each. Chunk size trades retry cost against bookkeeping cost.
+
+## Deep dive 2: dedupe and delta sync
+
+Every chunk is named by its content hash. That gives two savings for free.
+
+1. **Skip chunks the server already has.** The client sends its hash list first. The server answers with the hashes it lacks. The client uploads only those. A file that was already uploaded, even by another user, costs a hash list and no bytes. This is **content-based dedupe**.
+2. **Upload only what changed.** Edit a file and chunk it again. Unchanged chunks have unchanged hashes, so they are skipped.
+
+Point 2 hides a trap. Switch between the two chunking methods below.
+
+<DropboxChunks client:visible />
+
+With **fixed-size chunks**, a chunk boundary is a byte offset. Insert one byte near the start and every later byte shifts by one. Every chunk after the edit now has different bytes, so every hash changes. Dedupe finds nothing to skip.
+
+With **content-defined chunking**, a chunk boundary depends on the bytes near it. A rolling hash slides over the data and cuts where the hash matches a chosen pattern. After an insert, the cut points beyond the edit fall on the same bytes as before. Only the chunk around the edit changes. The cost is more compute on the client and chunks of uneven size, so bound the size above and below.
+
+Hashing needs a strong function. SHA-256 makes an accidental match practically impossible, so equal hash can mean equal bytes.
+
+**A privacy probe.** If one user's upload is skipped because the hash exists, then upload speed tells that user the content is stored. Someone holding a file's hash could learn whether another account has the file. Interviewers like this question. Answers: dedupe only inside one account or organization, or require the client to prove it holds the bytes before the server skips the upload.
+
+## Deep dive 3: sync
+
+A device must learn about changes made elsewhere. Polling `GET /files` every second for every user is wasteful: most polls find nothing. Instead each device keeps a **cursor**, a number that grows with every change in that user's account. The device asks `GET /changes?cursor=1840` and receives only entries after 1840, plus a new cursor. If the device was offline for a week, the same call catches it up.
+
+To avoid a poll loop, add a push channel. When the sync service sees a change, it sends a small nudge ("something changed") over a long-lived connection ([lesson 2.5](/learn/02-networking/real-time-transport/)), and the device then calls `/changes`. The nudge carries no data, so a missed nudge costs only delay: the device still polls now and then as a safety net. After `/changes`, the device compares chunk hashes and downloads only chunks it lacks.
+
+If two devices change the same file while offline, you have a conflict. A simple rule is to keep both: save the second version under a new name, such as "report (conflicted copy)". Do not discard a user's edit silently.
+
+## Trade-offs
+
+| Decision | Choice here | You gain | You pay |
+|---|---|---|---|
+| Upload path | Pre-signed URL, direct to storage | App servers carry no bytes | A two-step flow and a pending state |
+| Chunk size | 8 MiB (assumed) | Cheap retries. Few rows | A small edit to a big chunk re-uploads the chunk |
+| Chunking | Content-defined | Small edits upload little | More client CPU. Uneven chunk sizes |
+| Dedupe | By content hash | Less storage and upload | The existence leak across users |
+| Sync | Cursor plus push nudge | Little polling. Offline catch-up | A change log per account |
+| Conflicts | Keep both copies | No lost edits | Users must merge by hand |
+
+<Callout type="tip">
+Say the split first: "Metadata in a database, bytes in blob storage. The client chunks the file, hashes each chunk, and the server tells it which hashes are missing. Uploads go straight to storage with pre-signed URLs, so the API tier never carries bytes. Sync is a per-device cursor with a push nudge." Then raise dedupe and the fixed versus content-defined chunking issue yourself.
+</Callout>
+
+<Callout type="mistake">
+Do not store files in the database. Do not push the bytes through your API servers. Do not name chunks by file name, since renaming a file would look like new content. Do not use a long-lived or public download URL. And do not say "fixed-size chunks give delta sync" without noting that one inserted byte shifts every later chunk.
+</Callout>
+
+<Callout type="deep" title="A hash as an address">
+When a chunk is named by its hash, the name is also a checksum. After a download the client re-hashes the bytes. If the result differs from the name, the chunk is corrupt, and the client can fetch it again. This gives an integrity check for free. It also makes chunks immutable: the same name always means the same bytes, so chunks are easy to cache and safe to share.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A user inserts one byte at the start of a 1 GiB file. With fixed 8 MiB chunks, how many chunk hashes change?',
+      options: [
+        'All of them, as boundaries shift',
+        'None, because the file name did not change',
+        'Only the first one, since the insert was in that chunk',
+        'Half of them, because chunks are compared in pairs',
+      ],
+      answer: 0,
+      explain: 'A fixed chunk is a byte range. Inserting a byte moves every later byte, so each chunk now holds different bytes. Content-defined chunking is the fix: only the first chunk would change there.',
+    },
+    {
+      q: 'A client uploads a file whose chunk hashes the server already stores for another file. What does the server tell it to upload?',
+      options: [
+        'The whole file, to check it against the stored copy',
+        'Only the file name, since the bytes are known',
+        'Nothing at all, and only the hash list is sent',
+        'Only the chunks whose hashes are missing',
+      ],
+      answer: 3,
+      explain: 'The server compares the hash list with what it holds and asks only for the missing chunks. If none are missing, no bytes move, but the hash list is still needed so the file row can be created. The name is not enough to rebuild a file.',
+    },
+    {
+      q: 'Why does the upload API return pre-signed URLs and not accept the chunks itself?',
+      options: [
+        'Chunks sent to object storage need no authentication',
+        'Gateways cap bodies and bytes tie up servers',
+        'Pre-signed URLs make the chunks smaller on the wire',
+        'Object storage cannot be reached by the API servers',
+      ],
+      answer: 1,
+      explain: 'Direct upload keeps hour-long transfers off the API tier and avoids the gateway body cap. The URL is signed, so storage still checks authorization. A signed URL does not change the size of the chunks.',
+    },
+    {
+      q: 'A phone was offline for a week. How does a cursor-based sync bring it up to date?',
+      options: [
+        'It downloads every file again, then compares them one by one',
+        'It asks for changes after its saved cursor',
+        'It waits for push nudges that were sent during the week',
+        'It polls each file once a second until nothing changes',
+      ],
+      answer: 1,
+      explain: 'The cursor marks the last change the device saw, so one call returns everything after it, whether a minute or a week passed. Nudges sent while the phone was offline are lost, which is why the call does not depend on them.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="dropbox-resume-restart"
+  title="The upload that always starts over"
+  scenario="Users on a slow train connection upload 20 GB archives. About half of them fail near the end, and the client then starts again from 0%. Support says retrying wastes hours. The client currently sends the archive in one PUT to a pre-signed URL. The service has plenty of storage and bandwidth."
+  facts={[
+    'file size       : 20 GB',
+    'upload method   : one PUT of the whole file',
+    'failure rate    : about half on a slow, unstable link',
+    'on failure      : the client restarts from 0%',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the root cause of the lost hours?',
+      options: [
+        'The server stores too little, so it drops large files',
+        'One long request means one failure loses all progress',
+        'The pre-signed URL gives the client too little bandwidth',
+        'The SHA-256 hash is too slow for archives of this size',
+      ],
+      answer: 1,
+      explain: 'A single request is all or nothing. A drop at 95% throws away the 95%. Storage and bandwidth are fine, and a hash cannot slow a transfer that has not started.',
+    },
+    {
+      prompt: 'What change fixes it?',
+      options: [
+        'Use a longer URL expiry so the PUT can run for days',
+        'Compress the archive twice before it is sent',
+        'Split into chunks with multipart upload and resume missing parts',
+        'Ask users to retry until the link improves for them',
+      ],
+      answer: 2,
+      explain: 'Chunks turn one big all-or-nothing request into many small ones. After a failure the client lists which parts exist and sends only the rest. A longer expiry does not stop a drop, and compressing again barely changes the size.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Dropbox Tech: Streaming File Synchronization](https://dropbox.tech/infrastructure/streaming-file-synchronization) (4 MB blocks, SHA-256 hashes, blocklists, "need blocks")
+- [S3: Multipart upload limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html) (10,000 parts, 5 MiB minimum part size)
+- [S3: Download and upload objects with presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html) (expiry and signing)

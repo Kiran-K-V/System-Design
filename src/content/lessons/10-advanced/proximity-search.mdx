@@ -1,0 +1,220 @@
+---
+summary: 'Find the places near a point without scanning every row. A geohash turns two coordinates into one sortable key, and a quadtree adapts its cells to how dense the data is.'
+requires: ['04-data/indexing', '01-one-machine/estimation']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import ProxGeohash from '../../../components/anim/lessons/ProxGeohash.tsx';
+import ProxNeighbors from '../../../components/anim/lessons/ProxNeighbors.tsx';
+import ProxQuadtree from '../../../components/anim/lessons/ProxQuadtree.tsx';
+
+## The problem
+
+A ride app has 1 billion places and drivers on the map. A user opens the app. You must show everything within 1 km, in under 100 ms.
+
+The query reads like this: `WHERE lat BETWEEN a AND b AND lng BETWEEN c AND d`. It has two range conditions. Lesson [4.3](/learn/04-data/indexing/) showed what a B-tree does with that. A B-tree sorts in **one** dimension.
+
+You can build a composite index on `(lat, lng)`. The first range condition narrows the search. The second one can only filter what the first one already read. That is rule 2 in lesson 4.3.
+
+Do the numbers. Assume the 1 billion places are spread evenly over the Earth. That is false, but it keeps the arithmetic honest.
+
+- The search box is 2 km by 2 km, at latitude 51.5. That is 0.018° of latitude and 0.029° of longitude.
+- It holds about 4 km² / 510 million km² × 1 billion = **~8 places**.
+- The index finds a thin band: 2 km tall, all the way around the planet. At this latitude the band is about 25,000 km long, so it covers about 50,000 km². It holds about **~100,000 rows**.
+
+The database reads about 100,000 rows to return 8. It reads about 12,000 times too much. The B-tree is not the problem. The question has two dimensions and the index has one.
+
+## Naive solution: two indexes
+
+Put one B-tree on `lat` and one on `lng`. The planner may read both and intersect the row lists. Each index still returns a full band: one around the planet by latitude, one pole to pole by longitude. The intersection is small, but the work to find it is not.
+
+Both bands are huge. The work is proportional to the bands, not to the answer. We need **one** key where places that are close in space are close in the sort order.
+
+## The mechanism: geohash
+
+A **geohash** turns a latitude and a longitude into one string. Places that share a long prefix lie in the same small rectangle. A B-tree can then range-scan a prefix. That is one dimension again, and B-trees are good at it.
+
+The encoder is a repeated halving.
+
+1. Start with longitude in [−180, 180] and latitude in [−90, 90].
+2. Take the middle of longitude. If the point is at or above it, write bit 1 and keep the upper half. If not, write 0 and keep the lower half.
+3. Do the same for latitude.
+4. Alternate, longitude first.
+5. Cut the bits into groups of 5. Each group is a number from 0 to 31. Map it to the **base32** alphabet `0123456789bcdefghjkmnpqrstuvwxyz` (it leaves out a, i, l, and o).
+
+Step through the point at latitude 10, longitude 20.
+
+<ProxGeohash client:visible />
+
+Each character adds 5 bits, so it cuts the cell by a factor of 32. Longitude gets the extra bit when the count is odd, so cells alternate between shapes. Here are the sizes at the equator. They are computed from the bit counts, with 111.32 km per degree.
+
+| Length | Bits (lng + lat) | Cell width × height |
+|---|---|---|
+| 1 | 3 + 2 | ~5,000 km × ~5,000 km |
+| 2 | 5 + 5 | ~1,250 km × ~626 km |
+| 4 | 10 + 10 | ~39 km × ~20 km |
+| 5 | 13 + 12 | ~4.9 km × ~4.9 km |
+| 6 | 15 + 15 | ~1.2 km × ~0.6 km |
+| 8 | 20 + 20 | ~38 m × ~19 m |
+
+These agree with the error column on [Wikipedia's Geohash page](https://en.wikipedia.org/wiki/Geohash): the maximum error is half a cell, for example 2.4 km at length 5 and 19 m at length 8.
+
+Lesson [4.3](/learn/04-data/indexing/) rule 1 now works for us. Store the hash in a column and index it. "Everything in cell `gcpuz`" becomes `WHERE geohash LIKE 'gcpuz%'`. That is a range scan on a B-tree.
+
+### The edge problem
+
+A circle rarely fits inside one cell. If your point sits near the edge of its cell, places just across the edge are in a different cell. They may also have a different prefix. Two points 0.002° of longitude apart, about 140 m, can share **no** first character, because the Greenwich line is a top-level split.
+
+The fix is simple. Pick a cell at least as large as the search radius. Then query the point's cell **and its 8 neighbors**: 9 prefix scans. Then filter by the true distance, because the 3 × 3 block is larger than the circle.
+
+<ProxNeighbors />
+
+Count the work for our 1 km radius. Use length 5 cells (4.9 km). Nine cells cover 14.7 km × 14.7 km = 216 km². That holds about 216 / 510 million × 1 billion = **~420 rows**. The exact filter keeps about 6 of them. We read 420 rows instead of 100,000. The cost: 9 range scans instead of 1.
+
+Wrong choice of cell size breaks the guarantee. With length 6 cells (1.2 km × 0.6 km), the 3 × 3 block reaches only 0.6 km north and south of the middle cell. A 1 km radius can have places outside it. They are silently missed.
+
+## Quadtree: cells that follow the data
+
+A geohash grid has fixed cells. Midtown Manhattan and the Sahara get the same size. Midtown has thousands of places per cell. The Sahara has none.
+
+A **quadtree** adapts. It starts as one cell. When a cell holds more than a set **capacity** of points, it splits into four equal quadrants. Dense areas split again and again. Sparse areas stay as one big cell.
+
+<ProxQuadtree client:visible />
+
+Notice step 4. Five points fall in the same quarter of a quarter. The split repeats until the points separate. That is the cost of a quadtree: it is a tree that changes. Inserts can split cells, deletes can merge them, and in a sharded database the tree itself needs a home (lesson [4.7](/learn/04-data/sharding/)). Many systems keep the quadtree in memory and rebuild it from the table.
+
+A geohash is a table column and a B-tree. A quadtree is a structure you maintain. In practice you pick by the data's shape: even spread favors geohash, and strong clusters favor a quadtree.
+
+## What real systems use
+
+- **Redis GEO.** `GEOADD` stores each member in a sorted set. The score is a 52-bit interleaved geohash. Redis accepts longitude −180 to 180 and latitude ±85.05112878, and its docs state a worst-case distance error of about 0.5%. `GEOSEARCH` finds members in a radius or box. It is a good fit for a "drivers near me" set that fits in RAM (lesson [8.2](/learn/08-technologies/redis/)).
+- **PostGIS.** A PostgreSQL extension (lesson [8.1](/learn/08-technologies/postgresql/)). It builds a spatial index with GiST. `ST_DWithin` uses the index for a bounding-box check and then tests exact distance. The `geography` type works in meters on a spheroid.
+- **S2** (Google). It projects the sphere onto the six faces of a cube and splits each face with a quadtree to level 30. Cell IDs follow a **Hilbert curve**, a path that visits nearby cells close together, so near IDs are usually near on the map. The S2 statistics page gives level 12 an average area of about 5 km².
+- **H3** (Uber). It tiles the sphere with hexagons. Each cell has 7 children. At every resolution, 12 cells are pentagons, because hexagons cannot cover a sphere.
+
+All of these are the same idea: turn two dimensions into a cell ID, then use an ordinary index or sorted set on the ID.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Composite `(lat, lng)` index, 2 km box, 1 billion places spread evenly | reads ~100,000 rows for ~8 results | Derived above |
+| Geohash length 5 cell | ~4.9 km × ~4.9 km | Derived from bit counts |
+| 9 cells at length 5 | 216 km², ~420 rows | Derived |
+| Geohash base32 characters | 5 bits each | Wikipedia |
+| Redis GEO score | 52-bit geohash, ~0.5% worst-case error | Redis docs |
+| S2 level 12 average cell | ~5 km² | S2 statistics page |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Geohash + B-tree | Plain index, easy to shard by prefix | 9 scans per query; edge cases at the poles and the date line | Evenly spread data, you already have a B-tree store |
+| Quadtree | Small cells where data is dense | A tree to maintain; lives in memory | Strong clusters, an in-memory service |
+| S2 or H3 | Good cell shapes, library for neighbors and covers | A library and a cell-level choice | Large geo products, global data |
+| Redis GEO | One command, very fast | Data must fit in RAM; sphere model | Live positions, up to what one node holds |
+| PostGIS | Exact math, joins with SQL data | Heavier queries and index | Maps with rich queries and a relational model |
+
+## Interview lens
+
+<Callout type="tip">
+Start by saying why a B-tree on latitude and longitude fails: "it sorts one dimension, so I read a whole band to find a small box". Then give the fix: "I turn two coordinates into one cell ID with a geohash and query the cell plus its 8 neighbors". State the cell size rule: "the cell must be at least as large as the radius, then I filter by true distance". Say what you would use in production: "Redis GEO for live positions, PostGIS for rich queries".
+</Callout>
+
+<Callout type="mistake">
+Do not say "same prefix means within the radius". The cell is bigger than the circle, and two close points can sit in different cells. Do not say "longer geohash means more accurate for every query". A longer hash gives a smaller cell, so a fixed 3 × 3 block may no longer cover the radius. And do not forget that a hot city makes a hot shard: a geohash prefix for midtown can take most of the traffic (lesson [4.7](/learn/04-data/sharding/), hot keys).
+</Callout>
+
+<Callout type="deep" title="Why one-dimensional order cannot be perfect">
+A geohash walks the grid in a "Z" pattern. The walk jumps at some cell borders. So cells that touch in space can be far apart in the sort order. No order of a 2D grid can keep every pair of neighbors adjacent. The Hilbert curve in S2 has fewer big jumps than the Z pattern, but it has some. That is why every method here needs a neighbor step and a final exact-distance filter.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A geohash has 5 characters. About how big is its cell at the equator?',
+      options: ['About 4.9 km by 4.9 km', 'About 38 m by 19 m', 'About 156 km by 156 km', 'About 1.2 km by 0.6 km'],
+      answer: 0,
+      explain: '5 characters are 25 bits: 13 for longitude and 12 for latitude. 360 / 2^13 is 0.044 degrees, about 4.9 km. 180 / 2^12 is the same. 38 m by 19 m is length 8. 1.2 km by 0.6 km is length 6.',
+    },
+    {
+      q: 'Two shops are 140 m apart but their 6-character geohashes share no first character. What is the most likely reason?',
+      options: [
+        'The hash function has a bug that shows up for small distances',
+        'They straddle the top-level split at longitude 0',
+        'The shops are in two different countries, so the hashes must differ',
+        'Geohashes are chosen at random, so a prefix tells you nothing about place',
+      ],
+      answer: 1,
+      explain: 'The first bit splits longitude at 0. Points on either side of it start with different bits, however close they are. This is the edge problem. It is why queries also read neighbor cells.',
+    },
+    {
+      q: 'A quadtree has capacity 4. A cell holds 4 points. A 5th point arrives and all 5 fall in the same top-right quarter of that cell. What happens?',
+      options: [
+        'The cell splits once, and the 5 points may all stay together in one child cell',
+        'The new point is rejected until some other point in that cell is deleted',
+        'It splits again and again until the points separate or a depth limit stops it',
+        'Capacity doubles to 8 for that cell only',
+      ],
+      answer: 2,
+      explain: 'A split makes four children. If all five points land in one child, that child is over capacity too, so it splits. This repeats. A depth limit stops it when points share the same location.',
+    },
+    {
+      q: 'You need all drivers within 3 km. You use 9 geohash cells of length 6 (about 1.2 km by 0.6 km). What goes wrong?',
+      options: [
+        'Nothing goes wrong, because nine cells always cover any search radius',
+        'It returns too many drivers, so the app must filter them by true distance',
+        'It is too slow, because a length 6 query always needs 64 cells',
+        'It misses drivers, because the 3 × 3 block reaches under 3 km',
+      ],
+      answer: 3,
+      explain: 'The block covers the middle cell plus one cell on each side. At length 6 that is ±0.6 km north-south and ±1.2 km east-west at best. A cell must be at least as big as the radius. Use length 4 (about 39 km by 20 km) or a larger block.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="proximity-search-driver-map"
+  title="The slow driver map"
+  scenario="A delivery app finds nearby drivers with a table of 20 million rows and a composite index on (lat, lng)."
+  facts={['query: lat BETWEEN 51.49 AND 51.51 AND lng BETWEEN -0.01 AND 0.01', 'plan: index range scan on lat, filter on lng', 'rows read: 310,000   rows returned: 14']}
+  steps={[
+    {
+      context: 'The plan uses the index and still reads 310,000 rows.',
+      prompt: 'Why does the index not help more?',
+      options: [
+        'The range on lat narrows the scan, but the lng range can only filter what that band already read',
+        'The index is corrupt and needs a rebuild',
+        'The table is too large for any index to work',
+        'The query should use OR instead of AND',
+      ],
+      answer: 0,
+      explain: 'A composite index narrows on the first range column only. The band for lat 51.49 to 51.51 holds every driver at that latitude, in every longitude. Most of the 310,000 rows are filtered out.',
+    },
+    {
+      context: 'You switch to a stored geohash column of length 5 and query the cell with LIKE. Complaints arrive: drivers a block away are missing when the customer stands near a cell border.',
+      prompt: 'What is the fix?',
+      options: [
+        'Use length 8 so the cells are much smaller',
+        'Query the cell and its 8 neighbors, then filter by true distance',
+        'Raise the search radius until nobody complains',
+        'Hash the driver ID instead of the location',
+      ],
+      answer: 1,
+      explain: 'Drivers across a cell border are in another cell. Reading the 3 × 3 block finds them. Smaller cells make the border problem worse, because the circle spans more cells.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Wikipedia: Geohash](https://en.wikipedia.org/wiki/Geohash) (algorithm, base32 alphabet, edge cases, precision table)
+- [Redis: GEOADD](https://redis.io/docs/latest/commands/geoadd/) (52-bit score, coordinate limits, error)
+- [PostGIS: ST_DWithin](https://postgis.net/docs/ST_DWithin.html) (index use and distance in meters)
+- [S2 geometry: cell statistics](https://s2geometry.io/resources/s2cell_statistics) and [H3: resolution table](https://h3geo.org/docs/core-library/restable)

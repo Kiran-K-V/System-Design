@@ -1,0 +1,233 @@
+---
+summary: 'Machines need unique IDs without asking one central counter, and they need to agree on what happened first without a shared clock. Snowflake and UUIDv7 solve the first, and logical clocks solve the second.'
+requires: ['04-data/sharding', '04-data/indexing', '04-data/consistency-models']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import IdSnowflake from '../../../components/anim/lessons/IdSnowflake.tsx';
+import IdLamport from '../../../components/anim/lessons/IdLamport.tsx';
+
+## The problem
+
+Two needs hide inside every distributed system.
+
+1. **A unique ID for every row, event, or message.** Many machines create them at the same moment, and none may collide.
+2. **An order for events.** "Which write came last?" "Did the reply come after the question?"
+
+On one machine both are easy. A counter gives IDs. The machine's clock gives order. Across machines, neither the counter nor the clock is shared.
+
+## Naive solution: auto-increment
+
+Each database counts 1, 2, 3. Lesson [4.7](/learn/04-data/sharding/) split a table over shards. Now shard 1 hands out ID 1, 2, 3 and shard 2 hands out ID 1, 2, 3. The same ID names two different rows.
+
+You can give each shard its own range, or give each an offset. Flickr's old design used two "ticket servers" with a MySQL table: `REPLACE INTO` a stub row, then `LAST_INSERT_ID()` returns the next number. One server counts odd numbers and the other even. It works. The cost: every new ID is a round trip to a central database on the write path, and that database is a point of failure.
+
+We want IDs that each machine can make **alone**, that are unique, and ideally sort by creation time.
+
+## UUIDs
+
+A **UUID** is a 128-bit ID that machines generate on their own. Two versions matter.
+
+**UUIDv4** is random. Of 128 bits, 6 are fixed (4 for the version, 2 for the variant), so **122 bits are random**. A collision is possible but absurdly unlikely. The birthday bound says a 50% chance of one collision needs about 1.18 × 2^61 = 2.7 × 10^18 IDs. At 1 billion IDs per second that takes about 86 years.
+
+**UUIDv7** (RFC 9562) puts time first. The layout is:
+
+| Field | Bits |
+|---|---|
+| `unix_ts_ms`: Unix time in milliseconds | 48 |
+| `ver`: the number 7 | 4 |
+| `rand_a`: random (or a counter) | 12 |
+| `var`: variant | 2 |
+| `rand_b`: random | 62 |
+
+Take 1,700,000,000,000 ms (2023-11-14 22:13:20 UTC). In hex it is `018bcfe56800`. The UUID starts `018bcfe5-6800-7...`. The `7` is the version. Later UUIDs start with larger hex numbers, so they sort by time.
+
+Why does the order matter? Look at the index (lesson [4.3](/learn/04-data/indexing/)). A B-tree keeps keys sorted in pages. For 1 billion keys, lesson 4.3 counted about 2.5 million leaf pages. A **random** key lands on a random leaf page. Most of them are not in memory, so each insert may read a page from disk and later write it back. Pages also split at random places.
+
+A **time-ordered** key lands on the **rightmost** leaf page every time. That one page stays hot in memory. One page, not 2.5 million candidates. This is the same pattern as an auto-increment key.
+
+The price of v7: it shows when the ID was made. UUIDs are 16 bytes against 8 for a counter. And its order is only as good as the machine's clock. The RFC warns that clock rollback, leap seconds, and counter overflow can break it, so implementations should check.
+
+## Snowflake: 64 bits you can sort
+
+Twitter's Snowflake packs an ID into 64 bits (read in the original source and README). It is time first, so IDs sort roughly by creation time. It is small, so it fits an 8-byte integer column.
+
+| Field | Bits | What it gives |
+|---|---|---|
+| Sign | 1 | Always 0 |
+| Timestamp | 41 | Milliseconds since a custom epoch: 2^41 ms, about 69.7 years |
+| Machine ID | 10 | Up to 1,024 machines |
+| Sequence | 12 | 4,096 IDs per millisecond per machine |
+
+Step through one.
+
+<IdSnowflake client:visible />
+
+The numbers: 4,096 IDs per millisecond is 4,096,000 per second **per machine**. With 1,024 machines the cluster can issue 4.19 billion IDs per second. Twitter's source uses the epoch 1288834974657, which is 2010-11-04 01:42:54.657 UTC. An epoch close to "now" spends none of the 41 bits on years before your system existed.
+
+Snowflake has two hard parts.
+
+- **Assign machine IDs.** Two machines must never share one. A small coordination service such as ZooKeeper or etcd (lesson [8.8](/learn/08-technologies/zookeeper/)) can hand them out once at startup. After that, no coordination is needed per ID.
+- **Do not trust the clock to move forward.** If the clock steps back, the same millisecond comes again with the same sequence, and an ID repeats. The original code refuses to issue IDs until the clock passes the last timestamp used. Its README also advises running NTP so that it does not move the clock backwards.
+
+The order is also only **roughly** by time. Two machines in the same millisecond order by machine ID, not by what really happened first.
+
+## Clocks lie
+
+Wall clocks drift. **NTP** (Network Time Protocol) corrects them by asking time servers. Wikipedia's summary: accuracy is tens of milliseconds over the internet, better than 1 ms on a LAN in ideal conditions, and 100 ms or more in bad cases.
+
+Now use the clock to order two writes to the same key, with "last write wins" (lesson [4.6](/learn/04-data/replication/), multi-leader). Machine A's clock is 30 ms ahead.
+
+| Event | True time | Stamped time |
+|---|---|---|
+| A writes `x = 1` | 100 ms | 130 ms |
+| B writes `x = 2` | 110 ms | 110 ms |
+
+B wrote **after** A. By stamps, A looks later. Last write wins keeps `x = 1`, and the newer write is silently lost. A 30 ms error is enough to flip two writes that are 10 ms apart.
+
+So do not use physical time to order events that can race. Use **logical time**.
+
+## Logical clocks
+
+Leslie Lamport's insight: order matters only when one event could have **caused** another. Event a **happened before** b if they run on one process in that order, or a is a send and b is its receive, or through a chain of those.
+
+**Lamport clock.** Each process keeps one counter.
+
+- Local event or send: add 1.
+- Receive: set the counter to max(local, received) + 1.
+
+If a happened before b, then L(a) < L(b). The reverse is false: L(a) < L(b) does **not** mean a came first. They may be unrelated.
+
+**Vector clock.** Each process keeps one counter **per process**, so [A, B, C]. A local event adds 1 to its own entry. A receive takes the larger entry in every slot, then adds 1 to its own. Compare two vectors slot by slot. If one is at most the other in every slot, that event happened first. If neither is, the events are **concurrent**: no causal link. This is what Dynamo-style stores use to find conflicting writes (lesson [4.9](/learn/04-data/cap-pacelc/)).
+
+<IdLamport client:visible />
+
+The price of the vector is size: one entry per process.
+
+**Hybrid logical clock** (HLC, Kulkarni et al. 2014). A timestamp is a pair (l, c). l follows the largest physical time the node has seen. c breaks ties when l does not move. It stays close to real time, so you can still read it as a date, and it fits in 64 bits. Example: a node has (100, 0) and its clock reads 100. A message arrives stamped (105, 2) from a node whose clock runs ahead. The new l is max(100, 105, 100) = 105. It matches the message's l, so c = 2 + 1 = 3. The node now says (105, 3), later than the message, with no clock change.
+
+**TrueTime** (Google Spanner, 2012) takes the opposite route: fix the clock with GPS and atomic clocks and **admit the error**. `TT.now()` returns an interval [earliest, latest] that contains the true time. The paper reports the error bound ε as a sawtooth between about 1 and 7 ms, 4 ms most of the time. The sawtooth comes from a 30 s poll interval and a drift rate of 200 µs per second (30 × 200 µs = 6 ms). To commit, Spanner picks a timestamp and then does **commit wait**: it holds the result until `TT.after(s)` says the time has surely passed. Two transactions then get timestamps in the true order.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| UUIDv4 random bits | 122 of 128 | RFC 9562 |
+| UUIDv7 | 48-bit ms timestamp, 4-bit ver, 12-bit rand_a, 2-bit var, 62-bit rand_b | RFC 9562 |
+| Snowflake fields | 41 / 10 / 12 bits | Twitter snowflake README |
+| Snowflake timestamp life | 2^41 ms = 2,199,023,255,552 ms ≈ 69.7 years | Derived |
+| Snowflake rate | 4,096,000 IDs per second per machine | Derived |
+| NTP accuracy | tens of ms over the internet, under 1 ms on a good LAN | Wikipedia |
+| TrueTime error ε | about 1 to 7 ms, about 4 ms most of the time | Spanner paper |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Central counter or ticket server | Exact, dense sequence | A round trip per ID, a single point of failure | Low rate, you need gap-free numbers |
+| UUIDv4 | No coordination, no clock, no setup | 16 bytes, random index inserts, no order | Public tokens, low insert rate |
+| UUIDv7 | No coordination, time order, B-tree friendly | 16 bytes, leaks time, relies on a good clock | Primary keys in a B-tree table |
+| Snowflake | 8 bytes, sorts by time, 4 million per second per machine | Machine ID assignment, clock rollback risk | Large, sharded, high rate |
+| Lamport clock | One small number, cheap | Cannot tell concurrent from ordered | Total order of events, tie-break |
+| Vector clock | Detects concurrent writes | One entry per process | Conflict detection in leaderless stores |
+| HLC | Close to real time, 64 bits, causality kept | Needs reasonably synced clocks | Timestamps that must read as dates |
+| TrueTime | External consistency with known error | GPS and atomic clocks, commit wait | You own the hardware, as Google does |
+
+## Interview lens
+
+<Callout type="tip">
+Start from the constraint: "no central counter on the write path". Give two answers: "Snowflake if I need an 8-byte sortable ID, UUIDv7 if I want no machine-ID assignment". Say what could go wrong: "machine IDs must be unique, and the clock must not go backwards, so the generator refuses to issue IDs until it catches up". For ordering, say: "I do not order with wall clocks, because NTP skew can flip writes 10 ms apart. I use a version vector to detect conflicts, or a hybrid logical clock for timestamps".
+</Callout>
+
+<Callout type="mistake">
+Do not say "UUIDv7 is 64 bits". It is 128. Do not say "NTP makes clocks accurate to the millisecond everywhere". Do not say a Lamport timestamp tells you two events are concurrent. A smaller number does not mean "happened first". And do not claim Snowflake is safe when the clock goes back: without a guard it can issue the same ID twice.
+</Callout>
+
+<Callout type="deep" title="Why TrueTime waits">
+Suppose transaction T1 commits with timestamp s1. Transaction T2 starts after T1's commit is visible and takes timestamp s2. We need s1 < s2. With a plain clock, s2 could come out smaller if T2's server runs behind. TrueTime gives each server an interval. T1 picks s1 at the top of its interval and waits until `TT.after(s1)` is true, so the true time has passed s1 before anyone sees the commit. Any later transaction then gets an earliest time that is at least s1. The cost is a wait of about the clock error, so Spanner works to keep ε small.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A Snowflake machine is asked for 5,000 IDs within one millisecond. What does a correct generator do with the extra ones?',
+      options: ['Waits for the next millisecond, then continues', 'Reuses sequence numbers 0 to 903 inside the same millisecond', 'Borrows spare bits from the machine ID field for the sequence', 'Rolls the timestamp field forward by exactly one whole year'],
+      answer: 0,
+      explain: 'The sequence field has 12 bits, so 4,096 values per millisecond. Reusing a value would make a duplicate ID. A correct generator spins until the clock reaches the next millisecond, then restarts the sequence.',
+    },
+    {
+      q: 'Why does switching a primary key from random UUIDv4 to UUIDv7 usually make inserts faster on a huge B-tree table?',
+      options: [
+        'UUIDv7 is shorter than UUIDv4, so many more keys fit in each page',
+        'UUIDv7 skips the index for new rows, so no page is touched at all',
+        'New keys land on the rightmost leaf page, kept in memory',
+        'UUIDv7 uses a much faster hash, so the index is built sooner',
+      ],
+      answer: 2,
+      explain: 'A v7 key starts with the time, so every new key sorts after the last one and goes to the same hot page. A v4 key lands on a random leaf among millions of pages, so most inserts read a page from disk. Both are 16 bytes.',
+    },
+    {
+      q: 'Machine A\'s clock runs 30 ms fast. A writes x = 1 at true time 100 ms. B writes x = 2 at true time 110 ms. With last-write-wins on wall-clock stamps, which value survives?',
+      options: ['x = 2, since B wrote last in real time and that must win', 'x = 1, because A\'s stamp 130 beats 110', 'Neither survives, because equal stamps cause a conflict error', 'Both survive, kept together as a list of siblings'],
+      answer: 1,
+      explain: 'A stamps 100 + 30 = 130. B stamps 110. The larger stamp wins, so the older write x = 1 replaces the newer one. A logical clock or a version vector does not have this flaw.',
+    },
+    {
+      q: 'Event x has Lamport timestamp 4 and event y has Lamport timestamp 9. What is safe to conclude?',
+      options: ['x happened before y, because 4 is smaller than 9 for certain', 'x and y are concurrent, because the numbers are far apart', 'y did not happen before x', 'y happened before x, because 9 is the larger of the two'],
+      answer: 2,
+      explain: 'If y had happened before x, then L(y) < L(x). Since 9 is not less than 4, y did not happen before x. But x might be before y, or they might be unrelated. A Lamport timestamp cannot tell those two apart.',
+    },
+    {
+      q: 'Two replicas hold vector clocks [2, 1, 0] and [1, 2, 0] for the same key. What is the relation between their writes?',
+      options: ['The first is older, since its first slot is larger than the other', 'The second is older, since its middle slot is larger than the other', 'They are equal, since the two sums are both 3', 'They are concurrent: each is larger in one slot'],
+      answer: 3,
+      explain: 'The first is larger in slot A (2 against 1), and the second is larger in slot B (2 against 1). Neither is at most the other in every slot, so neither write saw the other. The store must keep both or merge them.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ids-and-time-clock-rollback"
+  title="The duplicate order IDs"
+  scenario="An order service creates Snowflake-style IDs on 40 machines. The database starts rejecting inserts with a duplicate primary key error."
+  facts={['error rate: a few per day, never in bursts of more than 3', 'all errors come from different machines', 'NTP logs: "clock stepped back 3 ms" at the same minute as each error']}
+  steps={[
+    {
+      prompt: 'Which cause best explains the pattern?',
+      options: [
+        'After NTP stepped the clock back, the generator reissued a millisecond it had already used',
+        'Two machines were given the same machine ID at startup, and they collide at random',
+        'The sequence field is only 8 bits, so it overflows in a busy millisecond',
+        'The 41-bit timestamp wrapped around and repeated an old value',
+      ],
+      answer: 0,
+      explain: 'The errors come from different machines and line up with a backwards clock step. Going back 3 ms repeats timestamps with the same sequence numbers. A duplicate machine ID would hit one pair of machines every time, and the epoch gives decades before a wrap.',
+    },
+    {
+      prompt: 'What is the right fix in the generator?',
+      options: [
+        'Switch the IDs to a random 64-bit number, which can never repeat',
+        'Add a retry in the database layer that picks a new ID on a duplicate error',
+        'Drop the sequence field and use only the timestamp and the machine ID',
+        'Wait until the clock passes the last timestamp used, and avoid backward NTP steps',
+      ],
+      answer: 3,
+      explain: 'The original Snowflake code does this: it will not issue IDs until the time is after the last one used. Retrying hides the symptom and still risks a silent duplicate on a table without a unique key. Removing the sequence makes duplicates much more likely.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RFC 9562: Universally Unique IDentifiers](https://datatracker.ietf.org/doc/html/rfc9562) (UUIDv4 and UUIDv7 layouts, clock-rollback guidance)
+- [Twitter Snowflake (2010 source)](https://github.com/twitter-archive/snowflake/tree/snowflake-2010) (41/10/12 layout, custom epoch, clock-going-back guard)
+- [Flickr: Ticket servers](https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/) (central counters with odd and even offsets)
+- [Kulkarni et al., "Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases"](https://cse.buffalo.edu/tech-reports/2014-04.pdf) (hybrid logical clocks)
+- [Corbett et al., "Spanner: Google's Globally-Distributed Database"](https://static.googleusercontent.com/media/research.google.com/en//archive/spanner-osdi2012.pdf) (TrueTime and commit wait)

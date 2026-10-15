@@ -1,0 +1,260 @@
+---
+summary: 'A distributed rate limiter keeps one token bucket per client in Redis. A single Lua script does refill, check, and take as one atomic step, and sharding by client key scales it.'
+requires: ['07-reliability/rate-limiting', '08-technologies/redis', '04-data/consistent-hashing']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import RateLimiterBuild from '../../../components/anim/lessons/RateLimiterBuild.tsx';
+import RateLimiterAtomic from '../../../components/anim/lessons/RateLimiterAtomic.tsx';
+
+## The problem
+
+Lesson [7.4](/learn/07-reliability/rate-limiting/) taught the algorithms. A token bucket caps the average rate and allows short bursts. That lesson also showed that the counters must live in one shared place when many servers enforce one limit.
+
+Now build the whole service. A company runs 50 gateway servers. One customer is allowed 100 requests a second. Which server counts? If each server counts alone, the customer can send 100 to each and get 5,000 in total. If one server counts for everyone, it becomes a bottleneck and a single point of failure.
+
+This case study is about three parts the algorithm lesson skipped: where the state lives, how a check stays correct under a race, and how the system scales and fails.
+
+## Requirements
+
+**Functional.**
+
+1. Identify the caller: by user id, API key, or IP address.
+2. Apply configurable rules, for example "100 per second per API key" or "5 per minute per IP on `/login`".
+3. Reject requests over the limit with HTTP 429 and tell the caller when to retry.
+
+**Below the line.** Analytics dashboards, long-term storage of counts, and exact agreement across regions.
+
+**Non-functional.** The check adds under 10 ms. The limiter is highly available. Counts may differ a little between nodes (eventual consistency is accepted), but one client must not get far above its limit.
+
+**Scale.** These are interview assumptions, not company data.
+
+- Peak of 1 million requests a second across all clients. Every request needs one check.
+- One Redis instance sustains about 50,000 limiter calls a second. Lesson [8.2](/learn/08-technologies/redis/) warns that no single ops-per-second number is universal, and a script costs more than a plain `GET`. So this is a planning number. Benchmark your own hardware.
+
+Derive the shard count. At 1M checks a second and 50K per shard, you need 1,000,000 ÷ 50,000 = 20 shards just to carry the load. Redis near 100% busy has no room for a burst. Many designs aim for about half load. That gives 40 shards. Say "20 at the minimum, about 40 for headroom". The exact number matters less than showing the division.
+
+<Ballpark
+  client:visible
+  title="Size the limiter fleet"
+  scenario="Peak traffic is 1 million requests a second, and each needs one Redis call. One shard handles 50,000 limiter calls a second. You want shards to run at about half load."
+  steps={[
+    { prompt: 'Shards needed if each runs at 100% of 50,000 a second', unit: 'shards', answer: 20, within: 1.1, explain: '1,000,000 ÷ 50,000 = 20. This is the floor, with no spare room.' },
+    { prompt: 'Shards needed if each runs at half load', unit: 'shards', answer: 40, within: 1.1, explain: 'At half load each shard serves 25,000 a second, so 1,000,000 ÷ 25,000 = 40. Headroom absorbs bursts and a failover.' },
+    { prompt: 'Calls per second one shard sees at half load', unit: 'per s', answer: 25000, within: 1.1, explain: '50,000 × 0.5 = 25,000 a second per shard.' },
+  ]}
+/>
+
+## Core entities
+
+- **Rule:** `rule_id`, a match (which clients and routes), `capacity`, and `refill_rate`.
+- **Bucket:** the state for one client under one rule. It holds `tokens` and `last_refill_time`. It is stored under a key such as `rl:{rule}:{client}`.
+
+Buckets are small and disposable. If one is lost, the client simply starts with a full bucket. That makes Redis a good home for them, even though Redis can lose recent writes ([lesson 8.2](/learn/08-technologies/redis/)).
+
+## API
+
+The limiter has no public API. Gateways call it inside the request path.
+
+- `allow(client_id, rule_id)` returns `{ allowed, remaining, retry_after }`.
+- A rejected call becomes `429 Too Many Requests` with `Retry-After`. Lesson [7.4](/learn/07-reliability/rate-limiting/) covers the headers.
+- Admin: `PUT /rules/{rule_id}` changes a limit.
+
+## High-level design
+
+Step through it. Each step adds one box for one requirement.
+
+<RateLimiterBuild client:visible />
+
+**Where does the check run?** You can place it in the client, in each service, or at the gateway. Never rely on the client, since callers can lie or skip it. Per-service checks repeat the same code and drift. The usual answer is the API gateway ([lesson 8.10](/learn/08-technologies/api-gateway/)), or a sidecar next to each service. The gateway already knows the caller, so it can pick the key. Keep a coarse per-IP limit before login and a per-user limit after it.
+
+## Deep dive 1: the check must be atomic
+
+Each check does three things: refill the bucket for the time that passed, test for a token, and take one. If these are separate Redis calls, two gateways can interleave them. Watch the race, then the fix.
+
+<RateLimiterAtomic client:visible />
+
+The cure is one **Lua script**. Redis guarantees that a script runs atomically. In the words of the Redis docs, all of a script's effects "either have yet to happen or had already happened". No other command runs in the middle.
+
+A sketch of the script:
+
+```lua
+local cap  = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])          -- tokens per second
+local t    = redis.call('TIME')
+local now  = t[1] + t[2] / 1e6
+local s    = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(s[1]) or cap
+local ts     = tonumber(s[2]) or now
+tokens = math.min(cap, tokens + (now - ts) * rate)
+local ok = 0
+if tokens >= 1 then tokens = tokens - 1; ok = 1 end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('EXPIRE', KEYS[1], math.ceil(cap / rate) * 2)
+return { ok, math.floor(tokens) }
+```
+
+Read it in order. It reads the stored state. It adds `elapsed × rate` tokens, capped at capacity. It takes one token if one exists. It writes the state and sets an expiry. It returns the answer and the count left, from which the gateway builds the headers.
+
+Details that matter:
+
+- **The script reads the clock inside Redis**, with `TIME`. All gateways then share one clock, so skew between gateway servers cannot give one client extra tokens. The Redis docs say that since version 5, scripts replicate by their effects, so calling `TIME` is allowed.
+- **The key expires after twice the refill time.** An idle bucket refills to full after `cap ÷ rate` seconds. A full bucket is the same as a missing key. So deleting it after that is lossless, and idle keys do not pile up. With capacity 100 and rate 10 a second, the expiry is 2 × 10 = 20 seconds.
+- **Pass only the key in `KEYS`.** The Redis docs require every key a script touches to be given as a key argument. That is what lets Redis Cluster route the call.
+- **Load the script once** with `SCRIPT LOAD` and call it by hash with `EVALSHA`. The script cache is lost on restart and failover, so the client must reload on a `NOSCRIPT` error. Most clients do this for you.
+- **Keep the script short.** A script blocks the whole instance while it runs. This one does a few hash operations.
+
+## Deep dive 2: scale and keys
+
+Twenty to forty shards need a rule that sends every call for one client to one shard. Redis Cluster does this with 16,384 hash slots: the slot is `CRC16(key) mod 16384`, and each primary owns a range of slots ([lesson 8.2](/learn/08-technologies/redis/)). Because each script touches one key, it never spans two shards. Resizing moves whole slots, in the spirit of [lesson 4.8](/learn/04-data/consistent-hashing/).
+
+Latency has two parts. The gateway keeps a pool of open connections to Redis, so no call pays for a new TCP handshake. The shard sits in the same region as the gateway, so one round trip is short. Our 10 ms budget covers the round trip and a script that does a few hash operations.
+
+**Hot keys.** One abusive client sending 200,000 calls a second would saturate its shard and hurt the other clients on it. Options: block it at the edge once it is far over limit, so most of its traffic never reaches Redis; let each gateway take a batch of 10 tokens at a time and spend them locally; or give heavy customers their own shards. Each option trades some accuracy for less load.
+
+**Many regions.** A global bucket needs a slow round trip across oceans on every request. Most designs give each region its own limit, such as a share of the total, and accept that a client can reach the sum of the regional limits. That is the eventual-consistency trade we accepted in the requirements.
+
+## Deep dive 3: when Redis fails
+
+The limiter sits in the path of every request. If Redis is down or slow, the gateway must still answer. There are two choices.
+
+| Policy | What happens | Risk | Choose when |
+|---|---|---|---|
+| Fail open | Let every request through | Abusers and floods get past while the limiter is down | The limit protects revenue or fairness, and the backend can survive a spike |
+| Fail closed | Reject every request | Your own outage becomes a full outage | The limit protects something fragile, such as a login or a payment call |
+
+Set a short timeout on the Redis call, around a few milliseconds. When it expires, apply the policy. Pair that with a circuit breaker ([lesson 7.3](/learn/07-reliability/circuit-breaker/)) so a sick Redis does not make every request wait. Each shard has a replica for failover. Replication is asynchronous, so a failover can lose the last few updates. For buckets that is fine: a client may get a few extra tokens for a moment.
+
+**Rules** change rarely. Gateways poll the rules store every few seconds and cache the result. A push channel is faster but needs more moving parts. Polling is the simpler default.
+
+## Trade-offs
+
+| Decision | Choice here | You gain | You pay |
+|---|---|---|---|
+| Algorithm | Token bucket | Bursts allowed. Two numbers per client | Needs the refill math in the script |
+| Shared state | Redis with Lua | One limit across all gateways. Atomic | An extra hop per request. A new dependency |
+| Placement | Gateway | One place. Knows the caller | A shared hop that must stay up |
+| Sharding | By client key | Linear scale. Each bucket in one place | A hot client loads one shard |
+| Failure | Fail open or closed | Clear behavior on outage | Choose abuse risk or outage risk |
+| Regions | Per-region limits | No cross-ocean call | A client can exceed the global limit |
+
+<Callout type="tip">
+Say the race out loud: "If I read the count, add one, and write it back, two gateways can both read 1 and both pass. So the refill, check, and take run in one Lua script inside Redis. Redis runs one script at a time." Then give the shard math: "1M checks a second, 50K per shard, so 20 shards, about 40 with headroom."
+</Callout>
+
+<Callout type="mistake">
+Do not enforce limits only in the client. Do not do a `GET` and then a `SET`. Do not store a log of every request when two numbers per client will do. Do not forget to say fail open or fail closed. And do not promise strict global limits across regions without naming the latency cost.
+</Callout>
+
+<Callout type="deep" title="Why TIME runs inside the script">
+If each gateway sent its own clock reading, a gateway whose clock runs 2 seconds fast would add 2 seconds of refill to every client it serves. Reading the clock in Redis gives one source of time for every caller of a bucket. The price is that the script is no longer a pure function of its arguments. Redis allows this because it replicates the writes the script made, not the script itself.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Two gateways each read tokens = 1 from Redis for the same client and then each write tokens = 0. What is the result?',
+      options: [
+        'Both requests pass, and one token paid for two requests',
+        'One request passes and Redis rejects the other write',
+        'Both requests are rejected because the bucket looks empty',
+        'Redis queues the second write until the bucket refills',
+      ],
+      answer: 0,
+      explain: 'Each gateway saw a free token before the other wrote. Plain GET and SET calls do not lock anything between them. A Lua script closes the gap because Redis runs it as one step.',
+    },
+    {
+      q: 'Why does the limiter script call Redis TIME instead of taking the time from each gateway?',
+      options: [
+        'Redis TIME is faster than reading a local clock',
+        'It lets the script skip the refill math entirely',
+        'All gateways then share one clock',
+        'It makes the script safe to call without a key argument',
+      ],
+      answer: 2,
+      explain: 'A gateway with a fast clock would grant extra refill to its clients. One shared clock removes that error. Speed is not the reason, the refill math still runs, and the script must still receive its key.',
+    },
+    {
+      q: 'A bucket has capacity 60 and refills 2 tokens a second. After how many idle seconds can its key be safely deleted?',
+      options: [
+        '2 seconds, the refill rate',
+        '120 seconds, capacity times the rate',
+        '60 seconds, the capacity',
+        '30 seconds, capacity over rate',
+      ],
+      answer: 3,
+      explain: 'An idle bucket is full after 60 ÷ 2 = 30 seconds. A full bucket equals a missing key, so deletion loses nothing. The script uses twice that time for margin. Multiplying instead of dividing gives a nonsense 120.',
+    },
+    {
+      q: 'The limiter guards a payment API that is easy to overload. Redis goes down. Which policy fits, and why?',
+      options: [
+        'Fail open, so customers can still pay while Redis is down',
+        'Fail closed, so the fragile backend is not flooded',
+        'Fail open, because a limiter should never block anyone',
+        'Fail closed, because Redis outages always last for hours',
+      ],
+      answer: 1,
+      explain: 'When the guarded system is fragile, letting all traffic in risks a larger outage. Fail open suits cases where the limit is about fairness and the backend can take a spike. Outage length is not part of the rule.',
+    },
+    {
+      q: 'You need 1M checks a second and one shard does 50,000 a second. At half load per shard, how many shards do you run?',
+      options: [
+        '20 shards, because 1M ÷ 50K = 20',
+        '10 shards, because half load needs half the shards',
+        '80 shards, because half load needs four times the shards',
+        '40 shards, because each carries 25K a second',
+      ],
+      answer: 3,
+      explain: 'Half load means 25,000 calls per shard. 1,000,000 ÷ 25,000 = 40. Twenty shards run at full load with no room to spare. Half load needs more shards, not fewer.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="rate-limiter-over-limit"
+  title="The limit that leaks"
+  scenario="A limiter allows 100 requests a minute per API key, kept in Redis by 20 gateway servers. The code runs GET tokens, adds the refill, then SET tokens. One partner is allowed 100 a minute, yet billing shows they sent about 140 a minute. The overage shows up only at busy times. Quiet times look correct."
+  facts={[
+    'limit           : 100 per minute per key',
+    'gateways        : 20, all calling one Redis shard',
+    'check           : GET, compute in the gateway, SET',
+    'observed        : about 140 per minute at peak, 100 when quiet',
+  ]}
+  steps={[
+    {
+      prompt: 'Why does the overage appear only at busy times?',
+      options: [
+        'Redis drops writes when it is under load',
+        'The token refill rate is wrong for busy periods',
+        'Several gateways read the same count before any of them writes',
+        'The partner uses more than one API key under load',
+      ],
+      answer: 2,
+      explain: 'The race needs overlapping requests. At peak, many requests for one key arrive in the same few milliseconds, and several read the same count. When traffic is quiet the calls do not overlap, so the count is right.',
+    },
+    {
+      prompt: 'What is the most direct fix?',
+      options: [
+        'Lower the limit to 60 so the overage lands near 100',
+        'Add a lock in each gateway server around the check',
+        'Run refill, check, and take in one Lua script in Redis',
+        'Send the partner to a dedicated gateway server',
+      ],
+      answer: 2,
+      explain: 'A lock inside one gateway does not cover the other 19. A Lua script runs atomically in the one place all gateways share. Lowering the limit hides the leak and punishes quiet clients.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Redis docs: Scripting with Lua](https://redis.io/docs/latest/develop/programmability/eval-intro/) (atomic execution, script cache, effects replication)
+- [Redis docs: Cluster specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) (hash slots and key routing)
+- [Redis docs: Rate limiting](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) (limiter patterns on Redis)

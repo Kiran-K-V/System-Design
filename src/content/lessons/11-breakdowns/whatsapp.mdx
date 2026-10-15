@@ -1,0 +1,268 @@
+---
+summary: 'WhatsApp keeps millions of WebSockets open, routes each message to the server that holds the recipient, and tracks sent, delivered, and read with acks and a per-device inbox.'
+requires: ['02-networking/real-time-transport', '06-async/delivery-semantics', '08-technologies/redis']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import WhatsappBuild from '../../../components/anim/lessons/WhatsappBuild.tsx';
+import WhatsappAckCompare from '../../../components/anim/lessons/WhatsappAckCompare.tsx';
+
+## The problem
+
+Alice types "running late" and presses send. Bob's phone is in his pocket. Within about a second it should buzz. If Bob is on a train with no signal, the message must still arrive when he gets signal back. Alice must see whether it left her phone, reached his phone, or was read.
+
+Two ideas are new here. First, the server must **push** to a phone that never asked. Second, the server must know which of thousands of machines holds Bob's connection. The rest comes from earlier lessons.
+
+## Requirements
+
+Follow the six-step method from lesson [0.3](/learn/00-orientation/design-method/).
+
+**Functional, above the line:**
+
+1. Send and receive 1:1 messages in real time.
+2. Show delivery state: sent, delivered, read.
+3. Deliver to a user who is offline when the message is sent.
+4. Group chats, up to about 100 members (an assumption).
+
+**Below the line:** media upload (lesson [9.6](/learn/09-patterns/large-blobs/) covers the pattern), voice and video calls, end-to-end encryption, sign-up, "last seen", spam control.
+
+**Non-functional.** The numbers are interview assumptions, not company figures:
+
+- Delivery to an online recipient in under 500 ms.
+- No silent loss. A message is delivered, or the sender can see that it is not.
+- The server keeps a message only until it is delivered, and for 30 days at most.
+- Scale: 500 million daily users, 40 messages sent per user per day. The Numbers section derives the load.
+
+## Core entities
+
+- **Chat**: `chat_id`, type (1:1 or group), members.
+- **Message**: `message_id`, `chat_id`, `sender_id`, `client_msg_id`, body, server time, `seq`.
+- **Device**: `device_id`, user, last sequence seen per chat. A user can have a phone and a laptop.
+- **Receipt**: message, device, state.
+- **Inbox entry**: device, message. It means "this device has not acked this message yet".
+
+`client_msg_id` is made by the sender's app. It lets the server recognize a retry (lesson [3.4](/learn/03-api-design/idempotency/)). `seq` is a number the server assigns, one counter per chat. Order by `seq`, never by a phone's clock.
+
+## API
+
+Messaging runs over a WebSocket, because the server must push (lesson [2.5](/learn/02-networking/real-time-transport/)). The frames are:
+
+- Client to server: `send {chat_id, client_msg_id, body}`. The server answers `sent {message_id, seq}`.
+- Server to client: `message {message_id, chat_id, seq, body}`.
+- Client to server: `ack {message_id, state}` where state is `delivered` or `read`.
+- On connect: `hello {device_id, last_seq per chat}`. The server replays what is missing.
+
+A plain HTTP `GET /chats/{id}/messages?after_seq=` also exists for history and resync.
+
+There is no data-flow section. Each message is one request with one reply, not a pipeline.
+
+## High-level design
+
+Step through the build. Each step adds boxes for one requirement.
+
+<WhatsappBuild client:visible />
+
+Two details deserve a second look. The session map is a key-value store with a short expiry, refreshed by each heartbeat, so a dead server's entries disappear on their own. Redis fits (lesson [8.2](/learn/08-technologies/redis/)). And "save first" in step 3 is the rule behind the whole design: a message is stored before anyone is told anything.
+
+## Deep dives
+
+### Routing a message to the right server
+
+Server A needs to reach server B. There are two common ways.
+
+**Direct forward.** Look up the recipient in the session map, then call server B. One lookup, one hop. You need a connection mesh between chat servers and care when the entry is stale.
+
+**Pub/sub doorbell.** Each chat server subscribes to a channel named for itself. Server A publishes to the channel of the target server. A subscribed server gets it at once. This is simple to run, and lesson [9.3](/learn/09-patterns/real-time-updates/) covers the pattern.
+
+Redis pub/sub is at-most-once (the Redis docs say a message is delivered once if at all). So a published message can be lost if the subscriber is briefly gone. That is fine only because the message is already in the store and inbox. The push is a doorbell. The inbox is the mailbox. The per-chat `seq` shows a gap if a doorbell was missed (lesson [6.3](/learn/06-async/delivery-semantics/) on why the sender and receiver cannot tell loss from slowness).
+
+**Why not one topic per user?** Every user would need a topic, a queue, or a consumer group of their own. Hundreds of millions of tiny topics is a bad fit for a log broker built around a few thousand partitions (lesson [6.2](/learn/06-async/pubsub-logs/)). A map of user to server is a far cheaper way to say "where is Bob".
+
+### Dead sockets and silent loss
+
+Press the toggle and step through both designs.
+
+<WhatsappAckCompare client:visible />
+
+TCP does not tell you the phone vanished. A phone that loses signal sends no close frame. The server's next write often succeeds, because it only fills a buffer. So the server needs three tools of its own:
+
+- A **heartbeat**: a small ping on a timer. A missed reply means a dead socket (lesson [2.5](/learn/02-networking/real-time-transport/)).
+- An **app-level ack** for every pushed message. Only that ack means delivered.
+- A **replay on reconnect**, driven by the last `seq` the phone saw.
+
+Together these give at-least-once delivery. The sender's retry and the server's replay can both create duplicates. The phone drops a repeat by `message_id`. The result is an effectively-once display.
+
+### Offline users, many devices
+
+Each device has its own inbox, because a laptop can be online while the phone is not. An entry lives until that device acks it, or for 30 days at most. Reconnect is a pull: the device reports its `last_seq`, and the server sends the gap.
+
+"Delivered" needs a product rule with several devices. A common choice is to mark it when the first device acks, and "read" when any device reports it. State the rule you pick. The wrong move is to wait for all devices, because one old tablet would block the ticks forever.
+
+### Group fan-out
+
+A message to a 100-member group is one write to the store and up to 99 deliveries. Fan-out on write is right here: the work is bounded by the group size limit (the lesson on the news feed, [11.5](/learn/11-breakdowns/news-feed/), shows what goes wrong when it is not bounded). Each member's device gets either a push or an inbox entry. Receipts for a group come from many devices, so the sender usually sees one tick set that means "reached some members", with per-member detail in the message info view.
+
+## Numbers
+
+All inputs are assumptions. The method is lesson [1.4](/learn/01-one-machine/estimation/).
+
+- **Messages.** 500M users × 40 messages = 20B messages per day. 20B / 86,400 s ≈ 231,000 per second on average. Assume peak is twice the average, so about 460,000 per second.
+- **Deliveries.** Say 80% of messages go to one person and 20% to groups of 10. Average recipients = 0.8 × 1 + 0.2 × 10 = 2.8. Deliveries ≈ 231,000 × 2.8 ≈ 650,000 per second.
+- **Sockets.** Say 30% of users are connected at once: 150M sockets. At 100,000 sockets per server, that is 1,500 servers. At 10 KB of memory per socket, 100,000 sockets use about 1 GB of RAM. Sockets are mostly idle, so memory and file descriptors matter more than CPU.
+- **Heartbeats.** One ping per socket every 30 s: 150M / 30 = 5M pings per second across the fleet, about 3,300 per server. Heartbeat interval is a real cost knob.
+- **Storage.** At 1 KB per message, keeping everything for 30 days is 20B × 1 KB = 20 TB per day × 30 = 600 TB. Instead, delete after the ack. If 3% of messages wait for an offline device, the standing store is 0.03 × 20B = 600M per day × 30 days × 1 KB = 18 TB. That is an upper bound, since most waits are short.
+
+One company data point, and it is dated. WhatsApp's own blog said it had sent just over 1 billion messages in a single day in late 2011. It put that at 11,574 per second. Our assumed 20B per day is about 20 times that. I found no primary source for current figures, so I quote none.
+
+<Ballpark
+  client:visible
+  title="Size the connection fleet"
+  scenario="Use the assumptions above: 500M daily users, 40 sent messages per user per day, 30% of users connected at once, 100,000 sockets per server."
+  steps={[
+    {
+      prompt: 'What is the average number of messages per second?',
+      unit: 'msg/s',
+      answer: 231000,
+      within: 1.2,
+      explain: '500M × 40 = 20B per day. 20B / 86,400 is about 231,000 per second.',
+    },
+    {
+      prompt: 'How many chat servers hold the sockets?',
+      unit: 'servers',
+      answer: 1500,
+      within: 1.2,
+      explain: '30% of 500M is 150M sockets. 150M / 100,000 per server = 1,500 servers.',
+    },
+    {
+      prompt: 'Each socket sends one heartbeat every 30 s. How many pings per second hit one server?',
+      unit: 'pings/s',
+      answer: 3333,
+      within: 1.2,
+      explain: '100,000 sockets / 30 s is about 3,333 pings per second. Small next to its message load, but it never stops.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| WebSocket push | Low latency, server can start a send | Stateful servers, reconnect storms (lesson [2.5](/learn/02-networking/real-time-transport/)) | Real-time two-way messaging |
+| Direct forward through a session map | One hop, no broker | Server mesh, stale entries | Fewer, larger chat servers |
+| Pub/sub doorbell | Easy routing | At-most-once, so a store must back it | Many servers, simple ops |
+| Save before ack | No silent loss | One write on the hot path | Always, for chat |
+| Inbox deleted after ack | Low retention, small store | A replay path to build | Privacy and cost matter |
+| Fan-out on write for groups | Fast reads, simple delivery | Cost grows with group size | Groups are capped |
+
+## Interview lens
+
+<Callout type="tip">
+Say the order out loud: "The server saves the message, then acks the sender, then pushes to the recipient, then waits for the recipient's ack. Delivered is an ack from the phone, not a successful socket write. If the phone is offline the entry waits in its inbox and replays by sequence number." That one paragraph covers most probes.
+</Callout>
+
+<Callout type="mistake">
+Three common slips. Saying "TCP will tell us if the phone is gone" (it will not; use heartbeats and acks). Using the sender's clock for order (use a server-side `seq`). Treating sent, delivered, and read as one flag (they are three acks from three places).
+</Callout>
+
+<Callout type="deep" title="What if the same message arrives twice?">
+Two retries can overlap: the sender resends after a lost `sent` ack, and the server replays after a reconnect. Both are safe if every write is keyed by `client_msg_id` on the way in and by `message_id` on the way out. Exactly-once on the wire is not possible (lesson 6.3). Exactly-once in effect is just a dedupe key.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In a WhatsApp-style chat, the server marks a message delivered. What should that mean?',
+      options: [
+        'The sender app received a sent ack from the server',
+        'The recipient app sent back an ack for that message',
+        'The socket write to the recipient returned without error',
+        'The message was saved in the message store',
+      ],
+      answer: 1,
+      explain: 'Delivered is a statement about the recipient device. A successful socket write only means the bytes entered a buffer, and a dead phone can still accept them. Saved is the sent state.',
+    },
+    {
+      q: 'A chat server holding 100,000 sockets crashes and its session map entries are not deleted. What keeps the map correct?',
+      options: [
+        'Each entry has a short expiry that heartbeats keep renewing',
+        'The clients rewrite the whole map themselves whenever they reconnect',
+        'The message store rejects every write that names the dead server',
+        'The load balancer rebuilds the entire map from scratch each second',
+      ],
+      answer: 0,
+      explain: 'With an expiry that only a live server renews, a dead server’s entries age out by themselves. Clients do not own the map, and the message store does not know about servers.',
+    },
+    {
+      q: 'Cara reconnects and her app reports last_seq = 41 for a chat. The inbox holds 42, 43, and 45. What does the server learn?',
+      options: [
+        'Nothing is wrong, so it sends 42 and 43 and stops',
+        'Cara already read 45, since 45 is the largest number',
+        'It must delete 45, because gaps are not allowed in a chat',
+        'Message 44 is missing and must be fetched',
+      ],
+      answer: 3,
+      explain: 'Per-chat sequence numbers are contiguous, so a gap means a lost write or a missed push. The server should fetch 44 from the message store, then replay 42 to 45 in order.',
+    },
+    {
+      q: 'A group of 100 members sends a message. Which design is a good fit for the delivery step?',
+      options: [
+        'The sender app opens 99 sockets, one for each member',
+        'Fan-out on write: one copy, one delivery per member',
+        'Fan-out on read: members poll the store every second',
+        'A new log topic per message with 100 consumer groups',
+      ],
+      answer: 1,
+      explain: 'The group size is capped, so the work per message is bounded. One stored copy and 99 pushes or inbox entries is cheap. Polling wastes work, and a topic per message is far too heavy.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="whatsapp-two-ticks-no-message"
+  title="Two ticks, no message"
+  scenario="Users on a train report that Alice's chat shows two ticks, but Cara never saw the message until much later, or never."
+  facts={[
+    'push path:   socket write returns OK',
+    'delivered:   set when the write returns',
+    'heartbeat:   none, relies on TCP close',
+    'inbox:       written only after delivered',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the root cause?',
+      options: [
+        'The server marks delivered without a phone ack, and it keeps no copy',
+        'Redis pub/sub is too slow, so messages arrive after the timeout',
+        'The message store uses too few partitions for this many chats',
+        'Group chats fan out on write, which overloads the server',
+      ],
+      answer: 0,
+      explain: 'A write that returns OK does not prove the phone got the bytes. With no ack and no stored copy, a dead socket loses the message while Alice sees two ticks.',
+    },
+    {
+      context: 'The team decides to keep delivered as it is for now and fix the loss first.',
+      prompt: 'Which change stops the loss?',
+      options: [
+        'Raise the socket write timeout to 60 seconds',
+        'Save to the inbox first, push with an id, delete on ack, replay on reconnect',
+        'Send every message twice over the same socket',
+        'Have the sender app retry every second until it sees two ticks',
+      ],
+      answer: 1,
+      explain: 'A stored copy plus an ack and a replay turns loss into delay. A longer timeout cannot detect a silent phone, sending twice does not help if the socket is dead, and sender retries cannot see the recipient.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [WhatsApp blog: one billion messages](https://blog.whatsapp.com/one-billion-messages) (the dated company figure used above)
+- [Redis docs: Pub/Sub](https://redis.io/docs/latest/develop/pubsub/) (at-most-once delivery)
+- [MDN: WebSockets API](https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API) (the protocol your connection servers speak)

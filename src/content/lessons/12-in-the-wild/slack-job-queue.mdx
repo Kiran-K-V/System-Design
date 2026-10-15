@@ -1,0 +1,170 @@
+---
+summary: 'Slack put Kafka in front of its Redis job queue so a spike lands on disk and not in memory. Redis stayed, and the old interfaces did not change.'
+requires: ['08-technologies/kafka', '06-async/delivery-semantics', '08-technologies/redis']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import SlackCompare from '../../../components/anim/lessons/SlackCompare.tsx';
+import SlackRelay from '../../../components/anim/lessons/SlackRelay.tsx';
+
+The source is Slack Engineering's "Scaling Slack's Job Queue". The page is dated December 6, 2017 and shows an update on June 25, 2020. The system it describes is from 2017. We keep **what Slack says** apart from **our reading**.
+
+## The problem
+
+Slack runs slow work off the web request. Examples are posting a message, sending push notifications, and billing. The post says that on its busiest days the system "processes over 1.4 billion jobs at a peak rate of 33,000 per second". Jobs run "from a few milliseconds to (in some cases) several minutes".
+
+This is a queue (lesson [6.1](/learn/06-async/queues/)). A queue only protects you while the machine that holds it has room.
+
+## Before: jobs in Redis memory
+
+**What Slack says.** The web app picks one of the configured Redis hosts "based on a hash" of the job identifier and the logical queue. Workers poll Redis. A worker moves a job from the pending queue to an in-flight list and starts a task. Failed jobs go to a retry queue a set number of times. Jobs that never succeed go to a list of permanently failed jobs, which people inspect by hand (lesson [6.4](/learn/06-async/backpressure-dlq/)).
+
+The outage began with database contention. Jobs ran slowly, so they piled up, "which caused Redis to reach its maximum configured memory limit". New jobs could not be enqueued. Then came the nasty part: "our system actually required a bit of free Redis memory in order to dequeue a job". The queue stayed locked after the database recovered.
+
+The post lists more limits. Redis had little operational headroom, "particularly with respect to memory". Connections formed "a complete bipartite graph", since every client talks to every Redis host. Workers "couldn't scale independently of Redis". And "dequeuing a job requires work proportional to the length of the queue".
+
+## After: Kafka in front of Redis
+
+<SlackCompare client:visible />
+
+**What Slack says.** Kafka sits ahead of Redis. Replacing Redis outright would have meant changes to scheduling, execution, and deduplication logic. So the team put Kafka in front, "leaving the existing application enqueue and dequeue interfaces in place".
+
+Two stateless Go services connect the pieces.
+
+- **Kafkagate** takes an HTTP POST with a topic, partition, and content, and writes to Kafka with the Sarama driver. It waits only for the partition leader: "we only wait for the leader to acknowledge the request, and not for replication". The post says this carries a small risk of losing a job if a broker dies first.
+- **JQRelay** moves jobs from Kafka to Redis. At startup it tries to take a Consul lock on a key for the topic. The winner relays all partitions of that topic. It "only advances the offset if the job is successfully written to Redis". For a Redis outage it retries without end. For a job-specific error it re-enqueues the job to Kafka. Rate limits live in Consul.
+
+When enqueues outpace dequeues, Kafka holds the backlog. Operators can lower JQRelay's rate limit or pause writes to Redis.
+
+The cluster, per the post, runs Kafka 0.10.1.2 on 16 brokers on i3.2xlarge machines. Every topic has 32 partitions, replication factor 3, and 2 days of retention. The rollout canaries covered 50 Redis clusters and 1600 Kafka partitions (50 topics times 32 partitions).
+
+Watch the failover case below. The "duplicate" step is our reading.
+
+<SlackRelay client:visible />
+
+<Callout type="deep" title="Our reading">
+The core change is where a spike waits. In RAM it breaks the store. On disk in Kafka it is just a backlog (lesson [8.6](/learn/08-technologies/kafka/)).
+
+Offsets move after the Redis write. A crash between the two replays a job. So delivery is at-least-once (lesson [6.3](/learn/06-async/delivery-semantics/)), and workers should tolerate a repeat (lesson [3.4](/learn/03-api-design/idempotency/)). The post does not say this. It is our inference from how offsets advance.
+
+Waiting for only the leader favors enqueue availability over durability. The post makes that choice openly. We do not read it as a mistake.
+</Callout>
+
+## Where it maps to earlier lessons
+
+| Idea in the story | Lesson |
+|---|---|
+| A queue and its workers | [6.1 Queues](/learn/06-async/queues/) |
+| A durable log as a buffer | [8.6 Kafka](/learn/08-technologies/kafka/), [6.2 Pub/Sub and Logs](/learn/06-async/pubsub-logs/) |
+| Offset after the write, so at-least-once | [6.3 Delivery Semantics](/learn/06-async/delivery-semantics/) |
+| Backlog, rate limits, failed jobs | [6.4 Backpressure and DLQ](/learn/06-async/backpressure-dlq/) |
+| The Redis side | [8.2 Redis](/learn/08-technologies/redis/) |
+
+## Trade-offs
+
+| Choice | Gain | Cost |
+|---|---|---|
+| Kafka in front of Redis | Spikes land on disk, interfaces unchanged | Two more services and a Kafka cluster to run |
+| Leader-only ack | Enqueue stays available | A small chance to lose a job if a broker dies first |
+| One relay per topic via a lock | No duplicate relaying in normal operation | A failover gap, and a replayed job after a crash |
+| Offset after the Redis write | No job skipped | A possible repeat |
+
+## Interview takeaways
+
+<Callout type="tip">
+Say: "I would put a durable log in front of the memory-bound store so a spike becomes a backlog on disk. A relay drains it at a tunable rate and commits the offset only after the write succeeds. Workers are idempotent." Then state your ack choice and why.
+</Callout>
+
+<Callout type="mistake">
+Do not say "Slack replaced Redis with Kafka". The post kept Redis. Do not say "always use acks=all". Slack chose leader-only acks on purpose, and said what it risks.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In Slack\'s 2017 outage, why did the job queue stay locked even after the database problem was fixed?',
+      options: [
+        'Workers crashed and could not restart without any fresh job data',
+        'Dequeuing also needed some free Redis memory, and there was none',
+        'Redis refused to start until an operator had cleared the retry list',
+        'The Kafka brokers had filled up and then rejected all reads',
+      ],
+      answer: 1,
+      explain: 'The post says dequeue required a bit of free Redis memory. With memory full, workers could not take jobs, so the queue could not drain. Kafka was not in the old design.',
+    },
+    {
+      q: 'Why did Slack put Kafka in front of Redis and not swap Redis out?',
+      options: [
+        'Kafka cannot hand jobs to workers in any other way than this',
+        'Redis could not store more than a few thousand jobs at any one time in memory',
+        'It would have been cheaper because Kafka needs no brokers to run',
+        'It kept the old interfaces and avoided rewriting scheduling',
+      ],
+      answer: 3,
+      explain: 'The post says a replacement would have needed changes across scheduling, execution, and deduplication logic. Putting Kafka in front relieved the bottleneck and left the interfaces in place.',
+    },
+    {
+      q: 'Kafkagate waits only for the partition leader. A broker dies right after it acknowledges a job, before replication. What can happen?',
+      options: [
+        'The job can be lost, a risk the post accepts',
+        'The job is always safe because the log keeps three full copies of it',
+        'JQRelay rebuilds the job from the Redis in-flight list of workers',
+        'The web app is told to resend it only after two whole minutes',
+      ],
+      answer: 0,
+      explain: 'Leader-only acknowledgment trades durability for availability. The record may exist only on the dead broker. Replication factor 3 helps only after the followers have copied the record.',
+    },
+    {
+      q: 'Redis goes down for ten minutes. What does the new design do with jobs that arrive meanwhile?',
+      options: [
+        'It drops them after the first failed write to Redis',
+        'It refuses all new jobs at Kafkagate until Redis is back online',
+        'It holds them in Kafka while JQRelay retries and holds its offset',
+        'It moves them to the permanently failed list for a manual fix later',
+      ],
+      answer: 2,
+      explain: 'JQRelay retries on a Redis outage and advances the offset only after a successful write. Kafka keeps the jobs on disk in the meantime, within its 2 day retention. Only job-specific errors are re-enqueued to Kafka.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="slack-relay-duplicate"
+  title="The job that ran twice"
+  scenario="A relay copies jobs from a Kafka topic to Redis. It commits the Kafka offset only after the Redis write. After a relay crash and failover, a billing job ran twice."
+  steps={[
+    {
+      prompt: 'What most likely happened?',
+      options: [
+        'The old relay wrote the job to Redis, then crashed before it committed the offset',
+        'The new relay skipped ahead and read the job from two partitions',
+        'Kafka replicated the job to a second topic after the failover',
+        'The worker pool started a second copy of the job on its own',
+      ],
+      answer: 0,
+      explain: 'The write to Redis and the offset commit are two steps. A crash between them leaves the job in Redis and the offset behind. The new relay resumes at the old offset and writes the job again.',
+    },
+    {
+      prompt: 'What is the right fix?',
+      options: [
+        'Commit the offset before the Redis write, so a crash cannot repeat a job',
+        'Make the billing job idempotent, using a job ID that workers check',
+        'Turn off the lock so two relays always read the topic at once',
+        'Shorten retention so that old offsets disappear faster after a failover',
+      ],
+      answer: 1,
+      explain: 'Committing first would trade a repeat for a lost job after a crash. Idempotent workers tolerate a repeat. Two relays on one topic would cause more duplicates, not fewer.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Scaling Slack's Job Queue (2017, updated 2020)](https://slack.engineering/scaling-slacks-job-queue/)
+- [Apache Kafka documentation: producer acks](https://kafka.apache.org/documentation/#producerconfigs_acks)

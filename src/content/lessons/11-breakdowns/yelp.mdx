@@ -1,0 +1,258 @@
+---
+summary: 'Yelp searches businesses by text, place, and category, and shows reviews. A search index serves search, and each business row stores a sum and a count so ratings stay cheap and safe.'
+requires: ['06-async/cdc', '08-technologies/elasticsearch', '10-advanced/proximity-search']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import YelpBuild from '../../../components/anim/lessons/YelpBuild.tsx';
+import YelpRating from '../../../components/anim/lessons/YelpRating.tsx';
+
+## The problem
+
+A user types "pizza" and a neighborhood, and wants good pizza places nearby. They open one result, read reviews, and later write one.
+
+The search mixes three kinds of match in one query: words in a name, a category, and a distance from a point. A normal database index handles one of these well. It does not handle all three at once. The second pain is the star rating. Every page shows an average. Averages change when a review arrives, and many reviews can arrive together.
+
+This case adds three ideas: geo search combined with text and filters, a rating that is stored and updated safely, and a search index kept beside the main store. The index is built from lesson [8.5](/learn/08-technologies/elasticsearch/), the distance part from lesson [10.1](/learn/10-advanced/proximity-search/), and the feed from lesson [6.5](/learn/06-async/cdc/).
+
+## Requirements
+
+**Functional.**
+
+1. Search businesses by name, location (latitude and longitude), and category.
+2. View one business and its reviews.
+3. Leave a review: a required 1 to 5 star rating and optional text.
+
+**Below the line.** Admin tools for businesses, a map view, personalized recommendations, spam and abuse checks, and privacy law. Name them and move on.
+
+**Non-functional.** Numbers are interview assumptions.
+
+- Search answers in under 500 ms.
+- High availability. Eventual consistency is fine: a new review may take seconds to show in search.
+- 100 million daily users and 10 million businesses.
+
+### Derive the load
+
+Use lesson [1.4](/learn/01-one-machine/estimation/). Assume each daily user does 3 searches and opens 5 business pages (assumptions).
+
+- Searches: 100,000,000 x 3 = 300 million per day. 300,000,000 / 86,400 = about **3,500 per second**. Allow 3 times that at peak: about 10,500 per second.
+- Page views: 100,000,000 x 5 = 500 million per day, about **5,800 per second**.
+- Reviews: assume 1 in 100 daily users writes one a day. That is 1,000,000 per day, or about **12 per second**.
+- Read to write ratio: (3,500 + 5,800) / 12 is about 800 to 1. This is a read-heavy system.
+- Storage: 1,000,000 reviews a day x 365 x 1 KB (assumed size with text and ids) = **about 365 GB a year**, so about 3.7 TB in 10 years. The businesses are 10,000,000 x 2 KB = **20 GB**.
+
+The shape of these numbers decides the design. Writes are tiny. Reads are many. The business data fits on one machine. Lesson [9.1](/learn/09-patterns/scaling-reads/) tells you to cache and replicate reads. The hard part is not volume. It is the query that mixes text, place, and category.
+
+## Core entities
+
+- **User**: writes reviews.
+- **Business**: name, category, location, and a stored rating summary (count and sum).
+- **Review**: business id, user id, rating, optional text, time.
+
+## API
+
+```
+GET  /businesses/search?q=pizza&lat=40.7&long=-74.0&category=italian&radius=2km
+GET  /businesses/:id                   -> business with its average rating
+GET  /businesses/:id/reviews?cursor=   -> a page of reviews
+POST /businesses/:id/reviews           { rating, text }
+```
+
+Page through reviews with a cursor, not an offset (lesson [3.3](/learn/03-api-design/pagination/)). New reviews arrive all the time, and offsets shift under the reader.
+
+## High-level design
+
+<YelpBuild client:visible />
+
+Notice that search never touches the review table. Each store does one job. The business database is the source of truth. The search index is a copy shaped for search. If the index is lost, you rebuild it from the database.
+
+## Deep dives
+
+### Search that mixes text, place, and category
+
+A SQL query such as `WHERE name LIKE '%pizza%' AND distance(...) < 2` has two problems. A leading wildcard cannot use a B-tree index, so it scans rows. And the distance must be computed for each candidate row. Ten million rows is too many to scan for 3,500 searches per second.
+
+A search index solves both. Lesson [8.5](/learn/08-technologies/elasticsearch/) showed the inverted index for words. For the place, a geo field stores each point so the index can find points inside a distance without visiting all of them (the idea from lesson [10.1](/learn/10-advanced/proximity-search/)).
+
+The query combines three clauses in a **bool query**. Put each clause where it belongs.
+
+- Name words go in `must`. These clauses add to the relevance score.
+- Category and distance go in `filter`. The Elasticsearch docs say filter clauses ignore scoring and are considered for caching. A category and a radius are yes-or-no questions, so they do not need a score.
+
+Then choose the order of results. Relevance, distance, or rating are different sorts, and the product decides. Say that aloud. It shows you know the query has a purpose.
+
+One more point: place names. A user types "Brooklyn", not coordinates. Keep the city and neighborhood as fields on each business, and look up the typed place to a point once. Do not run a geocoder (a service that turns an address into a point) on every business for every query.
+
+The index has 10,000,000 documents of about 1 KB each (assumption), so about 10 GB. Lesson [8.5](/learn/08-technologies/elasticsearch/) gives shard sizing advice. A few shards with replicas serve 10,500 searches per second at peak, and a replica adds read capacity. The numbers do not call for anything exotic.
+
+### The average rating
+
+<YelpRating client:visible />
+
+Compare the three designs.
+
+1. **Average at read time.** Simple and always right. Cost grows with the review count, and the most popular pages pay most. Reject it at this read volume.
+2. **Stored average, read then write.** Fast reads, but a **lost update** can happen. Two writers read the same old row, compute separate new averages, and the last write wins. The animation shows 3.73 where the right answer is 3.83. This is the race from lesson [4.4](/learn/04-data/transactions/).
+3. **Stored sum and count, relative update.** Store `rating_sum` and `review_count`. A new review runs `SET rating_sum = rating_sum + 5, review_count = review_count + 1`. The update carries no old value, so it cannot be stale. The database serializes updates to one row. The average is `rating_sum / review_count`, computed when someone reads or when the index is fed.
+
+Do the review insert and the counter update in **one transaction**, so a review never exists without its count. If you must update the counter from a stream instead (lesson [8.6](/learn/08-technologies/kafka/)), consumers retry. Then make the update idempotent (lesson [3.4](/learn/03-api-design/idempotency/)), for example by recording the review id with the update. Otherwise a retry counts a review twice.
+
+A popular business can get many reviews close together, which makes that one row hot. At 12 reviews per second across all businesses, even a busy place sees few per second. A row lock handles that. If it did not, you could batch counter updates, as in lesson [9.2](/learn/09-patterns/scaling-writes/).
+
+### One review per user per business
+
+The check "has this user already reviewed this place? If not, insert" is two steps. Two requests from a double tap can both pass the check. The fix is a **unique constraint** on `(user_id, business_id)`. The database rejects the second insert. The service turns that error into "you already reviewed this place". Never rely on a check in application code alone.
+
+### Keeping the index fresh
+
+A new review changes a business's average. The search index shows that average and may sort by it. Feed the change through CDC (lesson [6.5](/learn/06-async/cdc/)). The index is eventually consistent. For a business with 80,000 reviews, one more review changes the average in the second decimal place. So throttle: update the index only when the displayed rating changes, for example when it moves by 0.1 or more. This keeps index writes low without hurting what users see.
+
+## Numbers
+
+| Quantity | Value | Where it comes from |
+|---|---|---|
+| Searches per second | ~3,500 average, ~10,500 peak | 100M x 3 / 86,400, peak 3x (assumed) |
+| Business page views per second | ~5,800 | 100M x 5 / 86,400 (assumed) |
+| Reviews per second | ~12 | 1M per day / 86,400 (assumed) |
+| Read to write ratio | ~800 to 1 | (3,500 + 5,800) / 12 |
+| Review storage | ~365 GB per year | 1M x 365 x 1 KB (assumed) |
+| Business storage | ~20 GB | 10M x 2 KB (assumed) |
+| Search latency goal | under 500 ms | Requirement |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Search index beside the database | Fast mixed queries | A second store, lag | Text plus geo plus filters |
+| Database for geo search | One store | Slow at 10M rows | A small data set |
+| Average at read | Always exact | Cost grows with reviews | Few reviews |
+| Stored sum and count | Cheap reads, safe writes | Extra columns to keep right | Read-heavy, many reviews |
+| Update index on every review | Fresh ratings | Many index writes | Rare changes |
+| Update index when rating moves 0.1 | Few index writes | Rating up to 0.1 stale | Many reviews per business |
+
+## Interview lens
+
+<Callout type="tip">
+Say what is special: "search mixes text, place, and category, so I use a search index and keep the database as the source of truth". Then show the rating trick with a number: "I store sum and count, so a 5-star review is `sum + 5, count + 1`, not a new average". Mention the unique constraint without being asked.
+</Callout>
+
+<Callout type="mistake">
+Do not compute `AVG(rating)` on every page view. Do not read the average, change it in code, and write it back. Do not check for a duplicate review in code and then insert. Do not ask for strong consistency on search. The requirements allow stale results.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A business row holds rating_sum 40 and review_count 10. A 5-star and a 1-star review commit at the same time, each as sum = sum + stars and count = count + 1. What average results?',
+      options: ['3.50', '4.09', '3.73', '3.83'],
+      answer: 3,
+      explain: 'Relative updates run one after the other: sum becomes 46 and count becomes 12. 46 / 12 is 3.83. The values 4.09 and 3.73 come from the read-modify-write design, where each writer starts from the old average.',
+    },
+    {
+      q: 'Which placement is right for a Yelp bool query with a name, a category, and a 2 km radius?',
+      options: [
+        'Name in filter, category and radius in must',
+        'Name, category, and radius all in must',
+        'Name in must, category and radius in filter',
+        'Name and radius in must, category in filter',
+      ],
+      answer: 2,
+      explain: 'Name words should add to the relevance score, so they go in must. Category and radius are yes-or-no tests. Filter clauses skip scoring and can be cached. Swapping them wastes work and scores things that need no score.',
+    },
+    {
+      q: 'Two taps of "Submit review" reach two servers at once. Both check the table and find no review by this user for this business. What stops two rows?',
+      options: [
+        'A unique constraint on user id and business id in the database',
+        'A faster check that runs twice before the insert is done',
+        'A cache that remembers each user for a few seconds after a write',
+        'A larger connection pool so each request finishes sooner',
+      ],
+      answer: 0,
+      explain: 'Both requests passed the check, so the check alone cannot be trusted. The database must refuse the second row, and a unique constraint does. A repeated check still leaves a gap. A cache is not shared by atomic writes. A bigger pool does not remove the race.',
+    },
+    {
+      q: 'A new review moves a business from 4.2 to 4.3, but search shows 4.2 for 5 more seconds. What is the right reading of the requirements?',
+      options: [
+        'Expected, because ratings are never written to the search index',
+        'Expected, since the index copies changes with a small lag',
+        'A bug, because search must always match the database exactly',
+        'A bug, because the review service must update the index first',
+      ],
+      answer: 1,
+      explain: 'The stated requirement is high availability with eventual consistency. The index copies changes after the database commits, so a short lag is by design. Ratings are in the index, which is why they can be stale.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Size Yelp search and reviews"
+  scenario="100 million daily users. Each does 3 searches a day. 1 in 100 users writes one review a day. A review takes about 1 KB."
+  steps={[
+    {
+      prompt: 'How many searches per second on average?',
+      unit: 'searches per second',
+      answer: 3472,
+      within: 1.2,
+      explain: '100,000,000 x 3 = 300,000,000 per day. Divide by 86,400 s: about 3,500 per second.',
+    },
+    {
+      prompt: 'How many reviews per second on average?',
+      unit: 'reviews per second',
+      answer: 11.6,
+      within: 1.3,
+      explain: '1% of 100,000,000 is 1,000,000 reviews per day. 1,000,000 / 86,400 is about 12 per second.',
+    },
+    {
+      prompt: 'How many GB of review text and metadata per year?',
+      unit: 'GB',
+      answer: 365,
+      within: 1.2,
+      explain: '1,000,000 reviews x 365 days x 1 KB is 365,000,000 KB, about 365 GB per year.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="yelp-duplicate-reviews"
+  title="Double reviews"
+  scenario="Some users appear twice in a business review list, with the same stars and text a few milliseconds apart."
+  facts={['POST /reviews flow:   SELECT existing, then INSERT', 'servers:             6 behind a load balancer', 'duplicate gap:       3 to 40 ms', 'unique constraint:   none']}
+  steps={[
+    {
+      prompt: 'What is the cause?',
+      options: [
+        'Two requests ran the check at once, both saw no review, and both inserted',
+        'The load balancer sent one request to two servers by mistake',
+        'The search index copied the same review twice from the change feed',
+        'The 6 servers use clocks that differ by a few milliseconds',
+      ],
+      answer: 0,
+      explain: 'A gap of a few milliseconds fits two near-simultaneous requests. Both passed the check before either insert landed. Clock skew does not create rows, and the search index is not the source of the review table.',
+    },
+    {
+      prompt: 'Which fix closes the gap for good?',
+      options: [
+        'Add a unique constraint on user id and business id, and map the error to a friendly message',
+        'Disable the Submit button for two seconds after the first tap',
+        'Run the check inside a transaction at the default isolation level',
+        'Delete duplicates with a nightly job and keep the check as is',
+      ],
+      answer: 0,
+      explain: 'Only the database can enforce this for every server and every client. A disabled button helps one browser and not a retry. A transaction at default isolation may still let both checks pass. A nightly job leaves duplicates visible all day.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Elasticsearch: bool query](https://www.elastic.co/docs/reference/query-languages/query-dsl/query-dsl-bool-query), the meaning of must and filter.
+- [Elasticsearch: geo-distance query](https://www.elastic.co/docs/reference/query-languages/query-dsl/query-dsl-geo-distance-query), distance filters on geo points.
+- [Geohash (Wikipedia)](https://en.wikipedia.org/wiki/Geohash), one way to index points for nearby search.

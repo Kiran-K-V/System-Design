@@ -1,0 +1,268 @@
+---
+summary: 'A job scheduler runs jobs at the right time, once or on a repeat rule. A time-bucketed scan finds due jobs cheaply, and leases with heartbeats give at-least-once execution that survives worker crashes.'
+requires: ['06-async/queues', '08-technologies/zookeeper', '09-patterns/long-running-tasks']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import JobSchedulerBuild from '../../../components/anim/lessons/JobSchedulerBuild.tsx';
+import JobSchedulerCompare from '../../../components/anim/lessons/JobSchedulerCompare.tsx';
+
+Billing runs on the first of the month. A report goes out every morning at 10:00. A reminder fires 24 hours after sign-up. All of these are "run this later". A job scheduler is the system that remembers and does it. This case study follows the six steps of [lesson 0.3](/learn/00-orientation/design-method/).
+
+This design comes from first principles and the earlier lessons, not from one company's write-up. Treat the numbers as assumptions. The new ideas are the **time-bucketed scan** that finds due jobs, and **leases** that make execution survive crashes.
+
+## Requirements
+
+**Functional.**
+
+1. A user schedules a job to run now, at a future time, or on a repeat rule (for example, every day at 10:00).
+2. A user checks the status of a job and its runs.
+
+**Below the line.** Cancelling or editing a job, priorities, job dependencies (one job after another), and per-user quotas. Say so. Dependencies lead to workflow engines, which lesson [8.9](/learn/08-technologies/temporal/) covers.
+
+**Non-functional.**
+
+- A due job starts within 2 seconds of its time (assumption).
+- A job never gets lost. We accept that a job may run more than once (at-least-once).
+- Highly available: a machine failure does not stop the clock.
+- Scale: 10,000 job runs start per second at peak (assumption).
+
+### Scale, derived
+
+- Runs per day at that peak: 10,000 x 86,400 s = 864 million.
+- Runs due in one minute: 10,000 x 60 s = 600,000. Call this one **bucket**.
+- Memory for one bucket, as an id (16 B) plus a time (8 B): 600,000 x 24 B = 14.4 MB. It fits in one process, so the scheduler can hold the whole next minute in memory.
+- Run history: a run row of about 200 bytes (assumption) is 864,000,000 x 200 B = 173 GB per day. Keep seven days and that is about 1.2 TB. Old runs are deleted or moved out.
+- Concurrency: apply Little's Law (lesson [1.4](/learn/01-one-machine/estimation/)). If a job takes 2 seconds on average (assumption), running work in flight is 10,000 x 2 = 20,000 jobs. At 50 jobs per worker (assumption) that is 400 workers.
+- Heartbeats: if each running job renews its lease every 10 seconds, 20,000 / 10 = 2,000 renewals per second.
+
+## Core entities
+
+- **Task**: a reusable unit of work, named in code, such as `send_invoice`.
+- **Job**: a task plus parameters plus a schedule. It has a `next_run_at` time.
+- **Run**: one execution of a job for one due time. It has a status, an attempt number, a worker id, and a lease end time.
+
+Why split job and run? A job lives for months. A run lives for one execution and can be retried. Status, retries, and leases belong to the run.
+
+## API
+
+```
+POST /jobs        { task, params, run_at | cron }   -> { jobId }
+GET  /jobs/{id}   -> { job, lastRuns: [{ dueAt, status, attempts }] }
+```
+
+## Data flow
+
+Job rows sit in a store. A scheduler turns "due soon" rows into runs. Runs travel through a queue to workers. Workers write their result back to the run row.
+
+## High-level design
+
+Step through the build.
+
+<JobSchedulerBuild client:visible />
+
+Three decisions need a reason.
+
+**The store is indexed by time.** The scheduler asks one question over and over: "which jobs are due?" Keep an index on `next_run_at` (lesson [4.3](/learn/04-data/indexing/)). The job store can be a normal sharded database.
+
+**The scheduler advances the schedule, not the worker.** When it creates a run, it also moves a repeating job to its next time, in one transaction. A slow job then cannot push the next run later. You choose a policy for overlap: skip the next run if the last one is still going, or let them overlap. Say which one you pick.
+
+**A queue sits between scheduler and workers.** Scheduling is cheap and exact in time. Work is slow and uneven. The queue (lesson [6.1](/learn/06-async/queues/)) lets each side scale on its own and absorbs a burst.
+
+## Deep dives
+
+### Finding due jobs fast
+
+**Naive:** poll the whole table every second with `WHERE next_run_at <= now`. With a very large table, even an index range scan every second is wasteful. Many scheduler processes would also scan the same rows.
+
+**Better:** a **time-bucketed scan with look-ahead**.
+
+1. Cut time into buckets of one minute (assumption).
+2. Shortly before a bucket starts, the scheduler reads the whole bucket from the store with one indexed range query. At 10,000 jobs per second that is 600,000 rows, read once.
+3. It holds them in memory, ordered by time, and pushes each job to the ready queue when its time arrives. The 2-second target is met by the in-memory timer, not by a database poll.
+4. A job created for less than a minute ahead is sent straight to the scheduler that owns it, and also saved in the store. Otherwise it would miss its bucket load.
+
+The database sees one big read per minute per shard instead of a scan per second. The cost is memory (about 14 MB per bucket) and a small chance that a scheduler dies holding a bucket, which the next section handles.
+
+### Many schedulers, one owner per shard
+
+One scheduler is a single point of failure. Two schedulers reading the same bucket would start every job twice. So divide the job store into shards by job id (lesson [4.7](/learn/04-data/sharding/)). Each shard has exactly one **owner** scheduler at any time.
+
+Ownership is a **lease** held in a consensus store such as etcd or ZooKeeper (lesson [8.8](/learn/08-technologies/zookeeper/)). The owner renews it. If the owner dies, the lease expires and another scheduler takes the shard and reloads its bucket from the store. A short gap is possible. Because the store is the truth and buckets are read ahead, the new owner can reload jobs that were due during the gap and run them late rather than lose them.
+
+A rare mistake remains. A scheduler that is paused for a long time may wake up and push jobs after it lost ownership. The queue can then hold a duplicate. The run row decides: a worker must win a conditional update on the run before it works. Duplicates in the queue are harmless.
+
+### Running a job: leases and heartbeats
+
+This is the heart of the design. Compare two ways to claim a job.
+
+<JobSchedulerCompare client:visible />
+
+With **mark done first**, a crash after the claim loses the job. With a **lease**, the claim is a record that says "worker W has this until time T". The worker does the work, and then marks the run done. A heartbeat renews T while the work goes on. If the worker dies, no heartbeat comes, T passes, and another worker claims the run.
+
+The claim is a conditional write on the run row, such as "set worker and lease end where the run is waiting, or its lease has ended". Only one worker can win it. This is a compare-and-set, the same trick as the lock in lesson [8.2](/learn/08-technologies/redis/).
+
+Choose the lease length from the job. Short leases recover fast but cause false timeouts when a worker is only slow. The queue lesson showed the same trade with visibility timeouts. A common rule is to renew at one third of the lease. For jobs that run for hours, see lesson [9.7](/learn/09-patterns/long-running-tasks/): use heartbeats plus progress checkpoints so a retry resumes, not restarts.
+
+A worker that lost its lease but keeps running is a **zombie**. Give each claim an attempt number. When the worker writes its result, the store accepts it only if the attempt number is still current. This is a fencing token, as lesson 8.8 explains.
+
+### At-least-once and idempotent tasks
+
+Exactly-once execution is not on offer. A worker can finish the side effect and crash before it writes "done". The lease then expires and a second worker repeats the work. So the contract is **at-least-once**, and the task must be safe to repeat.
+
+Make it safe with an idempotency key (lesson [3.4](/learn/03-api-design/idempotency/)). The key is the run id, or the pair (job id, due time). Pass it to every downstream call. "Send invoice email" becomes "send the invoice email with key `job42:2026-10-01`, and skip if that key was already used".
+
+## Numbers
+
+<Ballpark
+  client:visible
+  title="Scheduler load"
+  scenario="Assume 10,000 job runs start per second, jobs take 2 seconds on average, a worker runs 50 jobs at once, and each running job sends a heartbeat every 10 seconds."
+  steps={[
+    {
+      prompt: 'How many jobs are due in one one-minute bucket?',
+      unit: 'jobs',
+      answer: 600000,
+      within: 1.1,
+      explain: '10,000 per second x 60 seconds = 600,000 jobs.',
+    },
+    {
+      prompt: 'How many workers are needed to run the load?',
+      unit: 'workers',
+      answer: 400,
+      within: 1.1,
+      explain: 'Jobs in flight = 10,000 per second x 2 seconds = 20,000 (Little\'s Law). 20,000 / 50 jobs per worker = 400 workers.',
+    },
+    {
+      prompt: 'How many heartbeats per second reach the store?',
+      unit: 'per second',
+      answer: 2000,
+      within: 1.1,
+      explain: '20,000 running jobs / 10 seconds between heartbeats = 2,000 heartbeats per second. This is a real write load. Batch heartbeats per worker if it grows.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| Poll the table every second | Very simple | Load grows with table size; duplicate scans | Tiny scale |
+| Time bucket with look-ahead | One read per bucket, exact in-memory timing | Memory, ownership logic | This scale |
+| Mark done before running | No duplicate runs | Lost jobs on a crash | Almost never |
+| Lease and heartbeat | No lost jobs | Duplicate runs, so tasks must be idempotent | Default |
+| Short lease | Fast recovery | False timeouts for slow jobs | Short jobs |
+| Long lease plus heartbeat | Few false timeouts | Heartbeat load, slower crash recovery | Long jobs |
+| Workflow engine such as Temporal | Retries and state handled for you | A new system to run | Multi-step jobs |
+
+## Interview lens
+
+<Callout type="tip">
+Say the contract first: "At-least-once, because a worker can crash between the work and the write. So every task takes an idempotency key." Interviewers listen for that sentence. Then show how due jobs are found: "A time bucket, read ahead, held in memory."
+</Callout>
+
+<Callout type="mistake">
+Do not promise exactly-once execution. Do not run cron on every server, because every server will run the job. Do not poll the whole jobs table. Do not delete or mark a job before it has run.
+</Callout>
+
+<Callout type="deep" title="Why not a delay queue only?">
+Some queues support delayed messages. They are enough for "run in 30 seconds". Long delays, such as a reminder in six months, strain them, and you cannot easily list or inspect pending jobs. A store with a time index keeps the long-range plan. The queue only carries the near future.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A worker claims a run with a 30-second lease and crashes after 5 seconds. When can another worker take the run?',
+      options: [
+        'At once, because the queue notices the closed connection',
+        'After the scheduler next scans the table for due jobs',
+        'After the lease ends, which is about 25 seconds later',
+        'Never, until an engineer resets the run by hand',
+      ],
+      answer: 2,
+      explain: 'Nothing renews the lease, so it simply runs out. After that the run can be claimed again. A queue cannot always see a crash, which is why the lease exists.',
+    },
+    {
+      q: 'Why does the scheduler create the run and move next_run_at forward in one transaction?',
+      options: [
+        'So a crash between the two steps cannot skip or repeat a run',
+        'So the workers can read the next run time without asking the job store',
+        'So the ready queue can sort jobs by the time of their next occurrence',
+        'So the lease ends sooner after the worker has finished the run',
+      ],
+      answer: 0,
+      explain: 'With two separate writes, a crash between them either skips the next run or fires the same one again. One transaction makes both happen or neither.',
+    },
+    {
+      q: 'A task sends a payment email and then writes "done". The worker crashes between the two. What does the design guarantee for the customer?',
+      options: [
+        'One email, because the lease stops a second worker from starting',
+        'No email, because the run is abandoned after a crash',
+        'Exactly one email, because the run row is updated in a transaction',
+        'At least one email, and two if the task has no idempotency key',
+      ],
+      answer: 3,
+      explain: 'The side effect and the status write cannot be atomic. After the lease expires, a second worker runs the task again. An idempotency key lets the email step recognize the repeat and skip it.',
+    },
+    {
+      q: 'The look-ahead bucket is one minute. A user creates a job due in 20 seconds. Without a special rule, what goes wrong?',
+      options: [
+        'The job store rejects any job that is due in under a minute',
+        'The scheduler has already loaded the bucket, so the job may run late',
+        'Two schedulers will both start the job, one from each bucket',
+        'The queue holds the job until the next bucket is loaded and then drops it',
+      ],
+      answer: 1,
+      explain: 'The scheduler read the bucket before the job existed. The fix is to send near-term jobs straight to the owning scheduler as well as saving them. The store alone would catch the job only at the next load.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="jobsched-late-and-double"
+  title="Reports run late, then twice"
+  scenario="Nightly reports are heavy and take about 4 minutes. Support sees each report running twice, and the second copy starts about 30 seconds after the first."
+  facts={[
+    'lease length:        30 s',
+    'heartbeat:           none (worker never renews)',
+    'report run time:     ~240 s',
+    'attempt numbers seen: 1, 2 for the same run',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'Two schedulers own the same shard and both push the run to the queue',
+        'The lease ends while the worker is still running, so another worker claims the run',
+        'The queue delivers each message twice because of a network retry',
+        'The scheduler reads the bucket twice and creates two run rows',
+      ],
+      answer: 1,
+      explain: 'The second start comes about 30 seconds after the first, which is the lease length. The job takes 240 seconds and never renews, so the lease ends mid-run. Two run rows would show two run ids, not two attempts of one run.',
+    },
+    {
+      prompt: 'What is the best fix?',
+      options: [
+        'Shorten the lease to 5 seconds so that crashes are detected sooner',
+        'Mark the run done at the start so nobody else can claim it',
+        'Add a heartbeat that renews the lease, and make the report task idempotent',
+        'Run reports in a single worker so there is never a second claimer',
+      ],
+      answer: 2,
+      explain: 'A heartbeat keeps the lease alive while the worker is healthy. Idempotency covers the rare case where a lease is lost anyway. A shorter lease makes this worse. Marking done first loses the job if the worker crashes.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Amazon SQS: visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html) (a lease on a message, and how to extend it)
+- [etcd: leases](https://etcd.io/docs/v3.5/learning/api/#lease-api) (time-limited keys for leader election)
+- [Kubernetes: CronJob](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/) (schedule rules and concurrency policy: allow, forbid, replace)

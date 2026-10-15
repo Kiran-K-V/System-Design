@@ -1,0 +1,253 @@
+---
+summary: 'A business action that spans services cannot use one transaction. A saga runs local transactions in order and undoes finished ones with compensating actions when a later step fails.'
+requires: ['04-data/transactions', '06-async/cdc', '08-technologies/temporal']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import PatternsBuildsOn from '../../../components/anim/lessons/PatternsBuildsOn.tsx';
+import MultiStepSaga from '../../../components/anim/lessons/MultiStepSaga.tsx';
+import MultiStepStyles from '../../../components/anim/lessons/MultiStepStyles.tsx';
+
+## The problem
+
+A customer places an order. Three things must happen.
+
+1. The order service records the order.
+2. The payment service charges the card.
+3. The inventory service reserves the item.
+
+Each service owns its own database. That is the point of splitting a system into services: each team changes its data without asking the others. But it means no single database can commit all three changes together.
+
+Now two failures show up.
+
+- **Step 3 fails after step 2 committed.** The card is charged and there is no item to ship. The customer is angry and support must find the charge by hand.
+- **The process dies between steps.** Step 2 committed, and the process that should call step 3 is gone. Nobody records that step 3 is still owed.
+
+A **multi-step process** is any business action that crosses more than one system and must end in a sensible state even when a step fails. This lesson shows how to build one from parts you already know.
+
+## What this pattern is made of
+
+This pattern adds almost nothing new. It is a recipe that combines earlier lessons.
+
+<PatternsBuildsOn
+  pattern="Multi-step process"
+  parts={[
+    { n: '4.4', title: 'Transactions and Isolation', href: '/learn/04-data/transactions/', job: 'Why one 2PC transaction across services blocks.' },
+    { n: '6.1', title: 'Queues', href: '/learn/06-async/queues/', job: 'Carry each step command to its service.' },
+    { n: '6.3', title: 'Delivery Semantics', href: '/learn/06-async/delivery-semantics/', job: 'Steps run at least once, so handlers dedupe.' },
+    { n: '6.5', title: 'Change Data Capture', href: '/learn/06-async/cdc/', job: 'The outbox publishes step events reliably.' },
+    { n: '8.9', title: 'Temporal', href: '/learn/08-technologies/temporal/', job: 'A workflow engine runs the saga for you.' },
+  ]}
+/>
+
+
+## Naive solution: one distributed transaction
+
+The first idea is to wrap all three steps in one transaction, using two-phase commit (2PC, [lesson 4.4](/learn/04-data/transactions/)). A coordinator asks every participant to prepare. Each participant writes its change durably, keeps its locks, and votes yes. When all vote yes, the coordinator records "commit" and tells everyone.
+
+Look at the protocol to see why this blocks. After a participant votes yes, it has promised to commit if told to. It may not decide alone, because the coordinator may already have told another participant to commit. So it keeps its locks and waits. If the coordinator crashes after the votes, every participant sits there holding locks until the coordinator comes back and reads its log. Every other request that needs those rows waits too.
+
+That is one cost. There are two more.
+
+- **Every participant must speak the protocol.** A card processor or an email provider will not join your transaction.
+- **Every participant must be up.** One slow service holds locks in all the others.
+
+Microservices.io, which documents the saga pattern, states the same conclusion in its forces list: "2PC is not an option."
+
+The second naive idea is to call the three services in order from one request handler, with a retry on each. That fails when the handler dies. Nothing remembers how far the order got. It is the dual-write problem from [lesson 6.5](/learn/06-async/cdc/) with three writes instead of two.
+
+## The mechanism: a saga
+
+A **saga** is a sequence of local transactions. Each step commits in one service's own database. Then it triggers the next step, usually with an event. If a step fails, the saga runs **compensating actions** for the steps that already committed. A compensating action undoes the business effect of a step: a refund undoes a charge.
+
+Step through an order that fails at step 3.
+
+<MultiStepSaga client:visible />
+
+Four rules make compensation work.
+
+1. **A compensation is a new action, not a rollback.** The charge committed and stays in the history. The refund is a second record. Microservices.io notes that a saga has no automatic rollback: a developer must design each compensation.
+2. **Compensations must be retried until they succeed, and they must be idempotent.** A refund that runs twice must refund once ([lesson 3.4](/learn/03-api-design/idempotency/)). A compensation that can fail for good leaves the system broken.
+3. **Put steps that cannot be undone last.** You cannot unsend an email. Reserve stock and take payment first. Send the confirmation only after every step has succeeded.
+4. **Expect visible middle states.** A saga has no isolation, the "I" in ACID. Between step 2 and the refund, the order is PENDING and the card is charged. Other readers can see that. A status field such as PENDING and CANCELLED makes the state honest, and the UI can show "processing."
+
+## Who drives the saga
+
+Two styles exist. Both are named in the microservices.io pattern.
+
+<MultiStepStyles />
+
+- **Choreography.** There is no coordinator. Each service listens for events and decides what to do. Payment hears "order created" and charges. Inventory hears "payment done" and reserves. It has no central point of failure. The cost is that the flow exists only as a web of subscriptions. To answer "where is order 7 stuck?" you must read logs from several services.
+- **Orchestration.** One orchestrator holds the flow. It tells the payment service to charge, waits for the answer, then tells inventory. The flow is in one place. The cost is that the orchestrator must keep its own state durably, or a crash loses the saga.
+
+A rule of thumb: choreography suits two or three steps with little branching. Orchestration suits longer flows, branches, timeouts, and anything the business wants to watch.
+
+## Reliable events: the outbox
+
+Every step does two things: change its database and publish an event. If it does them as two separate writes, a crash between them breaks the saga ([lesson 6.5](/learn/06-async/cdc/) shows that failure). The fix is the **transactional outbox**. The step writes its business row and an outbox row in one local transaction. A relay reads the outbox, by polling it or by tailing the database log, and publishes to the broker. The event exists if and only if the change committed.
+
+The relay can publish the same row twice, for example if it crashes before marking the row sent. So the next step must be idempotent. It can store the event id and skip a repeat ([lesson 6.3](/learn/06-async/delivery-semantics/)). I give no polling interval here, because the right value depends on your latency target and load, and I found no primary source that fixes one.
+
+## Workflow engines: the orchestrator you do not build
+
+Writing a durable orchestrator yourself means writing a state table, a retry timer, a recovery scan, and a way to resume after a crash. A **workflow engine** gives you that. [Temporal](/learn/08-technologies/temporal/) (lesson 8.9) keeps an Event History of every step. If a worker dies, another worker replays the workflow code against that history and continues from the last recorded step. Your saga becomes ordinary code:
+
+```ts
+// Pseudocode, not a real SDK call.
+async function placeOrder(order) {
+  const undo = [];
+  try {
+    await createOrder(order);      undo.push(() => cancelOrder(order));
+    await chargeCard(order);       undo.push(() => refundCard(order));
+    await reserveStock(order);
+  } catch (e) {
+    for (const f of undo.reverse()) await f(); // each one retried
+    throw e;
+  }
+}
+```
+
+Temporal runs the three calls as activities. Per the Temporal docs, activities are retried by default and workflow code is not. The workflow code must be deterministic: no clock reads, random numbers, or direct network calls, because it re-runs on replay. AWS Step Functions offers the same idea as a managed service. It has `Retry` and `Catch` on its states, and with no catcher an error fails the whole execution.
+
+## Numbers
+
+Sagas have no latency number of their own. Their cost is the work done when something fails. Take these assumptions: three steps, each fails independently with probability 0.5%, and 100 orders arrive per second.
+
+- A saga completes with no compensation with probability 0.995 × 0.995 × 0.995 = 0.985.
+- So about 1.5% of sagas run at least one compensation. That is about 1.5 per second.
+- A failure at step 3 costs two compensations. A failure at step 2 costs one.
+
+The point is that compensation is a normal path with real traffic, not a rare edge case. Test it as carefully as the happy path. For a sense of how slow a cross-service hop is, see lesson [1.5](/learn/01-one-machine/numbers-to-know/).
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Two-phase commit | Atomic commit across databases | Blocking if the coordinator fails. Locks held over the network. All parties must join | Rare. A few databases you control |
+| Saga with choreography | No central service. Loose coupling | Flow hard to trace. Cycles are easy to create | Two or three steps |
+| Saga with orchestration | Flow in one place. Easy to monitor | Orchestrator needs durable state | Longer flows, branches, timeouts |
+| Outbox for step events | No lost events without 2PC | A relay to run. Duplicates. Developers can skip the outbox write | Every step that publishes an event |
+| Workflow engine | Durable state and retries built in | Determinism rules. Workflow versioning. One more system to run | Flows that run long or are business critical |
+
+<Callout type="tip">
+Say: "I will not use 2PC across services, since a coordinator crash leaves participants holding locks. I will run a saga. Each step is a local transaction that writes an outbox row. If step 3 fails, earlier steps run idempotent compensations, like a refund. For control and visibility I will use an orchestrator, a workflow engine like Temporal, so a crash resumes from durable state." Then name the visible middle state and how the UI shows it.
+</Callout>
+
+<Callout type="mistake">
+Do not say "roll back the database". The earlier steps already committed in other databases. Do not write "write the DB, then publish to the broker" as the plan: a crash between the two loses the event. And do not forget the compensation of the compensation: a refund can fail, so it needs retries and an alert, not a shrug.
+</Callout>
+
+<Callout type="deep" title="Why sagas are not ACID">
+Atomicity is replaced by "eventually all steps done or all compensated." Consistency holds at the end, not during. Isolation is gone: another request can read the PENDING order or try to spend the same stock. Durability is per step. Common fixes for the missing isolation are a status field that acts as a soft lock, and ordering the steps so the scarce resource is claimed first. They reduce the problem. They do not remove it.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In two-phase commit, the coordinator crashes after every participant voted yes but before sending its decision. What state are the participants in?',
+      options: [
+        'They hold locks and wait, since none may choose alone',
+        'They commit at once, because every vote was yes',
+        'They abort after a short timeout and release their locks',
+        'They elect one participant to act as the new coordinator',
+      ],
+      answer: 0,
+      explain: 'A yes vote is a promise to follow the coordinator. The coordinator may already have told another participant to commit, so a participant that aborts alone could break atomicity. They wait with locks held. Basic 2PC has no election.',
+    },
+    {
+      q: 'A saga has charged the card and then inventory fails. What is the correct recovery?',
+      options: [
+        'Roll back the payment database to the state before the charge',
+        'Run a compensating refund as a new, idempotent transaction',
+        'Delete the charge record so the books look like it never ran',
+        'Retry the stock reservation forever until it succeeds',
+      ],
+      answer: 1,
+      explain: 'The charge already committed in its own database, so there is nothing to roll back. A refund undoes the business effect. Deleting the record hides history. Retrying forever may never succeed if the item is truly gone.',
+    },
+    {
+      q: 'You want to send the "order confirmed" email in a three-step saga. Where should that step go?',
+      options: [
+        'First, so the customer learns about the order quickly',
+        'Anywhere, because email steps are cheap to compensate',
+        'Last, after every step that could fail has succeeded',
+        'In parallel with the others, to cut the total time',
+      ],
+      answer: 2,
+      explain: 'An email cannot be unsent, so it has no real compensation. Steps that cannot be undone go after all steps that can fail. Running it earlier risks telling a customer about an order that later cancels.',
+    },
+    {
+      q: 'An outbox relay crashes after publishing event 9 but before marking the row as sent. What does the next saga step see?',
+      options: [
+        'Event 9 is lost, so the saga stalls at that step',
+        'Event 9 once, because the broker removes duplicates itself',
+        'An error, because the outbox row no longer matches',
+        'Event 9 twice, so the step must skip a repeated id',
+      ],
+      answer: 3,
+      explain: 'On restart the relay sees an unsent row and publishes it again. The outbox gives at-least-once delivery, not exactly-once. The consumer stores processed event ids and ignores repeats.',
+    },
+    {
+      q: 'Your orchestrator process runs the saga in memory and crashes in the middle of step 2. Which design lets another instance continue?',
+      options: [
+        'Restart the whole saga from step 1 on the new instance',
+        'Persist step results durably, then resume from them',
+        'Keep the saga state in a local variable on a bigger machine',
+        'Make steps run faster so crashes during them are rarer',
+      ],
+      answer: 1,
+      explain: 'Durable state, such as a saga table or a Temporal event history, lets a new instance see which steps finished. Restarting from step 1 repeats steps that are not idempotent. Faster steps only make crashes rarer, not harmless.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="multistep-refund-twice"
+  title="Customers refunded twice"
+  scenario="A checkout saga compensates a failed order by calling the payment service with a refund request. Finance reports that about 1 in 300 cancelled orders was refunded two times."
+  facts={[
+    'refund call:           POST /refunds {order_id, amount}',
+    'compensation retries:  on timeout, up to 5 times',
+    'payment service p99:   1.8 s',
+    'client timeout:        1 s',
+    'refund requests/day:   4,800',
+    'double refunds/day:    about 16',
+  ]}
+  steps={[
+    {
+      prompt: 'Why do some orders get two refunds?',
+      options: [
+        'The payment service refunds some orders at random',
+        'The retry follows a timeout, but the first call also succeeded',
+        'The saga ran the charge step two times before the failure',
+        'The outbox relay lost the refund event and sent a new one',
+      ],
+      answer: 1,
+      explain: 'The client timeout is 1 s and the payment p99 is 1.8 s. Some first calls finish after the client gave up. The retry then refunds again. Nothing is random, and a lost event would give zero refunds, not two.',
+    },
+    {
+      prompt: 'What is the right fix?',
+      options: [
+        'Send an idempotency key per order with each refund request',
+        'Raise the retry count from 5 to 10 so one call surely lands',
+        'Remove the retries so each refund is sent only once',
+        'Lower the client timeout to 500 ms to fail faster',
+      ],
+      answer: 0,
+      explain: 'A key lets the payment service return the saved refund for a repeat (lesson 3.4). More retries add more duplicates. No retries leave some refunds unsent. A shorter timeout makes the duplicates more frequent.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [microservices.io: Saga pattern](https://microservices.io/patterns/data/saga.html) (choreography, orchestration, compensating transactions, drawbacks)
+- [microservices.io: Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html) (the outbox and its relay)
+- [Temporal docs: Workflows](https://docs.temporal.io/workflows) (event history, replay, determinism)
+- [AWS Step Functions: Error handling](https://docs.aws.amazon.com/step-functions/latest/dg/concepts-error-handling.html) (Retry and Catch)

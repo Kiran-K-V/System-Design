@@ -1,0 +1,257 @@
+---
+summary: 'Live comments push each new comment to every viewer of one video. Channels per video, SSE for one-way push, and a sampled or CDN path for the biggest streams keep the fan-out affordable.'
+requires: ['02-networking/real-time-transport', '06-async/pubsub-logs', '04-data/consistent-hashing']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import LiveCommentsBuild from '../../../components/anim/lessons/LiveCommentsBuild.tsx';
+import LiveCommentsFanout from '../../../components/anim/lessons/LiveCommentsFanout.tsx';
+
+## The problem
+
+A streamer goes live. A few hundred thousand people watch. Every viewer can type a comment, and every viewer sees the comments of all the others, within a second or two.
+
+One comment is one write. But it must be shown to every viewer, so one write becomes hundreds of thousands of deliveries. The write path is easy. The **fan-out** (copying one item to many receivers) is the hard part.
+
+This is the opposite of the previous case study. In the WhatsApp lesson ([11.6](/learn/11-breakdowns/whatsapp/)) each message has one or a few readers and must never be lost. Here each comment has a huge audience, and losing one is fine.
+
+## Requirements
+
+**Functional, above the line:**
+
+1. A viewer posts a comment on a live video.
+2. Viewers of that video see new comments as they are posted.
+3. A viewer who joins late sees the most recent comments.
+
+**Below the line:** replies, reactions, moderation, spam checks, searching old comments.
+
+**Non-functional.** These are assumptions, not company figures:
+
+- A comment shows up for other viewers in about a second.
+- Availability beats consistency (lesson [4.9](/learn/04-data/cap-pacelc/)). A viewer may miss a comment, or see two comments in a slightly different order than another viewer.
+- Order only matters inside one video.
+- Very different sizes at once: most videos have a few hundred viewers, a few have a million.
+
+## Core entities
+
+- **LiveVideo**: `video_id`, status.
+- **Comment**: `comment_id`, `video_id`, `user_id`, text, `seq`. The `seq` is a number that grows within one video. It gives viewers a place to resume from.
+- **Subscription** (in server memory only): `video_id` to the open connections for it.
+
+## API
+
+- `POST /videos/{id}/comments` with `{text}`. Returns `{comment_id}`.
+- `GET /videos/{id}/comments?before=<seq>&limit=10`. A page of history (lesson [3.3](/learn/03-api-design/pagination/) on cursors).
+- `GET /videos/{id}/stream`. An SSE stream. After a drop, the browser reconnects with `Last-Event-ID` and the server resumes from there.
+
+No data-flow section is needed. This is request-response plus one long-lived stream.
+
+## High-level design
+
+<LiveCommentsBuild client:visible />
+
+### Why SSE and not a WebSocket
+
+Look at the direction of the data. Viewers send a comment now and then, and that is an ordinary POST. The server sends a constant stream down. Server-sent events (SSE) are made for this (lesson [2.5](/learn/02-networking/real-time-transport/)).
+
+| | SSE | WebSocket |
+|---|---|---|
+| Direction | Server to client | Both ways |
+| Reconnect and resume | Built in, with `Last-Event-ID` | You build it |
+| Transport | Plain HTTP, so proxies and CDNs understand it | Upgraded protocol, its own rules |
+| Cost | A held HTTP response | A held socket plus framing state |
+| Watch for | 6 connections per browser per domain on HTTP/1.1 (MDN) | More code and more moving parts |
+
+A WebSocket would work here. It is not wrong. It is just more machinery than a one-way feed needs, and you would write the resume logic yourself. If the product later adds two-way features, such as live polls that viewers answer in the same socket, revisit the choice.
+
+## Deep dives
+
+### Who receives which comment
+
+A simple first idea is one topic for all comments, with every stream server subscribed. See what that does.
+
+<LiveCommentsFanout client:visible />
+
+The fix is the pub/sub rule from lesson [6.2](/learn/06-async/pubsub-logs/): a **channel per video**, and a stream server joins a channel only while it has a viewer of that video. This is a routing problem, so lesson [4.8](/learn/04-data/consistent-hashing/) applies in one place: if one pub/sub node cannot carry all the channels, spread channels over nodes by `hash(video_id)`. Redis can run this layer (lesson [8.2](/learn/08-technologies/redis/)). Its pub/sub is at-most-once, which is acceptable here, because the comment is already saved and a missed comment costs the viewer only a moment.
+
+### The hot video
+
+Per-video channels fix the many-videos case. They do not fix the one-huge-video case. Do the arithmetic with assumed numbers: 1 million viewers and 2,000 comments per second.
+
+- Naive fan-out: 1,000,000 viewers × 2,000 comments = 2 billion pushes per second. No fleet does that.
+- No person can read 2,000 comments per second anyway. Say the screen shows at most 5 per second.
+- So each viewer should receive about 5 per second, not 2,000. That is 5 million pushes per second, a thing a fleet can do.
+
+How do you cut 2,000 to 5? **Sample**. A small aggregator keeps about 1 in 400 comments (5 / 2,000 = 0.25%) and the stream servers fan out only the sample. Everyone sees a lively, slightly thinned stream. Moderators and the store still see every comment.
+
+When even the sample is too costly, drop push and use the CDN. A job writes the latest 100 to 200 comments as a small snapshot object once a second, and viewers poll the CDN edge (lesson [2.7](/learn/02-networking/cdn-proxies/)). Say there are 50 edge locations: the origin handles about 50 requests per second, while the edge absorbs 500,000 per second from 1M viewers polling every 2 s. The price is delay: up to 1 s for the snapshot plus 2 s for the poll, so about 3 s.
+
+The write side can be hot too. Partition the store by `video_id` and one popular video makes one hot partition (lesson [4.7](/learn/04-data/sharding/)). Use a composite key such as `(video_id, minute)`. Order inside a video comes from time-sortable ids, not from a single counter (lesson [10.5](/learn/10-advanced/ids-and-time/)).
+
+### Disconnects and late joins
+
+Phones drop connections. SSE gives you the resume: each event carries an `id` equal to the comment `seq`, and the browser sends `Last-Event-ID` on reconnect. The server needs a short buffer of recent events to answer from. A time window is fine for a normal video. For the hot video it would be huge: 5 minutes × 2,000 per second = 600,000 comments. So bound the buffer by count (say the last 200). If the viewer is further behind than that, skip ahead and reload the latest page. That is a graceful gap, and it is acceptable by the requirements.
+
+If a stream server dies, all its viewers reconnect at once. Backoff and jitter prevent a storm (lesson [2.5](/learn/02-networking/real-time-transport/)).
+
+Late joiners read the recent-comment cache (lesson [9.1](/learn/09-patterns/scaling-reads/) for the read pattern), then subscribe. Subscribe first, then read history, and drop duplicates by `seq`, so nothing falls in the gap between the two.
+
+## Numbers
+
+All inputs are assumptions. The method is lesson [1.4](/learn/01-one-machine/estimation/).
+
+- **Mega-stream push.** 1M viewers × 5 comments per second = 5M pushes per second.
+- **Servers.** At 100,000 connections per server, 1M viewers need 10 servers.
+- **Bandwidth per server.** At 200 bytes per event: 100,000 × 5 × 200 B = 100 MB per second, about 800 Mbit per second out of each server.
+- **Sampling rate.** 5 / 2,000 = 0.25%, about 1 in 400.
+- **CDN snapshot.** 1M viewers / 2 s = 500,000 polls per second at the edge. Origin load is about 50 (edges) × 1 snapshot per second = 50 per second.
+- **Everyday video.** 200 viewers and 1 comment per second is only 200 pushes per second. One server does it.
+
+I found no primary source for any live-comment platform's real numbers, so none are quoted.
+
+<Ballpark
+  client:visible
+  title="Fan-out for one mega-stream"
+  scenario="One live video has 1,000,000 viewers and 2,000 new comments per second. Assume 100,000 connections per server and 200 bytes per pushed comment."
+  steps={[
+    {
+      prompt: 'If every comment goes to every viewer, how many pushes per second is that?',
+      unit: 'pushes/s',
+      answer: 2000000000,
+      within: 1.1,
+      explain: '1,000,000 × 2,000 = 2 billion per second. This is why you cannot fan out every comment on a mega-stream.',
+    },
+    {
+      prompt: 'Cap each viewer at 5 comments per second. How many pushes per second now?',
+      unit: 'pushes/s',
+      answer: 5000000,
+      within: 1.1,
+      explain: '1,000,000 × 5 = 5 million per second, 400 times less. The aggregator keeps 1 in 400 comments to make this true.',
+    },
+    {
+      prompt: 'How many megabytes per second does one server send?',
+      unit: 'MB/s',
+      answer: 100,
+      within: 1.1,
+      explain: 'One server holds 100,000 viewers. 100,000 × 5 × 200 B = 100,000,000 B, which is 100 MB per second, about 800 Mbit per second.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| SSE | Resume built in, plain HTTP | One way, browser connection limits | Feed flows server to client |
+| WebSocket | Two-way, one channel | Resume and heartbeats are yours | Viewers also send often over the same link |
+| One global topic | Trivial setup | Every server reads everything | Almost never |
+| Channel per video | Servers read only what they serve | A subscribe step per viewer set | Many videos at once |
+| Sampling | Bounded cost per viewer | Viewers do not see every comment | Mega-streams |
+| CDN snapshots | Origin load almost flat | About 3 s delay, no push | Largest streams |
+
+## Interview lens
+
+<Callout type="tip">
+Start by naming the direction: "Posting is a normal request. Seeing is a server push, so SSE." Then name the cost that explodes: "The write is one, the fan-out is a million, so I partition channels by video and I cap what each viewer receives." Offer the sampling or CDN fallback before you are asked.
+</Callout>
+
+<Callout type="mistake">
+Three slips. Polling every second from every viewer (a million requests per second for data that mostly did not change). One global topic that every server reads. Promising exact order and no loss across the whole site (the requirements allow eventual and per-video order, and each demand costs a lot).
+</Callout>
+
+<Callout type="deep" title="Why drop comments on purpose?">
+It feels wrong to drop data. But the screen is the limit. A viewer can only read a few comments per second, so sending 2,000 does not add value. The comment store and moderators still get all of them. You are choosing what to show, not what to keep.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why is SSE a good fit for the live comment feed itself?',
+      options: [
+        'It lets a viewer send a comment through the same stream',
+        'It keeps no connection state on the server',
+        'One-way push, with resume built in',
+        'It sends smaller frames than any other protocol',
+      ],
+      answer: 2,
+      explain: 'Comments go down to viewers all the time, while posting is a rare small POST. SSE gives one-way push with Last-Event-ID resume. It does not carry client data upstream, and it still keeps a held connection on the server.',
+    },
+    {
+      q: 'Each of 200 stream servers subscribes to one global topic for all videos. What gets worse as you add servers?',
+      options: [
+        'The store holds more copies of every comment',
+        'Each comment is copied to more idle servers',
+        'Late joiners wait longer for history',
+        'Posting a comment gets slower for the commenter',
+      ],
+      answer: 1,
+      explain: 'With a global topic, every server receives every comment, so copies grow with the fleet. A channel per video limits copies to servers that have viewers of that video. The store and the posting path are not affected.',
+    },
+    {
+      q: 'A video has 500,000 viewers and gets 1,000 comments per second. The screen can show 4 per second. About what share of comments should the aggregator keep?',
+      options: ['4%', '0.4%', '40%', '0.04%'],
+      answer: 1,
+      explain: '4 / 1,000 = 0.4%. Keeping 4% would send 40 comments per second per viewer, ten times more than anyone can read.',
+    },
+    {
+      q: 'A viewer reconnects after a 20-minute outage on a video that gets 2,000 comments per second. What should the server do?',
+      options: [
+        'Replay all 2.4 million missed comments in order',
+        'Close the stream and ask the viewer to reload the page',
+        'Replay only the last minute and say nothing about the gap',
+        'Skip ahead: send the latest page, then resume live',
+      ],
+      answer: 3,
+      explain: '20 min × 60 s × 2,000 = 2.4 million comments. Replaying them would swamp the viewer and the server. Requirements allow a gap, so send the newest page and continue. A silent partial replay would confuse order.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="live-comments-all-servers-busy"
+  title="Busy servers, quiet rooms"
+  scenario="After launch, all stream servers run at 90% CPU. But most videos have only a few viewers on any one server."
+  facts={[
+    'comments published:      40,000/s (site-wide)',
+    'comments received:       40,000/s per stream server',
+    'comments matching a local viewer: ~120/s per server',
+    'pub/sub topics:          1',
+  ]}
+  steps={[
+    {
+      prompt: 'What explains the load?',
+      options: [
+        'Each server reads every comment on the site and drops most of them',
+        'SSE connections use more CPU than WebSockets would',
+        'The comment store is slow, so servers retry their writes',
+        'Late joiners all read history from the cache at once',
+      ],
+      answer: 0,
+      explain: 'Each server receives 40,000 per second and uses 120. That is 99.7% waste. The single topic is the cause.',
+    },
+    {
+      prompt: 'Which change cuts the load the most?',
+      options: [
+        'Add more stream servers behind the same topic',
+        'Raise the SSE keep-alive interval to 30 seconds',
+        'Use a channel per video and subscribe only while a server has viewers',
+        'Move the topic to a bigger machine',
+      ],
+      answer: 2,
+      explain: 'With channels per video, each server receives only the videos it serves. More servers on one topic raises total copies. A longer keep-alive or a bigger topic host does not change what each server must read.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [MDN: Using server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events) (the event stream format, `Last-Event-ID`, the connection limit)
+- [WHATWG HTML Standard: Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html) (the reconnect rules in the spec)
+- [Redis docs: Pub/Sub](https://redis.io/docs/latest/develop/pubsub/) (channels, and the at-most-once guarantee)

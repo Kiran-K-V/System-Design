@@ -1,0 +1,221 @@
+---
+summary: 'A news feed is a read-heavy join between who you follow and what they posted. Fan-out on write precomputes feeds but breaks on celebrities, so real designs push ordinary authors and pull the famous ones.'
+requires: ['05-caching/cache-strategies', '06-async/queues', '08-technologies/redis']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import NewsFeedBuild from '../../../components/anim/lessons/NewsFeedBuild.tsx';
+import NewsFeedFanout from '../../../components/anim/lessons/NewsFeedFanout.tsx';
+
+## The problem
+
+You open a social app. A page of posts from people you follow appears, newest first. It must appear fast, every time, for every user.
+
+The question that drives the design is simple. A feed is the answer to: "show the latest posts of everyone I follow". When do you compute that answer? When the user asks (a **pull**), or when each author posts (a **push**)? Each choice moves a large cost to a different place, and each has a case where it fails.
+
+Sources for this topic are scarce. I did not reach a primary source with company numbers for this lesson, so every number below is an assumption that we derive. Do the same in an interview: state assumptions, then show the arithmetic.
+
+## Requirements
+
+**Functional.**
+
+1. A user publishes a post.
+2. A user follows and unfollows other users.
+3. A user views a home feed of posts from the accounts they follow, newest first.
+
+**Below the line.** Ranking by a model, ads, comments and likes, search, and notifications. Ranking changes the order, but not the main cost structure.
+
+**Non-functional.** Feed reads are fast. The system favors availability: a post may reach followers a few seconds late. Reads far outnumber writes.
+
+**Scale.** Interview assumptions, with the math shown.
+
+- 100 million daily active users, each opening the feed 10 times a day. That is 1 billion reads a day, or 1,000,000,000 ÷ 86,400 ≈ **11,600 feed reads a second**.
+- 1 in 10 users posts once a day. That is 10 million posts a day, or about **116 posts a second**.
+- A typical user follows 500 accounts and has 200 followers.
+- Read to write ratio: 11,600 ÷ 116 = 100 to 1.
+
+<Ballpark
+  client:visible
+  title="Size the feed"
+  scenario="100 million daily users open the feed 10 times a day. One in ten posts once a day. The average author has 200 followers. A day has 86,400 seconds."
+  steps={[
+    { prompt: 'Feed reads per second on average', unit: 'per s', answer: 11574, within: 1.3, explain: '100M × 10 = 1 billion a day. 1,000,000,000 ÷ 86,400 ≈ 11,574 a second.' },
+    { prompt: 'Posts per second on average', unit: 'per s', answer: 116, within: 1.3, explain: '100M × 0.1 = 10M posts a day. 10,000,000 ÷ 86,400 ≈ 116 a second.' },
+    { prompt: 'Feed writes per second if every post is pushed to 200 followers', unit: 'per s', answer: 23148, within: 1.3, explain: '116 × 200 ≈ 23,100 writes a second. That is the write amplification of fan-out on write: one post becomes 200 writes.' },
+  ]}
+/>
+
+## Core entities
+
+- **Post:** `post_id`, `author_id`, `body`, `created_at`.
+- **Follow:** `follower_id`, `followee_id`.
+- **Feed entry:** `user_id`, `post_id`, and a time. This is the precomputed feed. Store the id only. The body is fetched from the posts table. One copy of a post body beats 200 copies.
+
+## API
+
+| Call | Purpose |
+|---|---|
+| `POST /posts` with `{ body }` | Publish. The author comes from the auth token |
+| `POST /follows/{user_id}` and `DELETE /follows/{user_id}` | Follow and unfollow |
+| `GET /feed?cursor=...` | One page of the feed and a cursor for the next page |
+
+Use a cursor and not a page number, so new posts do not shift the pages ([lesson 3.3](/learn/03-api-design/pagination/)). A cursor can be the time and id of the last post the client saw.
+
+## High-level design
+
+Step through it. The design starts with the pull and then adds the push.
+
+<NewsFeedBuild client:visible />
+
+The first working design is a pull. To build a feed, find who the user follows, fetch each followee's recent posts, merge by time, and cut a page. With indexes ([lesson 4.3](/learn/04-data/indexing/)) on `(author_id, created_at)` and on the follow pairs, this works for small systems. It also fits the ideas of [lesson 9.1](/learn/09-patterns/scaling-reads/): add a cache when reads dominate.
+
+## Deep dive 1: pull or push
+
+Switch between the designs below and step through each one.
+
+<NewsFeedFanout client:visible />
+
+**Fan-out on read** costs nothing at post time. All the cost lands on reads. With 500 followees, each feed read does 500 lookups. At 11,600 reads a second, that is 500 × 11,600 = **5.8 million lookups a second**. Most of them fetch posts nobody has read yet. The feed gets slower for users who follow more people, and the scatter-gather pattern from [lesson 4.7](/learn/04-data/sharding/) makes the slowest of 500 calls set the latency.
+
+**Fan-out on write** moves the cost to post time. When a post is created, a queue ([lesson 6.1](/learn/06-async/queues/)) hands it to workers. A worker reads the author's follower list and adds the post id to each follower's feed. A feed read is then one lookup of a ready-made list, then a fetch of those posts by id. Reads are cheap and flat, no matter how many people the user follows.
+
+The price is **write amplification**: one post becomes one write per follower. With 200 followers on average, 116 posts a second become 23,100 feed writes a second. That is fine. It runs in the background, off the request path, and a queue smooths bursts ([lesson 6.4](/learn/06-async/backpressure-dlq/)).
+
+How big are the stored feeds? Keep only the newest 500 ids per user. At 8 bytes an id, that is 500 × 8 B = 4 KB. For 100 million active users: 100M × 4 KB = **400 GB** of raw ids. Real storage costs more, because every structure has overhead, so plan for several times that, spread over many shards. If a user's feed is missing or has expired, rebuild it with the pull method from the posts table. The cache is a copy, not the truth.
+
+A **sorted set** in Redis ([lesson 8.2](/learn/08-technologies/redis/)), with the post time as the score, suits a feed. `ZADD` adds an entry, and a range read returns the newest entries first. It is also safe to repeat. Queue delivery can run a job twice ([lesson 6.3](/learn/06-async/delivery-semantics/)). Adding the same post id to a sorted set twice leaves one entry, so a retry does no harm.
+
+## Deep dive 2: the celebrity problem
+
+Fan-out on write assumes that an author has few followers. Some accounts have millions. Say one has 20 million followers and posts once. That is 20 million feed writes from a single post. If the workers manage 200,000 writes a second, the job takes 20,000,000 ÷ 200,000 = **100 seconds**. The last follower waits more than a minute and a half. Meanwhile the queue backs up, and ordinary authors' posts wait behind the celebrity's job.
+
+The fix is a **hybrid**. Pick a threshold, such as 100,000 followers. Authors below it are pushed. Authors above it are not pushed at all. At read time, the feed service does two things. It reads the user's ready-made list. It also reads the recent posts of the few celebrities the user follows, and merges them in by time. A typical user follows a handful of celebrities, so this adds a handful of lookups, not 500.
+
+The hybrid has its own costs.
+
+- **Two read paths** to keep correct. The merge must keep the order and the page cursor stable.
+- **A threshold to tune.** Too low and you pull too much. Too high and a big account stalls the queue.
+- **Celebrity posts are read very often.** They are the best candidates for a cache, since millions of readers fetch the same few rows.
+- **Inactive users.** Do not push to users who have not opened the app for a month. Build their feed on demand when they return. This also cuts write amplification.
+
+**Unfollow and delete.** If a user unfollows someone, old posts from that person may still sit in the feed list. Filter them at read time, or accept a short delay. Deleting a post is the same: the feed holds only an id, so the fetch finds the post missing and skips it.
+
+## Trade-offs
+
+| Approach | You gain | You pay | Choose when |
+|---|---|---|---|
+| Fan-out on read | Cheap posts. Always fresh. No feed storage | Slow, costly reads that grow with follows | Small systems, or users who follow few accounts |
+| Fan-out on write | One cheap read. Flat latency | Write amplification. Storage. Slow for big accounts | Most authors have a modest follower count |
+| Hybrid | Cheap reads and bounded writes | Two paths. A threshold to tune | Any real social graph with a long tail of huge accounts |
+| Feed of ids only | One copy of each post | An extra fetch to turn ids into posts | Almost always |
+| Eventual consistency | Availability and speed | A post may be seconds late | Social feeds, where a delay is harmless |
+
+<Callout type="tip">
+Say the trade in one line: "Pull makes reads slow, push makes writes big. I push for ordinary authors so reads are one lookup, and I pull for celebrities so one post is not 20 million writes." Back it with your numbers: "500 lookups per read at 11,600 reads a second is 5.8 million lookups a second, so pull alone fails."
+</Callout>
+
+<Callout type="mistake">
+Do not say "fan-out on write for everyone" without naming the celebrity problem. Do not say "fan-out on read for everyone" without showing the 500 lookups. Do not store the whole post in every feed: store ids. Do not claim strong consistency for a feed. And do not skip what happens on unfollow, delete, and a cold cache.
+</Callout>
+
+<Callout type="deep" title="Write amplification is a dial, not a switch">
+The hybrid is one point on a line. At one end, push to nobody and pull everything. At the other, push to everyone. The threshold slides you along it. You can also slide per user: push to active users and skip dormant ones. Seeing the design as a dial turns "which is right?" into "what does my data say?" The follower distribution has a long tail, so the answer is almost never at an end.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A user follows 500 accounts. With fan-out on read, how many per-author lookups does one feed read do?',
+      options: [
+        'About 500, one for each account the user follows',
+        'One, because the feed is stored as a ready-made list',
+        'About 200, one for each follower the user has',
+        'About 116, one for each post published per second',
+      ],
+      answer: 0,
+      explain: 'Pull builds the feed at read time by asking each followee for recent posts. That is one lookup per account followed. A single lookup describes fan-out on write, and followers matter only for the push side.',
+    },
+    {
+      q: 'An account with 20 million followers posts once. Workers manage 200,000 feed writes a second. How long does a full fan-out on write take?',
+      options: [
+        'About 1 second, since the writes run in parallel',
+        'About 10 seconds, one second for every 2 million',
+        'About 100 seconds, which is 20 million over 200,000',
+        'About 4,000 seconds, because one worker does each write',
+      ],
+      answer: 2,
+      explain: '20,000,000 ÷ 200,000 = 100 seconds. The 200,000 rate already counts all workers working together. The delay also blocks the queue for other authors, which is why celebrities are pulled.',
+    },
+    {
+      q: 'Why store only post ids in each follower feed and not the whole post?',
+      options: [
+        'Ids sort faster than text inside a sorted set',
+        'The post body is not needed to show a feed',
+        'A post body cannot be stored in Redis at all',
+        'Edits and deletes then touch one row',
+      ],
+      answer: 3,
+      explain: 'With ids, the body lives in one place, so an edit or a delete changes one row, not 200 copies. The feed still needs the body, so it fetches by id. Redis can store text, and sort speed is not the reason.',
+    },
+    {
+      q: 'A fan-out worker crashes after adding a post id to a feed, and the queue redelivers the job. Which feed storage makes the retry harmless?',
+      options: [
+        'A list, where each retry appends one more entry',
+        'A sorted set, which keeps one entry per id',
+        'A counter that is incremented for each delivery',
+        'A queue per user that is cleared after each read',
+      ],
+      answer: 1,
+      explain: 'Delivery is at least once, so a job may run twice. A sorted set keeps one entry per member, so the repeat changes nothing. A list would show the post twice.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="news-feed-queue-stall"
+  title="The post that froze every feed"
+  scenario="A feed uses fan-out on write for every account. A well-known account with 20 million followers posts. For the next several minutes, new posts from ordinary users take minutes to show up in their friends' feeds. The queue depth graph shows a spike. Workers are healthy and the cache is not full."
+  facts={[
+    'design            : fan-out on write for all authors',
+    'celebrity         : 20M followers, one post',
+    'worker capacity   : 200,000 feed writes a second in total',
+    'symptom           : posts from ordinary users delayed for minutes',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the root cause of the delay for ordinary users?',
+      options: [
+        'The cache evicted the feeds of the ordinary users',
+        'The celebrity job holds the workers for about 100 seconds',
+        'Ordinary users posted too many posts in that period',
+        'The follow graph database lost some of its replicas',
+      ],
+      answer: 1,
+      explain: '20 million writes at 200,000 a second occupy every worker for about 100 seconds. Other jobs wait behind them. Workers and cache are healthy, so the cause is the size of one job, not a fault.',
+    },
+    {
+      prompt: 'What change prevents this for the next celebrity post?',
+      options: [
+        'Do not push authors over a follower threshold, and merge their posts at read time',
+        'Add more cache memory so each feed can hold more ids',
+        'Retry failed jobs faster, so the queue clears sooner',
+        'Fan out every post twice, to make sure it arrives',
+      ],
+      answer: 0,
+      explain: 'The hybrid skips the huge fan-out and pulls the celebrity posts at read time. More memory and faster retries do not shrink a job of 20 million writes. Sending twice makes the work larger.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Redis docs: Sorted sets](https://redis.io/docs/latest/develop/data-types/sorted-sets/) (a score-ordered set, suited to feeds)
+- [Redis docs: ZADD](https://redis.io/docs/latest/commands/zadd/) (add or update a member by score)
+- [Redis docs: Lists](https://redis.io/docs/latest/develop/data-types/lists/) (the other common structure for a feed, with append and trim)

@@ -1,0 +1,277 @@
+---
+summary: 'A notification system fans one request out to push, SMS, and email through per-channel queues with priority lanes, then handles flaky providers with backoff, deduplication, and per-user limits.'
+requires: ['03-api-design/idempotency', '06-async/queues', '07-reliability/timeouts-retries']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import NotifBuild from '../../../components/anim/lessons/NotifBuild.tsx';
+import NotifLanes from '../../../components/anim/lessons/NotifLanes.tsx';
+
+## The problem
+
+A product has many services that need to reach users. The order service says "your parcel shipped". The auth service says "your login code is 481516". Marketing says "50% off today".
+
+Each service could call Apple, Google, an SMS vendor, and an email vendor by itself. Then every team writes its own retry code, its own opt-out check, and its own rate limits. One bad deploy sends a user 40 copies of one message.
+
+A **notification system** is one shared service. Services send it a request. It decides whether to send, picks the channel, calls the outside **provider** (the vendor that really delivers the message), and records what happened.
+
+This case study follows the six steps of the [design method](/learn/00-orientation/design-method/). It adds three new ideas: fan-out over several channels, priority lanes, and safe retries against unreliable vendors. It does not re-teach queues, retries, or rate limiting. It links to the lessons that do.
+
+## Requirements
+
+**Functional.**
+
+1. A service sends one notification to one user over push, SMS, or email, now or at a set time.
+2. A service sends a campaign: one message to a segment of users.
+3. A user sets preferences: which channels are on, and quiet hours.
+
+**Below the line.** Message templates, delivery analytics, an in-app inbox, and "no more than N per week" frequency caps across campaigns. Say so aloud and move on.
+
+**Non-functional.** These numbers are our assumptions. Interview prompts give similar ones. We state them so we can do the math.
+
+- 10M notifications per day on average. We design for bursts of 5,000 per second.
+- An accepted notification is never silently dropped.
+- A login code reaches the vendor within about 5 seconds, even during a campaign.
+- A user never receives the same notification twice, even though the pipeline can redeliver (lesson [6.3](/learn/06-async/delivery-semantics/)).
+- One user gets at most a set number of messages per hour.
+
+The average rate is 10,000,000 / 86,400 = about 116 per second. We round to 100 per second. The burst is 5,000 per second, about 50 times the average. The design is about the burst, not the average.
+
+## Core entities
+
+- **Notification**: id, user id, channel, priority, status, idempotency key, send time.
+- **Campaign**: id, segment, template, send time.
+- **Preference**: user id, channels that are off, quiet hours.
+- **Delivery attempt**: notification id, provider, attempt number, result.
+
+## API
+
+| Call | Purpose |
+|---|---|
+| `POST /v1/notifications` | Body: user, channels, priority, send time, and an `idempotency_key`. Returns 202 (accepted, not yet sent). |
+| `POST /v1/campaigns` | Body: segment, template, send time. Returns 202. |
+| `PUT /v1/users/{id}/preferences` | Set opt-outs and quiet hours. |
+| `GET /v1/notifications/{id}` | Status per channel. |
+
+The idempotency key comes from the caller (lesson [3.4](/learn/03-api-design/idempotency/)). A caller that retries after a timeout gets the same notification, not a second one.
+
+Data flow is a simple chain here, so we skip a separate data-flow step.
+
+## High-level design
+
+Step through the build. Each step adds boxes for one requirement.
+
+<NotifBuild client:visible />
+
+Read the finished picture from left to right.
+
+- The **intake API** answers fast. It validates, writes to a log, checks preferences, and enqueues. It never calls a vendor itself, so a slow vendor cannot slow the callers.
+- Each **channel** has its own queue and worker pool (lesson [6.1](/learn/06-async/queues/)). The pools differ because the vendors differ. They have different latency, different limits, and different failure patterns.
+- **Preferences** are checked before the enqueue. Dropping an unwanted message early is cheaper than dropping it after the work.
+- **Campaigns** are expanded in the background. A 3M-user campaign becomes 3M small messages in the bulk lane. The API call itself finishes in milliseconds.
+- A **key-value store** such as Redis (lesson [8.2](/learn/08-technologies/redis/)) keeps per-user token buckets and dedupe keys.
+- **Failures** go to a retry queue, and after N tries to a dead-letter queue (lesson [6.4](/learn/06-async/backpressure-dlq/)).
+
+## Deep dive: a campaign must not starve a login code
+
+The simplest queue design puts every message in one queue. It fails the first time marketing sends a big campaign. Compare the two designs.
+
+<NotifLanes client:visible />
+
+The math is short. A campaign adds 3,000,000 SMS messages. The vendor limit we assume is 5,000 per second. A login code sent after the campaign waits 3,000,000 / 5,000 = 600 seconds.
+
+The fix has two parts.
+
+1. **Lanes.** Each channel has an urgent lane and a bulk lane. Campaigns only write to bulk.
+2. **Capped pools.** Bulk workers may use 4,500 of the 5,000 per second. Urgent workers keep 500 in reserve. Without a cap, bulk workers would use the whole vendor quota, and an urgent message would hit the vendor limit and fail.
+
+The cost is small. The campaign takes 3,000,000 / 4,500 = about 667 seconds instead of 600. That is 11% slower, and nobody is waiting on a campaign for 10 seconds.
+
+How many workers do we need? Use the throughput rule from lesson [1.3](/learn/01-one-machine/throughput-vs-latency/): requests in flight divided by latency. Assume a vendor call takes 100 ms and one worker keeps 20 calls in flight. One worker does 20 / 0.1 = 200 calls per second. The bulk pool needs 4,500 / 200 = about 23 workers. The urgent pool needs 500 / 200 = 3 workers.
+
+Link to the sibling case: the [rate limiter](/learn/11-breakdowns/rate-limiter/) shows how a token bucket is built. Here we use one in two places: per user, and per vendor.
+
+## Deep dive: retries without a storm
+
+Vendors fail. They time out, answer 429 ("slow down") or 503. A worker must not give up after one try. It also must not retry at once, because a thousand workers retrying together can keep a struggling vendor down (lesson [7.2](/learn/07-reliability/timeouts-retries/)).
+
+The rules we apply:
+
+- **Backoff with jitter.** Wait 1 second, then about 2, then about 4, with random spread. Failed messages go to a retry queue with a delay, so a worker is never blocked while it waits.
+- **Retry only what can work.** Retry timeouts, 429, and 5xx. Do not retry "invalid phone number". Send that to the dead-letter queue at once.
+- **A circuit breaker per vendor** (lesson [7.3](/learn/07-reliability/circuit-breaker/)). When most calls fail, stop calling for a while. Messages wait in the queue, and the vendor gets room to recover. A second SMS vendor can take over for urgent traffic.
+- **A limit on tries.** After N tries the message goes to the dead-letter queue. A person or a job can replay it when the vendor is back.
+
+Vendors also publish quotas, and exceeding them gets you throttled. For example, Firebase Cloud Messaging documents its throttling and quotas. Read the quota of the vendor you name in the interview and size the pool from it.
+
+## Deep dive: no duplicates
+
+Queues deliver at least once. A worker can send an SMS, get the vendor "ok", and crash before it acknowledges the queue message. The queue then gives the message to another worker, which sends it again.
+
+You cannot get exactly-once from the queue. You make the send idempotent instead (lesson [3.4](/learn/03-api-design/idempotency/)).
+
+- If the vendor supports an idempotency key, send the notification id as the key. The vendor drops the repeat.
+- If it does not, keep a dedupe record: before the send, check the key `notification_id + channel`, and set it after a successful send.
+
+Both leave a small window. A crash between "vendor accepted" and "record written" can still send twice. For a promo that is acceptable. For a login code, a repeat is harmless because the code is the same. State this trade-off. Do not promise zero duplicates.
+
+## Numbers
+
+| Quantity | Math | Result |
+|---|---|---|
+| Average rate | 10M / 86,400 | ~116 per second |
+| Burst | given | 5,000 per second |
+| Campaign time, one queue | 3,000,000 / 5,000 | 600 seconds |
+| Campaign time, capped bulk | 3,000,000 / 4,500 | ~667 seconds |
+| Intake log, 30 days | 10M x 300 B x 30 | ~90 GB |
+
+At 300 bytes per row, 10M rows a day is 3 GB a day. That fits one database with a retention job, or a sharded store if rows are bigger (lesson [4.7](/learn/04-data/sharding/)). Lesson [1.5](/learn/01-one-machine/numbers-to-know/) lists the numbers worth knowing.
+
+Try it with your own rounding.
+
+<Ballpark
+  client:visible
+  title="Sizing the notification pipeline"
+  scenario="The system sends 10M notifications a day. Treat a day as 100,000 seconds. A marketing campaign adds 3M messages. The bulk lane may send 4,500 per second. Each intake row is 300 bytes."
+  steps={[
+    {
+      prompt: 'How many notifications per second, on average?',
+      unit: 'per second',
+      answer: 100,
+      within: 1.3,
+      explain: '10,000,000 / 100,000 = 100 per second. With a real 86,400-second day it is about 116. Both round to "about 100".',
+    },
+    {
+      prompt: 'How many seconds does the 3M campaign need in the bulk lane?',
+      unit: 'seconds',
+      answer: 667,
+      within: 1.3,
+      explain: '3,000,000 / 4,500 = about 667 seconds, which is 11 minutes.',
+    },
+    {
+      prompt: 'How many GB does 30 days of intake rows take, if each row is 300 bytes?',
+      unit: 'GB',
+      answer: 90,
+      within: 1.3,
+      explain: '10M x 300 B = 3 GB per day. 3 GB x 30 = 90 GB.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| One queue per channel and priority | No starvation, tuned pools | More queues and workers to run | Message classes differ in urgency |
+| One shared queue | Simplest to run | A campaign blocks urgent messages | Very low volume only |
+| Retry queue with backoff | Vendor gets room to recover | Delivery is later | Vendor errors are temporary |
+| Dedupe store check | Fewer repeat sends | Extra lookup, a small gap remains | Repeats annoy users |
+| Check preferences before enqueue | Cheap drops | Stale cache can send to an opt-out | Always, with a short cache TTL |
+
+<Callout type="tip">
+Name the threat and the fix in one breath: "A campaign can starve login codes, so each channel has an urgent lane and a capped bulk lane." Then give the math: 3M divided by 5,000 is 10 minutes. Interviewers remember a number they can check.
+</Callout>
+
+<Callout type="mistake">
+Do not claim exactly-once delivery. Say "at-least-once from the queue, plus an idempotent send". Also do not call the vendor from the API request path. A slow vendor then stalls every caller.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An SMS worker sends a message, the vendor accepts it, and the worker crashes before it acknowledges the queue message. What happens next, and what protects the user?',
+      options: [
+        'The message is lost, so a separate retry job must send it again',
+        'The queue never redelivers it, so the user gets exactly one message',
+        'The queue redelivers it, and a dedupe or vendor key blocks the repeat',
+        'The vendor sees both calls on its own and automatically merges them into one',
+      ],
+      answer: 2,
+      explain: 'Queues deliver at least once, so an unacknowledged message comes back. The send must be idempotent: the notification id is used as a vendor key or a dedupe key. The vendor does not merge calls unless you give it a key.',
+    },
+    {
+      q: 'The SMS vendor allows 5,000 messages per second. Bulk workers are capped at 4,500 per second. How long does a 9M-message campaign take to drain?',
+      options: [
+        'About 2,000 seconds, which is roughly 33 minutes',
+        'About 1,800 seconds, which is exactly 30 minutes',
+        'About 200 seconds, which is just over 3 minutes',
+        'About 20,000 seconds, which is more than 5 hours',
+      ],
+      answer: 0,
+      explain: '9,000,000 / 4,500 = 2,000 seconds. The 1,800-second answer uses the full 5,000 limit, but bulk is capped lower to leave room for urgent messages.',
+    },
+    {
+      q: 'A vendor starts returning 503 for two minutes. Which worker behavior helps the vendor recover and loses no message?',
+      options: [
+        'Retry each failed call again at once, in a tight loop, until it works',
+        'Drop failed messages after the first error, to cut the load on the vendor',
+        'Add many more workers so that more calls get through each second',
+        'Delay retries in a queue, using backoff and jitter',
+      ],
+      answer: 3,
+      explain: 'A delayed retry queue spreads the retries over time and keeps every message. Instant retries and extra workers add load to a vendor that is already failing. Dropping messages breaks the never-dropped requirement.',
+    },
+    {
+      q: 'Why are per-user rate-limit counters kept in a shared store, not in each worker memory?',
+      options: [
+        'Memory on a worker is too slow to read for every single message',
+        'Any worker may handle the user messages, so counts are shared',
+        'A shared store is the only place where a token bucket can be kept',
+        'The vendor requires that counters are stored outside of our servers',
+      ],
+      answer: 1,
+      explain: 'Messages for one user spread across many workers. Local counters would each allow the full limit, so the user would get the limit times the number of workers. Worker memory is fast. That is not the reason.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="notification-system-double-sms"
+  title="Some users got the same SMS twice"
+  scenario="At 14:02 one SMS worker host was killed during a deploy. Afterward, support receives reports of duplicate order-shipped texts. No code change touched the send path."
+  facts={[
+    'time   event',
+    '14:02  worker sms-7 killed (SIGKILL)',
+    '14:02  queue: 41 messages in flight, unacked',
+    '14:03  queue: 41 messages redelivered',
+    '14:03  vendor accepted: 3,962   notifications created: 3,921',
+    '14:03  dedupe store: no check on the SMS path',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The SMS vendor has a bug that sends some messages twice',
+        'The 41 in-flight messages were already sent, then redelivered and sent again',
+        'The intake API accepted 41 requests twice from the callers',
+        'Users tapped the order-shipped button on the website twice',
+      ],
+      answer: 1,
+      explain: '3,962 - 3,921 = 41, the same as the redelivered count. The killed worker sent them but never acknowledged. The queue gave them to other workers. Nothing in the send path stopped the repeat.',
+    },
+    {
+      prompt: 'Which change fixes the cause, and what limit remains?',
+      options: [
+        'Disable queue redelivery altogether. Limit: crashed workers lose messages',
+        'Use the notification id as an idempotency key. Limit: a crash can still repeat',
+        'Add a second SMS vendor. Limit: it costs twice as much and repeats stay',
+        'Add more workers, so fewer messages are in flight. Limit: more hosts to run',
+      ],
+      answer: 1,
+      explain: 'The repeat comes from at-least-once delivery, so the send must be idempotent. A key shrinks the repeat window but cannot close it fully. Turning off redelivery drops messages. More workers or vendors do not touch the cause.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Firebase Cloud Messaging: throttling and quotas](https://firebase.google.com/docs/cloud-messaging/throttling-and-quotas) (an example of a vendor limit that sizes a worker pool)
+- [Amazon SNS: endpoints and quotas](https://docs.aws.amazon.com/general/latest/gr/sns.html) (publish and per-subscription limits of a managed fan-out service)
+- [Stripe: idempotent requests](https://docs.stripe.com/api/idempotent_requests) (how a vendor API exposes the idempotency key we pass through)

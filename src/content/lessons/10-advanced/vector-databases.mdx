@@ -1,0 +1,214 @@
+---
+summary: 'A vector database finds the stored vectors nearest to a query vector. Exact search reads everything. HNSW and IVF index it approximately and trade a little recall for a large cut in work.'
+requires: ['04-data/indexing', '01-one-machine/latency-numbers']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import VecMetrics from '../../../components/anim/lessons/VecMetrics.tsx';
+import VecHnsw from '../../../components/anim/lessons/VecHnsw.tsx';
+
+## The problem
+
+A user types "cheap flights to somewhere warm". No document holds those exact words. A keyword index (lesson [8.5](/learn/08-technologies/elasticsearch/)) finds documents that contain the words. It does not find documents that **mean** the same thing.
+
+An **embedding** model fixes the input side. It turns a text, an image, or a song into a **vector**: a list of d numbers, for example d = 768. The model is trained so that items with similar meaning get vectors that are close together. Now "find similar" becomes "find the stored vectors nearest to this query vector". That is a **nearest-neighbor search**, and asking for the top k is **k-nearest-neighbors**, or kNN.
+
+A B-tree (lesson [4.3](/learn/04-data/indexing/)) cannot help. It sorts one number. A vector has hundreds of dimensions, and "nearest" is not "next in sort order".
+
+## Measuring "close"
+
+Three measures are common. Take a query A = (1, 0) and a stored vector B = (1, 1).
+
+- **Dot product**: A · B = 1×1 + 0×1 = **1**. Higher means more alike.
+- **Cosine similarity**: the dot product divided by the two lengths: (A · B) / (|A| |B|) = 1 / (1 × 1.414) = **0.707**. It is the cosine of the angle between the vectors. Range: −1 to 1. **Cosine distance** is 1 − 0.707 = **0.293**.
+- **L2 distance** (straight-line): √((1−1)² + (0−1)²) = **1**. Lower means closer.
+
+Cosine looks only at **direction**. Dot product mixes direction and length. L2 looks at the gap. They can disagree. Move B in the widget and watch C = (3, 0) win or lose.
+
+<VecMetrics client:visible />
+
+At A = (1, 0) and B = (1, 1), C wins on cosine (it points the same way) and on dot product (it is longer), but **B** wins on L2 (distance 1 against 2). If every vector is scaled to length 1, dot product and cosine give the same ranking. Check what your model outputs and pick the measure it was trained for.
+
+In pgvector, the operators are `<->` for L2 distance, `<#>` for negative inner product, `<=>` for cosine distance, and `<+>` for L1 distance.
+
+## Naive solution: compare to everything
+
+Exact kNN computes the distance from the query to **every** stored vector, then keeps the best k. The cost per query is N × d.
+
+For 1 million vectors of 768 float32 numbers:
+
+- Memory: 1,000,000 × 768 × 4 bytes = **3.07 GB**.
+- Work: 1,000,000 × 768 = **768 million** multiply-adds per query.
+- Time floor: reading 3.07 GB at the 10 to 50 GB/s of RAM (lesson [1.2](/learn/01-one-machine/latency-numbers/)) takes 61 to 307 ms, and that is before any math.
+
+That is fine for 10,000 vectors, and too slow for 100 queries per second over a million. The result is **perfect**: its recall is 100%. **Recall** is the share of the true top k that you return. pgvector does exact search by default and gets perfect recall.
+
+To go faster we accept an **approximate** nearest neighbor (ANN) search: it may miss a true neighbor. Two index families dominate.
+
+## IVF: look only in the nearest buckets
+
+**IVF** (inverted file) groups vectors into clusters. A clustering step (k-means) picks **lists** centers. Each vector joins the list of its nearest center. A query finds its nearest `probes` centers and scans only those lists.
+
+In pgvector this is the IVFFlat index. The README suggests `lists` = rows / 1,000 up to 1 million rows, and √rows above that. The default `ivfflat.probes` is 1.
+
+Count the work. Take 1 million vectors, 1,000 lists, even lists of 1,000 each.
+
+- `probes = 1`: compare to 1,000 centers, then scan 1,000 vectors. About **2,000** distances, 500 times fewer than 1,000,000.
+- `probes = 10`: 1,000 + 10,000 = **11,000** distances, about 1.1% of exact.
+
+The miss: a query near a cluster border has its true neighbor in the **next** cluster. With probes = 1 you never look there. More probes raise recall and cost.
+
+## HNSW: a graph with express lanes
+
+**HNSW** (hierarchical navigable small world) is a graph. Each vector is a node linked to some near neighbors. A search starts somewhere and walks to nodes closer to the query. A single graph walks slowly across a big space. HNSW stacks layers, like the express and local lanes of a metro.
+
+- Every vector is in layer 0. A vector is also placed in layer 1 with probability 1/M, in layer 2 with probability 1/M², and so on (the paper's choice mL = 1/ln M).
+- For 1 million vectors and M = 16, the layers hold about 1,000,000 / 16^l: **62,500** on layer 1, **3,906** on layer 2, **244** on layer 3, **15** on layer 4, and **1** on layer 5. This number is derived from the rule, not measured.
+- A search enters at the top, walks greedily to the node closest to the query, drops one layer, and repeats from there. On layer 0 it widens the walk with a candidate list of size **efSearch**.
+
+Step through a toy: 18 points, three layers.
+
+<VecHnsw client:visible />
+
+The animation shows the knob that matters most. With efSearch = 1 the walk stopped at point 13, a local minimum. The true nearest, point 5, was two hops away behind a slightly worse point. With efSearch = 3 the search kept that worse point as a candidate and found point 5. This is the **recall versus latency** trade: a bigger candidate list reads more nodes and misses less.
+
+### The three parameters
+
+| Parameter | What it controls | pgvector default | Effect of raising it |
+|---|---|---|---|
+| `m` (M) | Links per node per layer. The paper allows 5 to 48. Layer 0 may hold up to 2M. | 16 | Better recall, more memory, slower build |
+| `ef_construction` | Candidate list size while building the graph | 64 | Better graph and recall, slower inserts and build |
+| `hnsw.ef_search` (efSearch) | Candidate list size per query | 40 | Better recall, slower query |
+
+Only efSearch can change per query, with no rebuild. Memory: the paper estimates about 60 to 450 bytes per element for M from 6 to 48, **on top of** the vector itself. The paper reports that search cost scales roughly logarithmically in tests. That is an empirical result, not a guarantee.
+
+### IVF or HNSW
+
+The pgvector README says IVFFlat builds faster and uses less memory, but gives a worse speed-recall trade-off than HNSW. HNSW is the usual default. IVFFlat needs data first, because its centers come from the data. HNSW can be built on an empty table.
+
+## Filtering breaks the index
+
+Real queries add a condition: "the 10 nearest products **in category 7**". An approximate index is scanned first, and the filter is applied **after** it. If a condition matches 10% of the rows, and `ef_search` is 40, the scan returns 40 candidates and only about 40 × 10% = **4** survive. You asked for 10.
+
+pgvector offers three fixes.
+
+- **Iterative index scans**: the index keeps scanning until enough rows pass the filter.
+- **A B-tree on the filter column**, when the filter matches a small share of rows. Postgres then finds those rows by index and sorts them by distance exactly.
+- **Partial indexes or partitions** when the filter has few distinct values, or per tenant.
+
+The same trap shows up in every vector store. Ask how it combines the filter with the index.
+
+## Where vectors live
+
+**pgvector** adds a `vector` type and these indexes to PostgreSQL (lesson [8.1](/learn/08-technologies/postgresql/)). Your vectors sit next to your rows, in the same transaction and the same backup. The `vector` type holds up to 2,000 dimensions in an HNSW index, and `halfvec` up to 4,000. Dedicated vector databases exist too. They add scale-out features around the same index ideas.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| 1M × 768 float32 | 3.07 GB; 768 million multiply-adds per query | Derived |
+| Time to stream 3.07 GB from RAM | 61 to 307 ms | Derived from 50 and 10 GB/s |
+| Layer sizes, N = 1M, M = 16 | 62,500; 3,906; 244; 15; 1 | Derived from the 1/M rule |
+| IVF, 1,000 lists, probes = 1 | ~2,000 distances instead of 1,000,000 | Derived, assumes even lists |
+| HNSW graph memory | ~60 to 450 bytes per element, M 6 to 48 | HNSW paper |
+| pgvector defaults | m 16, ef_construction 64, ef_search 40, probes 1 | pgvector README |
+| Filter loses rows | 10% match, ef_search 40: ~4 rows | pgvector README |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Exact scan | 100% recall, no index | N × d work per query | Under ~100,000 vectors, or a small filtered set |
+| IVF | Fast build, small index | Recall depends on probes; centers need data | Memory tight, data rarely changes |
+| HNSW | Best speed for a given recall | More memory and a slower build than IVF | Default for live search |
+| pgvector | Vectors with your SQL rows and transactions | One Postgres node's limits | Up to the scale one database serves |
+| Dedicated vector store | Sharding and scale features | A new system to run and sync | Billions of vectors |
+
+## Interview lens
+
+<Callout type="tip">
+Explain the pipeline in order: "An embedding model turns items into vectors. I store them with an HNSW index. A query is embedded and I fetch the top k by cosine". Then name the trade-off: "HNSW is approximate. I tune efSearch for recall against latency". Mention filters before you are asked: "I filter by tenant with a partition or an iterative scan, because a post-filter can return fewer than k rows".
+</Callout>
+
+<Callout type="mistake">
+Do not say HNSW is exact, or that its search is guaranteed O(log N). The paper shows logarithmic scaling in experiments, not a proof. Do not say "raise M to lower latency". M mostly buys recall, at the price of memory. And do not forget that a filtered ANN query can return fewer than k rows.
+</Callout>
+
+<Callout type="deep" title="Why not a k-d tree?">
+A k-d tree splits space one axis at a time, like a quadtree (lesson [10.1](/learn/10-advanced/proximity-search/)). It works in 2 or 3 dimensions. In hundreds of dimensions, a query ball touches almost every cell, and the tree degrades toward a full scan. Graph methods like HNSW avoid space cutting. They follow the data's own neighbor structure instead.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'The query is (1, 0). Candidate B is (1, 1) and candidate C is (3, 0). Which does cosine similarity pick, and which does L2 distance pick?',
+      options: ['Cosine picks C, L2 picks B', 'Cosine picks B, and L2 picks C instead', 'Both of them pick B, the closer point', 'Both of them pick C, the longer vector'],
+      answer: 0,
+      explain: 'Cosine for C is 1.0 (same direction) and for B is 0.707, so C wins. L2 distance to B is 1 and to C is 2, so B wins. Direction and gap can disagree when lengths differ.',
+    },
+    {
+      q: 'You store 1 million embeddings of 768 float32 numbers and scan them all for every query. About how much memory must one query read?',
+      options: ['About 3 MB', 'About 30 MB', 'About 300 MB', 'About 3 GB'],
+      answer: 3,
+      explain: '1,000,000 × 768 × 4 bytes = 3.07 GB. At RAM speeds of 10 to 50 GB/s that is 61 to 307 ms for one query, before any computation.',
+    },
+    {
+      q: 'An HNSW index gives poor recall. You cannot rebuild it today. Which change can you make at query time?',
+      options: ['Raise M', 'Raise ef_construction', 'Switch the column to a smaller dimension', 'Raise ef_search'],
+      answer: 3,
+      explain: 'ef_search is the candidate list size per query. A larger list reads more nodes and misses less. M and ef_construction are fixed when the graph is built, so changing them needs a rebuild.',
+    },
+    {
+      q: 'A pgvector HNSW query has ef_search = 40, LIMIT 10, and a filter that matches 10% of rows. How many rows does it likely return?',
+      options: ['About 10, because LIMIT always guarantees that many rows come back', 'About 4, since the filter runs after the scan', 'About 40, because ef_search sets how many rows come back', 'None, because a filter and an HNSW index can never be combined'],
+      answer: 1,
+      explain: 'The scan collects about 40 candidates, then the filter keeps 10% of them: about 4. LIMIT is a cap, not a promise. Iterative scans, a B-tree on the filter column, or partitions fix it.',
+    },
+    {
+      q: 'An IVF index has 1,000 lists and probes = 1. A query sits near the border of two clusters. What can go wrong?',
+      options: ['The query returns an error because the border is ambiguous', 'The index must be rebuilt before it can answer any more queries', 'The true neighbor may sit in an unprobed list and be missed', 'It scans all 1,000 lists and becomes very slow'],
+      answer: 2,
+      explain: 'With probes = 1 only the nearest cluster is scanned. A neighbor just across the border lives in another list and is skipped. Raising probes scans more lists, costs more, and misses less.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Embedding storage for a document search"
+  scenario="A search product embeds 10 million documents. Each embedding has 1,536 dimensions stored as float32 (4 bytes each). The HNSW index uses M = 16."
+  steps={[
+    {
+      prompt: 'How many GB do the raw vectors take?',
+      unit: 'GB',
+      answer: 61.4,
+      within: 1.1,
+      explain: '10,000,000 × 1,536 × 4 bytes = 61.44 billion bytes, about 61 GB. The graph links come on top.',
+    },
+    {
+      prompt: 'The same vectors as half-precision (2 bytes each, the halfvec type). How many GB?',
+      unit: 'GB',
+      answer: 30.7,
+      within: 1.1,
+      explain: 'Half the bytes per number gives half the size: about 30.7 GB. The price is lower precision in each number.',
+    },
+    {
+      prompt: 'How many of the 10 million points are on HNSW layer 1, if each point reaches layer 1 with probability 1/M?',
+      unit: 'points',
+      answer: 625000,
+      within: 1.1,
+      explain: '10,000,000 / 16 = 625,000 points on layer 1. Layer 2 has about 39,000. Each layer is one sixteenth of the one below.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Malkov and Yashunin, "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs"](https://arxiv.org/abs/1603.09320) (layers, M, efConstruction, memory estimate)
+- [pgvector README](https://github.com/pgvector/pgvector) (operators, HNSW and IVFFlat options, filtering, iterative scans)
+- [Wikipedia: Cosine similarity](https://en.wikipedia.org/wiki/Cosine_similarity) (the formula and its range)

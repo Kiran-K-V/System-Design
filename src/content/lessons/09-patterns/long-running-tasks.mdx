@@ -1,0 +1,210 @@
+---
+summary: 'Work that takes minutes cannot hold a request open. Accept it, return a job id with 202, run it on a worker, and let leases and heartbeats reassign the job if the worker dies.'
+requires: ['06-async/queues', '03-api-design/idempotency', '07-reliability/timeouts-retries']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import PatternsBuildsOn from '../../../components/anim/lessons/PatternsBuildsOn.tsx';
+import LongRunningLease from '../../../components/anim/lessons/LongRunningLease.tsx';
+import LongRunningStatus from '../../../components/anim/lessons/LongRunningStatus.tsx';
+
+## The problem
+
+A user asks for a report export, a video transcode, or a bulk import. The work takes 5 minutes. A web request cannot wait that long.
+
+- **Timeouts fire in the middle.** Browsers, load balancers, and gateways cut idle or slow requests ([lesson 2.4](/learn/02-networking/load-balancing/), [lesson 7.2](/learn/07-reliability/timeouts-retries/)). The client sees an error while the work may still be running.
+- **A held connection is a held thread.** Each waiting request ties up memory and a worker slot, so a burst of exports starves fast requests.
+- **A retry makes it worse.** The client times out and retries. Now two copies of the job run, and the report is built twice.
+- **A deploy kills the work.** If the server restarts mid-job, the job vanishes and nobody knows.
+
+A **long-running task** is work that outlives a single request. The fix is to stop doing it inside the request.
+
+## What this pattern is made of
+
+<PatternsBuildsOn
+  pattern="Long-running task"
+  parts={[
+    { n: '6.1', title: 'Queues', href: '/learn/06-async/queues/', job: 'Hold jobs until a worker is free.' },
+    { n: '6.3', title: 'Delivery Semantics', href: '/learn/06-async/delivery-semantics/', job: 'A job may run twice after a crash.' },
+    { n: '3.4', title: 'Idempotency', href: '/learn/03-api-design/idempotency/', job: 'A retried submit must not create a second job.' },
+    { n: '7.2', title: 'Timeouts, Retries, Backoff', href: '/learn/07-reliability/timeouts-retries/', job: 'Retry failed jobs without a storm.' },
+    { n: '6.4', title: 'Backpressure and Dead-letter Queues', href: '/learn/06-async/backpressure-dlq/', job: 'Park jobs that keep failing.' },
+  ]}
+/>
+
+New here is the **job record**, the status API, and the lease with its heartbeat.
+
+## The mechanism: accept, queue, work, report
+
+1. **Accept.** The API validates the request and writes a **job record** with status `QUEUED`. The record holds the job id, the owner, the input, and the idempotency key.
+2. **Queue.** The API puts a message that holds the job id on a queue ([lesson 6.1](/learn/06-async/queues/)).
+3. **Reply.** The API returns **202 Accepted** and the job id, plus a status URL such as `/jobs/42`. 202 means "I took it. It is not done." The reply takes milliseconds.
+4. **Work.** A worker takes the message, sets `RUNNING`, does the work, saves the result, and sets `SUCCEEDED` or `FAILED`.
+5. **Report.** The client finds out through one of three routes.
+
+Write the job record and the queue message so they cannot disagree. If the API writes the record and the process dies before it enqueues, the job is stuck `QUEUED` forever. The outbox from [lesson 6.5](/learn/06-async/cdc/) fixes this. A sweeper that re-enqueues old `QUEUED` jobs also works.
+
+### Three ways to report status
+
+<LongRunningStatus />
+
+- **Poll.** The client calls `GET /jobs/42` on a timer and sees `QUEUED`, `RUNNING`, or `SUCCEEDED`. Use backoff so ten thousand waiting clients do not hammer the API ([lesson 7.2](/learn/07-reliability/timeouts-retries/)).
+- **Webhook.** The service calls a URL the client registered when the job ends. It saves calls. It needs a public endpoint on the client, signature checks, and retries when the call fails.
+- **Push.** The service sends updates over an open connection such as SSE or a WebSocket ([lesson 2.5](/learn/02-networking/real-time-transport/)). Best for live progress. It needs a connection to hold.
+
+Most systems offer poll as the base and add one of the others. A poll always works when the others fail.
+
+## What happens when a worker dies
+
+This is the core problem. A worker takes a job and then crashes, or a deploy stops it, or the machine is lost. The queue cannot tell a dead worker from a slow one. If nothing handles this, the job is lost.
+
+The answer is a **lease**: the worker does not own the job forever. It borrows it for a fixed time. If the lease runs out, the job goes back to the queue for another worker. In SQS this is the **visibility timeout**: a received message is hidden until it is deleted or the timeout ends, and then it reappears. The default is 30 seconds ([lesson 6.1](/learn/06-async/queues/)).
+
+A lease raises a question. What if the job really needs 20 minutes? A lease longer than the job is too slow to recover from a crash. A lease shorter than the job hands it to a second worker while the first still runs. The answer is a **heartbeat**: while the worker is alive, it renews the lease. When the heartbeats stop, the lease runs out soon, and recovery is fast. The lease can be short, with a long job.
+
+In SQS the renewal is a call to `ChangeMessageVisibility`. The docs state a hard limit of 12 hours from the first receive, and extending does not reset it. For work longer than that, split it, or use a workflow engine. Temporal has a real Activity Heartbeat, and its docs say the server does not detect a worker that crashes unless you set a timeout, so set one.
+
+Step through it.
+
+<LongRunningLease client:visible />
+
+A heartbeat can also carry **progress**. Temporal's docs say a heartbeat may carry details that a later attempt can use. So a retry can resume at row 4,000 and not at row 0. That makes the retry cheap. It is optional, and your job must still be correct without it.
+
+## Retries need idempotency
+
+The lease gives you **at-least-once** work, never exactly-once. Worker A may have written the output file, or charged a card, before it died. Worker B then runs the job again. To make that safe, the effect must be **idempotent** ([lesson 3.4](/learn/03-api-design/idempotency/)):
+
+- **Dedupe key.** Use the job id as an idempotency key on every outside call. The payment API sees the same key and returns the saved result.
+- **Write once.** Write the output to a path derived from the job id. A second write replaces the same file with the same bytes.
+- **Record with the effect.** Save "step 3 done" in the same transaction as the step's database change. A repeat finds the mark and skips.
+
+Also set a retry limit. A **poison job** crashes every worker that touches it. After a set number of attempts, move it to a dead-letter queue and mark it `FAILED` ([lesson 6.4](/learn/06-async/backpressure-dlq/)). Retries use backoff with jitter ([lesson 7.2](/learn/07-reliability/timeouts-retries/)) and only for errors that can go away, such as a timeout. A validation error will fail the same way each time.
+
+A repeat of the client's own `POST` is a different duplicate. The client times out waiting for the 202 and posts again. The idempotency key in the request lets the API return the same job id for both posts.
+
+## Numbers
+
+These are derived from stated assumptions, not measured values.
+
+- **Recovery time.** With a 30 s lease and heartbeats every 10 s, a dead worker's job returns to the queue within 30 s of the last heartbeat. Without heartbeats, a lease long enough for a 20 minute job (1,200 s) means a crash delays the job by up to 1,200 s.
+- **Heartbeat load.** 10,000 running jobs, each heartbeating every 10 s, make 1,000 heartbeat calls per second. Pick the interval with that load in mind. Pick an interval well under the lease, so one missed heartbeat does not lose the job.
+- **Polling load.** 10,000 clients polling every 5 s make 2,000 requests per second, nearly all of them answering "still running." A webhook or push replaces them with 10,000 messages in total, one per job.
+
+For how queue depth and wait time grow when arrivals exceed capacity, see [lesson 1.3](/learn/01-one-machine/throughput-vs-latency/).
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Do the work in the request | No extra parts. Simple | Timeouts. Held connections. Lost work on restart | Work under a second or two |
+| Queue and workers with a job record | Fast reply. Survives crashes. Scales workers on queue depth | A status API. At-least-once means idempotent work | Most background work |
+| Short lease with heartbeat | Fast recovery. Long jobs possible | Heartbeat traffic. Code to renew. A stalled heartbeat loses the job | Jobs longer than a minute |
+| Long lease, no heartbeat | Simple worker | A crash delays the job for the whole lease | Short, uniform jobs |
+| Workflow engine | Retries, timers, heartbeats, and state built in | Another system. Determinism rules ([lesson 8.9](/learn/08-technologies/temporal/)) | Multi-step jobs with waits |
+
+<Callout type="tip">
+Say: "The API validates, writes a job record, enqueues the id, and returns 202 with a job id. A worker leases the job and heartbeats while it works. If the worker dies, the lease expires and another worker takes the job, so the job must be idempotent. The client polls the status URL, or gets a webhook. After N failed attempts the job goes to a dead-letter queue." Name the duplicate cases: worker retries and client retries.
+</Callout>
+
+<Callout type="mistake">
+Do not hold the HTTP connection for minutes and call it "async with a bigger timeout". Do not say "the queue keeps the job's progress": the queue only tracks whether the message was deleted. Do not claim exactly-once because the queue is "reliable". SQS delivers at least once. And do not retry every error forever: a poison job needs a limit and a dead-letter queue.
+</Callout>
+
+<Callout type="deep" title="Fencing a slow worker">
+A lease can expire while worker A is only slow, not dead (a long garbage-collection pause, for example). Then B starts, and A wakes up and finishes too. Both write results. Idempotent effects make that harmless. When they do not, give each attempt a number and let the store accept a write only from the newest attempt. That is a fencing token. The same idea appears with ZooKeeper locks in [lesson 8.8](/learn/08-technologies/zookeeper/).
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An export takes about 5 minutes. A client calls POST /exports. What should the API return?',
+      options: [
+        '200 with the file, after raising every timeout to 6 minutes',
+        '504 so the client retries until a worker has finished',
+        '202 with a job id and a status URL, after queuing the work',
+        '201 with the file URL before the file has been built',
+      ],
+      answer: 2,
+      explain: '202 means accepted but not finished. The job id lets the client check later. A long held request times out, a 504 is an error, and a 201 file URL would point at a file that does not exist yet.',
+    },
+    {
+      q: 'A job needs up to 20 minutes. You want a dead worker\'s job back in the queue within about 30 seconds. What do you use?',
+      options: [
+        'A 30 second lease that the worker renews with heartbeats',
+        'A 20 minute lease with no renewal and no heartbeat',
+        'A 30 second lease and a job that stops at 30 seconds',
+        'Two workers for every job, so one always survives a crash',
+      ],
+      answer: 0,
+      explain: 'A short lease with heartbeats gives fast recovery and still allows long jobs. A 20 minute lease delays recovery by up to 20 minutes. Stopping at 30 seconds breaks the job, and doubling workers doubles the work.',
+    },
+    {
+      q: 'Worker A charged a card for job 17, then crashed before it deleted the message. Worker B gets job 17. How do you avoid a second charge?',
+      options: [
+        'Configure the queue to deliver each message exactly once',
+        'Send the job id as the idempotency key on the charge',
+        'Make B wait twice the lease time before it starts the job',
+        'Have B ping A\'s machine to check whether it is still running',
+      ],
+      answer: 1,
+      explain: 'The payment API returns the saved result for a repeated key, so the second charge becomes a no-op. A standard queue cannot promise exactly-once. A longer wait does not tell B whether A finished, and B cannot reliably probe A.',
+    },
+    {
+      q: 'About 10,000 clients poll a job status every 5 seconds. Roughly how many status requests per second is that?',
+      options: ['500', '5,000', '50', '2,000'],
+      answer: 3,
+      explain: '10,000 ÷ 5 = 2,000 requests per second. Most return "still running", which is why webhooks or push help at this scale, or poll with a growing interval.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="longrunning-double-report"
+  title="Two emails for one report"
+  scenario="A report job runs on workers that lease jobs from a queue. Users sometimes get the finished report email twice. Workers have not crashed."
+  facts={[
+    'lease (visibility timeout):   30 s',
+    'heartbeats:                   none',
+    'report job p50:               20 s',
+    'report job p99:               70 s',
+    'duplicate emails:             about 1 in 20 jobs',
+    'job failures logged:          0',
+  ]}
+  steps={[
+    {
+      prompt: 'Why do duplicates occur with no crash?',
+      options: [
+        'The email provider retries sends on its own at random',
+        'The queue copies each message once it is received',
+        'Jobs past 30 s lose their lease, so a second worker starts them',
+        'The status API sends one email for each poll it receives',
+      ],
+      answer: 2,
+      explain: 'About 1 in 20 jobs run past the 30 s lease because p99 is 70 s. The message reappears while the first worker still runs. Both finish, and both send an email. The queue does not copy messages, and no failure appears in the logs.',
+    },
+    {
+      prompt: 'Which change fixes the cause and the harm?',
+      options: [
+        'Heartbeat to renew the lease, and send the email once per job id',
+        'Lower the lease to 10 s so crashes recover sooner',
+        'Run fewer workers so that two never overlap',
+        'Delete the message at the start, before the report is built',
+      ],
+      answer: 0,
+      explain: 'Heartbeats keep a live job leased, and a once-per-job-id guard makes any remaining repeat harmless. A shorter lease creates more overlaps. Fewer workers do not stop a message from reappearing. Deleting first loses the job if the worker dies.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Amazon SQS: Visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html) (30 s default, 12 hour limit, ChangeMessageVisibility)
+- [Temporal docs: Detecting Activity failures](https://docs.temporal.io/encyclopedia/detecting-activity-failures) (heartbeats, timeouts, progress in heartbeats)
+- [Amazon Builders' Library: Making retries safe with idempotent APIs](https://builder.aws.com/content/3Ev0BENTyBr0XxzRk5FDZzgNYos/making-retries-safe-with-idempotent-apis) (client tokens)
+- [Stripe: Designing robust and predictable APIs with idempotency](https://stripe.com/blog/idempotency) (idempotency keys on POST)

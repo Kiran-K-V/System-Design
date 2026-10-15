@@ -1,0 +1,272 @@
+---
+summary: 'An online auction is a contention problem on one hot row per auction: a conditional write picks the highest bid, a per-auction channel broadcasts it, and a server-side timer ends the auction.'
+requires: ['04-data/transactions', '09-patterns/contention', '09-patterns/real-time-updates']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../components/lesson/Ballpark.tsx';
+import AuctionBuild from '../../../components/anim/lessons/AuctionBuild.tsx';
+import AuctionRace from '../../../components/anim/lessons/AuctionRace.tsx';
+
+## The problem
+
+A seller lists a camera. Ten minutes before the end, 300 people want it. Many bids arrive in the same second.
+
+Two rules must hold. First, the highest bid wins, and no accepted bid may be silently lost. Second, everyone watching must see the new price quickly, or they bid against a price that is already gone.
+
+Most of the system is easy. One part is hard: many writers race to update **one value**, the highest bid of one auction. That is **contention**: many requests fighting for the same piece of data. Lesson [9.4](/learn/09-patterns/contention/) taught the general patterns. This case study applies them and adds two more problems: broadcasting the new price, and ending the auction on time.
+
+## Requirements
+
+**Functional.**
+
+1. A seller posts an item with a start price and an end time.
+2. A buyer places a bid. It is accepted only if it is higher than the current highest bid.
+3. Anyone can view an auction and its current highest bid.
+
+**Below the line.** Search, category filters, sort by price, and a history of past auctions.
+
+**Non-functional.** These are our assumptions. No public company figure gives bids per second for one auction.
+
+- Strong consistency for the highest bid. Two bids must never both "win" the same step.
+- A bid gets an answer quickly. Agree on the number with the interviewer.
+- Viewers see a new highest bid within about 1 second.
+- No accepted bid is lost.
+- The server clock decides when the auction ends.
+
+## Core entities
+
+- **Item**: id, seller, title.
+- **Auction**: id, item, start price, end time, status, highest bid, highest bidder, version.
+- **Bid**: id, auction, bidder, amount, time, idempotency key.
+
+## API
+
+| Call | Purpose |
+|---|---|
+| `POST /v1/auctions` | Item, start price, end time. Returns 201. |
+| `POST /v1/auctions/{id}/bids` | Amount and an idempotency key. Returns 201, or 409 if outbid. |
+| `GET /v1/auctions/{id}` | Status and current highest bid. |
+| `WS /v1/auctions/{id}/stream` | Server pushes each new highest bid. |
+
+The bid call needs an idempotency key (lesson [3.4](/learn/03-api-design/idempotency/)). A phone that retries after a timeout must not place two bids.
+
+## High-level design
+
+Step through the build.
+
+<AuctionBuild client:visible />
+
+Three details are worth saying aloud.
+
+- The **auction row** holds the current highest bid. It is the only value that bids compete for. The **bid log** is append-only, so all bids are kept.
+- **Reads** and **writes** have different shapes. A viewer reads again and again. A bidder writes once in a while. Keep the two paths apart so viewers cannot slow bids down.
+- **Sharding** (lesson [4.7](/learn/04-data/sharding/)) is by auction id. All bids for one auction go to one shard. Different auctions spread over many shards.
+
+## Numbers
+
+Assume 1M new auctions a day and 10 bids per auction on average.
+
+| Quantity | Math | Result |
+|---|---|---|
+| Bids per day | 1M x 10 | 10M |
+| Average bid rate | 10M / 100,000 s | ~100 per second |
+| Peak bid rate, 10x | 100 x 10 | ~1,000 per second |
+| Bid log, one year | 10M x 100 B x 365 | ~365 GB |
+| One hot auction, pushes | 20 bids/s x 5,000 viewers | 100,000 per second |
+
+The total write load is modest in this model. Two things are large. The first is **per-auction contention**: the last minute of one popular auction has many bids on one row. The second is **fan-out**: each bid must reach every viewer of that auction. Notice that the fan-out is the bigger number. Sizing is about one hot auction, not the total.
+
+<Ballpark
+  client:visible
+  title="One hot auction"
+  scenario="Assume 1M auctions a day with 10 bids each. Treat a day as 100,000 seconds. In its last minute one popular auction gets 20 bids per second and has 5,000 viewers. A bid row is 100 bytes."
+  steps={[
+    {
+      prompt: 'How many bids per second across all auctions, on average?',
+      unit: 'bids per second',
+      answer: 100,
+      within: 1.3,
+      explain: '1M x 10 = 10M bids a day. 10,000,000 / 100,000 = 100 per second.',
+    },
+    {
+      prompt: 'How many WebSocket pushes per second does the hot auction need?',
+      unit: 'pushes per second',
+      answer: 100_000,
+      within: 1.3,
+      explain: 'Each bid is sent to each viewer. 20 x 5,000 = 100,000 pushes per second, from one auction. Spread over gateway servers, each holds a share of the 5,000 viewers.',
+    },
+    {
+      prompt: 'How many GB of bid log do we store in one year?',
+      unit: 'GB',
+      answer: 365,
+      within: 1.3,
+      explain: '10M x 100 B = 1 GB a day. 1 GB x 365 = 365 GB. Small enough for one replicated database or a few shards.',
+    },
+  ]}
+/>
+
+## Deep dive: the highest-bid race
+
+The naive handler does three steps in code: read the row, compare, write. The problem is that the three steps are not one step. Another bid can run between them.
+
+<AuctionRace client:visible />
+
+The failure is called a **lost update**. B was told "accepted", then A overwrote B. This is the same anomaly lesson [4.4](/learn/04-data/transactions/) showed.
+
+The fix puts the check and the write in one statement. It is a **conditional write**, also called **compare-and-set**: change the value only if it still has the value you expect.
+
+```sql
+UPDATE auctions
+SET highest_bid = :amount, highest_bidder = :user, version = version + 1
+WHERE id = :id AND highest_bid < :amount AND status = 'open' AND end_at > now();
+```
+
+The database locks the row for the length of the statement, so two bids on one auction run one after the other. In PostgreSQL at the default READ COMMITTED level, the second one re-checks the row after the first commits. If it affects 0 rows, the bid was too low, the auction was closed, or time ran out. The service returns 409 with the current high bid. The bid log insert goes in the same transaction.
+
+This is **optimistic concurrency**: assume no conflict, and detect one at write time. It holds no lock while the client thinks. It works well when conflicts are rare for most auctions and bounded for one auction. The `version` column is for cases where the rule is more than "higher than". If a bid must be at least 5 above the current high, the service reads the row, computes, and writes with `WHERE version = :seen`. A 0-row result means "retry with fresh data".
+
+What are the other options?
+
+| Option | How | Cost |
+|---|---|---|
+| Row lock first | `SELECT ... FOR UPDATE`, then update | Holds a lock across two statements. Bids queue behind each other |
+| Single writer per auction | Route all bids of one auction to one partition and one thread | Needs routing, and failover for the owner. No lock fights at all |
+| Redis script | A Lua script does the compare and set in memory (lesson [8.2](/learn/08-technologies/redis/)) | Fast, but a failover can lose the latest bids. Say this out loud |
+
+Do not lock the whole table. That makes every auction wait for every other auction.
+
+## Deep dive: telling everyone
+
+Each viewer wants the new price. The first idea is to poll. With 5,000 viewers polling once a second, one auction row takes 5,000 reads a second, and a viewer sees a new price up to a second late.
+
+Push is better. After a bid commits, the service publishes it to a **channel** for that auction, using pub/sub (lesson [6.2](/learn/06-async/pubsub-logs/)). **Gateway** servers hold the viewers' WebSocket connections (lesson [9.3](/learn/09-patterns/real-time-updates/)). Each gateway subscribes to the channels of the auctions its viewers watch, and pushes each message to those viewers.
+
+Two details matter. A gateway that restarts loses its connections. Clients reconnect and fetch the current state with a plain `GET`, so a missed push is repaired. Second, send the highest bid and its version, not "a bid happened". A viewer drops any message older than what it already shows, so out-of-order delivery is harmless.
+
+## Deep dive: when the auction ends
+
+A cron job that scans all auctions every minute is late by up to a minute, and it scans millions of rows. Use a timer per auction instead. When an auction is created, schedule a close event at its end time in a delay queue or scheduler (lesson [11.15](/learn/11-breakdowns/job-scheduler/) shows one).
+
+Two rules protect the end.
+
+1. **The server clock decides.** A bid is valid only if `end_at > now()` on the database. A phone clock can be wrong or changed. A bid that left the phone at 17:59:59.9 but arrives at 18:00:00.1 is late. Say so in the rules. Clocks across servers also differ slightly (lesson [10.5](/learn/10-advanced/ids-and-time/)), so judge time in one place, the shard that owns the auction.
+2. **Closing is conditional too.** Many auctions use **anti-sniping**: a bid in the last two minutes pushes the end time out by two minutes. Then the timer that fires at the old time is stale. The close statement is `UPDATE ... SET status = 'closed' WHERE id = :id AND status = 'open' AND end_at <= now()`. If it affects 0 rows, the auction was extended, so reschedule the timer for the new `end_at`.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Conditional update in a SQL database | Simple, correct, durable | One row is the throughput limit per auction | Default answer |
+| Single writer per auction | No retries, clear order | Routing and owner failover | Very hot auctions |
+| Redis compare-and-set | Very low latency | A failover can lose acknowledged bids | Speed matters more than strict durability |
+| Push over WebSocket | Prices are fresh, no polling load | Many connections to manage | Many viewers per auction |
+| Polling every few seconds | Easy | Stale prices, read load | Few viewers, relaxed freshness |
+| Anti-sniping extension | Fairer end | Auctions can run long | Late bidding is common |
+
+<Callout type="tip">
+Draw the race first. "Two bids read 100, both pass the check, the lower one writes last." Then give the fix in one line: "one conditional update, so the database decides." Then say what the second bidder sees: a 409 with the current high bid.
+</Callout>
+
+<Callout type="mistake">
+Do not say "use a distributed lock" before you have tried a conditional write. A lock adds a second system that can fail, and the database already locks the row. Also do not let the client send the bid time. The server picks the time.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'The auction row says highest = 100. Two bids, 150 and then 160, run one after the other with the statement UPDATE ... WHERE highest_bid < :amount. What is the outcome?',
+      options: [
+        'Only 160 is accepted, because the 150 bid conflicts with the 160 bid',
+        'Only 150 is accepted, because it arrived first and was already stored',
+        'Both fail, because the row changed in between the two statements',
+        'Both are accepted, 150 first, and the final high is 160',
+      ],
+      answer: 3,
+      explain: 'The statements do not overlap. 150 is higher than 100, so it succeeds. 160 is higher than 150, so it also succeeds. The conditional write only rejects a bid that is not higher than the current row. Both bids stay in the log.',
+    },
+    {
+      q: 'An auction was extended from 18:00:00 to 18:02:00 by a late bid. The old close timer fires at 18:00:00. Which close statement is safe?',
+      options: [
+        'Close only if status is open and end_at <= now(), else reschedule',
+        'Close if status is open, because the timer fired on time',
+        'Read end_at in code, then close if it is past, in a second query',
+        'Close it, then reopen it if a bid arrives in the next two minutes',
+      ],
+      answer: 0,
+      explain: 'The timer is stale. A conditional close that checks end_at affects 0 rows because end_at is now 18:02:00, and the service reschedules. Checking status alone closes the auction early. A read followed by a write has the same race as the naive bid.',
+    },
+    {
+      q: 'A hot auction gets 30 bids per second and has 2,000 viewers on WebSockets. How many pushes per second must the gateways send for this one auction?',
+      options: [
+        'About 30 per second, since there is one push for each bid',
+        'About 2,000 per second, since there is one push for each viewer',
+        'About 60,000 per second, since each bid reaches each viewer',
+        'About 32,000 per second, as the sum of both numbers',
+      ],
+      answer: 2,
+      explain: 'Fan-out multiplies. 30 bids a second times 2,000 viewers is 60,000 pushes a second. Adding the two numbers has no meaning. This is why the push path is the larger load.',
+    },
+    {
+      q: 'You shard the auctions table across 50 databases by auction id. What does this change for the highest-bid race?',
+      options: [
+        'It removes the race, because each shard has only a few rows left to fight over',
+        'Nothing for one auction: its bids still hit one row on one shard',
+        'It makes the race worse, because bids for one auction now cross shards',
+        'It removes the need for a conditional write on the auction row',
+      ],
+      answer: 1,
+      explain: 'Sharding spreads different auctions apart. All bids for one auction still land on one row on one shard, so the conditional update is still what picks the winner. It also keeps a bid and its log row in one local transaction.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="online-auction-early-close"
+  title="The winner had the second-highest bid"
+  scenario="Auction a-77 had its end time pushed out by anti-sniping. Afterward the 410 bidder complains that the item went to someone who bid 400."
+  facts={[
+    'time      event',
+    '17:59:58  bid 410 (user u4) accepted',
+    '17:59:58  end_at moved 18:00:00 -> 18:02:00',
+    '18:00:00  close timer fired for a-77',
+    '18:00:00  status = closed, winner = bid 400 (user u9)',
+    '18:00:02  bid 410 row exists in the bid log',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The bid log lost the 410 bid, so the winner was chosen from older data',
+        'The viewers saw a stale price, so the 410 bidder bid on old information',
+        'The old timer closed it without checking the moved end time, using a stale read',
+        'The 410 bid was rejected by the conditional update, but the log still stored it',
+      ],
+      answer: 2,
+      explain: 'The timer was set for 18:00:00 and nothing told it that end_at moved. It closed the auction and read a stale winner. The log has the 410 row, so the data is not lost. The bid was accepted, so the update did not reject it.',
+    },
+    {
+      prompt: 'Which change fixes it?',
+      options: [
+        'Close with a conditional update on status and end_at, and reschedule on 0 rows',
+        'Run the close timer one minute later, so extensions are always done by then',
+        'Stop extending end times, so every timer fires at a fixed time',
+        'Let the client tell the server when the auction has ended, to avoid clock issues',
+      ],
+      answer: 0,
+      explain: 'The conditional close fails safely when end_at moved, and the service reschedules. A later timer only shifts the race. Removing the extension drops a product rule. The client clock is the wrong source for the end time.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [PostgreSQL: Explicit locking](https://www.postgresql.org/docs/current/explicit-locking.html) (row locks, and what `UPDATE` and `SELECT ... FOR UPDATE` hold)
+- [PostgreSQL: Transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) (how concurrent updates to one row behave at each level)
+- [Redis: Scripting with Lua](https://redis.io/docs/latest/develop/programmability/eval-intro/) (atomic compare-and-set in memory, and its limits)

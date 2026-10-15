@@ -1,0 +1,249 @@
+---
+summary: 'To push updates to many users you need more than a socket. Connection servers hold sockets, pub/sub fans events out, a registry finds a user, and a log lets a client catch up.'
+requires: ['02-networking/real-time-transport', '06-async/pubsub-logs', '08-technologies/redis']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import PatternsBuildsOn from '../../../components/anim/lessons/PatternsBuildsOn.tsx';
+import RealTimeUpdatesWalk from '../../../components/anim/lessons/RealTimeUpdatesWalk.tsx';
+import RealTimeUpdatesFanout from '../../../components/anim/lessons/RealTimeUpdatesFanout.tsx';
+
+## The problem
+
+A user opens a chat, a live score page, or an order tracker. Something changes on the server. The user should see it in well under a second, without asking.
+
+Lesson [2.5](/learn/02-networking/real-time-transport/) solved the client side of this: which transport carries the update. That lesson assumed one server. The hard part starts with two. The user is connected to server 1. The event is created by a request that landed on server 2. How does it get from one to the other?
+
+Three questions follow, and this lesson answers each of them.
+
+- **Fan-out.** One event must reach many sockets spread over many servers. How do you do it without sending a message to every server, or one message to every user?
+- **Where is the user?** A socket is state held by one machine. Something must know which one.
+- **What if the socket drops?** Deploys, crashes, and phone tunnels all cut connections. How does a user get what they missed?
+
+<PatternsBuildsOn
+  pattern="Real-time updates"
+  parts={[
+    { n: '2.5', title: 'Real-time transport', href: '/learn/02-networking/real-time-transport/', job: 'The socket itself, and reconnect with jitter.' },
+    { n: '6.2', title: 'Pub/sub and logs', href: '/learn/06-async/pubsub-logs/', job: 'Fan-out to many listeners, and a log to replay from.' },
+    { n: '8.2', title: 'Redis', href: '/learn/08-technologies/redis/', job: 'A fast shared store for the registry and a simple pub/sub.' },
+    { n: '4.11', title: 'Consensus and ordering', href: '/learn/04-data/consensus/', job: 'One writer per channel gives one order of events.' },
+    { n: '7.2', title: 'Timeouts, retries, backoff', href: '/learn/07-reliability/timeouts-retries/', job: 'Jitter, so a drop does not become a reconnect storm.' },
+  ]}
+/>
+
+## Transport recap, in one table
+
+Do not re-learn this. Lesson [2.5](/learn/02-networking/real-time-transport/) has the detail.
+
+| Method | How it works | Pick it for |
+|---|---|---|
+| Short polling | The client asks every few seconds | Slow updates |
+| Long polling | The server holds the request until there is news | A fallback |
+| SSE | One long HTTP response that the server keeps writing to | Server-to-client feeds |
+| WebSocket | One two-way connection | Chat, games, collaboration |
+
+Two SSE facts matter for the server side. MDN says the browser reconnects by default when the connection drops. And the event stream has an `id` field. The HTML standard says that on reconnect the browser sends the last id it saw in a `Last-Event-ID` header. That is a ready-made hook for catch-up. With WebSocket you build that part yourself.
+
+## Naive solution: sockets and logic in one process
+
+The simplest server keeps a map from user id to socket in memory. To notify user 7, it looks up the socket and writes. It works with one server.
+
+With two servers it breaks in a quiet way. The write request for a message may land on server 2. The recipient is on server 1. Server 2 has no socket for them. The message is saved, and the user does not see it until they reload.
+
+Two bad fixes appear next.
+
+- **Each socket polls the database** every second. With 100,000 sockets that is 100,000 queries per second to learn that usually nothing changed.
+- **Every server asks every other server.** The number of connections grows with the square of the fleet.
+
+## The mechanism
+
+The pattern splits the work into four parts. Step through the walk: it follows one message, then one private message, then a crash.
+
+<RealTimeUpdatesWalk client:visible />
+
+**Connection servers** do only one job: hold sockets and write to them. They keep no business logic. Lesson [2.5](/learn/02-networking/real-time-transport/) calls this layer a gateway. Because they are stateful, deploys and load balancing need care.
+
+**A durable log** is the source of truth. The API appends the event first and gets an order number for the channel: a sequence number. Only then does it announce it. If the live path loses the event, the log still has it. One writer per channel (or one log partition per channel, lesson [6.2](/learn/06-async/pubsub-logs/)) gives all listeners the same order.
+
+**Pub/sub** carries the announcement. Each connection server subscribes to the channels its own users watch, and unsubscribes when the last such user leaves. The bus then delivers one copy to each interested server. Each server writes it to its own sockets.
+
+**A registry** answers "which server holds user 7?" for targeted messages. Each server writes `user -> server` entries with a short expiry and refreshes them while the socket lives. A crashed server's entries expire by themselves. A key with an expiry is a basic Redis feature (lesson [8.2](/learn/08-technologies/redis/)).
+
+Use the right tool for the audience. **Broadcast to a channel** goes through pub/sub. **A message to one person** goes through the registry to one server. An entry that is missing, or that points to a dead server, means "not connected now". Send a push notification, or leave the message in the log for catch-up.
+
+## The cost of fan-out
+
+How many internal messages does one event cost? It depends on how many servers hold a member, not on how many members there are. Try it.
+
+<RealTimeUpdatesFanout client:visible />
+
+**The model.** If each member sits on a random server, the expected number of servers with at least one member is `S x (1 - (1 - 1/S)^m)`. For `S = 50` and `m = 20` that is 50 x (1 - 0.98^20) = 50 x (1 - 0.668) = about 16.6. A global topic sends 50. One message per member sends 20, and many of them go to the same server.
+
+**Assumptions.** Uniform random placement. Equal servers. Every server subscribes only to channels it has members in. Real placement is skewed, because friends often join around the same time and hit the same server, so real numbers are usually a little lower for small groups.
+
+What to notice: a small channel is cheap with per-channel subscriptions and wasteful with a global topic. A huge channel reaches nearly every server anyway. After that point the cost is on the last hop: a server with 1,000 members of a channel writes 1,000 small frames for each event. For very large audiences, one option is to batch the events of one short tick into a single frame per socket.
+
+## Pub/sub is not a log
+
+This trap catches many designs. Redis documents its Pub/Sub as **at-most-once**: "a message will be delivered once if at all". If a subscriber is not connected, or cannot keep up, the message is gone. The Redis docs point to Redis Streams for persisted messages.
+
+So pub/sub gives a **fast** path and no **safe** path. That is why the log comes first. Treat the live message as a hint: "something new is in channel 9, sequence 43". The log is where the truth is. Lesson [6.2](/learn/06-async/pubsub-logs/) covers logs that keep records.
+
+## Reconnect and catch-up
+
+A connection drops. The reconnect itself needs jitter, or 100,000 clients return in the same second (lessons [2.5](/learn/02-networking/real-time-transport/) and [7.2](/learn/07-reliability/timeouts-retries/)). Reconnecting only restores the pipe. The client still has a gap.
+
+The fix has three parts:
+
+1. **Every event carries a sequence number** per channel, from the log.
+2. **The client remembers the last number it processed** and sends it on reconnect. SSE does this with `Last-Event-ID`. With a WebSocket, send it in the first message.
+3. **The server replays from the log**: every event after that number, in order. Then it switches the client to the live path.
+
+The switch is the tricky moment. While the server replays events 43 to 50, event 51 may arrive live. If the server sends 51 first, the client sees a gap. If it sends 51 twice, the client sees a duplicate. The safe way is to buffer live events during the replay, send the replay, and then send buffered events whose sequence number is above the last one sent. The client also ignores any number it has already seen. Sequence numbers make the whole thing safe to repeat.
+
+If the gap is very large, such as a phone that was off for a week, replaying every event is slower than sending the current state. Pick a limit and send a fresh snapshot beyond it.
+
+Slow clients need a rule as well. A client that cannot read as fast as events arrive makes the server buffer without limit. Give each socket a bounded send buffer. When it fills, drop the client. It reconnects and catches up from the log, which is correct because the log holds everything.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Redis Pub/Sub delivery | at-most-once | Redis docs |
+| SSE connections per browser and domain on HTTP/1.1 | 6 (the limit is per browser and domain, across tabs) | MDN |
+| SSE streams on HTTP/2 | negotiated, default 100 | MDN |
+| Expected servers reached, 20 members, 50 servers | ~16.6 | Derived above |
+| Expected servers reached, 5 members, 50 servers | 50 x (1 - 0.98^5) = ~4.8 | Derived |
+| Sockets per server | measure it: depends on runtime and kernel settings | Lesson 2.5 |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| One global topic | Simple, no subscription bookkeeping | Every server handles every event | Few servers or tiny fleets |
+| Per-channel topics | Servers see only their channels | Subscribe and unsubscribe churn | Many channels, uneven size |
+| Registry and direct send | Exact targets for private messages | A registry to keep fresh, stale entries | Direct messages, notifications |
+| Log plus resume | Nothing is lost, replay is safe | A log to run and a sequence per channel | Any feature where a missed event matters |
+| Pub/sub only | Lowest latency, least to run | Lost events on any drop | Ephemeral signals such as typing |
+
+## Interview lens
+
+<Callout type="tip">
+Name the four parts in order. "Sockets live on connection servers. The API writes the event to a log, then publishes to pub/sub. Each server subscribes to the channels its users watch. A registry maps users to servers for direct messages. On reconnect the client sends its last sequence number and gets a replay." Then state the weak point: "Pub/sub is at-most-once, so the log is the safety net."
+</Callout>
+
+<Callout type="mistake">
+Do not say "use Redis pub/sub" as if it never loses a message. Do not skip reconnect: a design with no catch-up loses events on every deploy. Do not let every server subscribe to everything when channels are many. And do not send the replay and the live stream as two unordered streams. Say how you avoid gaps and duplicates.
+</Callout>
+
+<Callout type="deep" title="Why a deploy is a reconnect storm">
+A rolling deploy restarts connection servers one at a time. Each restart drops all of its sockets at once. Those clients reconnect to the survivors, which are then busy with their own load. If the fleet has 10 servers and you restart one, the other 9 absorb 1/9 more clients each, in a burst. Drain first: stop accepting new sockets, tell clients to reconnect after a random delay, and restart in small batches. Jitter plus a replay from the log makes it invisible to users.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A channel has 20 members placed at random on 50 connection servers. Servers subscribe per channel. About how many servers receive one event?',
+      options: [
+        'About 17 servers, because some members share a server',
+        'Exactly 20 servers, one for each of the members',
+        'All 50 servers, because pub/sub sends to the whole fleet',
+        'Exactly 1 server, because the channel has one owner',
+      ],
+      answer: 0,
+      explain: 'The expected number is 50 x (1 - (49/50)^20) = about 16.6. Twenty members would need 20 servers only if no two shared one. With 20 members on 50 servers, a few collide, so the count is a little below 20.',
+    },
+    {
+      q: 'A connection server restarts and is gone for 3 seconds. Events published meanwhile use Redis Pub/Sub only. What happens for the clients of that server when they reconnect?',
+      options: [
+        'Redis stores the events and replays them to the new subscriber',
+        'The events are queued on the new connection server for later',
+        'The browser fetches them again because SSE always re-sends the stream',
+        'Lost on the live path, so the client catches up from the log',
+      ],
+      answer: 3,
+      explain: 'Redis documents Pub/Sub as at-most-once: a message is delivered once if at all, so a listener that is not connected does not get it later. The durable log, replayed from the client\'s last sequence number, fills the gap.',
+    },
+    {
+      q: 'Registry entries expire 30 seconds after the last refresh. A connection server crashes. For how long can the API still believe a user is on that dead server, and what should a failed send do?',
+      options: [
+        'Never, because the registry notices the crash at once.',
+        'For up to 5 min. Delete the user\'s data so the entry is rebuilt.',
+        'For up to 30 s. Treat a failed send as "offline".',
+        'For up to 30 s. Retry the same server until the entry expires.',
+      ],
+      answer: 2,
+      explain: 'The entry is only removed when its expiry passes, so for up to the full 30 s the registry can be wrong. A send to the dead server fails. Treat that as "not connected" and fall back. Retrying the same machine adds load and does nothing.',
+    },
+    {
+      q: 'During catch-up the server replays events 43 to 50 from the log. Event 51 arrives live on the new socket in the middle of the replay. What prevents a gap or a duplicate?',
+      options: [
+        'Turning off the live path until the replay has fully finished',
+        'Buffering live events, then sending those above the replay',
+        'Sending event 51 first so that the client sees the newest state',
+        'Asking the client to reload the page after the replay ends',
+      ],
+      answer: 1,
+      explain: 'Sequence numbers let the server order the two streams. It sends the replay, then the buffered live events with a number above 50. Turning the live path off loses events that arrive in that window. Sending 51 first creates a gap.',
+    },
+    {
+      q: 'A browser uses SSE and the server tags each event with an id. The connection drops and the browser reconnects by itself. What does the browser send, and why does it help?',
+      options: [
+        'A new session cookie, which makes the server replay from its start',
+        'The Last-Event-ID header, which tells the server where to resume',
+        'A retry count, which tells the server how many events were lost',
+        'Nothing, because SSE has no way to report what the client saw',
+      ],
+      answer: 1,
+      explain: 'The HTML standard has the browser send the last event id it saw in a Last-Event-ID header when it reconnects. The server can replay everything after that id. It is catch-up built into the protocol.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="real-time-updates-deploy-gap"
+  title="Messages missing after a deploy"
+  scenario="A chat service has 10 connection servers and Redis Pub/Sub. After every rolling deploy, a few users report that messages sent during the deploy never appear, even after refresh in the app view."
+  facts={[
+    'API logs: every message published to channel 9, no errors',
+    'message store (database): all messages present, in order',
+    'client: reconnects in ~2 s after the socket drops, shows only live events',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The database lost the messages during the deploy',
+        'Redis Pub/Sub dropped events for sockets that were reconnecting',
+        'The load balancer sent the reconnecting clients to the wrong region',
+        'The messages arrived out of order, so the app hid them',
+      ],
+      answer: 1,
+      explain: 'The messages are stored and the API published them. Pub/Sub is at-most-once, so events published while a client had no live connection were never delivered to it. The client shows only live events, so nothing fills the gap.',
+    },
+    {
+      prompt: 'What is the fix?',
+      options: [
+        'Reconnect faster, so the socket is down for less than a second',
+        'Publish each message to Pub/Sub twice, to double the delivery chance',
+        'Number messages per channel and replay after the last one',
+        'Disable rolling deploys, and restart every server at the same time',
+      ],
+      answer: 2,
+      explain: 'Faster reconnects shrink the gap but never close it. Publishing twice does not help a listener that is not connected. A per-channel sequence number plus a replay from the stored messages closes the gap by design.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Redis docs: Pub/Sub](https://redis.io/docs/latest/develop/pubsub/): at-most-once delivery, and a pointer to Streams.
+- [MDN: Using server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events): the event stream format, `id`, `retry`, and the connection limit.
+- [WHATWG HTML Standard: Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html): the `Last-Event-ID` header on reconnect.
+- [Slack Engineering: Real-time Messaging](https://slack.engineering/real-time-messaging/): gateway servers and channel servers at scale (a company's own account).
