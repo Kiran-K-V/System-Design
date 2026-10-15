@@ -171,9 +171,9 @@ export default function QueueSim() {
               <dl className="grid grid-cols-2 gap-y-1 text-xs">
                 <dt className="text-muted">Work per request</dt>
                 <dd className="text-right font-mono">100 ms</dd>
-                <dt className="text-muted">Theory: response</dt>
+                <dt className="text-muted">Theory: avg response</dt>
                 <dd className="text-right font-mono">{Math.round(theory(rho) * 1000)} ms</dd>
-                <dt className="text-muted">Measured: response</dt>
+                <dt className="text-muted">Measured: avg response</dt>
                 <dd className="text-right font-mono">{measured === null ? '—' : `${Math.round(measured * 1000)} ms`}</dd>
               </dl>
               <div className="flex gap-2">
@@ -201,7 +201,8 @@ export default function QueueSim() {
 
         <figcaption className="border-t border-line px-4 py-3 text-[0.95rem] leading-relaxed">
           Press Run. Start at 50%, then drag to 80%, 90%, and 95%. The work per request never changes. Only the wait in
-          the queue grows, and it grows faster the closer you get to 100%.
+          the queue grows, and it grows faster the closer you get to 100%. Both numbers are averages: “measured” is the
+          mean of the last 300 requests.
         </figcaption>
       </figure>
     </MotionConfig>
@@ -219,7 +220,7 @@ function Curve({ rho, measured }: { rho: number; measured: number | null }) {
   for (let r = 0; r <= 0.967; r += 0.01) pts.push(`${x(r).toFixed(1)},${y(theory(r)).toFixed(1)}`);
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="h-auto w-full" role="img" aria-label="Response time versus utilization">
+    <svg viewBox={`0 0 ${W} ${H}`} className="h-auto w-full" role="img" aria-label="Average response time versus utilization">
       {[0, 1, 2, 3].map((s) => (
         <g key={s}>
           <line x1={P.l} x2={W - P.r} y1={y(s)} y2={y(s)} stroke="var(--border)" />
