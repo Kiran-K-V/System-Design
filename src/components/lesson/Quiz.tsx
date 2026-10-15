@@ -1,6 +1,7 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import QuestionCard from './QuestionCard';
 import { POINTS } from '../../lib/mastery';
+import { celebrate } from '../../lib/confetti';
 import type { Question } from '../../lib/questionId';
 
 export type { Question };
@@ -13,9 +14,14 @@ export default function Quiz({ questions }: { questions: Question[] }) {
   const correct = Object.values(results).filter((r) => r.correct).length;
   const max = questions.length * POINTS.sure[0];
   const top = useRef<HTMLDivElement>(null);
+  // Max points means every answer was right and every confidence was "Sure".
+  const perfect = answered === questions.length && points === max;
+  useEffect(() => {
+    if (perfect) celebrate();
+  }, [perfect]);
 
   return (
-    <div ref={top} className="not-prose my-6 space-y-5">
+    <div ref={top} className="not-prose my-6 space-y-5" data-pagefind-ignore>
       {questions.map((question, qi) => (
         <QuestionCard
           key={`${attempt}-${qi}`}

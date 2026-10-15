@@ -46,6 +46,22 @@ export const loadCalibration = () =>
 export const loadExplain = () => read<Explain>('sd-explain', {});
 export const loadDone = () => read<string[]>('sd-progress', []);
 
+const ACTIVITY_DAYS = 200;
+
+/** Local calendar day as YYYY-MM-DD. */
+export const isoDay = (d = new Date()) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+export const loadActivity = () => read<string[]>('sd-activity', []);
+
+/** Log one activity for today (a lesson marked complete or a review answer). One ISO date per event, last 200 days kept. */
+export function recordActivity(now = new Date()) {
+  const cutoff = isoDay(new Date(now.getTime() - ACTIVITY_DAYS * DAY));
+  const days = loadActivity().filter((d) => d >= cutoff);
+  days.push(isoDay(now));
+  write('sd-activity', days);
+}
+
 export function recordAnswer(id: string, correct: boolean, confidence: Confidence, now = Date.now()) {
   const cards = loadCards();
   const prev = cards[id] ?? { box: 1, due: now, seen: 0, right: 0 };
@@ -53,8 +69,11 @@ export function recordAnswer(id: string, correct: boolean, confidence: Confidenc
   cards[id] = { box, due: now + BOX_DAYS[box] * DAY, seen: prev.seen + 1, right: prev.right + (correct ? 1 : 0) };
   const cal = loadCalibration();
   cal[confidence] = [cal[confidence][0] + (correct ? 1 : 0), cal[confidence][1] + 1];
-  localStorage.setItem('sd-calibration', JSON.stringify(cal));
+  try {
+    localStorage.setItem('sd-calibration', JSON.stringify(cal));
+  } catch {}
   write('sd-cards', cards);
+  recordActivity();
 }
 
 export function saveExplain(id: string, text: string) {

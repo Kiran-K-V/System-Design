@@ -65,7 +65,7 @@ export default function Ballpark({ title, scenario, facts, steps }: Props) {
   const right = results.filter((r) => r.ok).length;
 
   return (
-    <div className="not-prose my-6 rounded-xl border border-line p-4">
+    <div className="not-prose my-6 rounded-xl border border-line p-4" data-pagefind-ignore>
       <p className="font-mono text-[12px] uppercase tracking-wide text-muted">Prove it · {title}</p>
       <p className="mt-2 font-medium">{scenario}</p>
       {facts && <pre className="mt-3 overflow-x-auto rounded-lg bg-surface p-3 font-mono text-[13px] leading-relaxed">{facts.join('\n')}</pre>}

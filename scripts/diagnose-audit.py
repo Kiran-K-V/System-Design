@@ -42,7 +42,7 @@ def diagnose_steps(src):
 
 def main():
     rows = []
-    for path in sorted(glob.glob('src/content/lessons/*/*.mdx')):
+    for path in sorted(glob.glob('src/content/lessons/**/*.mdx', recursive=True)):
         src = open(path, encoding='utf-8').read()
         for block in diagnose_steps(src):
             for om in OPTIONS.finditer(block):

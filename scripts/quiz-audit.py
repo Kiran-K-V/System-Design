@@ -14,7 +14,7 @@ import statistics
 import sys
 from collections import Counter
 
-LESSONS = 'src/content/lessons/*/*.mdx'
+LESSONS = 'src/content/lessons/**/*.mdx'
 QUESTION_START = re.compile(r"\{\s*(?:id:\s*'[^']*',\s*)?q:\s*'((?:[^'\\]|\\.)*)'")
 OPTIONS = re.compile(r"options:\s*\[(.*?)\],\s*answer:\s*(\d+)", re.S)
 STRING = re.compile(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"")
@@ -60,7 +60,7 @@ def questions(path):
 
 def main():
     rows = []
-    for path in sorted(glob.glob(LESSONS)):
+    for path in sorted(glob.glob(LESSONS, recursive=True)):
         lesson = path.split('/')[-2] + '/' + path.split('/')[-1][:-4]
         for text, opts, ans in questions(path):
             lens = [len(o) for o in opts]

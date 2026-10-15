@@ -1,0 +1,204 @@
+---
+summary: 'A transformer is a stack of identical layers, each with an attention block and an MLP block. Most of its parameters are in matrices, so cost is about 2 FLOPs per parameter per token. Count parameters from the config.'
+requires: ['ai/a1-model-function/embeddings', '01-one-machine/estimation']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai1FwdFlow from '../../../../components/anim/lessons/Ai1FwdFlow.tsx';
+import Ai1FwdCalc from '../../../../components/anim/lessons/Ai1FwdCalc.tsx';
+
+## The problem
+
+You need to answer three sizing questions about a model you did not build. How much GPU memory do the weights take? How much compute does one token cost? How does it change if you pick the 70B model instead of the 8B?
+
+You do not need the math of training. You need to read a model config and turn it into bytes and FLOPs. A **FLOP** [mid] is one floating-point operation, such as one multiply or one add. This lesson gives you that skill, using Llama 3 as the worked case.
+
+## Naive view: a black box
+
+If the model is a black box, you can only measure it: run it, time it, read the bill. That works for one model. It fails when you must compare models before you buy GPUs, or explain why a 70B model is about nine times more compute per token than an 8B one. The inside is simple enough to count.
+
+## The mechanism: a stack of identical layers
+
+A decoder-only transformer turns a list of token ids into a score for each possible next token. It does this in four parts.
+
+1. **Embed.** Look up each id in the table (lesson A1.2). Each token becomes a vector of d_model numbers.
+2. **N layers.** Every layer has two blocks with the same shape in every layer, but different weights.
+   - **Attention** [mid]: each token reads information from earlier tokens (lesson A1.4).
+   - **MLP** [mid] (feed-forward block): two or three matrix multiplies that work on each token alone. The Illustrated Transformer states it plainly: the same network is applied to each position independently.
+3. **Output head.** A final matrix maps the last vector to one **logit** [mid] (raw score) per vocabulary token.
+4. **Softmax** [mid]. It turns the logits into probabilities that sum to 1 (lesson A1.5 covers sampling from them).
+
+Between blocks, a vector per token flows along the **residual stream** [senior]: each block computes a change and adds it to the stream. The stream keeps its width (d_model) from the first layer to the last. For a systems engineer, think of it as a shared buffer that every layer reads and appends to.
+
+Follow one token through Llama 3 8B. The counter shows FLOPs as they accumulate.
+
+<Ai1FwdFlow client:visible />
+
+### The Llama 3 configs
+
+These come from Table 3 of the Llama 3 paper.
+
+| | 8B | 70B | 405B |
+|---|---|---|---|
+| Layers | 32 | 80 | 126 |
+| d_model | 4,096 | 8,192 | 16,384 |
+| FFN dim | 14,336 | 28,672 | 53,248 |
+| Query heads | 32 | 64 | 128 |
+| KV heads | 8 | 8 | 8 |
+| Vocabulary | 128,000 | 128,000 | 128,000 |
+
+For scale, the original Transformer paper's base model had 6 layers, d_model 512, FFN dim 2,048, and 8 heads. Llama 3 8B is wider by 8x and deeper by 5x.
+
+### Counting the parameters
+
+A **parameter** is one learned number. Every weight matrix is a rectangle of them, so counting is multiplication. Let d be d_model, h the number of query heads, h_kv the KV heads, and head dim = d / h (128 in all three models).
+
+- **Attention per layer:** four matrices. The query and output matrices are d × d. The key and value matrices are d × (h_kv × head dim), smaller because the 8 KV heads are shared (grouped-query attention, lesson A1.4).
+- **MLP per layer:** three matrices of d × FFN (the SwiGLU design in Llama).
+- **Embeddings:** vocabulary × d for the input table, and the same again for the output head.
+
+<Math block tex="P \approx L\,\bigl(2d^2 + 2d\,d_{kv} + 3\,d\,d_{ff}\bigr) + 2\,V d" />
+
+Work the 8B model with real numbers. Here d_kv = 8 × 128 = 1,024.
+
+- Attention: 2 × 4,096² + 2 × 4,096 × 1,024 = 33.6M + 8.4M = 41.9M.
+- MLP: 3 × 4,096 × 14,336 = 176.2M.
+- One layer: 218.1M. Thirty-two layers: 6.98B.
+- Embeddings: 2 × 128,000 × 4,096 = 1.05B.
+- Total: **8.03B**. The paper says 8B.
+
+The same arithmetic for 70B gives 70.5B, and for 405B gives 405.8B. All three land within 1% of the published sizes. We assume untied input and output tables, SwiGLU, and we skip the small normalization weights. Two facts stand out. The MLP holds about 70% of all 8B parameters (80% for 70B). And attention holds only about 17% of the 8B parameters, even though the next lesson shows it can dominate the cost at long context.
+
+Try your own config. Pick a preset, then change one number and watch the totals.
+
+<Ai1FwdCalc client:visible />
+
+## Cost per token: about 2N
+
+Each parameter in a matrix takes part in one multiply and one add per token. That is **2 FLOPs per parameter per token**. Kaplan and colleagues give the forward pass as about 2N FLOPs per token, with N the parameter count. For the 8B model: 2 × 8.03B = 16.1 GFLOPs. For 70B: 2 × 70.5B = 141 GFLOPs, about 140. The rule has one flaw: the input table is a lookup, not a multiply. For 8B that is 0.52B parameters, so a tighter count is 15.0 GFLOPs, as the animation shows. For 70B the gap is 1.5%. The attention score math adds more at long prompts (lesson A1.4).
+
+Memory is separate. The weights in BF16 take 2 bytes per parameter. The 8B model needs about 16 GB. The 70B model needs about 141 GB, which a single 80 GB GPU cannot hold. (Lesson A2.4 does this properly.)
+
+Training costs more. The backward pass takes about twice the forward pass, so training costs about 6 FLOPs per parameter per token: **6 × N × D** for D training tokens. Llama 3 405B was trained on 15.6T tokens: 6 × 405 × 10⁹ × 15.6 × 10¹² = 3.8 × 10²⁵ FLOPs. Meta's blog reports over 15T tokens for the 8B and 70B models.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Parameters, 8B / 70B / 405B (our count) | 8.03B / 70.5B / 405.8B | Derived from Table 3 |
+| Forward FLOPs per token, 8B | about 16 GFLOPs | 2N, Kaplan |
+| Forward FLOPs per token, 70B | about 140 GFLOPs | 2N, Kaplan |
+| FLOPs to generate 500 tokens, 70B | about 70 TFLOPs | Derived: 500 × 140 G, no attention term |
+| Weights in BF16, 70B | about 141 GB | Derived: 2 bytes × 70.5B |
+| Training FLOPs, 405B | 3.8 × 10²⁵ | Derived: 6ND |
+| KV cache per token, 70B | 320 KiB | Derived: 2 × 80 × 8 × 128 × 2 bytes |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| More layers | More depth to compute | Cost grows in proportion | Reasoning-heavy tasks |
+| Wider d_model | Bigger matrices | Parameters grow with d² | Quality has to scale |
+| Fewer KV heads (GQA) | Smaller KV cache and fewer key and value weights | Slight quality risk | Long contexts, many users |
+| Bigger vocabulary | Fewer tokens per text | Larger tables | Multilingual use |
+| Bigger model | Higher quality | About 2N FLOPs per token and N × 2 bytes of memory | Hard tasks that a small model fails |
+
+## Interview lens
+
+<Callout type="tip">
+Say the cost the way a systems person does: "A 70B model costs about 140 GFLOPs per token and needs about 140 GB for the weights in BF16, so it needs several GPUs." Then show the multiplication: 2 FLOPs per parameter, 2 bytes per parameter.
+</Callout>
+
+<Callout type="mistake">
+Do not say a model "has billions of lines of logic". It has a few matrix shapes repeated per layer. Do not forget that FLOPs and memory are separate limits. Do not say "bigger model, slower by the same factor" without saying which limit you mean: compute for long prompts, memory for generating one token at a time (module A2).
+</Callout>
+
+<Callout type="deep" title="Why the 2N rule is an estimate">
+The count skips the normalization weights, which are tiny. It treats embeddings as a lookup. It skips the attention-score math, which grows with context length and is the topic of the next lesson. For a first estimate, 2N is within a few percent at short context. State it as "about 2N".
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="FLOPs for a generation"
+  scenario="Llama 3 70B uses about 2 FLOPs per parameter per token. Use N = 70 billion and ignore the attention-score term."
+  steps={[
+    {
+      prompt: 'FLOPs per generated token?',
+      unit: 'FLOPs',
+      answer: 140e9,
+      within: 1.1,
+      explain: '2 × 70e9 = 140e9 FLOPs, or 140 GFLOPs.',
+    },
+    {
+      prompt: 'FLOPs to generate a 500-token answer?',
+      unit: 'FLOPs',
+      answer: 70e12,
+      within: 1.1,
+      explain: '500 × 140 GFLOPs = 70,000 GFLOPs = 70 TFLOPs.',
+    },
+    {
+      prompt: 'Training FLOPs for a 8B model on 15T tokens, at 6 × N × D?',
+      unit: 'FLOPs',
+      answer: 7.2e23,
+      within: 1.2,
+      explain: '6 × 8e9 × 15e12 = 7.2e23 FLOPs.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In Llama 3 8B, which part of the transformer holds the most parameters?',
+      options: [
+        'The attention matrices, since attention is the key idea',
+        'The MLP matrices, about 70% of the total',
+        'The input and output embedding tables',
+        'The softmax step at the end of the pass',
+      ],
+      answer: 1,
+      explain: 'The MLP has 176.2M parameters per layer against 41.9M for attention. Over 32 layers that is 5.6B of 8.03B. The two tables hold 1.05B. Softmax has no parameters.',
+    },
+    {
+      q: 'A 70B model costs about 140 GFLOPs per token. What is the cost of one forward pass over a 1,000-token prompt, ignoring attention scores?',
+      options: ['140 GFLOPs', '14 TFLOPs', '1.4 PFLOPs', '140 TFLOPs'],
+      answer: 3,
+      explain: '1,000 × 140 GFLOPs = 140,000 GFLOPs = 140 TFLOPs. The weights are used once per token, so cost grows in proportion with prompt length at this level.',
+    },
+    {
+      q: 'Why is "2N FLOPs per token" slightly high for Llama 3 8B?',
+      options: [
+        'The input table is a lookup, so it costs no FLOPs',
+        'Half of the parameters are skipped at random on each token',
+        'The softmax step reduces the cost by a fixed 10%',
+        'The residual stream removes the need for the MLP blocks',
+      ],
+      answer: 0,
+      explain: 'The table adds parameters but no multiplies: the id just selects a row. Dropping its 0.52B parameters gives 15.0 GFLOPs instead of 16.1. The model uses all its other weights on every token.',
+    },
+    {
+      q: 'You tie the input and output embedding tables in the calculator for Llama 3 8B. What changes?',
+      options: [
+        'The layer count falls by one block',
+        'The MLP share of the total parameters drops',
+        'The KV cache per token grows in size',
+        'The total drops by about 0.52B parameters',
+      ],
+      answer: 3,
+      explain: 'Tying shares one 128,000 × 4,096 table, so the second copy of 0.52B parameters disappears. Layers, MLP weights, and the KV cache are unchanged. The MLP share actually rises, because the total is smaller.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Llama 3 paper, "The Llama 3 Herd of Models"](https://arxiv.org/abs/2407.21783): Table 3 has the configs.
+- [Vaswani et al., "Attention Is All You Need"](https://arxiv.org/abs/1706.03762)
+- [Jay Alammar, The Illustrated Transformer](https://jalammar.github.io/illustrated-transformer/)
+- [Kaplan et al., "Scaling Laws for Neural Language Models"](https://arxiv.org/abs/2001.08361): the 2N and 6N rules.

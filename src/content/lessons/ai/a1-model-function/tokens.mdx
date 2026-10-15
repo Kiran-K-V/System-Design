@@ -1,0 +1,184 @@
+---
+summary: 'A model reads integers, not text. A tokenizer cuts text into pieces, and every limit and every bill counts those pieces. Learn how byte-pair encoding builds them and why other languages cost more.'
+requires: ['ai/a0-orientation/ai-design-method', '01-one-machine/request-journey']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai1BpeWalk from '../../../../components/anim/lessons/Ai1BpeWalk.tsx';
+import Ai1TokenCounter from '../../../../components/anim/lessons/Ai1TokenCounter.tsx';
+
+## The problem
+
+Your design says "the user sends a 2,000-word document and gets a summary". Three questions follow. Does it fit in the model? How long will it take? What does it cost?
+
+All three answers depend on one unit. It is not the word, the character, or the byte. It is the **token** [junior]: one piece of text that the model treats as a single symbol. The context limit counts tokens. Latency grows with tokens. The price list is in tokens. If you size a design in words, you will be wrong, and the error is not the same for every user.
+
+## Naive view: one word is one token
+
+A beginner thinks a model reads words. That fails in two ways.
+
+- A word list is closed. A new name, a typo, or a word in another language has no entry. The old fix was an "unknown" symbol, and the model lost the word.
+- A word list is huge. Every form of every word (run, runs, running, runner) is its own row.
+
+The other extreme is one token per character. That never fails on unknown words, but a 2,000-word document becomes about 12,000 symbols, and the model has to learn spelling for every word.
+
+Tokenizers sit between the two. Common words are one token. Rare words are a few pieces. Unknown text falls back to bytes.
+
+## The mechanism: byte-pair encoding
+
+A **tokenizer** [junior] is the component that turns text into token ids and back. It is fixed before the model is trained. It is a lookup structure, close to a compression dictionary.
+
+**Byte-pair encoding (BPE)** [mid] builds that dictionary from data. It was taken from data compression and applied to translation by Sennrich and colleagues (2015), who report gains of +1.1 and +1.3 BLEU over a back-off dictionary on two WMT15 tasks. The training loop is short:
+
+1. Start with single symbols. For GPT-2 and Llama 3 the base is the 256 possible byte values, so any input can be encoded and no unknown token is needed.
+2. Count each pair of neighbors, weighted by how often the word occurs.
+3. Merge the most frequent pair into a new symbol.
+4. Repeat until the vocabulary reaches the target size.
+
+Karpathy's `minbpe` states the id rule: ids 0 to 255 are raw bytes, so the vocabulary size is 256 plus the number of merges. Step through three merges on a real string. The corpus here is the string itself. A real tokenizer reads terabytes of text, but the loop is the same.
+
+<Ai1BpeWalk client:visible />
+
+Sizes: GPT-2 has 50,257 tokens. GPT-4-era `cl100k_base` has about 100K. Llama 3 has 128K: about 100K from the tiktoken tokenizer plus 28K added for non-English text. The Llama 3 paper reports 3.94 characters per token on English, up from 3.17 for Llama 2. A bigger vocabulary packs the same text into fewer tokens. The price is a larger embedding table (lesson A1.2).
+
+To encode new text, apply the learned merges in the order they were learned. Decoding is a table lookup from id to bytes. Both are fast and run on a CPU, outside the model.
+
+<CrossTrackLink id="01-one-machine/request-journey">
+Before any request reaches a model, a parser turns bytes into structure. Tokenizing is the same kind of step. It runs on the CPU, before the GPU, and its output size sets the work for everything after it.
+</CrossTrackLink>
+
+## Where the rule of thumb breaks
+
+You will hear "one token is about four characters" or "three quarters of a word". The first number is real for English prose on older tokenizers: Kaplan and colleagues measured 4.3 characters and 1.4 tokens per word on WebText2 with the GPT-2 tokenizer. It is not a law. Anthropic's model overview says 1M tokens is about 555K words on the current Claude tokenizer (about 1.8 tokens per word), and 750K words on earlier models. The same page gives 200K tokens as about 150K words for the earlier ones. **The ratio belongs to the tokenizer.** Count with the tokenizer of the model you use.
+
+Other languages are worse. A tokenizer trained mostly on English has few merges for Hindi or Burmese, so those texts stay in small pieces. Petrov and colleagues (2023) found that the same translated text can differ in token length by up to 15x between languages. A TopBots test in 2023 on `cl100k_base`, with 2,033 short texts per language, found median token counts of about 5x English for Hindi and Bengali, about 9x for Armenian, and over 10x for Burmese. Newer tokenizers show smaller gaps, but multilingual tokenizers still do not close them.
+
+This is a cost and a quality issue. A Hindi user pays about five times more per message, fills the context window five times faster, and waits for five times more tokens on the way out.
+
+Try it. The widget estimates from the sourced ratios above. It is an estimate, not a tokenizer. Change the message, the ratio source, and the price.
+
+<Ai1TokenCounter client:visible />
+
+Prices as of 2026-10-15 from the [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing): Claude Sonnet 5.5 costs $2 per million input tokens and $10 per million output tokens. Claude Haiku 5.5 costs $0.10 per million input tokens and $0.50 per million output tokens (prompts up to 100,000 tokens). Check the live page before you quote them.
+
+Two more failures come from the same cause. First, the model sees tokens, not letters. One paper on letter counting reports that the GPT-4o tokenizer cuts "strawberry" into "st", "raw", "berry", so a question about the letter r asks the model to see inside a symbol. The paper lists three causes: tokenization, attention limits, and no character-level training data. We did not test current models. Second, numbers and code also split in ways that depend on the tokenizer. We have no sourced ratio for them, so measure them.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Byte-level base vocabulary | 256 ids | minbpe, GPT-2 |
+| GPT-2 vocabulary | 50,257 | tiktoken |
+| Llama 3 vocabulary | 128K | Llama 3 paper |
+| English characters per token, Llama 3 | 3.94 | Llama 3 paper |
+| English characters per token, GPT-2 | 4.3 | Kaplan et al. |
+| Words per 1M tokens, current Claude | about 555K | Anthropic docs |
+| Hindi or Bengali, tokens vs English | about 5x | TopBots, 2023 |
+| 2,000 input tokens on Sonnet 5.5 | $0.004 | Derived: 2,000 × $2 / 1,000,000 |
+| Same on Haiku 5.5 | $0.0002 | Derived: 2,000 × $0.10 / 1,000,000 |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Bigger vocabulary | Fewer tokens per text, faster and cheaper | Larger embedding and output tables | Many languages, long contexts |
+| Smaller vocabulary | Small tables | More tokens per text | Tiny models |
+| Count by tokenizer | Exact limits and bills | You need the tokenizer library | Any production budget |
+| Count by words times a ratio | Quick sizing | Off by 25% or more for some users | Interviews, first estimates |
+
+## Interview lens
+
+<Callout type="tip">
+Size a design in tokens and name the tokenizer: "A 3K-token prompt on a 128K-context model, priced per million input tokens." Then add: "For non-English users I would measure token counts per language, because they can be several times higher."
+</Callout>
+
+<Callout type="mistake">
+Do not say "one word is one token" or give a fixed "4 characters per token" for every user. Say it is a ratio that depends on the tokenizer and the language. Do not forget that output tokens cost more than input tokens on the pricing page above.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Cost of a prompt"
+  scenario="A support bot sends 2,000 input tokens per request to Claude Sonnet 5.5 at $2 per million input tokens. Ignore output tokens and caching."
+  steps={[
+    {
+      prompt: 'Input cost of one request?',
+      unit: 'dollars',
+      answer: 0.004,
+      within: 1.1,
+      explain: '2,000 tokens × $2 / 1,000,000 tokens = $0.004.',
+    },
+    {
+      prompt: 'Input cost of 1,000,000 requests in a month?',
+      unit: 'dollars',
+      answer: 4000,
+      within: 1.1,
+      explain: '1,000,000 × $0.004 = $4,000.',
+    },
+    {
+      prompt: 'The same prompts in Hindi take about 5 times the tokens. What is the monthly input cost?',
+      unit: 'dollars',
+      answer: 20000,
+      within: 1.3,
+      explain: '5 × $4,000 = $20,000. A flat per-user price hides a large cost gap by language.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In byte-level BPE with 3 merges learned, how many tokens are in the vocabulary?',
+      options: ['259', '3', '256', '253'],
+      answer: 0,
+      explain: 'Ids 0 to 255 are the raw bytes, so the base is 256. Each merge adds one token. 256 + 3 = 259.',
+    },
+    {
+      q: 'Why does the same translated message cost more tokens in Burmese than in English on a tokenizer trained mostly on English?',
+      options: [
+        'The model charges a language fee on top of the token price',
+        'Burmese sentences always carry more meaning than English ones',
+        'Few Burmese merges exist, so its text stays in small pieces',
+        'Byte-level BPE cannot encode any script outside the Latin alphabet',
+      ],
+      answer: 2,
+      explain: 'Merges are learned from training data. With little Burmese in that data, few merges cover it, so text splits into small pieces. Byte-level BPE can encode any script, so the last option is wrong. The price is per token, with no language fee.',
+    },
+    {
+      q: 'You size a context budget as "words times 1.33" for a new model. What is the main risk?',
+      options: [
+        'Words cannot be counted by the API, so any estimate by words is invalid',
+        'The ratio is per tokenizer: a newer one may use 1.8 tokens per word',
+        'The estimate is too high, because tokens are always longer than words',
+        'Tokens only matter for output, so input size does not count at all',
+      ],
+      answer: 1,
+      explain: 'Anthropic documents about 1.8 tokens per word on the current tokenizer and 750K words per 1M tokens on earlier ones. A fixed ratio of 1.33 would be 26% too low. Count with the real tokenizer.',
+    },
+    {
+      q: 'A user asks how many letter r are in "strawberry" and the model fails. Which cause fits best?',
+      options: [
+        'The model has no memory of what was said in earlier messages',
+        'The vocabulary is too large to store on a single GPU at once',
+        'The tokenizer fails on any word that has double letters in it',
+        'It sees pieces such as "st", "raw", "berry", not letters',
+      ],
+      answer: 3,
+      explain: 'The model reads token ids. A paper on this failure lists tokenization as one cause, along with attention limits and the lack of character-level training data. The other options do not match how the input is built.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Hugging Face LLM course: byte-pair encoding tokenization](https://huggingface.co/learn/llm-course/chapter6/5)
+- [karpathy/minbpe](https://github.com/karpathy/minbpe): a short BPE implementation with the 256-byte rule.
+- [Sennrich et al., "Neural Machine Translation of Rare Words with Subword Units"](https://arxiv.org/abs/1508.07909)
+- [Petrov et al., "Language Model Tokenizers Introduce Unfairness Between Languages"](https://arxiv.org/abs/2305.15425)
+- [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing): live prices.

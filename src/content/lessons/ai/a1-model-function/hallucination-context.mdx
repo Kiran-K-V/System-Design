@@ -1,0 +1,190 @@
+---
+summary: 'A model is trained to produce a likely next token, and most tests reward a guess over "I do not know". So it fills gaps with fluent text. Facts in the prompt fix this, but long prompts hide facts in the middle.'
+requires: ['ai/a1-model-function/sampling-decoding', 'ai/a1-model-function/attention-cost']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai1HallWalk from '../../../../components/anim/lessons/Ai1HallWalk.tsx';
+import Ai1HallCurve from '../../../../components/anim/lessons/Ai1HallCurve.tsx';
+
+## The problem
+
+A support bot tells a customer: "You can return a laptop within 30 days." The real policy is 14 days. The customer reads the reply, trusts it, and files a complaint on day 20. Nothing crashed. No error was logged. The reply was well written and sounded sure.
+
+This is a **hallucination**: a fluent answer that is not true, or not supported by the source. For a backend engineer the closest picture is a cache that, on a miss, returns a plausible-looking value instead of a miss. There is no "not found" path in the model, unless you build one.
+
+Two questions follow. Why does the model do this? And if the fix is to give it the facts, how many facts can you give it, and where do you put them? The first question is about training. The second is about the **context window**: the maximum number of tokens the model can read at once, counting the prompt and the reply.
+
+## Why a model guesses
+
+A language model is trained on one task: given text so far, produce a likely next token (lesson A1.5 showed how the next token is drawn). The training text has facts in it, and the model stores some. A fact it saw once or twice is stored weakly. A fact it never saw is not stored at all.
+
+When the model needs such a fact, it has no "I do not know" signal built in. It has a probability list, and it picks from it. The walk below uses made-up probabilities for a made-up shop. It shows what the list looks like when the fact is missing, and what happens when the fact is in the prompt.
+
+<Ai1HallWalk client:visible />
+
+OpenAI researchers explain the cause in "Why Language Models Hallucinate" (Kalai et al., 2025). Two parts matter to us.
+
+1. **Pretraining makes some errors unavoidable.** The paper says hallucinations "originate simply as errors in binary classification": telling a valid statement from an invalid one is hard. It gives a lower bound. If 20% of birthday facts appear exactly once in the training data, the model should hallucinate on at least about 20% of birthday questions after pretraining. A fact seen once cannot be told from a lucky guess.
+2. **Tests reward guessing.** The paper says "language models are optimized to be good test-takers, and guessing when uncertain improves test performance". Most benchmarks give 1 point for a right answer and 0 for a wrong one, and also 0 for "I do not know". So "IDK-type responses are maximally penalized while an overconfident 'best guess' is optimal". If a model is 30% sure of an answer, a guess scores 0.3 points on average and "I do not know" scores 0. A model trained and ranked on such tests learns to guess.
+
+The paper gives a real example. A model (DeepSeek-V3) was asked for a person's birthday and told to answer only if it knew. In three attempts it gave three different dates: "03-07", "15-06", and "01-01". All were wrong.
+
+The paper also notes that a model after pretraining can be well calibrated, meaning its confidence matches how often it is right. In its Figure 2 caption, "The pretrained model is well calibrated". Post-training changes that.
+
+The practical lesson: you cannot count on the model to say "I do not know". You must design the "not found" path yourself. The standard way is to put the facts in the prompt and require the model to quote them. That is retrieval, which module A6 covers. For now, think of it as turning a memory test into an open-book test.
+
+## What the window holds
+
+An open-book test only works if the book fits. Context windows have grown fast. Here are the current flagship numbers, read from the providers' own model pages on 2026-10-15.
+
+| Provider | Models (as shown on the page) | Context window | Max output |
+|---|---|---|---|
+| Anthropic | Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5 | 1M tokens | 128K |
+| OpenAI | GPT-6 Astra, GPT-6.1 Sol, GPT-6 Luna | 1.05M tokens | 128K |
+| Google | Gemini 4 Argon | 1M tokens, shared by input, thinking, and output | up to 1M (long decode) |
+
+Sources, as of 2026-10-15: [Anthropic models overview](https://platform.claude.com/docs/en/models/overview), [OpenAI models](https://developers.openai.com/api/docs/models), [Gemini models](https://ai.google.dev/gemini-api/docs/models) and [Gemini long context](https://ai.google.dev/gemini-api/docs/long-context). Model names and sizes change often, so check the page before you design around a number.
+
+Anthropic's page says 1M tokens is roughly 555,000 words on the current tokenizer. That is several novels. So the window is no longer the limit for most documents. Cost is. A full 1M-token prompt to Claude Sonnet 5.5 costs $2.00 in input alone (1 million tokens at $2 per million input tokens, from the same page, as of 2026-10-15). You pay it on every call unless you cache. The Gemini docs make the same point: "you have to pay the input token cost every time you send that query."
+
+## Naive solution: put everything in the window
+
+If 1M tokens fit, why not paste the whole wiki into every prompt? Because accuracy drops with more text, and it drops unevenly.
+
+**Lost in the Middle** (Liu et al., 2023) tested multi-document question answering. The prompt held 10, 20, or 30 documents, and exactly one held the answer. The authors moved the answer document to different positions. Accuracy was highest at the start, lower at the end, and lowest in the middle: a U-shaped curve. The abstract says performance "significantly degrades when models must access relevant information in the middle of long contexts". The chart uses real numbers from the paper's Appendix G tables. The paper reports only some positions, so the chart shows only those.
+
+<Ai1HallCurve client:visible />
+
+Read the numbers for GPT-3.5-Turbo (16K) with 30 documents. Answer first: 73.4%. Answer at index 9: 50.5%. That is a drop of 22.9 points. And the closed-book score, with no documents at all, was 56.0%. So with the answer buried in the middle, the extra documents made the model worse than no documents. Switch to Claude-1.3: the dip is smaller (59.1% first, 54.8% at index 9), but it is there. These are 2023 models. Current models are better, but the shape of the problem is still documented.
+
+Two newer results point the same way.
+
+- **Needle in a haystack** hides one fact (the needle) at a chosen depth in a long text and asks for it back. The Gemini docs report about 99% recall for a single needle. They also warn that with several needles "the model does not perform with the same accuracy".
+- **Context rot** (Chroma, 2025-07-14) tested 18 LLMs and found their performance "grows increasingly unreliable as input length grows". The text gives no per-model numbers, only charts.
+
+So there are two costs of a long prompt: dollars, and a quality loss that you must measure on your own task. The attention cost of long prompts (lesson A1.4) adds latency on top.
+
+## Design rules that follow
+
+1. **Retrieve, do not dump.** Send the few passages that matter, not the whole corpus.
+2. **Put the key facts first or last.** The U-curve says the ends are safest.
+3. **Require quotes.** Ask the model to copy the sentence it relies on. A cheap string check then confirms that the quote appears in the source. If it does not, reject the answer.
+4. **Make "I do not know" an allowed answer.** Say so in the prompt, and test that the bot uses it when the source is missing.
+5. **Measure.** Build a test set of questions with known sources and some with none. Track how often the bot invents an answer.
+
+| Option | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Rely on model memory | No extra pipeline | Silent wrong answers on rare facts | Common knowledge only |
+| Retrieval plus quote check | Grounded, checkable answers | A retrieval system to build and run | Facts that change or are private |
+| Whole corpus in the window | Simple code | Input cost on every call, and the middle gets lost | Small corpus, low traffic |
+| Fine-tuning on the facts | Style and format control | Slow to update, and facts are still stored weakly | A behavior fails, not a missing fact |
+
+## Interview lens
+
+<Callout type="tip">
+Name the failure rate, not only the failure: "On my golden set of 300 questions, 60 have no answer in the docs. The bot should refuse on those. I track the fabrication rate on those 60 and the unsupported-quote rate on the other 240." Then name the fix: retrieval, a quote check, and a refusal path.
+</Callout>
+
+<Callout type="mistake">
+Do not say "a bigger context window removes hallucination". The window removes the retrieval step, not the guessing. If the fact is not in the prompt, or sits in the middle of 500K tokens, the model can still invent an answer. Also do not propose fine-tuning to teach a changing policy. A fact seen a few times is stored weakly, and you must retrain to update it.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'GPT-3.5-Turbo (16K) scores 56.0% with no documents. With 30 documents it scores 73.4% when the answer is first and 50.5% at index 9. What does this show?',
+      options: [
+        'Extra documents always help, because the first-position score is higher than closed-book',
+        'The model ignores the documents, since 50.5% is close to 56.0%',
+        'Documents help only after index 20, where accuracy climbs back up',
+        'In the middle, the documents can hurt more than having none',
+      ],
+      answer: 3,
+      explain: 'At index 9 the score (50.5%) is below the closed-book score (56.0%), so the long prompt made the answer worse. The first position (73.4%) shows documents can help, which is why position matters. The model clearly uses the documents, and the curve rises only near the very end (63.7% at the last index).',
+    },
+    {
+      q: 'In a pretraining set, 20% of a type of fact appear exactly once. By the Kalai et al. lower bound, what hallucination rate should a model have on that type of fact?',
+      options: [
+        'About 2%, since most of the facts were seen at least once during training',
+        'About 80%, because only the repeated facts can ever be learned by a model',
+        'At least 20%, since a fact seen once looks like a guess',
+        'Zero, because a larger model memorizes every fact it ever sees',
+      ],
+      answer: 2,
+      explain: 'The bound is based on the fraction of facts that appear once. For 20% singletons, the rate should be at least about 20% on that fact type. 80% overstates it, and size alone does not remove the singleton effect.',
+    },
+    {
+      q: 'A benchmark gives 1 point for a right answer, 0 for a wrong answer, and 0 for "I do not know". A model is 30% sure of one answer. What does the scoring reward?',
+      options: [
+        'Answering "I do not know", because wrong answers should be avoided at all cost',
+        'Guessing: expected score 0.3, against 0 for a refusal',
+        'Either choice, because both have the same expected score under this rule',
+        'Guessing only if the model is more than 50% sure of the answer',
+      ],
+      answer: 1,
+      explain: 'The guess has an expected value of 0.3 x 1 = 0.3, and a refusal always gets 0. So any guess beats a refusal under this grading. The paper argues this is why post-training makes models guess. A threshold of 50% would apply only if wrong answers lost points.',
+    },
+    {
+      q: 'A bot must answer from 20 retrieved documents. Which placement of the most relevant document is best, given the Lost in the Middle results?',
+      options: [
+        'First or last, because both ends scored higher than the middle',
+        'Exactly in the middle, so the model sees it with equal context on each side',
+        'In a random position on each call, to spread any positional effect',
+        'Repeated in the middle three times, since repeats raise attention scores',
+      ],
+      answer: 0,
+      explain: 'The U-shaped curve is highest at the start and next highest at the end. For GPT-3.5-Turbo (16K) with 20 documents, first is 75.7% and last is 63.1%, but index 9 is 54.1%. The middle is the worst place. Random placement gives average results, and the paper does not test repeats.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai1-hallucination-policy-cite"
+  title="A policy that does not exist"
+  scenario="An HR bot told an employee that 'Policy HR-114 gives 10 days of paid study leave'. No such policy exists. The bot has no documents in its prompt."
+  facts={[
+    'prompt: system message + user question (about 300 tokens)',
+    'model: hosted, temperature 0.2',
+    'HR handbook: 400 pages, updated monthly',
+  ]}
+  steps={[
+    {
+      context: 'The reply cited a policy number and a leave length in a confident tone.',
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The model has no handbook text to read, so it produced a likely-sounding policy',
+        'Temperature 0.2 is too low, which makes the model repeat rare tokens at random',
+        'The 300-token prompt overflowed the context window and cut the handbook off',
+        'The model looked up HR-114 in a database that had a stale copy of the rules',
+      ],
+      answer: 0,
+      explain: 'The prompt has no handbook, so the model filled the gap with a typical policy name and number. A low temperature does not cause this. A 300-token prompt cannot overflow a window of about 1M tokens. The bot has no database lookup.',
+    },
+    {
+      context: 'The handbook changes every month. The team wants the lowest-effort fix that works now and keeps working after each update.',
+      prompt: 'What is the cheapest fix?',
+      options: [
+        'Fine-tune the model on the handbook and retrain it each month',
+        'Raise the temperature to 1.0 so that answers vary and the wrong one is rarer',
+        'Retrieve the matching handbook passages, add them to the prompt, and require a quote',
+        'Paste all 400 pages into every prompt and skip the quote and refusal checks',
+      ],
+      answer: 2,
+      explain: 'Retrieval gives the model the text, and the quote check catches invented policies. When the handbook changes, you re-index. No training run is needed. Fine-tuning is slow to update and stores facts weakly. A higher temperature makes errors more frequent. Pasting all 400 pages costs input tokens on every call and loses facts in the middle.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Kalai et al., "Why Language Models Hallucinate" (OpenAI, 2025)](https://arxiv.org/abs/2509.04664)
+- [Liu et al., "Lost in the Middle: How Language Models Use Long Contexts"](https://arxiv.org/abs/2307.03172)
+- [Chroma, "Context Rot"](https://www.trychroma.com/research/context-rot)
+- [Gemini API long context guide](https://ai.google.dev/gemini-api/docs/long-context)

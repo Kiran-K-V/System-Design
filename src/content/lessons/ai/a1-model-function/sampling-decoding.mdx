@@ -1,0 +1,209 @@
+---
+summary: 'The model scores every possible next token. Decoding turns those scores into text. Temperature, top-k, and top-p shape the choice, and even temperature 0 can vary on a busy server because batching changes the arithmetic.'
+requires: ['ai/a1-model-function/forward-pass']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai1SampBars from '../../../../components/anim/lessons/Ai1SampBars.tsx';
+import Ai1SampWalk from '../../../../components/anim/lessons/Ai1SampWalk.tsx';
+
+## The problem
+
+You send the same prompt twice. You get two different answers. Or you send a classification prompt 1,000 times and the label flips on a few of them. Your test suite is flaky and nobody changed the code.
+
+The cause is in the last step of the model, not the first. The forward pass ([lesson A1.3](/learn/ai/a1-model-function/forward-pass/)) ends with one score per token in the vocabulary. A vocabulary is the full list of tokens the model knows. GPT-2 has 50,257 of them. Llama 3 has 128K. The model has not chosen a word yet. It has produced a long list of scores.
+
+**Decoding** is the loop that turns those scores into text. It picks one token, appends it to the input, runs the model again, and repeats. [Lesson A0.3](/learn/ai/a0-orientation/probabilistic-components/) said a model is not a function that always returns the same output. This lesson shows where the randomness comes from, how to control it, and where the control stops working.
+
+## Naive solution: always take the top token
+
+The simplest rule is **greedy decoding**: pick the token with the highest score each time. It is a lookup with no random number in it. It sounds safe, and it fails in two ways.
+
+First, the text is poor. The nucleus sampling paper (Holtzman et al., 2020) found that text from likelihood-maximizing decoding is "bland and strangely repetitive". Beam search, a smarter search that keeps several candidate sentences, did no better. With beam size 32 the model got "stuck in a repetition loop it cannot escape".
+
+Second, greedy is not as deterministic as it looks. Later in this lesson we show a real experiment where 1,000 greedy runs gave 80 different texts.
+
+## From scores to a token
+
+The scores the model outputs are called **logits**. A logit can be any real number. To get probabilities, apply the **softmax** function with a **temperature** T:
+
+<Math block tex="p_i = \frac{e^{x_i / T}}{\sum_j e^{x_j / T}}" />
+
+In words: divide every score by T, raise e to that power, and divide by the total so everything sums to 1. At T = 1 this is the plain softmax. A small T makes the top token win by more. A large T flattens the list. As T goes to 0 the result is greedy decoding, and most APIs treat T = 0 as exactly that.
+
+Two more tools cut the tail of the list. Long tails matter: with a 128K vocabulary, thousands of tokens are each unlikely, but together they hold real mass, and sampling from all of them sometimes picks nonsense.
+
+- **Top-k** keeps only the k most likely tokens. Holtzman et al. note that a fixed k is "sub-optimal across varying contexts": 40 candidates is too many when one token is obvious and too few when many fit.
+- **Top-p**, also called **nucleus sampling**, keeps the smallest set of tokens whose probabilities add up to at least p. The set grows and shrinks with the model's confidence. Their paper uses p = 0.95.
+
+After each cut, the kept probabilities are scaled so they sum to 1 again. Then the sampler draws one token.
+
+Here is a worked example with ten illustrative scores for the next token after "The capital of France is". At T = 1, softmax gives Paris 76.5%, the 8.5%, a 4.7%, and a small tail. Check the first number by hand: the scores are 5.0, 2.8, 2.2, 1.9, 1.5, 1.2, 0.8, 0.5, 0.1, and -0.3. The value e^5 is 148.4, and the sum of all ten e^x is 194.0, so Paris is 148.4 / 194.0 = 0.765.
+
+Now cut. With top-k = 3, the kept values are 148.4, 16.4, and 9.0, which sum to 173.8. Paris becomes 148.4 / 173.8 = 85.4%. With top-p = 0.9 at T = 1, the running total is 76.5%, 84.9%, 89.6%, 93.0%. The first three are below 0.9 and the fourth passes it, so four tokens stay. Try it.
+
+<Ai1SampBars client:visible />
+
+What to notice:
+
+1. **Temperature changes shape, not order.** The ranking of tokens never changes. At T = 0.5 Paris holds 98.1%. At T = 2 it holds 40.0% and the tail wakes up.
+2. **Cuts are applied in order.** This widget runs temperature, then top-k, then top-p. Libraries differ in the exact order and in tie handling, so read the docs of the one you use.
+3. **The grey bar shows what was cut.** The blue bar is bigger than the grey bar for every kept token, because the cut mass is shared among the survivors.
+4. **Counts match the bars.** Press "Draw 1,000 samples". With T = 1 and no cuts, Paris should get about 765 of 1,000 draws.
+
+Now watch decoding run. The sampler needs one random number per token. It lines up the probabilities as a strip from 0 to 1 and picks the token whose segment holds the number.
+
+<Ai1SampWalk client:visible />
+
+The walk shows the key idea of this lesson. The model is a pure function from tokens to scores. The only random piece is the number u. Fix u (a **seed**) and the output repeats.
+
+## Temperature 0 is not deterministic
+
+Set T = 0 and you expect the same output every time. In production it often is not. Thinking Machines tested this ("Defeating Nondeterminism in LLM Inference"). They asked Qwen3-235B-A22B at temperature 0 the same question, "Tell me about Richard Feynman", 1,000 times, with 1,000 tokens each.
+
+- They got **80 unique completions**. The most common one appeared 78 times.
+- The first 102 tokens were identical in all runs. At token 103, 992 runs wrote "Queens, New York" and 8 wrote "New York City". After that the texts went apart.
+- With batch-invariant kernels turned on, all 1,000 completions were identical.
+
+Why does a fixed model with no random number give different text? The reason is in how computers add numbers. **Floating-point** addition is not associative: the order of the additions changes the result. Here is a case in 32-bit floats. Add 1 to 100,000,000 first, then subtract 100,000,000: the 1 is lost to rounding, and the answer is 0. Subtract first, then add 1: the answer is 1. Same three numbers, two answers.
+
+A GPU adds up thousands of numbers inside every matrix multiply. How it splits that work depends on the shape of the input. The shape depends on the **batch**, which is the group of requests the server runs together to keep the GPU busy. Your request shares a batch with other users' requests (module A5 covers batching in detail). So the order of additions, and the last bits of every score, depend on how many other people are on the server right now. As the paper puts it, "the load (and thus batch-size) nondeterministically varies".
+
+Most of the time the last bits do not matter. But at some token the top two scores are almost tied, and a change in the 7th digit flips which one wins. Once one token differs, every token after it can differ. This is a backend idea you know: a result that depends on the **hidden state of a shared system**, like a cache hit that changes a timing, but here it changes the output.
+
+The fix exists. Batch-invariant kernels compute each request the same way regardless of batch size. It costs speed. On one GPU with Qwen-3-8B and 1,000 sequences of about 100 tokens, the paper measured 26 seconds for default vLLM, 55 seconds for the unoptimized deterministic version, and 42 seconds with an improved attention kernel. That is 1.6 times slower in the best case (42 / 26 = 1.6).
+
+<Callout type="deep" title="Seed, temperature 0, and what you can promise">
+A seed fixes the random number u. It does not fix the scores that go into the strip. If the scores move by a tiny amount, the same u can land on a different token. So "temperature 0" and "seed = 42" are both **best effort** on a shared hosted model, unless the provider documents a stronger guarantee. Check the provider's docs. Do not build a system that fails if two calls differ. Build one that checks the output (see below) and treats a rare difference as normal.
+</Callout>
+
+## Numbers
+
+| Choice | What it does | Typical use |
+|---|---|---|
+| T = 0 (greedy) | Always the top token, up to the numeric noise above | Classification, extraction, tool calls |
+| T around 0.7 to 1 | Draws from the full distribution | Chat, brainstorming |
+| Top-p 0.95 | Cuts the unlikely tail (Holtzman's setting) | Open-ended text |
+| Repetition penalty about 1.2 | Divides the score of tokens already used | Stops loops. The CTRL paper reports 1.2 as a good balance |
+| Constrained decoding | Sets the probability of tokens that break a format to zero before the draw | JSON, a fixed label set |
+
+Cost: sampling is cheap. A softmax over a 128K vocabulary is on the order of 5e5 operations (derived: 128K values times a few steps each). The forward pass of a 70B model is 2 x 70e9 = 1.4e11 FLOPs per token. Sampling is about 300,000 times smaller. Nobody picks greedy to save compute.
+
+## Trade-offs
+
+| Setting | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Greedy or T = 0 | Fewer different outputs, easier tests | Repetitive text, still not exact | One right answer exists |
+| Higher T | Varied, natural text | More wrong or odd tokens, flaky tests | Variety is the product |
+| Top-p / top-k | Fewer nonsense tokens | A little less variety | Any sampling with a long tail |
+| Batch-invariant kernels | Bit-exact repeat runs | About 1.6x time in the paper's best case | Evals, debugging, audits |
+| Output check and retry | Catches the rare flip | One extra call on failures | Any pipeline that needs a valid label |
+
+## Interview lens
+
+<Callout type="tip">
+Say what you set, and why: "Temperature 0 and a fixed label set for the classifier, plus a validator that rejects anything outside the set and retries once. I measure the label flip rate on a golden set of 500 tickets, and I expect it to be low, not zero." That answer names a setting, a check, and a rate.
+</Callout>
+
+<Callout type="mistake">
+Do not say "temperature 0 makes it deterministic". It removes the deliberate randomness only. On a shared server, batch size can still change the numbers. Also do not use a high temperature to "make the model more creative" on a task with one right answer.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Three tokens have scores 2.0, 1.0, and 0.0 at T = 1. You apply top-k with k = 2, and rescale. What probability does the top token get?',
+      options: [
+        'About 66.5%, because the cut does not change any probability',
+        'About 73.1%, because 7.39 / (7.39 + 2.72) after the cut',
+        'About 50%, because two tokens stay and they share equally',
+        'About 100%, because top-k keeps only the best token',
+      ],
+      answer: 1,
+      explain: 'The full softmax gives 66.5%. Top-k drops the third token, leaving e^2 = 7.39 and e^1 = 2.72. Rescaled, the top one is 7.39 / 10.11 = 73.1%. Equal sharing would ignore the scores, and k = 2 keeps two tokens, not one.',
+    },
+    {
+      q: 'After temperature, four tokens have probabilities 0.50, 0.30, 0.15, and 0.05. Top-p is 0.9. What happens?',
+      options: [
+        'Three tokens stay and the top one becomes about 52.6%',
+        'Two tokens stay and the top one becomes about 62.5%',
+        'Three tokens stay and the top one stays at 50% exactly',
+        'All four stay, since the total is above 0.9 already',
+      ],
+      answer: 0,
+      explain: 'The running totals are 0.50, 0.80, 0.95. The set stops at the first total that reaches 0.9, which is the third token. The kept mass is 0.95, so the top token becomes 0.50 / 0.95 = 52.6%. Two tokens would only reach 0.80.',
+    },
+    {
+      q: 'A team sets temperature to 0. Over 1,000 identical calls to a shared hosted model, a handful of outputs differ at token 100 or later. What is the most likely cause?',
+      options: [
+        'The API adds a small random number to every score on purpose each time',
+        'The tokenizer splits the same text in different ways on each separate call',
+        'Load changes batch size, so float additions reorder and flip a near-tie',
+        'Temperature 0 is clamped to 0.01 by the server before sampling',
+      ],
+      answer: 2,
+      explain: 'Float addition is not associative, and a GPU kernel adds in an order that depends on batch shape. Other users change the batch. A near-tie then flips. The tokenizer is deterministic, and a clamp to 0.01 would not explain a rare difference at a late token.',
+    },
+    {
+      q: 'In the greedy-versus-sampled walk, why does the sampled run see different probabilities at position 2 than the greedy run?',
+      options: [
+        'The sampler applies a higher temperature at every later position',
+        'Its first token differs, so the model reads a different context',
+        'The random number u is reused and shifts the distribution',
+        'Sampling changes the model weights after each draw it makes',
+      ],
+      answer: 1,
+      explain: 'Greedy chose "mat" and the sampler chose "sofa". Each next-token distribution is a function of all tokens so far, so the two runs now ask the model different questions. Temperature is a fixed setting, u only picks a token, and weights never change during decoding.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai1-sampling-label-flip"
+  title="A label that flips"
+  scenario="A support tool tags each ticket as negative, neutral, or mixed. The same ticket was sent 1,000 times to a hosted model."
+  facts={[
+    'temperature: 0.8, top_p: 1.0',
+    'negative: 912   neutral: 83   mixed: 5',
+    '100,000 tickets per day, all with prompts of this kind',
+  ]}
+  steps={[
+    {
+      context: 'Engineers see 8.8% of runs return a label other than the most common one. At 100,000 tickets per day, that is about 8,800 tickets with a minority label.',
+      prompt: 'What explains the spread?',
+      options: [
+        'At T = 0.8 the sampler draws from a distribution where the labels are close in probability',
+        'The model has no opinion about this ticket, so it picks from a hash of the ticket text',
+        'The ticket is too long, so the model forgets the label set partway through the read',
+        'The hosted model changes its weights between calls to stay current with new data',
+      ],
+      answer: 0,
+      explain: 'Sampling at T = 0.8 with no cut draws a label from its probability. A 91.2% label loses about 1 time in 11. Models do not hash input, weights do not change per call, and a short ticket gives the same spread.',
+    },
+    {
+      context: 'The team wants stable tags and does not want to retrain anything.',
+      prompt: 'What is the best first fix?',
+      options: [
+        'Set temperature to 0, restrict output to the three labels, and validate each reply',
+        'Raise temperature to 1.5 so the model explores more labels and picks a better one',
+        'Run the call 3 times and take the longest reply, since longer text is more reliable',
+        'Add a seed and promise customers that the tags will never change between runs',
+      ],
+      answer: 0,
+      explain: 'T = 0 removes the deliberate draw, a fixed label set rules out invalid text, and a validator catches the rare numeric flip. A higher T makes it worse. Reply length says nothing about the label. A seed is best effort on a shared server, so never promise "never".',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Holtzman et al., "The Curious Case of Neural Text Degeneration" (nucleus sampling)](https://arxiv.org/abs/1904.09751)
+- [Thinking Machines, "Defeating Nondeterminism in LLM Inference"](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/)
+- [Keskar et al., "CTRL" (temperature and repetition penalty)](https://arxiv.org/abs/1909.05858)

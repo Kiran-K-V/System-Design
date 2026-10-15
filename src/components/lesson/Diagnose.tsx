@@ -30,7 +30,7 @@ export default function Diagnose({ id, title, scenario, facts, steps }: Props) {
   const firstTry = picks.filter((p, i) => p === steps[i].answer).length;
 
   return (
-    <div className="not-prose my-6 rounded-xl border border-line p-4">
+    <div className="not-prose my-6 rounded-xl border border-line p-4" data-pagefind-ignore>
       <p className="font-mono text-[12px] uppercase tracking-wide text-muted">Prove it · {title}</p>
       <p className="mt-2 font-medium">{scenario}</p>
       {facts && (

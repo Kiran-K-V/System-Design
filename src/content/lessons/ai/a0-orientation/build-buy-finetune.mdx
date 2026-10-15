@@ -1,0 +1,206 @@
+---
+summary: 'Start with a hosted API and a prompt. Add retrieval for missing facts, fine-tune for behavior, and self-host only when privacy, unit cost, or latency force it. A cost crossover shows when a rented GPU beats the API.'
+requires: ['ai/a0-orientation/ai-design-method', 'ai/a0-orientation/probabilistic-components', '01-one-machine/estimation']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai0DecisionTree from '../../../../components/anim/lessons/Ai0DecisionTree.tsx';
+import Ai0CostCrossover from '../../../../components/anim/lessons/Ai0CostCrossover.tsx';
+
+## The problem
+
+You have a quality bar, an eval, and a budget (lesson A0.2). Now step 4: where does the model come from? There are four options. Each costs more effort than the one before.
+
+1. Use no model. Rules or a heuristic.
+2. Buy: call a hosted model through an API, with a prompt.
+3. Adapt: add retrieval so the model sees your facts, or fine-tune it on your examples.
+4. Build and run: host a model on your own GPUs.
+
+A common mistake is to jump to the last two because they feel serious. The right order is the reverse. Take the cheapest option that clears the bar, and move down only when the eval shows a gap.
+
+## Naive solution: fine-tune to teach the model our facts
+
+A team has a product with thousands of policy documents. They think: the model does not know our policies, so we will train it on them. It feels natural. It fails in two ways.
+
+First, facts change. Weights are fixed at training time. A policy that changes on Tuesday stays old in the model until the next training run. Second, fine-tuning is poor at storing exact facts. OpenAI's guide on model optimization splits the problem this way: prompting fixes missing knowledge, unclear goals, and output format. Fine-tuning fits when you need consistent behavior or format, or need shorter prompts at scale. Facts belong in the context, not in the weights.
+
+## The mechanism: a decision tree
+
+The tree has five questions, from cheapest to most expensive. A "yes" stops the walk. A "no" moves down.
+
+<Ai0DecisionTree client:visible />
+
+**Row 1: rules first.** Google's Rules of Machine Learning, Rule 1, reads "Don't be afraid to launch a product without machine learning." If a simple heuristic gets you part of the way, launch with it. It gives you data, a baseline, and a metric. Rule 4 adds that a simple first model "provides you with baseline metrics and a baseline behavior" to test fancier ones against.
+
+**Row 2: hosted API and a prompt.** Start here for most GenAI work. You pay per token, you run nothing, and you can change model by changing a string. Anthropic's agent guide gives the stance: find the simplest solution, and add complexity only when needed.
+
+**Row 3: retrieval.** If answers fail because the model lacks facts, put the facts in the prompt. Retrieval fetches the relevant text at request time. Updates take effect when the document changes. This track covers retrieval later.
+
+**Row 4: fine-tuning.** Fine-tuning means more training on your own examples. Use it when prompts cannot fix the behavior or format, when you need shorter prompts, or when a small tuned model can replace a big one. OpenAI's guide lists these reasons: more examples than fit in a context window, shorter prompts, proprietary data kept out of requests, and a smaller cheaper model for a narrow task. Hamel Husain says 99% of the labor in fine-tuning is assembling high-quality data. Budget for that, not for the training run. One more risk: the same OpenAI guide says its fine-tuning is no longer accessible to new users. A fine-tune can sit on a platform that changes its terms.
+
+**Row 5: self-hosting.** Run an open model on GPUs you rent or own. Three things can force it: **privacy** (data may not leave your network), **unit cost at volume**, and **latency** (a model close to the user, or a small model for a tight budget). Next: the cost question.
+
+## Numbers: API against a GPU
+
+Prices are USD, as of 2026-10-15.
+
+API output prices, per 1M tokens, standard tier:
+
+| Provider and model | Output price | Source |
+|---|---|---|
+| Anthropic Haiku 5.5 (prompt up to 100K tokens) | $0.50 | claude.com/pricing |
+| Anthropic Sonnet 5.5 | $10.00 | claude.com/pricing |
+| Anthropic Opus 5.5 | $20.00 | claude.com/pricing |
+| OpenAI gpt-6-luna | $0.50 | developers.openai.com/api/docs/pricing |
+| OpenAI gpt-5.4-mini | $4.50 | developers.openai.com/api/docs/pricing |
+| Google Gemini 2.5 Flash | $2.50 | ai.google.dev/gemini-api/docs/pricing |
+
+GPU rental: Lambda lists H100 SXM at $3.99 per GPU-hour on demand for its largest configuration (lambda.ai/pricing). Smaller configurations are $4.09 to $4.29. RunPod's page (updated 2026-10-08) shows $3.49 secure and $2.69 community in its structured data, but its visible table shows $3.99. The two sources disagree, so this lesson uses Lambda and you should confirm on the console.
+
+One H100 costs 3.99 x 730 hours = $2,913 per month (derived). It costs that whether it is busy or idle.
+
+How many tokens does it make? One benchmark served Llama 3.1 8B on one H100 with vLLM. It measured 8,399 tokens per second at a request rate of 64 for short chat (128 tokens in, 128 out). The page defines throughput as tokens generated per second, so this lesson treats it as output tokens. That is an inference, not a stated fact. It is also an 8B model on one setup. Your model, prompt size, and server will differ.
+
+The cost per million output tokens at utilization u is:
+
+<Math block tex="c_{\text{self}} = \frac{P_{\text{GPU}} \times 10^{6}}{3600 \times R \times u}" />
+
+In words: GPU price per hour, divided by the tokens it makes in an hour at utilization u, scaled to a million tokens. Here R is the tokens per second at full load. Work it out for R = 8,399 and a price of $3.99:
+
+- At 100% busy: 8,399 x 3,600 = 30.2M tokens per hour. $3.99 / 30.2 = about $0.13 per 1M tokens.
+- At 25% busy: four times that, about $0.53 per 1M.
+
+Now compare with the API. The break-even against Haiku 5.5's $0.50 output price is 3.99 / 0.50 = 7.98M tokens per hour, about 2,217 tokens per second, or about 26% of the GPU's capacity (derived). Below that, the API is cheaper. Above it, the rented GPU is cheaper, if utilization holds. Utilization is the catch: a GPU that serves a spiky workload sits idle most of the day, and idle time is billed.
+
+<CrossTrackLink id="01-one-machine/estimation">
+The backend track teaches back-of-envelope estimation: convert users to requests per second and bytes, then to machines. The same chain works here. Convert requests to tokens per day, tokens to GPU-seconds, and GPU-seconds to dollars.
+</CrossTrackLink>
+
+The calculator uses those formulas. It counts output tokens only and ignores input processing, batching limits, and quality differences. Try the default (Haiku 5.5, 50% utilization), then move to Sonnet 5.5, then drop utilization to 20%.
+
+<Ai0CostCrossover client:visible />
+
+What to notice. Against a cheap API model the break-even needs high volume and high utilization. Against a $10-per-million model the GPU wins at a far lower volume. But the 8B model is not equal to Sonnet 5.5 in quality. Compare on your eval, not on price alone.
+
+## Hidden costs
+
+The calculator misses four terms.
+
+- **Eval cost.** Every model you try needs the eval run on it. A judge model for grading is a second bill.
+- **Lock-in.** Prompts tuned to one model drift when you change it. Fine-tunes tie you to the platform that hosts them.
+- **Privacy.** A hosted API sends data to a third party. For regulated data this may rule the option out, and the cost comparison does not matter.
+- **Operations.** Self-hosting means you handle GPU failures, scaling, upgrades, and on-call. Budget for two GPUs if you need failover, as the checkbox shows.
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| Rules | Free, fast, auditable | Weak on free text | When a heuristic clears the bar |
+| API plus prompt | No ops, quick start, best models | Per-token bill, data leaves your network | Default start |
+| Retrieval | Fresh facts, citations | Pipeline to build and evaluate | When failures are missing facts |
+| Fine-tune | Format and behavior, shorter prompts | Data labor, platform risk, stale facts | When prompts cannot fix behavior |
+| Self-host | Privacy, low unit cost at high load | Ops, idle GPU cost, weaker models | Volume and utilization are high, or data cannot leave |
+
+## Interview lens
+
+<Callout type="tip">
+Say the order out loud: "I would start with a hosted model and a prompt, measure it against the eval, add retrieval if the failures are missing facts, fine-tune only if behavior or format still fails, and self-host if privacy or volume forces it." Then give one break-even number, such as 26% utilization against a $0.50 per million model, and name its assumptions.
+</Callout>
+
+<Callout type="mistake">
+Do not fine-tune to add facts. Do not compare an API price with a GPU price at 100% utilization and call it done. Do not leave out the quality gap between an 8B open model and a frontier model. And do not quote a price without a date: these numbers change often.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="a0-4-stale-finetune"
+  title="The stale fine-tune"
+  scenario="A team fine-tunes a model on 5,000 company policy documents. It scores well in the first week. A week later, a policy changes, and the bot keeps quoting the old rule. Support complaints rise."
+  steps={[
+    {
+      prompt: 'Which step of the decision tree did the team skip?',
+      options: [
+        'Self-hosting: the model should have run on their own GPUs',
+        'Retrieval: facts that change belong in the prompt, fetched at request time',
+        'Rules: a keyword filter would have been enough for every question',
+        'A larger model: the old rule shows the base model was too small',
+      ],
+      answer: 1,
+      explain: 'The failure is a missing or stale fact. Row 3 of the tree says to put facts in context with retrieval, so an update takes effect when the document changes. Fine-tuning stores facts in weights, which stay fixed until the next training run.',
+    },
+    {
+      prompt: 'What should the team have done before spending on training data?',
+      options: [
+        'Collect more training examples, then run a longer training job',
+        'Raise the temperature so the model explores newer answers',
+        'Run the eval on a prompt-only version and on a retrieval version, and compare the gap',
+        'Move to a cheaper model to make retraining each week affordable',
+      ],
+      answer: 2,
+      explain: 'The method says to measure first. A prompt-only run and a retrieval run on the same golden set show which fix closes the gap. Retraining weekly treats the symptom and adds data labor, which Hamel Husain puts at 99% of fine-tuning work.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'a0-4-q-order',
+      q: 'A hosted model with a good prompt scores 85% against a 90% bar. Wrong answers mostly cite outdated pricing. What is the cheapest next step?',
+      options: [
+        'Fine-tune on pricing pages, which teaches the model current prices',
+        'Self-host an open model so pricing data stays on your own servers',
+        'Add retrieval of the current pricing pages to the prompt',
+        'Lower the bar to 85% because the model is close enough',
+      ],
+      answer: 2,
+      explain: 'The failures are stale facts, so supply the facts at request time. Fine-tuning would freeze the current prices into weights, and they would go stale again. Self-hosting changes who runs the model, not what it knows. Lowering the bar changes the goal.',
+    },
+    {
+      id: 'a0-4-q-breakeven',
+      q: 'A GPU costs $4 per hour and serves 8,000 tokens per second at full load. An API costs $0.50 per 1M output tokens. About what utilization is break-even?',
+      options: ['About 100%', 'About 28%', 'About 5%', 'About 60%'],
+      answer: 1,
+      explain: '$4 / $0.50 = 8M tokens per hour needed. That is about 2,222 tokens per second. 2,222 / 8,000 is about 28%. Below that the API is cheaper. At 100% the GPU is about four times cheaper than the API at this price.',
+    },
+    {
+      id: 'a0-4-q-forcing',
+      q: 'Which situation most clearly forces self-hosting?',
+      options: [
+        'A prototype that serves about 1,000 requests a day for a small test group',
+        'A bot that sometimes gets facts wrong when the policy documents change',
+        'A team that wants to build the cheapest possible demo for a customer visit',
+        'Rules say patient records may not leave the hospital network',
+      ],
+      answer: 3,
+      explain: 'Privacy rules can remove the hosted API from the options, whatever the price. The prototype and demo are better served by an API with no fixed GPU bill. Wrong facts point to retrieval first.',
+    },
+    {
+      id: 'a0-4-q-idle',
+      q: 'Why can a self-hosted GPU cost more per token than the calculator shows at 100% busy?',
+      options: [
+        'Idle hours are billed, so low use raises the cost per token',
+        'GPU prices change by the hour, so any estimate is likely wrong by half',
+        'Tokens from a self-hosted model are counted twice by the server itself',
+        'Open models always need twice as many tokens for one answer',
+      ],
+      answer: 0,
+      explain: 'You pay for the hour whether the GPU is busy or not. At 25% busy the cost per token is four times the 100% figure. The other claims are not true in general.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Google, Rules of Machine Learning](https://developers.google.com/machine-learning/guides/rules-of-ml/): Rules 1 and 4.
+- [OpenAI, Model optimization](https://developers.openai.com/api/docs/guides/model-optimization): evals, prompting, then fine-tuning, and what each fixes.
+- [Hamel Husain, "Your AI Product Needs Evals"](https://hamel.dev/blog/posts/evals/): data labor in fine-tuning.
+- [E2E Networks, inference benchmarks](https://docs.e2enetworks.com/docs/tir/benchmarks/inference_benchmarks/): the Llama 3.1 8B throughput used above.
+- Price pages: [Claude](https://claude.com/pricing), [OpenAI](https://developers.openai.com/api/docs/pricing), [Gemini](https://ai.google.dev/gemini-api/docs/pricing), [Lambda](https://lambda.ai/pricing), [RunPod](https://www.runpod.io/pricing).

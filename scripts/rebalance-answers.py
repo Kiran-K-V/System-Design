@@ -21,7 +21,7 @@ BLOCKED = re.compile(r"\b(above|below|both|none of|all of|previous)\b", re.I)
 def main():
     apply = '--apply' in sys.argv
     counter, changed, skipped = 0, 0, 0
-    for path in sorted(glob.glob('src/content/lessons/*/*.mdx')):
+    for path in sorted(glob.glob('src/content/lessons/**/*.mdx', recursive=True)):
         src = open(path, encoding='utf-8').read()
         edits = []
         for m in OPTIONS.finditer(src):
