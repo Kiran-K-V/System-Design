@@ -7,11 +7,19 @@ interface Row extends Question {
   id: string;
   lesson: string;
   lessonTitle: string;
+  track: 'backend' | 'ai';
+  href: string;
   number: string;
 }
 
 const SESSION = 5;
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+type Filter = 'all' | 'backend' | 'ai';
+const FILTERS: [Filter, string][] = [
+  ['all', 'All'],
+  ['backend', 'Backend'],
+  ['ai', 'AI'],
+];
 
 export default function Review() {
   const [rows, setRows] = useState<Row[] | null>(null);
@@ -21,6 +29,7 @@ export default function Review() {
   const [round, setRound] = useState(0);
   const [points, setPoints] = useState(0);
   const [done, setDone] = useState(0);
+  const [filter, setFilter] = useState<Filter>('all');
 
   useEffect(() => {
     fetch(`${base}/questions.json`)
@@ -38,14 +47,14 @@ export default function Review() {
       const c: Card | undefined = cards[r.id];
       return c ? c.due <= now : doneLessons.has(r.lesson);
     };
-    const due = rows.filter(isDue).sort((a, b) => (cards[a.id]?.due ?? 0) - (cards[b.id]?.due ?? 0));
+    const due = rows.filter((r) => filter === 'all' || r.track === filter).filter(isDue).sort((a, b) => (cards[a.id]?.due ?? 0) - (cards[b.id]?.due ?? 0));
     const cal = loadCalibration();
     const boxes = [0, 0, 0, 0, 0];
     for (const c of Object.values(cards)) boxes[c.box - 1]++;
     setStats({ boxes, sure: sureAccuracy(cal), sureTotal: cal.sure[1], due: due.length });
     setQueue(due.slice(0, SESSION));
     setExplain(loadExplain());
-  }, [rows, round]);
+  }, [rows, round, filter]);
 
   const byId = useMemo(() => new Map((rows ?? []).map((r) => [r.id, r])), [rows]);
 
@@ -56,6 +65,26 @@ export default function Review() {
 
   return (
     <div className="not-prose space-y-8">
+      <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Filter by track">
+        {FILTERS.map(([k, label]) => (
+          <button
+            key={k}
+            type="button"
+            aria-pressed={filter === k}
+            onClick={() => {
+              setFilter(k);
+              setDone(0);
+              setPoints(0);
+              setRound((n) => n + 1);
+            }}
+            className={`rounded-full border px-3 py-1 text-[13px] transition-colors ${
+              filter === k ? 'border-fg bg-fg text-bg' : 'border-line text-muted hover:text-fg'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
       <section className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <Stat label="Due now" value={String(stats.due)} />
         <Stat label="In box 4–5" value={String(stats.boxes[3] + stats.boxes[4])} />
@@ -70,14 +99,16 @@ export default function Review() {
         <h2 className="text-lg font-semibold">Today's review</h2>
         {queue.length === 0 ? (
           <p className="mt-2 text-muted">
-            Nothing due. Finish a lesson and answer its check questions. They come back here after a day, then after longer gaps.
+            {filter === 'ai' && !rows.some((r) => r.track === 'ai')
+              ? 'AI lessons are coming soon, so there are no AI questions yet.'
+              : 'Nothing due. Finish a lesson and answer its check questions. They come back here after a day, then after longer gaps.'}
           </p>
         ) : (
           <div className="mt-3 space-y-5">
             {queue.map((r, i) => (
               <div key={`${round}-${r.id}`}>
                 <p className="mb-1 font-mono text-[12px] text-muted">
-                  From <a className="hover:text-fg" href={`${base}/learn/${r.lesson}/`}>{r.number} {r.lessonTitle}</a>
+                  From <a className="hover:text-fg" href={r.href}>{r.number} {r.lessonTitle}</a>
                 </p>
                 <QuestionCard
                   question={r}

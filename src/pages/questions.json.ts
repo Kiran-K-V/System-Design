@@ -1,4 +1,5 @@
 import { loadSyllabus } from '../lib/lessons';
+import { lessonHref, trackOf } from '../lib/tracks';
 import { questionId, type Question } from '../lib/questionId';
 
 const raw = import.meta.glob<string>('/src/content/lessons/**/*.mdx', { query: '?raw', import: 'default', eager: true });
@@ -41,7 +42,7 @@ export async function GET() {
       const id = questionId(q);
       if (seen.has(id)) throw new Error(`Duplicate question id "${id}" in ${lesson}`);
       seen.add(id);
-      rows.push({ id, lesson, lessonTitle: meta?.title ?? lesson, number: meta?.number ?? '', q: q.q, options: q.options, answer: q.answer, explain: q.explain });
+      rows.push({ id, lesson, lessonTitle: meta?.title ?? lesson, track: trackOf(lesson), href: lessonHref(lesson), number: meta?.number ?? '', q: q.q, options: q.options, answer: q.answer, explain: q.explain });
     }
   }
   return new Response(JSON.stringify(rows), { headers: { 'Content-Type': 'application/json' } });

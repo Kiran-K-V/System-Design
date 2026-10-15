@@ -2,7 +2,7 @@
 
 Track name: **AI System Design**. Site: Uptime. Sibling of the Backend System Design track (13 modules, see `/home/ll-kv-kirababu/.claude/plans/i-need-to-create-delightful-crescent.md`).
 
-Date of research: 2026-10-14. Source keys like `[K3]` are listed in section 9 with their URLs.
+Date of research: 2026-10-14. Decisions applied: 2026-10-15 (see the Decisions section). Source keys like `[K3]` are listed in section 9 with their URLs.
 
 ## Summary: lessons per module
 
@@ -21,9 +21,9 @@ Date of research: 2026-10-14. Source keys like `[K3]` are listed in section 9 wi
 | A10 | Production and LLMOps | 8 |
 | A11 | Safety and Security | 7 |
 | A12 | Multimodal and Generative Media | 5 |
-| A13 | Case Studies | 22 |
+| A13 | Case Studies (12 deep cases with drills) | 12 |
 | A14 | In the Wild | 8 |
-| **Total** | | **138** |
+| **Total** | | **128** |
 
 ---
 
@@ -77,12 +77,12 @@ The 10 gaps come from section (b) of `1-platforms.md`.
 |---|---|---|---|
 | 1 | Eval-driven design | Eval plan is step 2 of the A0 method. Every case ends with an eval section. A9 teaches the full method | A0.2, A9.1 to A9.9, all A13 |
 | 2 | Cost as a design constraint | Dollar-per-request model in A2. Cost levers in A5 and A7. Cost engineering in A10. Every case has a cost table | A2.5, A2.6, A7.6, A7.7, A10.3, all A13 |
-| 3 | Agent system design | State, durable retries, permissions, sandboxes, reliability math | A8.1 to A8.10, A13.15, A13.18 |
-| 4 | LLM serving at scale | Eleven lessons from KV cache to autoscaling. A platform case | A5.1 to A5.11, A13.20 |
+| 3 | Agent system design | State, durable retries, permissions, sandboxes, reliability math | A8.1 to A8.10, A13.9, A13.11 |
+| 4 | LLM serving at scale | Eleven lessons from KV cache to autoscaling. A platform case | A5.1 to A5.11, A13.6 |
 | 5 | Rollout of AI features | A/B, shadow, canary, rollback, version pinning | A3.8, A9.6, A9.7, A10.5, A10.7 |
-| 6 | Feedback pipelines | Logs to evals to training data, with a build lesson | A9.8, A4.7, A13.22 |
-| 7 | Retrieval beyond a demo | Freshness, ACLs, chunking at scale, filtered search, RAG eval | A6.5 to A6.12, A13.12 |
-| 8 | Generative media pipelines | Image, speech, video with latency budgets, cost, evals | A12.1 to A12.5, A13.17 |
+| 6 | Feedback pipelines | Logs to evals to training data, with a build lesson | A9.8, A4.7, A13.4 (eval-platform drill) |
+| 7 | Retrieval beyond a demo | Freshness, ACLs, chunking at scale, filtered search, RAG eval | A6.5 to A6.12, A13.7 |
+| 8 | Generative media pipelines | Image, speech, video with latency budgets, cost, evals | A12.1 to A12.5, A13.6 (text-to-image drill) |
 | 9 | Threat model for LLM apps | Indirect injection, lethal trifecta, exfiltration, least privilege | A11.1 to A11.7, A8.8 |
 | 10 | UX for probabilistic output | Uncertainty display, correction flows, trust calibration | A7.9, A7.10, A9.8 |
 
@@ -111,13 +111,40 @@ The lesson contract, quiz rules, and visual contract live in `design/NEXT_LESSON
 5. **Derive, then quote.** Show the arithmetic for each hardware number. Quote the vendor figure second.
 6. **Mark dense vs sparse.** NVIDIA lists Tensor Core peaks with sparsity. Dense is half [H1]. Always say which one you use.
 7. **Probabilistic language.** Say "pass rate" and "failure rate". Never say "the model knows" or "the model decides to lie".
-8. **Backend reuse.** Link back to the Backend lesson for each shared mechanism (cache, queue, rate limit, consistency). Do not re-teach it. Show what changes when the component is a model.
-9. **Dated facts.** Model names, prices, and limits change. Each such number carries the page date. Prefer formulas over price lists.
+8. **Backend reuse and the overlap rule.** See "Cross-track overlap rule" below. Do not re-teach a Backend mechanism (cache, queue, rate limit, consistency, vector database). Show what changes when the component is a model.
+9. **Dated facts.** Model names and limits change. Each such number carries the page date. Prefer formulas over lists.
 10. **Original text.** Platforms are for coverage checks only. Never copy sentences, structure, or diagrams.
+11. **Live prices.** Quote live provider pricing. Each price shows four things: provider, model, price, and an "as of YYYY-MM-DD" stamp with the source URL. The writer fetches the provider pricing page when writing the lesson. All prices live in one table, `src/lib/ai-prices.ts`, and lessons render them with `AiPriceTag`. There is no "assumed price only" option. If a price cannot be fetched, the lesson shows the formula with a named input and does not show a made-up figure. A quarterly price-refresh task keeps the table current (section 8).
+
+### Cross-track overlap rule
+
+Some AI topics already have a Backend chapter. The AI lesson does not re-teach it. It does three things:
+
+1. It shows a short summary of the Backend topic: 3 to 5 sentences, in new words, using only terms the AI lesson already requires.
+2. It shows a `CrossTrackLink` card that points to the Backend chapter.
+3. It then goes deeper only on the AI-specific part.
+
+Known overlaps:
+
+| AI lesson | Backend chapter | AI lesson adds |
+|---|---|---|
+| A3.5, A13.1 | `B:11-breakdowns/youtube`, `B:11-breakdowns/news-feed` | Two-tower retrieval, ranking cascade, long-term metrics |
+| A6.2, A6.3, A6.4 | `B:10-advanced/vector-databases` (10.4) | Recall and memory tuning, billion scale, filtered search |
+| A13.5 | `B:11-breakdowns/chatgpt` (11.24) | KV cache state, serving, evals, cost per conversation |
+| A5.4, A7.6 | `B:05-caching/*` | KV prefix reuse, provider prompt cache, semantic cache risks |
+| A7.8, A13.4 | `B:07-reliability/rate-limiting`, `B:11-breakdowns/rate-limiter` | TPM, RPM, and ITPM limits, spend caps, provider fallback |
+| A5.2, A12.4, A13.6 | `B:06-async/queues` | Per-step batch scheduler, fixed-size media jobs, GPU pools |
+| A7.5 | `B:02-networking/real-time-transport` | Cancel on disconnect, partial output |
+| A6.10 | `B:06-async/cdc` | Re-embed, upsert, and delete-old-chunks pipeline |
+| A6.11 | `B:03-api-design/auth` | ACLs in vector search, leak windows |
+| A10.1 | `B:07-reliability/observability` | Traces for model calls and tools |
+| A13.2 | `B:11-breakdowns/ad-click-aggregator` | Calibration, sparse embeddings, online learning |
+
+Any other overlap found by a writer follows the same rule. The writer adds a row to this table through the orchestrator.
 
 ### Case study template (A13)
 
-Each case follows the A0.2 method as h2 sections: Requirements (with quality bar), Eval plan, Budgets (latency and dollars), Core entities and API, High-level design, Deep dives, Failure modes, Staff-level extensions. Then Trade-offs, Interview lens, Check yourself. Animation 1 uses `DesignBuild`. Animation 2 uses `DesignCompare` for one deep dive. The backend template in `NEXT_LESSONS.md` section 8 applies.
+Each of the 12 deep cases follows the A0.2 method as h2 sections: Requirements and quality bar, Eval plan, Budgets (latency and dollars, with live prices from `ai-prices.ts`), Core entities and API, High-level design, three staff-level Deep dives, Failure modes with an incident drill, and a "Staff answer vs senior answer" box. Where a dropped case folds in, add a **Drill** h2 (10 to 15 min variant exercise with its own Prove it and sources). Then Trade-offs, Interview lens, Check yourself. Animation 1 uses `DesignBuild`. Animation 2 uses `DesignCompare` for one deep dive. The backend template in `NEXT_LESSONS.md` section 8 applies. If the case overlaps a Backend chapter, apply the overlap rule above.
 
 ---
 
@@ -240,9 +267,9 @@ Backend ids used in `requires` use short names, for example `B:05-caching/why-ca
 
 **A2.5 interconnects-cost: Interconnects and GPU Cost Estimation**
 - requires: A2.3, A2.4, B:01-one-machine/estimation
-- Write: GPUs in a node talk over NVLink (900 GB/s on H100 [H1]; 1.8 TB/s bidirectional per Blackwell GPU [H3]). Between nodes, InfiniBand ports run at up to 400 Gb/s, which is 50 GB/s (derived) [H3]. Why tensor parallelism stays inside a node. Cost formula: dollars per million output tokens = GPU $/hour / (tokens/s x 3600) x 1e6 [derived]. Example with an assumed $3/GPU-hour and 2,000 tokens/s is $0.42 (assumption, not sourced). Doubling throughput halves cost.
+- Write: GPUs in a node talk over NVLink (900 GB/s on H100 [H1]; 1.8 TB/s bidirectional per Blackwell GPU [H3]). Between nodes, InfiniBand ports run at up to 400 Gb/s, which is 50 GB/s (derived) [H3]. Why tensor parallelism stays inside a node. Cost formula: dollars per million output tokens = GPU $/hour / (tokens/s x 3600) x 1e6 [derived]. The worked example takes a live GPU price from `ai-prices.ts` (provider, SKU, price, as-of date, source URL) and a throughput the writer measures or sources. Doubling throughput halves cost.
 - Animate: Topology diagram with link speeds; send a tensor and watch time per hop. Second: cost calculator with sliders for GPU price, throughput, utilization, SLO-meeting share (goodput).
-- Prove it: Ballpark. Cost per million tokens at $2.50/hour and 1,500 tokens/s.
+- Prove it: Ballpark. Cost per million tokens at a live GPU price from `ai-prices.ts` and 1,500 tokens/s.
 - Src: [H1], [H3], [K2]
 
 **A2.6 ai-numbers: AI Numbers to Know**
@@ -475,12 +502,12 @@ Backend ids used in `requires` use short names, for example `B:05-caching/why-ca
 - requires: A1.2
 - Write: Bi-encoder: encode query and document separately, so document vectors are precomputed. What changes with dimension, max input (8192 tokens [R1]), and domain. Shorter vectors via `dimensions` save storage [R1]. Evaluate on your own queries, not only on public leaderboards. Re-embedding cost when you change model.
 - Animate: Same corpus embedded by two models; query neighbors differ. Second: dimension vs storage vs recall table.
-- Prove it: Ballpark. Cost and time to re-embed 50M chunks (writer states price inputs).
+- Prove it: Ballpark. Cost and time to re-embed 50M chunks (price inputs come from `ai-prices.ts`).
 - Src: [R1]
 
 **A6.2 ann-indexes: ANN Indexes**
 - requires: A6.1, B:10-advanced/vector-databases
-- Write: Exact search compares the query with every vector: too slow at scale. ANN trades recall for speed. HNSW: layered graph, greedy hops from the top [R4]. IVF: cluster, probe some clusters (Milvus defaults nlist 128, nprobe 8) [R3]. PQ: compress each vector to a short code. Memory formulas from Faiss: Flat 4d bytes; PQ ceil(M x nbits / 8); HNSW 4d + links [R2]. The backend lesson showed HNSW; this lesson adds recall, memory, and tuning.
+- Write: Exact search compares the query with every vector: too slow at scale. ANN trades recall for speed. HNSW: layered graph, greedy hops from the top [R4]. IVF: cluster, probe some clusters (Milvus defaults nlist 128, nprobe 8) [R3]. PQ: compress each vector to a short code. Memory formulas from Faiss: Flat 4d bytes; PQ ceil(M x nbits / 8); HNSW 4d + links [R2]. Overlap: Backend 10.4 (`B:10-advanced/vector-databases`) showed HNSW. This lesson gives a 3 to 5 sentence summary and a `CrossTrackLink` card, then adds recall, memory, and tuning only.
 - Animate: HNSW greedy hop from the entry point down layers to the nearest neighbor. Second: recall vs QPS sliders for efSearch and nprobe.
 - Prove it: Ballpark. PQ with M=96, 8 bits, at 1536 dims: 96 bytes, ~64x smaller than float32 [derived].
 - Src: [R2], [R3], [R4], [R16]
@@ -605,7 +632,7 @@ Backend ids used in `requires` use short names, for example `B:05-caching/why-ca
 - requires: A7.6, B:08-technologies/api-gateway
 - Write: A gateway sits between apps and model providers. Jobs: auth, quotas, logging, caching, routing, fallback. Routing is a workflow pattern [A5]. Cascade: try a cheap model, escalate on low confidence. Eval-gated routing. Cost and quality Pareto (Anthropic cookbook cost_optimization [P16]).
 - Animate: Request enters; router picks model by rule; cost meter. Second: Pareto chart of routing thresholds.
-- Prove it: Ballpark. Blended cost with 70% on a cheap model and 30% on a strong one (writer states prices).
+- Prove it: Ballpark. Blended cost with 70% on a cheap model and 30% on a strong one (prices come from `ai-prices.ts`).
 - Src: [A5], [P16]
 
 **A7.8 limits-fallbacks: Rate Limits and Fallbacks (TPM and RPM)**
@@ -917,161 +944,176 @@ Backend ids used in `requires` use short names, for example `B:05-caching/why-ca
 
 ### A13. Case Studies
 
-Each case follows the template in section 2. Each entry lists the **new ideas** it adds, the animations, and one Prove it. Order is easy to hard and by dependency. Backend lesson `B:11-breakdowns/chatgpt` exists; A13.10 deepens it with serving, evals, and cost and links to it.
+Twelve deep cases. Quality over quantity. Order is easy to hard and by dependency. Each case follows the template in section 2 and has more depth than a normal lesson: requirements and quality bar, eval plan, latency and dollar budget with live prices, high-level design, 3 staff-level deep dives, failure modes with an incident drill, and a "staff answer vs senior answer" box. Cases dropped from the first plan are kept as **Drill** sections (10 to 15 min variant exercises) inside the nearest deep case. Drills keep their sources. Every price in a case comes from `src/lib/ai-prices.ts` (provider, model, price, "as of" date, source URL). Where a case overlaps a Backend chapter, the case follows the overlap rule in section 2.
 
-**A13.1 ad-click-prediction: Ad Click Prediction**
+**A13.1 video-recommendation: Video Recommendation Feed**
+- requires: A3.5, A3.8, B:11-breakdowns/youtube
+- Requirements and quality bar: Goal is long-term satisfaction, not clicks. Bar: watch time up with a satisfaction survey and a 28-day retention guardrail not down.
+- Eval plan: Offline: candidate recall@k, NDCG, calibration. Online: A/B with a long-term holdout. Guardrails: diversity, creator reach, complaints.
+- Budgets: Latency by stage (candidates, ranker, re-rank) from the A3.5 funnel. Dollars: ranker QPS, embedding refresh job, GPU price from `ai-prices.ts`.
+- High-level design: Two-stage design from [M2]. PinnerFormer: a user embedding from an action sequence, refreshed daily in batch, trained to predict long-term engagement; the abstract reports retention gains without figures [G4]. Re-rank for policy and diversity.
+- Deep dives: (1) Two-tower candidates, ANN index, and embedding refresh lag. (2) Multi-objective ranking: watch time, satisfaction, long-term retention; exploration and cold start. (3) Feedback loops and long-term metrics: how the log is biased by the old model, and a holdout design.
+- Failure modes and incident drill: Popularity collapse; failed batch leaves stale embeddings. Drill: CTR is up and 28-day retention is down. Find the cause.
+- Staff vs senior: Senior names the funnel and the metric. Staff names the proxy gap, the holdout, the exploration budget, and the rollback gate.
+- Drill: Search ranking. Query understanding, retrieval, learning-to-rank, re-ranking; position bias in click logs; NDCG offline and interleaving online; latency budget by stage for a 200 ms search. Src: [P6], [P7], [M2].
+- Drill: People You May Know. Graph candidates (friends of friends), then ranking; privacy and fairness limits; cold start; accept rate and hide feedback. Prove it: a user is shown an ex-partner; name the missing control. Src: [P4], [P6].
+- Animate: `DesignBuild`. Second: exploration-rate slider vs long-term metric. Drill visuals: position-bias click curves; candidate-count explosion by hop.
+- Prove it: Ballpark. Ranker QPS for 100M daily users at 20 feeds per session.
+- Src: [M2], [G4], [P4], [P3], [P6], [P7]
+
+**A13.2 ad-click-prediction: Ad Click Prediction**
 - requires: A3.6, A3.9, B:11-breakdowns/ad-click-aggregator
-- Write: Goal: predict click probability for auction ranking. Calibration matters more than AUC, because the model's number sets prices. Features, labels with delay, imbalance. Monolith online learning [C7]. DLRM for the model shape: embedding tables for sparse features, a bottom MLP for dense features, pairwise dot-product interaction, a top MLP, sigmoid; tables use model parallelism, MLPs data parallelism, with an all-to-all exchange [G5]. Eval plan: offline logloss and calibration, online revenue with guardrails. Cost: serving at ad-auction latency.
-- Animate: `DesignBuild` of the system by requirement. Second: calibration plot with a slider for bias.
+- Requirements and quality bar: Predict click probability for auction ranking. The number sets prices, so calibration matters more than AUC. Bar: logloss and calibration error within a stated band per segment.
+- Eval plan: Offline logloss and calibration; online revenue with advertiser guardrails.
+- Budgets: Auction latency budget split by stage. Dollars: serving cost per 1,000 auctions with the live GPU or CPU price.
+- High-level design: Features, labels with delay, imbalance. Monolith online learning [C7]. DLRM shape: embedding tables for sparse features, a bottom MLP for dense features, pairwise dot-product interaction, a top MLP, sigmoid; tables use model parallelism, MLPs data parallelism, with an all-to-all exchange [G5].
+- Deep dives: (1) Calibration under delayed labels and class imbalance. (2) Sparse embedding tables: sharding, minute-level sync, memory [C7]. (3) Feature store reads at auction QPS and training-serving skew (A3.4).
+- Failure modes and incident drill: Miscalibrated model overcharges advertisers; a feature outage. Drill: revenue drops 3% after a deploy with no AUC change.
+- Staff vs senior: Senior says "train a DLRM". Staff says why calibration is the product, how delayed labels bias it, and how to roll back safely.
+- Drill: ETA prediction. Regression with a skewed error cost (late is worse than early); features: route, traffic, time, restaurant prep; quantile loss; MAE and late-rate; A/B by region. Prove it: MAE improves and complaints rise; explain. Src: [P7], [P6].
+- Drill: Dynamic pricing as a variant of ETA plus CTR (calibrated demand, guardrails on fairness).
+- Animate: `DesignBuild`. Second: calibration plot with a slider for bias. Drill visual: error distribution with an asymmetric loss slider.
 - Prove it: Ballpark. QPS and feature-store reads for 50K auctions per second.
-- Src: [C7], [G5], [P4], [P7]
-
-**A13.2 eta-prediction: ETA Prediction**
-- requires: A3.5, A3.6, B:10-advanced/proximity-search
-- Write: Regression with a skewed error cost: late is worse than early. Features: route, traffic, time, restaurant prep. Quantile loss. Eval: MAE and late-rate. Rollout via A/B by region.
-- Animate: `DesignBuild`. Second: error-distribution chart with asymmetric loss slider.
-- Prove it: Diagnose. MAE improves and customer complaints rise.
-- Src: [P7], [P6]
+- Src: [C7], [G5], [P4], [P7], [P6]
 
 **A13.3 fraud-detection: Fraud Detection**
 - requires: A3.2, A3.4, A3.8
-- Write: Stripe Radar: score each payment on 1,000+ characteristics in under 100 ms; fraud is about 1 in 1,000 payments; about 0.1% of legitimate payments blocked [C8]. DNN-only model cut training time over 85%; dropping XGBoost outright would have cost about 1.5% recall [C8]. 10x more data gave significant gains [C8]. Trade-off: explainability. Eval: recall at a fixed false-positive rate.
-- Animate: `DesignBuild`. Second: threshold slider with the cost of a false block vs a miss.
+- Requirements and quality bar: Score each payment in real time. Bar: recall at a fixed false-positive rate, and a decision under 100 ms.
+- Eval plan: Recall at a fixed false-positive rate; delayed labels (chargebacks); shadow mode then canary.
+- Budgets: Latency under 100 ms with stage split. Dollars: cost of a false block vs a missed fraud; serving cost per million scores with the live compute price.
+- High-level design: Stripe Radar: 1,000+ characteristics in under 100 ms; fraud about 1 in 1,000 payments; about 0.1% of legitimate payments blocked [C8]. DNN-only model cut training time over 85%; dropping XGBoost outright would have cost about 1.5% recall [C8]. 10x more data gave significant gains [C8].
+- Deep dives: (1) Label delay and imbalance: how to train and evaluate when truth arrives in weeks. (2) Model choice and the explainability trade-off; reason codes for declines. (3) Adversarial drift: fraudsters adapt; retrain cadence and a rules layer for fast response.
+- Failure modes and incident drill: Feature outage fails open or closed; a wave of new fraud. Drill: block rate doubles after a feature-pipeline change.
+- Staff vs senior: Senior picks a model and a threshold. Staff sets the threshold from the cost of both errors, owns the label-delay plan, and defines the fail-open policy.
+- Drill: Content moderation with LLMs. Cascade: cheap classifier, then LLM, then human review. Class imbalance. Policy as a prompt; policy versioning. Eval: precision and recall per policy class; appeals. LLM only on the uncertain band (priced from `ai-prices.ts`). Failure: adversarial rewording. Discord Osprey (Dec 2025 scale): about 400M actions per day, 204 action types, 2,288 rules, about 500 rules per action; rules are written in a Python-based language and reach workers through etcd with no deploy; outputs go to Kafka and Druid for investigators, and investigation feedback becomes new rules [G8]. Llama Guard (Llama2-7B base) matches or exceeds other moderation tools on two public evals [G10]. OpenAI describes taxonomy-driven classifiers with active learning for rare events [G9]. No latency figures are loaded. Prove it: human reviews per day at a stated pass-through rate. Depends on A9.4, A7.8, A11.5. Src: [G8], [G9], [G10], [P3], [P4].
+- Drill: Bot detection, and spam and phishing detection, as variants of the cascade above.
+- Animate: `DesignBuild`. Second: threshold slider with the cost of a false block vs a miss. Drill visual: cascade threshold vs review load and cost.
 - Prove it: Ballpark. Blocked good payments per day at 0.1% of 5M payments.
 - Src: [C8], [P6]
 
-**A13.4 people-you-may-know: People You May Know**
-- requires: A3.5, A3.3, B:11-breakdowns/news-feed
-- Write: Graph candidates (friends of friends), then ranking. Privacy and fairness limits. Cold start. Eval: accept rate and reverse feedback (hide). Cost: graph traversal and embedding refresh.
-- Animate: `DesignBuild`. Second: candidate-count explosion by hop.
-- Prove it: Diagnose. A user is shown an ex-partner. Name the missing control.
-- Src: [P4], [P6]
+**A13.4 llm-gateway: LLM Gateway**
+- requires: A7.7, A7.8, A10.2
+- Requirements and quality bar: Multi-tenant gateway in front of many providers. Bar: no tenant starves another; failover within a stated time; spend per team is exact.
+- Eval plan: Routing quality by eval gate (A9.4); failover drills; budget accuracy against provider invoices.
+- Budgets: Added latency of the gateway (target a few ms). Dollars: blended cost per million tokens by route, with live provider prices from `ai-prices.ts`.
+- High-level design: Auth, quotas by team, per-model limits, caching, routing, fallback, logging, budget enforcement, chargeback. Overlap: rate limiting and caching follow the overlap rule (cards to B:07-reliability/rate-limiting and B:05-caching).
+- Deep dives: (1) Quota design: token buckets on TPM and RPM, fair share, burst credit. (2) Eval-gated routing and cascades: cheap model first, escalate on low confidence. (3) Provider outage and spend-cap 429s [A10]: fallback order, retry budget, and degraded modes.
+- Failure modes and incident drill: Primary provider outage; one team burns the shared quota; cache poisons answers across tenants. Drill: a cost spike at 3 a.m.; find the team and cut it off.
+- Staff vs senior: Senior builds a proxy with keys and limits. Staff adds eval-gated routing, per-tenant isolation, exact cost attribution, and a tested failover.
+- Drill: Eval platform. Datasets, runners, judges, scoreboards, CI gates, trace import, human labeling queue. Judge validation on 25 to 50 labels per batch [E1]. Regression gates per release. Cost per eval run priced from `ai-prices.ts`. Feedback flywheel integration. Prove it: eval cost per release: cases x judge price x runs. Depends on A9.8, A10.1, A10.7. Src: [E1], [P8], [E2].
+- Animate: `DesignBuild`. Second: quota simulator with bursts and token buckets. Drill visual: CI gate showing a regression blocking a release.
+- Prove it: Diagnose. One team burns the shared quota. Fix the design.
+- Src: [A10], [A5], [E1], [P8], [E2]. No loaded primary source for a named gateway design; writer must source.
 
-**A13.5 search-ranking: Search Ranking**
-- requires: A3.5, A6.7, B:08-technologies/elasticsearch
-- Write: Query understanding, retrieval, learning-to-rank, re-ranking. Position bias in click logs. Eval: NDCG offline, interleaving online. Latency budget by stage.
-- Animate: `DesignBuild`. Second: position-bias demo with click curves.
-- Prove it: Ballpark. Stage budget for a 200 ms search.
-- Src: [P6], [P7], [M2]
-
-**A13.6 video-recommendation: Video Recommendation Feed**
-- requires: A3.5, A3.8, B:11-breakdowns/youtube
-- Write: Two-stage design from [M2]. PinnerFormer: a user embedding from an action sequence, refreshed daily in batch, trained to predict long-term engagement; the abstract reports retention gains without figures [G4]. Objectives: watch time, satisfaction, long-term retention. Exploration. Cold start. Feedback loops. Eval: A/B with guardrails. Cost: embedding refresh and ranker QPS.
-- Animate: `DesignBuild`. Second: exploration-rate slider vs long-term metric.
-- Prove it: Ballpark. Ranker QPS for 100M daily users at 20 feeds per session.
-- Src: [M2], [G4], [P4], [P3]
-
-**A13.7 smart-compose: Smart Compose**
-- requires: A5.6, A7.5, A9.6
-- Write: Suggest the next words while typing. Latency budget under human typing speed. Small model, local or edge cache, speculative methods. Quality: acceptance rate vs annoyance. Privacy. Eval plan with online acceptance. Cost: millions of calls per user-day.
-- Animate: `DesignBuild`. Second: latency-vs-model-size chart with a keystroke deadline.
-- Prove it: Ballpark. QPS for 50M users at 10 suggestions per minute for 2 hours a day.
-- Src: [P5], [C3]
-
-**A13.8 visual-semantic-search: Visual and Semantic Search**
-- requires: A6.2, A6.4, A12.1
-- Write: Embed images and text into one space. Index with ANN. Filters. Re-rank. Update path for new items. Eval: recall@k on labeled queries. Cost: index memory.
-- Animate: `DesignBuild`. Second: query-by-image neighbor demo.
-- Prove it: Ballpark. Index size for 500M images at 512 dims in PQ.
-- Src: [P4], [R2]
-
-**A13.9 content-moderation: Content Moderation with LLMs**
-- requires: A9.4, A7.8, A11.5
-- Write: Cascade: cheap classifier, then LLM, then human review. Class imbalance. Policy as a prompt; policy versioning. Eval: precision and recall per policy class; appeals. Cost: LLM only on the uncertain band. Failure: adversarial rewording. Discord Osprey (Dec 2025 scale): about 400M actions per day, 204 action types, 2,288 rules, about 500 rules per action; rules are written in a Python-based language and reach workers through etcd with no deploy; outputs go to Kafka and Druid for investigators, and investigation feedback becomes new rules [G8]. Llama Guard (Llama2-7B base) matches or exceeds other moderation tools on two public evals [G10]. OpenAI describes taxonomy-driven classifiers with active learning for rare events [G9]. No latency figures are loaded.
-- Animate: `DesignBuild`. Second: cascade threshold slider vs review load and cost.
-- Prove it: Ballpark. Human reviews per day at a stated pass-through rate.
-- Src: [G8], [G9], [G10], [P3], [P4]
-
-**A13.10 chatgpt-assistant: ChatGPT-style Assistant**
+**A13.5 chatgpt-assistant: ChatGPT-style Assistant**
 - requires: A5.11, A7.5, B:11-breakdowns/chatgpt
-- Write: Streaming chat with history. KV cache as conversation state: a miss recomputes the whole chat; GPU RAM is the usual bottleneck [C1]. Scheduling by batch size and KV use [C1]. Routing, safety, memory, cost per conversation. Eval: online satisfaction and offline golden set. 100M weekly users in about a year [C1]. No latency or cost figures are published in the source.
+- Overlap: Backend `B:11-breakdowns/chatgpt` already teaches the chat app. This case opens with a 3 to 5 sentence summary and a `CrossTrackLink` card, then covers only serving, evals, and cost.
+- Requirements and quality bar: Streaming chat with history. Bar: TTFT and TPOT SLOs; answer quality on a golden set; safe-output rate.
+- Eval plan: Offline golden set and regression suite; online satisfaction and thumbs; safety rate.
+- Budgets: TTFT, tokens per second, history length. Dollars per conversation by formula (A2.5) with live prices from `ai-prices.ts`.
+- High-level design: KV cache as conversation state: a miss recomputes the whole chat; GPU RAM is the usual bottleneck [C1]. Scheduling by batch size and KV use [C1]. Routing, safety, memory. 100M weekly users in about a year [C1]. No latency or cost figures are published in the source.
+- Deep dives: (1) Session affinity vs cache miss: routing for KV reuse. (2) Memory and history: compaction, summaries, and what to store. (3) Capacity under launch spikes: no spare GPUs, multi-region, graceful degradation [C1].
+- Failure modes and incident drill: Cache-miss storm after a deploy; a region loses GPUs. Drill: TTFT doubles for long chats only.
+- Staff vs senior: Senior draws the chat flow. Staff prices a conversation, plans KV memory, and defines shed-load behavior.
 - Animate: `DesignBuild`. Second: session-affinity vs cache-miss simulator.
 - Prove it: Ballpark. KV memory for 10K concurrent 4K-token chats on 70B.
 - Src: [C1], [K2], [P5]
 
-**A13.11 llm-gateway: LLM Gateway**
-- requires: A7.7, A7.8, A10.2
-- Write: Multi-tenant gateway: auth, quotas by team, per-model limits, caching, routing, fallback, logging. Budget enforcement and chargeback. Eval-gated routing. Failure: a provider outage and spend-cap 429s [A10]. No loaded primary source for a named gateway design; writer must source.
-- Animate: `DesignBuild`. Second: quota simulator with bursts and token buckets.
-- Prove it: Diagnose. One team burns the shared quota. Fix the design.
-- Src: [A10], [A5]
+**A13.6 inference-platform: LLM Inference Platform for an Open Model**
+- requires: A5.11, A10.3, A10.8
+- Requirements and quality bar: Serve an open model for many apps. Bar: TTFT and TPOT SLO attainment; quality parity after quantization.
+- Eval plan: SLO attainment (goodput); a quality-parity suite per quantization and engine change; load tests.
+- Budgets: Per-request latency budget. Dollars per million tokens by formula [A2.5] with the live GPU price from `ai-prices.ts`; compare with a hosted API price from the same table.
+- High-level design: Router, engine pool (vLLM, SGLang), prefix-aware routing, prefill and decode pools [K7, K8], autoscaling on queue depth and KV use [C1], weights cache, quotas, metrics. Capacity plan with goodput. Character.AI: about 20,000 QPS, under 1 cent per hour of conversation, at least 33x cost cut since 2022, inter-turn caching named [C2].
+- Deep dives: (1) Capacity plan: goodput, pool split, and the queueing knee. (2) Prefix-aware routing vs load balance, and the KV transfer cost of disaggregation. (3) Cold start and autoscaling: weights load time, warm pools, cost of idle GPUs.
+- Failure modes and incident drill: GPU node loss mid-stream; a bad engine upgrade lowers quality; a hot expert (MoE). Drill: goodput falls while throughput rises.
+- Staff vs senior: Senior picks vLLM and autoscaling. Staff builds the cost model, sets SLO-based capacity, and gates every engine or quantization change with the parity suite.
+- Drill: Text-to-image service. Async job queue, GPU pool, safety filters, storage and CDN delivery. Steps vs latency vs cost (A12.2). Prompt and output moderation. Eval: preference tests and safety rate. Failure: queue backlog. Prove it: GPUs for 20 images per second at a stated per-image time. UNVERIFIED: SDXL and Flux numbers. Src: [G7], [P5]. Text-to-video, headshots, and captioning are variants (A12.4).
+- Drill: Multi-tenant LoRA platform. Many tenants, one base model. Train LoRA adapters [T7]. Serve many adapters on one base: load on demand, batch across adapters. Isolation, data privacy, quotas, evals per tenant, versioned rollouts. Cost: adapter storage and swap time. 175B GPT-3: 10,000x fewer trainable parameters [T7]. Prove it: memory for 500 adapters at 100 MB each. UNVERIFIED: multi-adapter serving; writer must source. Src: [T7], [T8].
+- Animate: `DesignBuild`. Second: simulator for pool split and goodput. Drill visuals: queue and GPU-pool simulator; adapter cache hit rate vs swap latency.
+- Prove it: Ballpark. GPUs and monthly cost at 20,000 QPS under stated assumptions.
+- Src: [C2], [K7], [K8], [C1]
 
-**A13.12 code-completion: Code Completion (Copilot, Cursor Tab)**
-- requires: A5.4, A5.6, A9.6
-- Write: Copilot: prompt built from code and context; fill-in-the-middle added about 10% relative gain in accepted completions; neighbor tabs about 5%; about 6,000 characters fit; caching keeps context work off the latency path; a contextual filter, then a model generating n completions [C3]. Cursor apply: about 1000 tokens/s on a 70B fine-tune with deterministic speculation [C5]. Eval: acceptance rate, retention.
-- Animate: `DesignBuild`. Second: context-budget packer; what gets into 6,000 characters.
-- Prove it: Ballpark. Latency budget: keystroke to ghost text.
-- Src: [C3], [C5]
-
-**A13.13 enterprise-rag: Enterprise RAG over Company Docs with Permissions**
+**A13.7 enterprise-rag: Enterprise RAG over Company Docs with Permissions**
 - requires: A6.11, A6.12, A6.10
-- Write: Connectors, ACL sync, chunking, hybrid retrieval, rerank, citations. ACL filter with filtered-search limits [R5]. Freshness SLO. Contextual retrieval gains [R8]. Eval: retrieval golden set, faithfulness [R15]. Failure: stale ACL leak. Cost per query: embed, search, rerank, generate. Notion says its AI only surfaces what the user may access (marketing page only). No engineering post on Glean or Notion ACL sync is loaded; writer must source.
-- Animate: `DesignBuild`. Second: ACL-change leak window simulator.
+- Requirements and quality bar: Answers with citations from company docs. Bar: zero permission leaks; retrieval recall and faithfulness above stated pass bars; freshness SLO.
+- Eval plan: Retrieval golden set; faithfulness and answer relevance [R15]; leak tests with canary documents; freshness probes.
+- Budgets: Latency by stage: embed, search, rerank, generate. Dollars per query with live embedding and model prices from `ai-prices.ts`; index cost and re-embed cost.
+- High-level design: Connectors, ACL sync, chunking, hybrid retrieval, rerank, citations. ACL filter with filtered-search limits [R5]. Freshness SLO. Contextual retrieval gains [R8]. Overlap: vector database basics follow the overlap rule (card to B:10-advanced/vector-databases).
+- Deep dives: (1) ACL propagation: pre-filter vs post-filter vs per-tenant index, and the leak window after a revoke. (2) Freshness pipeline: change events, re-embed, delete old chunks, and the SLO. (3) Retrieval quality at scale: chunking, hybrid, contextual retrieval, and fixing retrieval before prompts.
+- Failure modes and incident drill: Stale ACL leak; deleted doc still answers; connector falls behind. Drill: a manager's doc leaks to an ex-member.
+- Staff vs senior: Senior builds a RAG pipeline. Staff owns the ACL consistency model, the freshness SLO, and the retrieval eval, and says what happens on partial failure.
+- Drill: Visual and semantic search. Embed images and text into one space. Index with ANN. Filters. Re-rank. Update path for new items. Eval: recall@k on labeled queries. Cost: index memory. Variants: street-view blurring, similar listings, entity linking, defect detection. Prove it: index size for 500M images at 512 dims in PQ. Src: [P4], [R2].
+- Animate: `DesignBuild`. Second: ACL-change leak window simulator. Drill visual: query-by-image neighbor demo.
 - Prove it: Diagnose. A manager's doc leaks to an ex-member.
-- Src: [R8], [R5], [R15], [C4]
+- Src: [R8], [R5], [R15], [C4], [P4], [R2]. Notion says its AI only surfaces what the user may access (marketing page only). No engineering post on Glean or Notion ACL sync is loaded; writer must source.
 
-**A13.14 answer-engine: Answer Engine (Perplexity-style)**
-- requires: A6.7, A7.6, A9.4
-- Write: Query rewrite, web search, fetch, chunk, rerank, cited answer. Latency budget across fetches. Citation check. Freshness. Source trust and injection from web pages (A11). Eval: citation precision and answer correctness by judge. Perplexity on Vespa (vendor case study): one engine does retrieval, ranking, filtering, real-time indexing, and model inference, which avoids network hops; hybrid keyword, semantic, and structured filters; vector databases could not reliably support even simple boolean filters; passage-level retrieval, then a light ranker, then neural rerank; 780M+ queries per month [G1]. No latency in ms is published.
-- Animate: `DesignBuild`. Second: latency Gantt of parallel fetches.
-- Prove it: Ballpark. Budget for 6 parallel fetches with 1.2 s p95 each.
-- Src: [G1], [R11], [S2]
+**A13.8 code-completion: Code Completion (Copilot, Cursor Tab)**
+- requires: A5.4, A5.6, A9.6
+- Requirements and quality bar: Ghost text while typing. Bar: acceptance rate and retention up; latency under a typing-speed deadline.
+- Eval plan: Online acceptance and retained-after-N-seconds; offline pass@k on a repo suite; latency percentiles.
+- Budgets: Keystroke-to-ghost-text budget by stage. Dollars per accepted completion with live prices.
+- High-level design: Copilot: prompt built from code and context; fill-in-the-middle added about 10% relative gain in accepted completions; neighbor tabs about 5%; about 6,000 characters fit; caching keeps context work off the latency path; a contextual filter, then a model generating n completions [C3]. Cursor apply: about 1000 tokens/s on a 70B fine-tune with deterministic speculation [C5].
+- Deep dives: (1) Context packing under a character budget. (2) Speculative and deterministic decoding for speed (A5.6). (3) Cancellation, debouncing, and caching so most keystrokes cost nothing.
+- Failure modes and incident drill: Stale context suggests deleted code; a latency spike kills acceptance. Drill: acceptance drops after a model upgrade.
+- Staff vs senior: Senior says "small fast model". Staff sets the latency deadline, the packing policy, and the acceptance-based rollout gate.
+- Drill: Smart Compose. Suggest the next words while typing. Latency under human typing speed. Small model, local or edge cache, speculative methods. Acceptance vs annoyance. Privacy. Prove it: QPS for 50M users at 10 suggestions per minute for 2 hours a day. Variants: search autocomplete, Translate-style system. Src: [P5], [C3].
+- Animate: `DesignBuild`. Second: context-budget packer; what gets into 6,000 characters. Drill visual: latency vs model size against a keystroke deadline.
+- Prove it: Ballpark. Latency budget: keystroke to ghost text.
+- Src: [C3], [C5], [P5]
 
-**A13.15 support-agent: Customer Support Agent**
-- requires: A8.7, A8.10, A13.13
-- Write: RAG plus tools (refund, order lookup) plus human handoff. Workflow first, agent only where needed [A5]. Least-privilege tools. Eval: resolution rate, escalation rate, wrong-action rate. Cost per resolved ticket. Failure: injection through ticket text. Klarna (press release, Feb 2024): 2.3M conversations in the first month, two-thirds of chats, 35+ languages, resolution under 2 min (was 11), work of 700 agents; no architecture detail [G2]. Fin (vendor page): "Procedures" run multi-step actions such as refunds; claims 76% average resolution; other published figures (56%, 38 to 50%) use other definitions, so treat all as unverified [G3]. Airbnb voice support: ASR word error rate 33% to about 10% with a domain phrase list; top-30 vector retrieval, then an LLM reranker; intent detection under 50 ms, retrieval within 60 ms [G13].
+**A13.9 support-agent: Customer Support Agent**
+- requires: A8.7, A8.10, A13.7
+- Requirements and quality bar: Resolve tickets with RAG plus tools plus human handoff. Bar: resolution rate, escalation rate, and wrong-action rate at stated levels.
+- Eval plan: Task-level evals on real tickets; wrong-action audits; handoff quality; online resolution and CSAT.
+- Budgets: Latency per turn. Dollars per resolved ticket with live model prices; compare with human cost per ticket (writer states the source).
+- High-level design: Workflow first, agent only where needed [A5]. Least-privilege tools (refund, order lookup). Handoff policy. Klarna (press release, Feb 2024): 2.3M conversations in the first month, two-thirds of chats, 35+ languages, resolution under 2 min (was 11), work of 700 agents; no architecture detail [G2]. Fin (vendor page): "Procedures" run multi-step actions such as refunds; claims 76% average resolution; other published figures (56%, 38 to 50%) use other definitions, so treat all as unverified [G3]. Airbnb voice support: ASR word error rate 33% to about 10% with a domain phrase list; top-30 vector retrieval, then an LLM reranker; intent detection under 50 ms, retrieval within 60 ms [G13].
+- Deep dives: (1) Tool permissions and confirmation for money-moving actions. (2) Injection through ticket text and the lethal trifecta (A11). (3) Handoff policy: when to escalate, and how to measure the cost of a wrong answer.
+- Failure modes and incident drill: Injected ticket triggers a refund; the agent loops on a failing tool. Drill: refunds rise 4x in a day.
+- Staff vs senior: Senior builds RAG plus tools. Staff defines the action budget, the human path, and the metric that counts wrong actions, not only resolutions.
 - Animate: `DesignBuild`. Second: handoff-policy slider vs cost and risk.
 - Prove it: Ballpark. Cost per resolved ticket with a stated resolution rate.
 - Src: [G2], [G3], [G13], [A5], [S3]
 
-**A13.16 voice-agent: Voice Agent**
+**A13.10 voice-agent: Voice Agent**
 - requires: A12.3, A8.1, A7.5
-- Write: Streamed speech pipeline, turn-taking, barge-in, tool calls without dead air. Latency budget to first audio. Telephony. Eval: task success, interruption handling, word error rate. Cost per minute. Use the ElevenLabs stage budget from A12.3 [G6].
+- Requirements and quality bar: Natural spoken conversation. Bar: P50 time to first audio under 800 ms and P95 under 1.5 s (vendor target [G6]); task success rate; low word error rate.
+- Eval plan: Task success; interruption handling; word error rate; latency percentiles from real calls.
+- Budgets: Use the ElevenLabs stage budget from A12.3 [G6]. Dollars per call minute from live STT, LLM, and TTS prices in `ai-prices.ts`, plus telephony.
+- High-level design: Streamed speech pipeline, turn-taking, barge-in, tool calls without dead air, telephony.
+- Deep dives: (1) Endpointing: the silence threshold is a main latency cost [G6]. (2) Barge-in and turn-taking state machine. (3) Tool calls with filler speech, and fallback when a stage fails.
+- Failure modes and incident drill: Echo triggers self-interrupt; a slow tool call creates dead air. Drill: P95 doubles on mobile networks.
+- Staff vs senior: Senior lists the stages. Staff budgets each stage, tunes endpointing, and plans the fallback path.
 - Animate: `DesignBuild`. Second: budget Gantt with tool-call filler.
 - Prove it: Ballpark. Cost per call minute from stage prices.
 - Src: [G6], [K2]
 
-**A13.17 text-to-image: Text-to-Image Service**
-- requires: A12.2, A12.5, B:06-async/queues
-- Write: Async job queue, GPU pool, safety filters, storage and CDN delivery. Steps vs latency vs cost. Prompt moderation and output moderation. Eval: preference tests and safety rate. Failure: queue backlog.
-- Animate: `DesignBuild`. Second: queue and GPU-pool simulator.
-- Prove it: Ballpark. GPUs for 20 images per second at a stated per-image time.
-- Src: [G7], [P5]. UNVERIFIED: SDXL and Flux numbers.
-
-**A13.18 coding-agent: AI Coding Agent**
+**A13.11 coding-agent: AI Coding Agent**
 - requires: A8.8, A8.5, A10.7
-- Write: Loop: search, edit, run tests, verify [A11]. Agentic search first, semantic search if needed [A11]. Codebase index with Merkle sync [C4]; semantic search gave 12.5% average accuracy gain; time to first query median 7.87 s down to 525 ms with index reuse [C4]. Sandbox for code runs. Subagents keep context small [A11]. Coupled coding tasks suit multi-agent poorly [A6]. Eval: task pass rate on a repo suite with tests. Cost per task.
+- Requirements and quality bar: Complete repo tasks end to end. Bar: task pass rate on a repo suite with tests; no writes outside the repo; cost per task within a stated cap.
+- Eval plan: Pass rate on a held-out repo suite; trace review; regression gate per prompt or model change.
+- Budgets: Wall-clock per task. Dollars per task with live model prices and measured tokens.
+- High-level design: Loop: search, edit, run tests, verify [A11]. Agentic search first, semantic search if needed [A11]. Codebase index with Merkle sync [C4]; semantic search gave 12.5% average accuracy gain; time to first query median 7.87 s down to 525 ms with index reuse [C4]. Sandbox for code runs. Subagents keep context small [A11]. Coupled coding tasks suit multi-agent poorly [A6].
+- Deep dives: (1) Sandbox and permissions: file, network, and secret boundaries. (2) Context management: search strategy, compaction, subagents. (3) Verification loop: tests as the reward, and handling flaky tests and runaway loops.
+- Failure modes and incident drill: Edits outside the repo; infinite fix loop; leaked secret in a log. Drill: pass rate falls after a tool-output size change.
+- Staff vs senior: Senior describes the loop. Staff defines sandbox policy, the eval suite, per-task budgets, and the kill switch.
 - Animate: `DesignBuild`. Second: agent loop with a failing test and a retry.
 - Prove it: Diagnose. The agent edits files outside the repo. Which control?
 - Src: [A11], [C4], [A6]
 
-**A13.19 deep-research: Deep Research Agent**
+**A13.12 deep-research: Deep Research Agent**
 - requires: A8.6, A8.7, A9.4
-- Write: Lead plans; 3 to 5 subagents search in parallel; citation subagent checks claims [A6]. Token cost about 15x chat [A6]. Durable state and rainbow deploys [A6]. Eval: judge on a rubric plus human spot checks. Failure: 50 subagents for a simple query [A6]. Limits on tool calls.
-- Animate: `DesignBuild`. Second: effort-scaling rule table: query complexity vs subagents.
+- Requirements and quality bar: Long-form cited reports. Bar: claim-level citation precision; rubric score above a stated bar; cost per report within a cap.
+- Eval plan: Judge on a rubric plus human spot checks; citation check per claim; cost and latency tracking.
+- Budgets: Wall-clock with parallel subagents. Dollars per run: token cost about 15x chat [A6], priced with live model prices from `ai-prices.ts`.
+- High-level design: Lead plans; 3 to 5 subagents search in parallel; citation subagent checks claims [A6]. Durable state and rainbow deploys [A6]. Limits on tool calls.
+- Deep dives: (1) Effort scaling: how many subagents for which query. (2) Durable execution: checkpoints, resume, and rainbow deploys [A6]. (3) Source trust, injection from fetched pages, and citation verification (A11).
+- Failure modes and incident drill: 50 subagents for a simple query [A6]; a poisoned page steers the report. Drill: cost per run triples in a week.
+- Staff vs senior: Senior draws lead plus subagents. Staff sets effort-scaling rules, a cost cap, resume semantics, and a citation gate.
+- Drill: Answer engine (Perplexity-style). Query rewrite, web search, fetch, chunk, rerank, cited answer. Latency budget across fetches. Citation check. Freshness. Source trust and injection from web pages (A11). Eval: citation precision and answer correctness by judge. Perplexity on Vespa (vendor case study): one engine does retrieval, ranking, filtering, real-time indexing, and model inference, which avoids network hops; hybrid keyword, semantic, and structured filters; vector databases could not reliably support even simple boolean filters; passage-level retrieval, then a light ranker, then neural rerank; 780M+ queries per month [G1]. No latency in ms is published. Prove it: budget for 6 parallel fetches with 1.2 s p95 each. Depends on A6.7, A7.6. Src: [G1], [R11], [S2].
+- Animate: `DesignBuild`. Second: effort-scaling rule table: query complexity vs subagents. Drill visual: latency Gantt of parallel fetches.
 - Prove it: Ballpark. Dollar cost of a run at 15x tokens of a stated chat.
-- Src: [A6], [A9]
-
-**A13.20 inference-platform: LLM Inference Platform for an Open Model**
-- requires: A5.11, A10.3, A10.8
-- Write: Router, engine pool (vLLM, SGLang), prefix-aware routing, prefill/decode pools [K7, K8], autoscaling on queue depth and KV use [C1], weights cache, quotas, metrics. Capacity plan with goodput. Cost per million tokens by formula [A2.5]. Character.AI: about 20,000 QPS, under 1 cent per hour of conversation, at least 33x cost cut since 2022, inter-turn caching named [C2]. Eval: SLO attainment and quality parity after quantization.
-- Animate: `DesignBuild`. Second: simulator for pool split and goodput.
-- Prove it: Ballpark. GPUs and monthly cost at 20,000 QPS under stated assumptions.
-- Src: [C2], [K7], [K8], [C1]
-
-**A13.21 lora-platform: Multi-tenant Fine-tuning (LoRA) Platform**
-- requires: A4.8, A5.8, A10.5
-- Write: Many tenants, one base model. Train LoRA adapters [T7]. Serve many adapters on one base: load on demand, batch across adapters. Isolation, data privacy, quotas, evals per tenant, versioned rollouts. Cost: adapter storage and swap time. 175B GPT-3: 10,000x fewer trainable parameters [T7]. Writer must source multi-adapter serving.
-- Animate: `DesignBuild`. Second: adapter cache hit-rate vs swap latency simulator.
-- Prove it: Ballpark. Memory for 500 adapters at 100 MB each.
-- Src: [T7], [T8]. UNVERIFIED: multi-adapter serving.
-
-**A13.22 eval-platform: Eval Platform**
-- requires: A9.8, A10.1, A10.7
-- Write: Datasets, runners, judges, scoreboards, CI gates, trace import, human labeling queue. Judge validation on 25 to 50 labels per batch [E1]. Regression gates per release. Cost per eval run and scheduling. Feedback flywheel integration. Closes the loop of the track.
-- Animate: `DesignBuild`. Second: CI gate showing a regression blocking a release.
-- Prove it: Ballpark. Eval cost per release: cases x judge price x runs.
-- Src: [E1], [P8], [E2]
+- Src: [A6], [A9], [G1], [R11], [S2]
 
 ### A14. In the Wild
 
@@ -1085,7 +1127,7 @@ Each lesson is a teardown with "company claim" and "our reading" labels, and a b
 - Src: [T2]
 
 **A14.2 characterai-inference: Character.AI Inference**
-- requires: A13.20
+- requires: A13.6
 - Write: About 20,000 QPS; under 1 cent per hour of conversation; at least 33x cost cut since 2022; inter-turn caching [C2]. The loaded page does not list MQA or int8; say "secondary reports" if used.
 - Animate: Before and after cost bars. Second: inter-turn cache hit simulator.
 - Prove it: Ballpark. Cost per million conversation hours.
@@ -1099,14 +1141,14 @@ Each lesson is a teardown with "company claim" and "our reading" labels, and a b
 - Src: [C4]
 
 **A14.4 cursor-apply: Cursor Instant Apply**
-- requires: A5.6, A13.12
+- requires: A5.6, A13.8
 - Write: Full-file rewrite with deterministic speculation; about 1000 tokens/s on a 70B fine-tune; about 9x over the earlier GPT-4 speculative-edits setup; served on Fireworks [C5].
 - Animate: Speculation accepting copied lines. Second: tokens/s bar compare.
 - Prove it: Ballpark. Time to rewrite a 400-line file.
 - Src: [C5]
 
 **A14.5 anthropic-research: Anthropic Multi-agent Research System**
-- requires: A8.6, A13.19
+- requires: A8.6, A13.12
 - Write: Lead and 3 to 5 subagents; up to 90% less time; 4x and 15x chat tokens; 90.2% gain over single-agent on an internal eval; tool-testing agent cut task time 40%; checkpoints and rainbow deploys [A6].
 - Animate: System diagram step-through. Second: token-use vs score chart (80% variance).
 - Prove it: Diagnose. Spawning too many subagents: which rule fixes it?
@@ -1120,7 +1162,7 @@ Each lesson is a teardown with "company claim" and "our reading" labels, and a b
 - Src: [C6], [C7], [C8]
 
 **A14.7 perplexity-vespa: Perplexity on Vespa**
-- requires: A6.7, A13.14
+- requires: A6.7, A13.12
 - Write: Vendor case study; label company claim vs our reading. One serving engine for retrieval, ranking, filtering, real-time indexing, and inference. Hybrid retrieval; passage-level retrieval; light ranker then neural rerank; 780M+ queries per month, 20%+ monthly growth. Boolean-filter limits of vector databases. The web index later moved to an internal system [G1].
 - Animate: Before and after: separate stores vs one engine, with network hops counted. Second: multi-stage ranking funnel.
 - Prove it: Diagnose. Which hops disappear when inference runs inside the serving layer?
@@ -1137,62 +1179,62 @@ Each lesson is a teardown with "company claim" and "our reading" labels, and a b
 
 ## 4. Interview question bank
 
-The notes list 26 prompts in `1-platforms.md` section (c), 11 more in `4-case-studies.md` (source [C9]), and 32 in `5-case-gaps.md`. Each maps to a case. "Variant" means a drill inside a nearby case, not a new lesson.
+The notes list 26 prompts in `1-platforms.md` section (c), 11 more in `4-case-studies.md` (source [C9]), and 32 in `5-case-gaps.md`. Each maps to a deep case (12 in A13). "Drill" means a variant exercise inside a deep case, not a lesson. "Variant" means a small change of a case or drill.
 
 | # | Prompt (source) | Case |
 |---|---|---|
-| 1 | Visual search (ByteByteGo, Grokking) | A13.8 |
-| 2 | Street View face and plate blurring (ByteByteGo) | Variant of A13.8 plus A13.9 |
-| 3 | YouTube video search (ByteByteGo) | Variant of A13.8 and A13.5 |
-| 4 | Harmful content detection (ByteByteGo, Grokking, Hello Interview) | A13.9 |
-| 5 | Video recommendation (ByteByteGo, Educative, Hello Interview) | A13.6 |
-| 6 | Event recommendation (ByteByteGo) | Variant of A13.6 |
-| 7 | Ad click prediction (ByteByteGo, Educative, Grokking) | A13.1 |
-| 8 | Similar vacation-rental listings (ByteByteGo) | Variant of A13.8 |
-| 9 | Personalized news feed (ByteByteGo, Grokking, Educative) | Variant of A13.6 and A13.5 |
-| 10 | People You May Know (ByteByteGo, Grokking) | A13.4 |
-| 11 | Rental search ranking (Educative, Grokking) | A13.5 |
-| 12 | Food-delivery ETA (Educative, Grokking) | A13.2 |
+| 1 | Visual search (ByteByteGo, Grokking) | Drill in A13.7 |
+| 2 | Street View face and plate blurring (ByteByteGo) | Variant of the A13.7 drill plus the A13.3 moderation drill |
+| 3 | YouTube video search (ByteByteGo) | Variant of the A13.7 drill and the A13.1 search drill |
+| 4 | Harmful content detection (ByteByteGo, Grokking, Hello Interview) | Drill in A13.3 (content moderation) |
+| 5 | Video recommendation (ByteByteGo, Educative, Hello Interview) | A13.1 |
+| 6 | Event recommendation (ByteByteGo) | Variant of A13.1 |
+| 7 | Ad click prediction (ByteByteGo, Educative, Grokking) | A13.2 |
+| 8 | Similar vacation-rental listings (ByteByteGo) | Variant of the A13.7 drill |
+| 9 | Personalized news feed (ByteByteGo, Grokking, Educative) | Variant of A13.1 and its search drill |
+| 10 | People You May Know (ByteByteGo, Grokking) | Drill in A13.1 |
+| 11 | Rental search ranking (Educative, Grokking) | Drill in A13.1 (search ranking) |
+| 12 | Food-delivery ETA (Educative, Grokking) | Drill in A13.2 |
 | 13 | Bot detection (Hello Interview) | Variant of A13.3 |
 | 14 | Fraud detection (Grokking) | A13.3 |
-| 15 | Dynamic pricing (Grokking) | Variant of A13.2 and A13.1 |
-| 16 | Entity linking (Grokking) | Variant of A13.8 |
+| 15 | Dynamic pricing (Grokking) | Variant in A13.2 (ETA and CTR drills) |
+| 16 | Entity linking (Grokking) | Variant of the A13.7 drill |
 | 17 | Self-driving image segmentation (Grokking) | Out of scope. A12.1 covers the basics |
-| 18 | Movie or show recommendation (Grokking) | Variant of A13.6 |
-| 19 | Gmail Smart Compose (ByteByteGo) | A13.7 |
-| 20 | Google Translate-style system (ByteByteGo) | Variant of A13.7 |
-| 21 | ChatGPT-style assistant (ByteByteGo, Hello Interview) | A13.10 |
-| 22 | RAG system design (ByteByteGo, Aminian) | A13.13 |
-| 23 | Text-to-image, text-to-video, headshots (ByteByteGo) | A13.17, A12.4 |
-| 24 | LLM inference system design (calm.rocks) | A13.20 |
-| 25 | Ask-the-web and deep-research agents (Aminian) | A13.14, A13.19 |
+| 18 | Movie or show recommendation (Grokking) | Variant of A13.1 |
+| 19 | Gmail Smart Compose (ByteByteGo) | Drill in A13.8 |
+| 20 | Google Translate-style system (ByteByteGo) | Variant of the A13.8 drill |
+| 21 | ChatGPT-style assistant (ByteByteGo, Hello Interview) | A13.5 |
+| 22 | RAG system design (ByteByteGo, Aminian) | A13.7 |
+| 23 | Text-to-image, text-to-video, headshots (ByteByteGo) | Drill in A13.6, A12.2, A12.4 |
+| 24 | LLM inference system design (calm.rocks) | A13.6 |
+| 25 | Ask-the-web and deep-research agents (Aminian) | A13.12 (includes the answer-engine drill) |
 | 26 | Agent vs fixed pipeline; PAIR red-team loop (calm.rocks) | A8.2, A11.6 |
-| 27 | YouTube recommendations (C9) | A13.6 |
-| 28 | Instagram feed ranking (C9) | Variant of A13.6 |
-| 29 | Search autocomplete (C9) | A13.7 |
-| 30 | Design ChatGPT (C9) | A13.10 |
-| 31 | Coding assistant (C9) | A13.12, A13.18 |
-| 32 | Assistant over company documents (C9) | A13.13 |
+| 27 | YouTube recommendations (C9) | A13.1 |
+| 28 | Instagram feed ranking (C9) | Variant of A13.1 |
+| 29 | Search autocomplete (C9) | Variant of the A13.8 drill |
+| 30 | Design ChatGPT (C9) | A13.5 |
+| 31 | Coding assistant (C9) | A13.8, A13.11 |
+| 32 | Assistant over company documents (C9) | A13.7 |
 | 33 | Where would you add AI to our e-commerce platform (C9) | A0.4, A0.2 |
-| 34 | Support ticket overload (C9) | A13.15 |
-| 35 | Agent that books travel (C9) | A8.10, A13.15 |
+| 34 | Support ticket overload (C9) | A13.9 |
+| 35 | Agent that books travel (C9) | A8.10, A13.9 |
 | 36 | Model takes actions for a user (C9) | A8.8, A11.4 |
 | 37 | "Our RAG is slow and wrong, fix it" (C9) | A6.12, A10.1 |
-| 38 | LLM gateway (not in notes; added by this plan) | A13.11 |
-| 39 | Eval platform, multi-tenant LoRA platform (added by this plan) | A13.22, A13.21 |
-| 40 | Image captioning, realistic face generation, high-resolution synthesis, headshot generation (ByteByteGo GenAI intro [G15]) | Variants of A13.17, A12.1, A12.2 |
-| 41 | Design an agent harness and evaluation system (Prachub [G16]) | A8.1, A13.22 |
+| 38 | LLM gateway (not in notes; added by this plan) | A13.4 |
+| 39 | Eval platform, multi-tenant LoRA platform (added by this plan) | Drills in A13.4 and A13.6 |
+| 40 | Image captioning, realistic face generation, high-resolution synthesis, headshot generation (ByteByteGo GenAI intro [G15]) | Variants of the A13.6 drill, A12.1, A12.2 |
+| 41 | Design an agent harness and evaluation system (Prachub [G16]) | A8.1, A13.4 (eval-platform drill) |
 | 42 | Scalable and safe agentic system (Prachub [G16]) | A8.8, A8.10, A11.4 |
-| 43 | E-commerce search ranking (Analytics Vidhya [G17]) | A13.5 |
-| 44 | Spam and phishing detection (G17) | Variant of A13.9, A13.3 |
-| 45 | Visual defect detection (G17) | Variant of A13.8, A12.1 |
+| 43 | E-commerce search ranking (Analytics Vidhya [G17]) | Drill in A13.1 (search ranking) |
+| 44 | Spam and phishing detection (G17) | Variant of the A13.3 moderation drill and A13.3 |
+| 45 | Visual defect detection (G17) | Variant of the A13.7 drill, A12.1 |
 | 46 | Demand forecasting (G17) | Out of scope as a case. A3.1 to A3.7 cover the method |
 | 47 | End-to-end ML system; real-time feature store (Prachub ML [G18]) | A3.1 to A3.9; A3.3, A3.9, A14.6 |
-| 48 | Short-video, food-delivery, generic recommender; ranking service; personalized feed (G18) | A13.6, A13.5 |
+| 48 | Short-video, food-delivery, generic recommender; ranking service; personalized feed (G18) | A13.1, A13.2 (ETA drill) |
 
 Merged lists: the 32 prompts in `5-case-gaps.md` section 13 (ByteByteGo GenAI intro, Prachub GenAI, Analytics Vidhya, Prachub ML). Duplicates of rows 1 to 39 were dropped: Smart Compose, Translate, ChatGPT, RAG, text-to-image, text-to-video, enterprise support agent, RAG with evaluation, enterprise RAG agent, feed ranking, ads CTR, fraud, ETA, dynamic pricing, RAG support assistant.
 
-Answer structure from C9: confirm depth, clarify requirements and metrics, cover data and serving, finish with evaluation, feedback, and risks. A0.2 extends it with budgets.
+Answer structure from C9: confirm depth, clarify requirements and metrics, cover data and serving, finish with evaluation, feedback, and risks. A0.2 extends it with budgets. Each deep case adds a "staff answer vs senior answer" box.
 
 ---
 
@@ -1203,33 +1245,51 @@ Answer structure from C9: confirm depth, clarify requirements and metrics, cover
 - `src/lib/syllabus.ts`: one array `syllabus: ModuleOutline[]` (13 modules). `buildSyllabus(written)` assigns numbers `${moduleIndex}.${lessonIndex+1}`, then checks that each `requires` id exists and sits earlier in the flat order.
 - `src/lib/lessons.ts`: `loadSyllabus()` reads the `lessons` collection and calls `buildSyllabus`.
 - `src/content.config.ts`: one collection, glob `**/*.mdx` under `src/content/lessons`, schema `{ summary, requires[] }`.
-- `src/pages/learn/[...id].astro`: one lesson route. It computes `level` from `parseInt(entry.id)` and uses `flat` for prev and next.
+- `src/pages/learn/[...id].astro`: one lesson route at `/learn/<id>/`. It computes `level` from `parseInt(entry.id)` and uses `flat` for prev and next.
 - `src/layouts/Layout.astro`: sidebar renders `modules` as `<details>` with lesson links and "Soon" pills.
 - `src/lib/mastery.ts`: progress, review cards, and calibration in `localStorage` keys (`sd-progress`, `sd-cards`, `sd-explain`).
 - `src/pages/questions.json.ts` and `review.astro`: read every `.mdx` under `src/content/lessons/**` and extract quizzes.
 - `scripts/quiz-audit.py`, `diagnose-audit.py`: audit quiz and Diagnose rules.
 
+### Decided routes (2026-10-15)
+
+| URL | Page |
+|---|---|
+| `/` | Hub. A track picker with two cards (Backend, AI). Each card shows lesson count and the reader's progress |
+| `/learn/backend/` | Backend landing page (track map and roadmap) |
+| `/learn/backend/<id>/` | Backend lesson. `<id>` is the current id, for example `05-caching/why-cache` |
+| `/learn/ai/` | AI landing page (track map and roadmap) |
+| `/learn/ai/<id>/` | AI lesson. `<id>` is the id without the `ai/` prefix, for example `a5-inference/kv-cache` |
+| `/learn/<id>/` (old) | Redirects to `/learn/backend/<id>/` |
+
 ### Proposal
 
-1. **Content path.** `src/content/lessons/ai/<module-slug>/<lesson-slug>.mdx`. Lesson id becomes `ai/a5-inference/kv-cache`. The existing glob already matches it. No change to `content.config.ts`.
-2. **Syllabus.** Add `src/lib/ai-syllabus.ts` that exports `aiSyllabus: ModuleOutline[]`. Keep `syllabus.ts` for the backend. Extend `ModuleOutline` with `track: 'backend' | 'ai'`. Reason: one flat order lets AI lessons list backend lessons in `requires`, and the existing "earlier only" check still works. Define the flat order as backend modules first, then AI modules.
-3. **Numbering.** Pass a number prefix to `buildSyllabus`: backend `0.1`, AI `A0.1`. Module `number` becomes a string label.
-4. **Cross-track `requires`.** AI to backend allowed (backend comes first in the flat order). Backend to AI blocked by the existing check. Build fails on a violation. Backend lessons that mention AI use plain text, not links.
-5. **Routes.** Keep one dynamic route to avoid forking the lesson page. Option A (recommended): `/learn/ai/<module>/<lesson>/`, a lesson under the same route. Option B (the first proposal): `/ai/learn/<id>/` through a second page `src/pages/ai/learn/[...id].astro`. Option B needs the lesson page body extracted into a shared `LessonPage.astro`. Choose B only if the user wants the `/ai/` URL prefix.
-6. **Level label.** The route computes `level` from `parseInt(entry.id)`. For AI ids, read the module's `level` field in the outline instead. Add an optional `level` to `ModuleOutline`.
-7. **Track switcher.** In `Layout.astro`, add a two-tab control at the top of the sidebar: Backend, AI. Pass `modules` for the active track only. Remember the last track in `localStorage` (wrapped in try/catch). Add a landing page `src/pages/ai/index.astro` with a track map and a roadmap, reusing `CourseMap.tsx`.
-8. **Progress, quiz, review, mastery.** Reuse as is. `sd-progress` keys on lesson id, so prefixed AI ids do not collide. `questions.json.ts` and `review.astro` already glob all lessons. Add a track filter on `/review` (all, backend, AI).
-9. **Audits.** `quiz-audit.py` and `diagnose-audit.py` must scan `src/content/lessons/ai/` as well. Question text stays unique across both tracks.
-10. **Search.** `search.json.ts` takes both tracks. Add a track badge to results.
-11. **Contract.** `NEXT_LESSONS.md` applies unchanged. Add one short section that says AI lessons live under `ai/` and may require backend ids.
+1. **Content path.** Backend lessons stay at `src/content/lessons/<module>/<lesson>.mdx`. AI lessons live at `src/content/lessons/ai/<module-slug>/<lesson-slug>.mdx`. The AI lesson id is `ai/a5-inference/kv-cache`. The existing glob already matches it. No change to `content.config.ts`.
+2. **Backend ids do not change.** `sd-progress`, `sd-cards`, and `sd-explain` key on the lesson id. Unchanged ids keep all existing progress. AI ids start with `ai/`, so they cannot collide.
+3. **Routes.** Replace `src/pages/learn/[...id].astro` with a shared `src/components/LessonPage.astro` and two thin pages: `src/pages/learn/backend/[...id].astro` (all ids that do not start with `ai/`) and `src/pages/learn/ai/[...id].astro` (ids that start with `ai/`; the page strips the prefix from the URL). Add `src/pages/learn/backend/index.astro` and `src/pages/learn/ai/index.astro` as landing pages. Both reuse `CourseMap.tsx`.
+4. **Redirects.** Old `/learn/<id>/` URLs must keep working. Use the Astro `redirects` option in `astro.config.mjs`. Build the map at config time from the backend syllabus: `'/learn/<id>': '/learn/backend/<id>/'` for each backend id. Add `'/learn': '/learn/backend/'`. If the config cannot read the syllabus, generate one static redirect page per lesson instead. Add a build check that every old URL resolves.
+5. **Internal links.** A scripted pass rewrites `/learn/<id>/` links in all `.mdx`, `Layout.astro`, `CourseMap.tsx`, `review.astro`, `search.json.ts`, and `questions.json.ts` to `/learn/backend/<id>/`. The redirects remain for external links only. Writers use the new form (see section 8).
+6. **Hub.** `src/pages/index.astro` becomes the track picker. Show "continue where you left off" from `sd-progress`. Remember the last track in `localStorage`, wrapped in try/catch.
+7. **Syllabus.** Add `src/lib/ai-syllabus.ts` that exports `aiSyllabus: ModuleOutline[]`. Keep `syllabus.ts` for the backend. Extend `ModuleOutline` with `track: 'backend' | 'ai'`. Define the flat order as backend modules first, then AI modules, so AI lessons can list backend lessons in `requires` and the existing "earlier only" check still works.
+8. **Numbering.** Pass a number prefix to `buildSyllabus`: backend `0.1`, AI `A0.1`. Module `number` becomes a string label.
+9. **Cross-track `requires`.** AI to backend allowed. Backend to AI blocked by the existing check. Build fails on a violation. Backend lessons that mention AI use plain text, not links.
+10. **Level label.** The route computes `level` from `parseInt(entry.id)`. For AI ids, read the module's `level` field in the outline instead. Add an optional `level` to `ModuleOutline`.
+11. **Sidebar and track switch.** In `Layout.astro`, add a two-tab control at the top of the sidebar: Backend, AI. The active track comes from the URL. Pass `modules` for the active track only.
+12. **Coming soon stubs.** Every AI lesson is in `ai-syllabus.ts` from day one. `buildSyllabus(written)` marks a lesson without an `.mdx` file as "Soon". The AI landing page and the sidebar show all 128 lessons, with "Soon" pills, from Phase 0.
+13. **Cross-track cards.** Add the `CrossTrackLink` component (section 7). It takes a target lesson id, finds its title and track from the syllabus, and builds the URL with the new routes. The build fails if the target id does not exist.
+14. **Prices.** Add `src/lib/ai-prices.ts`: the one table for every price shown in a lesson. Each row has `provider`, `model` (or GPU SKU), `unit` (for example per million input tokens), `price`, `asOf` (YYYY-MM-DD), and `sourceUrl`. Lessons import prices through the `AiPriceTag` component and never type a price by hand. A build check fails when a lesson quotes a dollar figure that has no row. A row older than 120 days prints a warning; it does not fail the build. See the quarterly refresh task in section 8.
+15. **Progress, quiz, review, mastery.** Reuse as is. `questions.json.ts` and `review.astro` already glob all lessons. Add a track filter on `/review` (all, backend, AI).
+16. **Audits.** `quiz-audit.py` and `diagnose-audit.py` must scan `src/content/lessons/ai/` as well. Question text stays unique across both tracks.
+17. **Search.** `search.json.ts` takes both tracks. Add a track badge to results.
+18. **Contract.** `NEXT_LESSONS.md` applies unchanged. Add one short section that says AI lessons live under `ai/`, may require backend ids, use the new routes, and follow the overlap and price rules of this plan.
 
-Shared files that only the orchestrator edits: `syllabus.ts`, `ai-syllabus.ts`, `Layout.astro`, `[...id].astro`, `content.config.ts`, `index.astro`. Writers do not touch them.
+Shared files that only the orchestrator edits: `syllabus.ts`, `ai-syllabus.ts`, `ai-prices.ts` (writers may request a row; the orchestrator adds it), `Layout.astro`, `LessonPage.astro`, both route pages, `astro.config.mjs`, `content.config.ts`, `index.astro`. Writers do not touch them.
 
 ---
 
 ## 6. AI Numbers to Know (draft)
 
-Only numbers present in the research notes. "Derived" means the notes show the arithmetic. Dated: 2026-10-14.
+Only numbers present in the research notes. "Derived" means the notes show the arithmetic. Dated: 2026-10-14. This table holds no dollar prices. Prices live in `src/lib/ai-prices.ts`.
 
 | Group | Number | Lesson | Source |
 |---|---|---|---|
@@ -1283,7 +1343,7 @@ Only numbers present in the research notes. "Derived" means the notes show the a
 
 ## 7. Reusable animation components (build first)
 
-All use the sketch primitives and `AnimFrame`. Pure functions of the step index. Logic in separate `.ts` files with node tests. Prefix `Ai`.
+`CrossTrackLink` and `AiPriceTag` are plain content components (not animations) and carry no `Ai` animation logic. The others use the sketch primitives and `AnimFrame`. Pure functions of the step index. Logic in separate `.ts` files with node tests. Prefix `Ai` for animation components.
 
 | Component | Purpose | Used by |
 |---|---|---|
@@ -1302,11 +1362,13 @@ All use the sketch primitives and `AnimFrame`. Pure functions of the step index.
 | `AiAnnGraph` | HNSW layered graph with greedy hops, filter greying | A6.2, A6.4 |
 | `AiRankMerge` | Two ranked lists merged by RRF | A6.6, A6.7 |
 | `AiTraceWaterfall` | Span waterfall for model calls and tools | A8.1, A10.1 |
-| `AiAgentLoop` | Agent loop with injectable failure and budgets | A8.1, A8.9, A13.18 |
+| `AiAgentLoop` | Agent loop with injectable failure and budgets | A8.1, A8.9, A13.11 |
 | `AiJudgeLab` | Answer pair with order swap and length toggles | A9.4, A9.5 |
 | `AiChainReliability` | p^n chain with verifier and retry toggles | A0.3, A8.9 |
 | `AiTrustMap` | Data-flow with trust boundaries and attack path | A11.1 to A11.4 |
 | `AiBudgetCard` | Latency and cost budget that fills as choices are made | A0.2, A13.x |
+| `CrossTrackLink` | Card that links an AI lesson to a Backend chapter (or the reverse). Shows the target title, track, and a one-line "what you already know" note. Builds the URL from the syllabus. Build fails if the target id is missing | A5.4, A6.2, A7.6, A7.8, A13.x (see the overlap table) |
+| `AiPriceTag` | Renders one price from `ai-prices.ts`: provider, model, price, "as of" date, source link. Shows a warning style when the date is older than 90 days | A1.1, A2.5, A6.8, A7.6, A10.2, A13.x |
 
 `DesignBuild` and `DesignCompare` (already in `src/components/anim/DesignBuild.tsx`) drive all A13 builds. Build order inside the kit: `AiMemoryBar`, `AiRoofline`, `AiCostCalc`, `AiKvGrowth`, `AiBatchTimeline` first (A2 and A5 use them), then the rest as each module starts.
 
@@ -1316,14 +1378,22 @@ All use the sketch primitives and `AnimFrame`. Pure functions of the step index.
 
 ### Order
 
-1. Orchestrator: `ai-syllabus.ts`, flat-order change, track switcher, landing page, audit script changes (section 5). Build the five core kit components above.
-2. A0 and A1 and A2 (17 lessons). These set the vocabulary and numbers for all later work. Review with the user before more content.
-3. A5 early, then A3, A4. A5 carries the most original value (gap 4).
-4. A6, A7, A8 in order.
-5. A9, A10, A11 (the eval, ops, and security spine).
-6. A12.
-7. A13 in table order, in batches of about 5. Classic ML cases (A13.1 to A13.6) can start after A3 and A9.
-8. A14 last.
+**Phase 0: UI redesign and track shell.** This is the first build step. It ships before any AI lesson text.
+- Redesign the site UI.
+- Add the track shell: the hub at `/`, the two landing pages, the routes `/learn/backend/<id>/` and `/learn/ai/<id>/`, and the old-URL redirects (section 5).
+- Add `ai-syllabus.ts` with **all 128 AI lessons as "coming soon" stubs** (no `.mdx` yet), `ai-prices.ts`, `CrossTrackLink`, `AiPriceTag`, and the audit script changes.
+- Build the five core kit components.
+- Exit check: every backend lesson still opens at the new URL; every old URL redirects; every AI lesson shows as "Soon"; progress keys are intact.
+
+**Phase 1 and later: writing modules.** Each phase replaces stubs with real lessons.
+1. Phase 1: A0, A1, A2 (17 lessons). These set the vocabulary and numbers for all later work. Review with the user before more content.
+2. Phase 2: A5 early, then A3, A4. A5 carries the most original value (gap 4).
+3. Phase 3: A6, A7, A8 in order.
+4. Phase 4: A9, A10, A11 (the eval, ops, and security spine).
+5. Phase 5: A12.
+6. Phase 6: A13, 12 deep cases in table order, one or two per batch. A13.1 to A13.3 can start after A3 and A9. Each deep case is larger than a normal lesson. Budget more writer and review time for it.
+7. Phase 7: A14 last.
+
 
 ### Routing
 
@@ -1341,13 +1411,23 @@ Rules for writers:
 - **Research and verify any number not in the notes.** Cite a fetched URL. If you cannot verify it, say it without a number or drop it.
 - Entries marked `UNVERIFIED` in this plan are not facts. Treat them as open research tasks.
 - For each model failure example, run the prompt and keep the transcript with the model name and date.
-- Prices and limits carry the page date.
+- Prices come from `src/lib/ai-prices.ts` and render with `AiPriceTag`. Fetch the provider pricing page when you write. Every price shows provider, model, price, and an "as of YYYY-MM-DD" stamp with the source URL. Limits carry the page date.
+- Where your lesson overlaps a Backend chapter, follow the overlap rule in section 2: 3 to 5 sentence summary, a `CrossTrackLink` card, then only the AI-specific part.
 - Touch only your own lesson files and new `Ai*` components.
-- Lessons link back with `/learn/<id>/`. Never link forward to an unwritten lesson. Write the lesson number as plain text instead.
+- Lessons link to Backend lessons with `/learn/backend/<id>/` and to AI lessons with `/learn/ai/<id>/` (no `ai/` prefix in the URL). Prefer `CrossTrackLink` for cross-track links. Never link forward to an unwritten lesson. Write the lesson number as plain text instead.
+
+### Quarterly price-refresh task
+
+Every quarter (January, April, July, October), the orchestrator runs one task:
+1. Open each row of `ai-prices.ts`. Fetch its `sourceUrl`. Update `price` and `asOf`. If a model is retired, mark it and swap the lesson example to a current model.
+2. Run the price check: refresh rows the check warns are older than 120 days; every dollar figure in a lesson has a row.
+3. Re-run each lesson `Ballpark` node test that reads a price. Fix any changed answer.
+4. List lessons whose worked example changed and review them.
+Route: a Haiku 5.5 worker fetches and proposes row changes; the orchestrator checks them and commits.
 
 ### Verification
 
-Same as `NEXT_LESSONS.md` section 6. Add: every `requires` is earlier in the combined flat order; one quiz per lesson passes `quiz-audit.py --strict` over both tracks; each `Ballpark` answer is checked by a node test.
+Same as `NEXT_LESSONS.md` section 6. Add: old backend URLs redirect to `/learn/backend/<id>/`; every `requires` is earlier in the combined flat order; one quiz per lesson passes `quiz-audit.py --strict` over both tracks; each `Ballpark` answer is checked by a node test.
 
 ---
 
@@ -1500,14 +1580,16 @@ Writers must research each before use.
 - VLM token counts. SDXL and Flux serving costs (only SD v1.4 numbers from [G7]). Video generation costs. LiveKit, Pipecat, and OpenAI Realtime latency budgets (ElevenLabs budget is loaded [G6]).
 - Case-study primaries still missing: Glean and Notion ACL internals, DoorDash feature store, Netflix foundation model (403), YouTube paper full text, Instacart (403), OpenAI and Meta moderation blogs (403 and 404), Midjourney, a named LLM gateway design. Intercom Fin figures conflict (76% vendor claim vs 56% and 38 to 50% elsewhere); Klarna has no architecture detail.
 - Vendor-sourced figures (Vespa, Fin, ElevenLabs, Salad, Klarna) are company claims. Lessons must label them so.
-- Any API price used in a worked example. Use a stated assumption and cite the page date.
-- All example costs marked "assumed" in A2.5 ($3 per GPU-hour, 2,000 tokens/s) are assumptions, not sourced.
+- Every price (API, GPU hour, embedding, STT, TTS) used in a worked example. Fetch it live, add a row to `ai-prices.ts` with provider, model, price, as-of date, and source URL. No assumed prices.
+- Throughput figures in A2.5 examples (for example 2,000 tokens/s) must be measured or sourced, not assumed.
 - `5-case-gaps.md` is merged into this plan.
 
-### Open questions for the user
+### Decisions (2026-10-15)
 
-1. **Route.** Do you want `/learn/ai/<id>/` (one lesson route, less code) or `/ai/learn/<id>/` (cleaner URL, needs a shared lesson-page component)?
-2. **Overlap with backend lessons.** Backend 10.4 (vector databases) and 11.24 (ChatGPT-style app) already exist. Keep them and deepen in A6.2 and A13.10, or fold them into the AI track?
-3. **Depth of training.** A4 has 10 lessons. Do you need training depth for interviews, or can A4 shrink to 6 lessons (memory, parallelism, post-training, LoRA, distillation, fine-tune vs RAG)?
-4. **Prices in lessons.** Provider prices change often. Use formulas and a dated "assumed price" table only, or quote live provider prices with a date stamp?
-5. **Case study scope.** The plan has 22 cases. Do you want the variant drills from section 4 (street blurring, event recommendation, dynamic pricing, and others) as full lessons, or kept as drills inside a nearby case?
+1. **Routes.** Lessons live at `/learn/backend/<id>/` and `/learn/ai/<id>/`. Old `/learn/<id>/` URLs redirect to `/learn/backend/<id>/`. Backend ids do not change, so `localStorage` progress survives. AI ids carry the prefix `ai/` (content under `src/content/lessons/ai/`). Each track has a landing page. `/` is a track-picker hub. See section 5.
+2. **Overlap.** An AI lesson does not re-teach a Backend topic (10.4 vector databases, 11.24 ChatGPT-style app, caching, rate limiting, queues, and others). It shows a 3 to 5 sentence summary and a `CrossTrackLink` card, then goes deeper on the AI-specific part only. See section 2 and section 7.
+3. **Scope and rollout.** Keep all lessons, including the 10 in A4. All AI lessons ship first as "coming soon" stubs. Phase 0 is the UI redesign and track shell. Phase 1 and later write the modules. See section 8.
+4. **Prices.** Quote live provider pricing. Each price shows provider, model, price, and an "as of YYYY-MM-DD" stamp with source URL. One central table, `src/lib/ai-prices.ts`. A quarterly refresh task. The "assumed price only" option is removed. See section 2 rule 11, section 5, and section 8.
+5. **Case studies.** Quality over quantity. A13 has 12 deep cases in this order: video recommendation feed, ad click prediction, fraud detection, LLM gateway, ChatGPT-style assistant, LLM inference platform, enterprise RAG, code completion, customer support agent, voice agent, AI coding agent, deep research agent. The 10 dropped cases are Drill sections inside the nearest deep case. See A13 and section 4.
+
+No blocking open questions remain.

@@ -4,6 +4,8 @@
 export interface LessonOutline {
   slug: string;
   title: string;
+  /** Ids of lessons in the other track that this lesson builds on. Not filled in Phase 0. */
+  crossRequires?: string[];
 }
 
 export interface ModuleOutline {
@@ -190,51 +192,76 @@ export const syllabus: ModuleOutline[] = [
   },
 ];
 
+export type TrackKey = 'backend' | 'ai';
+
 export interface SyllabusLesson {
   id: string;
   title: string;
   number: string;
   moduleTitle: string;
+  moduleSlug: string;
+  /** Position of the module inside its own track. */
+  moduleIndex: number;
+  track: TrackKey;
+  /** Position in the combined order (all backend lessons, then all AI lessons). */
   index: number;
   written: boolean;
+  crossRequires: string[];
 }
 
 export interface SyllabusModule {
   slug: string;
   title: string;
+  /** Position inside the track. */
   number: number;
+  /** Shown to readers: "4" for backend, "A4" for AI. */
+  label: string;
+  track: TrackKey;
   lessons: SyllabusLesson[];
 }
 
-// Merges the outline with the lesson ids that exist on disk.
-// Fails the build when a lesson file is not in the outline, or requires a missing or later lesson.
+/** Numbers one track's outline. `offset` is the count of lessons that come before it in the combined order. */
 export function buildSyllabus(
-  written: { id: string; requires: string[] }[],
+  outline: ModuleOutline[],
+  written: { id: string }[],
+  prefix: string,
+  track: TrackKey = 'backend',
+  offset = 0,
 ): { modules: SyllabusModule[]; flat: SyllabusLesson[] } {
   const flat: SyllabusLesson[] = [];
-  const modules = syllabus.map((m, mi) => ({
+  const modules = outline.map((m, mi) => ({
     slug: m.slug,
     title: m.title,
     number: mi,
+    label: `${prefix}${mi}`,
+    track,
     lessons: m.lessons.map((l, li) => {
       const id = `${m.slug}/${l.slug}`;
       const lesson: SyllabusLesson = {
         id,
         title: l.title,
-        number: `${mi}.${li + 1}`,
+        number: `${prefix}${mi}.${li + 1}`,
         moduleTitle: m.title,
-        index: flat.length,
+        moduleSlug: m.slug,
+        moduleIndex: mi,
+        track,
+        index: offset + flat.length,
         written: written.some((w) => w.id === id),
+        crossRequires: l.crossRequires ?? [],
       };
       flat.push(lesson);
       return lesson;
     }),
   }));
+  return { modules, flat };
+}
 
+/** Fails the build when a lesson file is not in the outline, or requires a missing or later lesson. */
+export function checkSyllabus(flat: SyllabusLesson[], written: { id: string; requires: string[] }[]) {
   const byId = new Map(flat.map((l) => [l.id, l]));
   for (const w of written) {
     const self = byId.get(w.id);
-    if (!self) throw new Error(`Lesson "${w.id}" is not in src/lib/syllabus.ts`);
+    if (!self) throw new Error(`Lesson "${w.id}" is not in src/lib/syllabus.ts or src/lib/ai-syllabus.ts`);
     for (const r of w.requires) {
       const dep = byId.get(r);
       if (!dep) throw new Error(`Lesson "${w.id}" requires unknown lesson "${r}"`);
@@ -242,5 +269,4 @@ export function buildSyllabus(
         throw new Error(`Lesson "${w.id}" requires "${r}", which comes later in the syllabus`);
     }
   }
-  return { modules, flat };
 }
