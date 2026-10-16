@@ -13,7 +13,7 @@ import Ai7LoopSim from '../../../../components/anim/lessons/Ai7LoopSim.tsx';
 
 An agent loop asks the model what to do, runs a tool, and asks again. Who decides when to stop? In the happy case the model does: it replies with no tool call. But a loop that depends on the model alone has no hard end. The model can repeat a failing call, flip between two approaches, or chase a goal that cannot be met.
 
-Two things go wrong, and they feed each other. Quality falls as steps are added. Cost rises with every step, and rises faster than you expect. This lesson covers both: the math, the stop conditions, the caps, and the detector that catches a loop that is going nowhere.
+Two things go wrong, and they feed each other. Quality falls as steps are added. Cost rises with every step, and rises faster than you expect. This lesson covers both: the math, the stop conditions, the caps, and the detector. That detector catches a loop that is going nowhere.
 
 ## Errors compound
 
@@ -25,15 +25,15 @@ Two things go wrong, and they feed each other. Quality falls as steps are added.
 
 A step that is "95% good" sounds fine. A 20-step run built from such steps fails almost two times in three. Independent errors are a simplification. In real runs, one bad step often makes the next one worse. So p^n is a gentle estimate.
 
-Four levers move it: fewer steps, a verifier after risky steps, retries on steps that are safe to repeat (idempotent, see lesson [A7.1](/learn/ai/a7-agents-prod/durable-graph-runtime/)), and checkpoints so a failure costs one step and not the run. Judge a run by its path, not only its final answer. Lesson A8.1 returns to that.
+Four levers move that probability: fewer steps, a verifier after risky steps, retries, and checkpoints. Retries suit steps that are safe to repeat (idempotent, see lesson [A7.1](/learn/ai/a7-agents-prod/durable-graph-runtime/)). Checkpoints limit a failure to one step, not the whole run. Judge a run by its path, not only its final answer. Lesson A8.1 returns to that.
 
 ## Naive solution: trust the model to stop
 
 Leave the loop with no limit. The Claude Agent SDK documents this case. Its `max_turns` and `max_budget_usd` options both default to "No limit". Without limits, the loop "runs until Claude finishes on its own, which is fine for well-scoped tasks but can run long on open-ended prompts". The same page says setting a budget "is a good default for production agents".
 
-What does a run with no limit cost? Take a flat illustration: each model call carries 30,000 input tokens of context. This is a made-up round number, not a measurement. Then 200 steps send 200 x 30,000 = 6,000,000 input tokens. At Sonnet 5.5 input price of $2 per million tokens (claude.com/pricing, as of 2026-10-16), that is 6 x $2 = $12, with no caching. At Opus 5.5 ($4 per million) it is $24. Prompt caching (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) cuts the repeated prefix, but the shape stays: cost is steps times context times price.
+What does a run with no limit cost? Take a flat illustration: each model call carries 30,000 input tokens of context. This is a made-up round number, not a measurement. Then 200 steps send 200 x 30,000 = 6,000,000 input tokens. At Sonnet 5.5 input price of $2 per million tokens, that is 6 x $2 = $12, with no caching. The price comes from claude.com/pricing, as of 2026-10-16. At Opus 5.5 ($4 per million) it is $24. Prompt caching (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) cuts the repeated prefix, but the shape stays: cost is steps times context times price.
 
-LangGraph has a built-in ceiling. Its graph docs say "Starting in version 1.0.6, the default recursion limit is set to 1000 steps", and "once the limit is reached, LangGraph will raise `GraphRecursionError`". A step here is a super-step. At the same illustration, 1,000 steps x 30,000 tokens = 30 million input tokens, which is $60 on Sonnet 5.5 without caching. A default that protects the process does not protect the budget.
+LangGraph has a built-in ceiling. Its graph docs say "Starting in version 1.0.6, the default recursion limit is set to 1000 steps". The graph docs also say "once the limit is reached, LangGraph will raise `GraphRecursionError`". A step here is a super-step. At the same illustration, 1,000 steps x 30,000 tokens = 30 million input tokens. That is $60 on Sonnet 5.5 without caching. A default that protects the process does not protect the budget.
 
 ## Stop conditions
 
@@ -57,9 +57,9 @@ The same number means different amounts of work. A limit of 10 in one SDK is not
 
 ## Budget caps and overshoot
 
-A budget cap in dollars is the most direct control. The Claude Agent SDK has `max_budget_usd`. When it fires, the result subtype is `error_max_budget_usd`. The cap includes subagents: their spend counts toward the total, and once spend reaches the cap, spawning another subagent fails with "Budget limit reached".
+A budget cap in dollars is the most direct control. The Claude Agent SDK has `max_budget_usd`. When it fires, the result subtype is `error_max_budget_usd`. The cap includes subagents: their spend counts toward the total. Once spend reaches the cap, spawning another subagent fails with "Budget limit reached".
 
-Know one detail: the cap is a check after the fact. The SDK docs say Claude Code compares spend with the cap "after model responses arrive". The response that reaches the cap "still completes and counts". Spend can pass the cap by the cost of that one response, plus whatever subagents still running spend before they stop. Set the cap below the real limit you can afford. A cap is a fence, not a wall.
+Know one detail: the cap is a check after the fact. The SDK docs say Claude Code compares spend with the cap "after model responses arrive". The response that reaches the cap "still completes and counts". Spend can pass the cap by the cost of that one response. Subagents still running add whatever they spend before they stop. Set the cap below the real limit you can afford. A cap is a fence, not a wall.
 
 A budget cap alone also has a gap. It fires only when money is gone. A loop that repeats one useless call for 40 turns is wasteful long before it hits $5. For that you need a detector.
 
@@ -85,7 +85,7 @@ Notice three things. A stuck run with the detector on stops after n turns, at a 
 
 ## A hook as a stop point
 
-If you use Claude Code hooks, a `PreToolUse` hook can block a call. The hooks page says to "exit with code 2 to block the action". One caution from that page: a timed-out command hook does not block the tool call, and the default command timeout is 600 seconds. The hooks page says to set `onFailure: "block"` if the call must be blocked when the hook times out. A guard that can fail open is not a guard. The Claude Code GitHub Actions page lists three cost controls for CI: set `--max-turns` in `claude_args`, set workflow-level timeouts to avoid runaway jobs, and use GitHub concurrency controls to limit parallel runs.
+If you use Claude Code hooks, a `PreToolUse` hook can block a call. The hooks page says to "exit with code 2 to block the action". One caution from that page: a timed-out command hook does not block the tool call. The default command timeout is 600 seconds. The hooks page says to set `onFailure: "block"` if the call must be blocked when the hook times out. A guard that can fail open is not a guard. The Claude Code GitHub Actions page lists three cost controls for CI. Set `--max-turns` in `claude_args`. Set workflow-level timeouts to avoid runaway jobs. Use GitHub concurrency controls to limit parallel runs.
 
 ## Trade-offs
 

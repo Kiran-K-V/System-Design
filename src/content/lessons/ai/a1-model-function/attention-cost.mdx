@@ -21,7 +21,7 @@ It does not. Measure it and the long prompt is slower than 100 times. The 2N rul
 
 If each token costs the same, a prompt costs `n × 2N`. Latency grows in a straight line. You plan capacity on that. And for a short prompt it is nearly true.
 
-It fails because of what attention does. **Attention** [mid] lets a token pull information from the other tokens. Each token makes a **query** [mid] (what am I looking for), each earlier token offers a **key** [mid] (what do I hold) and a **value** [mid] (what I pass on). The model compares the query with every key, turns the scores into weights with softmax, and takes a weighted sum of the values.
+It fails because of what attention does. **Attention** [mid] lets a token pull information from the other tokens. Each token makes a **query** [mid] (what am I looking for). Each earlier token offers a **key** [mid] (what do I hold) and a **value** [mid] (what I pass on). The model compares the query with every key. It turns the scores into weights with softmax. Then it takes a weighted sum of the values.
 
 <Math block tex="\text{Attention}(Q,K,V) = \text{softmax}\!\left(\frac{Q K^{\top}}{\sqrt{d_k}}\right) V" />
 
@@ -33,7 +33,7 @@ Picture the scores as an n × n grid. Row i holds token i's scores against every
 
 <Ai1AttnMatrix client:visible />
 
-Per layer, the score step costs 2·n²·d FLOPs for QKᵀ and another 2·n²·d for the weighted sum with V (d is d_model, equal to heads times head dim). Over L layers:
+Per layer, the score step costs 2·n²·d FLOPs for QKᵀ and another 2·n²·d for the weighted sum with V. Here d is d_model, equal to heads times head dim. Over L layers:
 
 <Math block tex="\text{attention FLOPs} \approx 4\,n^{2}\,d\,L" />
 
@@ -47,31 +47,31 @@ Plug in Llama 3 70B: N = 70.5B, d = 8,192, L = 80. Then 2·d·L/N = 1,310,720 / 
 - **n = 131,072 (128K):** the ratio is 2.43. Linear work is 18.5 PFLOPs. Attention is 45 PFLOPs, about **2.4x** the linear part.
 - The ratio reaches 1 at n = N / (2dL), about **54,000 tokens**.
 
-Going from 8K to 128K is 16 times more tokens. Linear work grows 16x. Attention work grows 16² = 256x. These numbers are for the full square. Kernels that skip the masked half do half the work: 7.6% at 8K, 1.2x at 128K, and a break-even near 108,000 tokens. Drag the slider and switch the mask.
+Going from 8K to 128K is 16 times more tokens. Linear work grows 16x. Attention work grows 16² = 256x. These numbers are for the full square. Kernels that skip the masked half do half the work. The results are 7.6% at 8K, 1.2x at 128K, and a break-even near 108,000 tokens. Drag the slider and switch the mask.
 
 <Ai1AttnCost client:visible />
 
-All of this is the **prefill** [mid] phase: the model reads the whole prompt at once. During generation, each new token adds just one row of n scores, so its attention work grows linearly with the context. Lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) covers that phase.
+All of this is the **prefill** [mid] phase: the model reads the whole prompt at once. During generation, each new token adds just one row of n scores. As a result, its attention work grows linearly with the context. Lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) covers that phase.
 
 ## Memory: the n × n matrix
 
 A naive implementation writes the whole score matrix to GPU memory. For 70B that is 64 heads × n² × 2 bytes (BF16) per layer. At 8K tokens that is 8.6 GB. At 128K it is 2.2 TB. No GPU has that, so the naive method does not work at long context, whatever the compute budget.
 
-**FlashAttention** [senior] fixes the memory problem without changing the answer. Its authors call it "an IO-aware exact attention algorithm that uses tiling". It computes the result in small tiles that fit in fast on-chip memory, fuses the steps into one GPU kernel, and keeps only a running maximum and sum per row. The paper reports that it uses less memory, linear in sequence length, and is up to 7.6x faster on GPT-2 (their Figure 1). Per layer the extra storage is about one fp32 number per row per head: 64 × 131,072 × 4 bytes = 34 MB at 128K, our estimate from the paper's O(n) result.
+**FlashAttention** [senior] fixes the memory problem without changing the answer. Its authors call it "an IO-aware exact attention algorithm that uses tiling". It computes the result in small tiles that fit in fast on-chip memory. The method fuses the steps into one GPU kernel. It also keeps only a running maximum and sum per row. The paper reports that it uses less memory, linear in sequence length, and is up to 7.6x faster on GPT-2 (their Figure 1). Per layer, the extra storage is about one fp32 number per row per head. At 128K, 64 × 131,072 × 4 bytes = 34 MB. This is our estimate from the paper's O(n) result.
 
-Note what did **not** change. FlashAttention computes every cell, so FLOPs stay quadratic. It saves memory reads and writes, which is where the time goes in practice, but a 128K prefill still does the n² work.
+Note what did **not** change. FlashAttention computes every cell, so FLOPs stay quadratic. It saves memory reads and writes, which is where the time goes in practice. But a 128K prefill still does the n² work.
 
 ## The KV cache: what you must keep
 
 When a model generates token n+1, it needs the keys and values of all n earlier tokens. They do not change, so the model computes them once and stores them. That store is the **KV cache** [mid]. It is a cache in the backend sense: compute once, read many times, memory in exchange for compute.
 
 <CrossTrackLink id="05-caching/why-cache">
-A cache trades memory for repeated work. The KV cache does this for attention: it keeps each token's key and value so later tokens do not recompute them. As with any cache, size and eviction become design questions.
+A cache trades memory for repeated work. The KV cache avoids repeated work for attention. It keeps each token's key and value. As a result, later tokens do not recompute them. As with any cache, size and eviction become design questions.
 </CrossTrackLink>
 
-The size per token is 2 (K and V) × layers × KV heads × head dim × 2 bytes (BF16). For 70B: 2 × 80 × 8 × 128 × 2 = 327,680 bytes, which is **320 KiB per token**. An 8K sequence takes 2.5 GiB. A 128K sequence takes 40 GiB. The cache grows in a straight line with n, but each user has their own.
+The size per token is 2 (K and V) × layers × KV heads × head dim. Multiply that by 2 bytes (BF16). For 70B: 2 × 80 × 8 × 128 × 2 = 327,680 bytes, which is **320 KiB per token**. An 8K sequence takes 2.5 GiB. A 128K sequence takes 40 GiB. The cache grows in a straight line with n, but each user has their own.
 
-Why 8 KV heads and not 64? **Multi-query attention (MQA)** [senior] has all query heads share one key and value head, which cuts memory traffic when generating, at a small quality loss. **Grouped-query attention (GQA)** [senior] sits between full multi-head and MQA. Its authors report that a multi-head checkpoint can be converted with about 5% of the original pretraining compute, with quality close to multi-head and speed close to MQA. Llama 3 uses 8 KV heads with 64 query heads at 70B. With 64 KV heads the cache would be 8 times larger: 2.5 MiB per token, or 320 GiB at 128K. This is derived arithmetic.
+Why 8 KV heads and not 64? **Multi-query attention (MQA)** [senior] has all query heads share one key and value head. The shared head cuts memory traffic when generating, at a small quality loss. **Grouped-query attention (GQA)** [senior] sits between full multi-head and MQA. Its authors report that a multi-head checkpoint can be converted with about 5% of the original pretraining compute. The converted model has quality close to multi-head and speed close to MQA. Llama 3 uses 8 KV heads with 64 query heads at 70B. With 64 KV heads the cache would be 8 times larger: 2.5 MiB per token, or 320 GiB at 128K. This is derived arithmetic.
 
 Llama 3 supports up to 128K tokens. Its paper says the model was pretrained at 8K and then extended. Several vendors list windows of about 1M tokens as of 2026-10-15 (lesson [A1.6](/learn/ai/a1-model-function/hallucination-context/)). A big window is a ceiling, not a recommendation: each token costs compute, memory, and latency.
 
@@ -101,11 +101,11 @@ Llama 3 supports up to 128K tokens. Its paper says the model was pretrained at 8
 ## Interview lens
 
 <Callout type="tip">
-When someone proposes "just put the whole corpus in the prompt", answer with numbers: "At 128K tokens a 70B model spends about 2.4 times more on attention than on the weights, and the KV cache is 40 GiB for one user. I would retrieve the 3K tokens that matter."
+When someone proposes "just put the whole corpus in the prompt", answer with numbers. "At 128K tokens a 70B model spends about 2.4 times more on attention than on the weights. The KV cache is 40 GiB for one user. I would retrieve the 3K tokens that matter."
 </Callout>
 
 <Callout type="mistake">
-Do not say "FlashAttention makes attention linear". It makes the **memory** linear. The FLOPs stay quadratic. Do not say "double the context, double the cost" for prefill. Do not confuse the KV cache (grows in a line with n, per user) with the score matrix (grows with n², and is never stored by a good kernel).
+Do not say "FlashAttention makes attention linear". It makes the **memory** linear. The FLOPs stay quadratic. Do not say "double the context, double the cost" for prefill. Do not confuse the KV cache (grows in a line with n, per user) with the score matrix. The score matrix grows with n², and a good kernel never stores it.
 </Callout>
 
 ## Check yourself

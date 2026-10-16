@@ -20,11 +20,11 @@ If the agent runs inside the HTTP request, this fails in three ways. Load balanc
 Backend engineers solved this shape years ago. The agent version adds a few new parts: a sandbox for every run, a durable state store, cost caps, and a human who may need to answer in the middle.
 
 <CrossTrackLink id="09-patterns/long-running-tasks">
-Work that takes minutes cannot hold a request open. Accept the task, return a job id with HTTP 202, run it on a worker, and let the client poll or subscribe. Leases and heartbeats let another worker take over a job if one dies. Every pattern in this lesson sits on that base.
+Work that takes minutes cannot hold a request open. Accept the task and return a job id with HTTP 202. Run it on a worker. Let the client poll or subscribe. Leases and heartbeats let another worker take over a job if one dies. Every pattern in this lesson sits on that base.
 </CrossTrackLink>
 
 <CrossTrackLink id="06-async/queues">
-A queue lets a producer hand work to workers and move on. It absorbs bursts and survives worker crashes, but it adds no capacity and delivers at least once. The visibility timeout, which hides a claimed message and then returns it if the worker is silent, is the part that matters most for runs that last minutes.
+A queue lets a producer hand work to workers and move on. It absorbs bursts and survives worker crashes, but it adds no capacity and delivers at least once. The visibility timeout hides a claimed message and then returns it if the worker is silent. That timeout is the part that matters most for runs that last minutes.
 </CrossTrackLink>
 
 ## The mechanism: submit, queue, run, notify
@@ -32,7 +32,7 @@ A queue lets a producer hand work to workers and move on. It absorbs bursts and 
 The flow has five parts.
 
 1. **Submit.** The API validates the request, stores a run record, enqueues it, and returns a run id at once.
-2. **Queue.** The run waits, usually in a queue per tenant, until a worker is free and the tenant is under its limit.
+2. **Queue.** The run waits, usually in a queue per tenant. It moves on when a worker is free and the tenant is under its limit.
 3. **Worker and sandbox.** A worker claims the run and boots an isolated sandbox for it. The agent loop runs there (lesson [A7.4](/learn/ai/a7-agents-prod/sandboxes-code-execution/) covers the sandbox).
 4. **Progress.** The agent writes each step to a trace. Clients poll the run id or subscribe to events.
 5. **Finish.** The result is stored with the trace, and a notification goes out.
@@ -63,14 +63,14 @@ A run need not start from a user click. Common triggers are a schedule, a webhoo
 
 - Issue and pull request events need a user with write access. A schedule has no user, so that check is skipped.
 - A bot actor is rejected unless you list it in `allowed_bots`. This keeps bots from triggering the agent in a loop.
-- GitHub runs scheduled workflows only from the default branch, and in public repositories it disables the schedule after 60 days without repository activity.
+- GitHub runs scheduled workflows only from the default branch. In public repositories, GitHub disables the schedule after 60 days without repository activity.
 - Commits pushed with the default `GITHUB_TOKEN` do not trigger other workflows. If you expect CI to run on the agent's commits, authenticate differently.
 
 ### When the worker dies
 
 A worker can crash 5 minutes into a 6-minute run. Two recovery styles exist. With a durable runtime (lesson [A7.1](/learn/ai/a7-agents-prod/durable-graph-runtime/)), state is checkpointed, and another worker resumes from the last checkpoint. With a plain queue, the message becomes visible again after the visibility timeout, and another worker runs the whole task. That second style needs idempotent steps, or the retry sends the email twice.
 
-The timeout must fit the job. If a run takes 6 minutes and the timeout is 30 seconds, the queue hands the same run to a second worker while the first is still working. The fix is a heartbeat or lease that extends the timeout while the worker is alive, as the long-running tasks lesson explains.
+The timeout must fit the job. If a run takes 6 minutes and the timeout is 30 seconds, the queue hands it to another worker. This happens while the first worker is still working. The fix is a heartbeat or lease. The heartbeat or lease extends the timeout while the worker is alive. The long-running tasks lesson explains it.
 
 ### The output is a pull request
 
@@ -97,13 +97,13 @@ The standard fixes are a queue per tenant, a concurrency limit per tenant, prior
 
 <Ai7BgFair client:visible />
 
-Try 100 runs from tenant A on 4 workers. First in, first out makes B's mean wait 151.2 minutes. Derivation: A's 100 runs need 100 / 4 = 25 rounds of 6 minutes, so B's first runs start at round 25, 150 minutes in. With fair share, B's five runs start at 0, 0, 6, 6, and 12 minutes, a mean of 4.8. The last run in either mode starts at 156 minutes. Fair share adds no capacity. It decides who waits.
+Try 100 runs from tenant A on 4 workers. First in, first out makes B's mean wait 151.2 minutes. Derivation: A's 100 runs need 100 / 4 = 25 rounds of 6 minutes. As a result, B's first runs start at round 25, 150 minutes in. With fair share, B's five runs start at 0, 0, 6, 6, and 12 minutes, a mean of 4.8. The last run in either mode starts at 156 minutes. Fair share adds no capacity. It decides who waits.
 
 ## Capacity and cost
 
 Sizing a pool is Little's law: runs in flight = arrival rate x time per run. The plan's example is 500 runs per hour at 6 minutes each. That is 500 x 6 = 3,000 busy minutes per hour, or 3,000 / 60 = 50 workers busy at the same time. At exactly 100% busy, queue wait grows without bound, so you add headroom. 2x headroom gives 100 workers.
 
-Cost has two lines. Model spend is bounded by the per-run cap, such as the `max_budget_usd` option in the Claude Agent SDK. The docs warn the last response can pass the cap by its own cost plus any running subagent spend, so leave margin. Sandbox spend is busy time times the sandbox price, plus idle capacity you keep warm. Boot time counts as busy time with no useful work in it.
+Cost has two lines. Model spend is bounded by the per-run cap, such as the `max_budget_usd` option in the Claude Agent SDK. The docs warn the last response can pass the cap by its own cost plus any running subagent spend. For that reason, leave margin. Sandbox spend is busy time times the sandbox price, plus idle capacity you keep warm. Boot time counts as busy time with no useful work in it.
 
 <Ai7BgCalc client:visible />
 
@@ -150,11 +150,11 @@ Cost has two lines. Model spend is bounded by the per-run cap, such as the `max_
 ## Interview lens
 
 <Callout type="tip">
-Describe it as a pipeline: "Submit returns a run id with 202 and an idempotency key. A queue per tenant feeds a worker pool with fair share and concurrency limits. Each run gets its own sandbox, state is checkpointed so a worker crash resumes instead of restarting, and the output is a PR plus a notification. Capacity is runs per hour x minutes per run / 60 in flight, times 2 for headroom. Each run has a budget cap, and each queue has a cost limit."
+Describe it as a pipeline: "Submit returns a run id with 202 and an idempotency key. A queue per tenant feeds a worker pool with fair share and concurrency limits. Each run gets its own sandbox. State is checkpointed, so a worker crash resumes instead of restarting. The output is a PR plus a notification. Capacity is runs per hour x minutes per run / 60 in flight, times 2 for headroom. Each run has a budget cap, and each queue has a cost limit."
 </Callout>
 
 <Callout type="mistake">
-Do not leave out the visibility timeout. A 6-minute run with a 30-second timeout runs twice. And do not let the agent push to the main branch: a background agent works unwatched, so its output needs a review gate.
+Do not leave out the visibility timeout. A 6-minute run with a 30-second timeout runs twice. And do not let the agent push to the main branch. A background agent works unwatched, so its output needs a review gate.
 </Callout>
 
 ## Check yourself

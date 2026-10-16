@@ -16,15 +16,15 @@ You ask an agent to compare how three services handle authentication, billing, a
 
 There is a second cost. The three topics do not depend on each other, yet the agent does them one after another. Wall time is the sum of the three.
 
-A subagent addresses both. It is the same idea as a worker process: give a narrow job to a separate unit with its own memory, and take back only the result.
+A subagent addresses both. It is the same idea as a worker process. Give a narrow job to a separate unit with its own memory. Then take back only the result.
 
 ## What a subagent is
 
-A **subagent** is a separate agent instance that your main agent starts to handle a focused subtask. The Claude Agent SDK docs list its main benefits. **Context isolation**: each subagent "runs in its own conversation", and "intermediate tool calls and results stay inside the subagent; only its final message returns to the parent". **Parallelization**: concurrent subagents finish "in the time of the slowest one rather than the sum of all of them". The docs also list specialized instructions and tool restrictions (source: [Subagents in the SDK](https://code.claude.com/docs/en/agent-sdk/subagents), fetched 2026-10-16).
+A **subagent** is a separate agent instance that your main agent starts to handle a focused subtask. The Claude Agent SDK docs list its main benefits. **Context isolation**: each subagent "runs in its own conversation". Also, "intermediate tool calls and results stay inside the subagent; only its final message returns to the parent". **Parallelization**: concurrent subagents finish "in the time of the slowest one rather than the sum of all of them". The docs also list specialized instructions and tool restrictions (source: [Subagents in the SDK](https://code.claude.com/docs/en/agent-sdk/subagents), fetched 2026-10-16).
 
-The mapping for a backend engineer: the parent is a coordinator and a subagent is a worker with private memory. The brief is the job message. The final message is the job result. The parent never sees the worker's scratch state, the same way a queue consumer's local variables are not in the message it returns.
+The mapping for a backend engineer: the parent is a coordinator and a subagent is a worker with private memory. The brief is the job message. The final message is the job result. The parent never sees the worker's scratch state. A queue consumer's local variables are likewise not in the message it returns.
 
-Two facts about what crosses the boundary matter most. The docs say a fresh subagent receives its own system prompt, the project CLAUDE.md, tool definitions, and the Agent tool's prompt string. It does not receive "the parent's conversation history or tool results". And "the only content you pass from parent to subagent is the Agent tool's prompt string, so include any file paths, error messages, or decisions the subagent needs directly in that prompt."
+Two facts about what crosses the boundary matter most. The docs say a fresh subagent receives its own system prompt. It also receives the project CLAUDE.md, tool definitions, and the Agent tool's prompt string. It does not receive "the parent's conversation history or tool results". And "the only content you pass from parent to subagent is the Agent tool's prompt string, so include any file paths, error messages, or decisions the subagent needs directly in that prompt."
 
 ## Defining one
 
@@ -55,7 +55,7 @@ Read-only `tools` is a design choice, not a detail. A tool you leave out "isn't 
 
 ## Writing a good brief
 
-The brief is the only channel in. A vague brief gives a vague result. Anthropic's multi-agent research team found that "each subagent needs an objective, an output format, guidance on the tools and sources to use, and clear task boundaries". They also logged failures from early versions: "spawning 50 subagents for simple queries", subagents repeating each other's work, and endless searches for sources that did not exist ([source](https://www.anthropic.com/engineering/multi-agent-research-system)).
+The brief is the only channel in. A vague brief gives a vague result. Anthropic's multi-agent research team found that "each subagent needs an objective, an output format, guidance on the tools and sources to use, and clear task boundaries". They also logged failures from early versions. One failure was "spawning 50 subagents for simple queries". Other failures were subagents repeating each other's work, and endless searches for sources that did not exist ([source](https://www.anthropic.com/engineering/multi-agent-research-system)).
 
 A usable brief has four parts:
 
@@ -68,26 +68,26 @@ For large outputs, Anthropic suggests that subagents store their work in externa
 
 ## The cost
 
-Subagents are not free. The same Anthropic post says agents use about 4 times the tokens of chat, and multi-agent systems about 15 times. In their research system, an Opus 4 lead with Sonnet 4 subagents "outperformed single-agent Claude Opus 4 by 90.2%" on an internal research eval. They also report that, on a browsing benchmark (BrowseComp), token usage by itself explained 80% of the variance in performance. Read that carefully: part of the gain came from spending more tokens. The 15 times figure is an average for that system, not a law, and the 90.2% is on their own eval, not yours.
+Subagents are not free. The same Anthropic post says agents use about 4 times the tokens of chat, and multi-agent systems about 15 times. In their research system, an Opus 4 lead with Sonnet 4 subagents "outperformed single-agent Claude Opus 4 by 90.2%". That result is on an internal research eval. They also report that, on a browsing benchmark (BrowseComp), token usage by itself explained 80% of the variance in performance. Read that carefully: part of the gain came from spending more tokens. The 15 times figure is an average for that system, not a law. The 90.2% figure is on their own eval, not yours.
 
 Where do the extra tokens come from? Three places. Every subagent re-sends its own system prompt and tool definitions. Subagents cannot see each other, so they may repeat work. And the parent still pays for the briefs and the summaries.
 
 But a fan-out can also save tokens. A subagent's window is small, and a small window is cheap to re-read. The calculator below models this. Its assumptions are ours: independent topics of equal size, a parent holding 8,000 tokens, 500-token briefs, 1,500-token summaries, and 6 seconds per call. The default is the walk above: 3 topics, 10 calls each, 3,000 tokens per result.
 
-- One agent: 30 calls. Input is 30 x 8,000 + 3,000 x (0 + 1 + ... + 29) = 240,000 + 1,305,000 = 1,545,000 tokens. Time is 30 x 6 = 180 s.
+- One agent: 30 calls. Input is 30 x 8,000 + 3,000 x (0 + 1 + ... + 29). That is 240,000 + 1,305,000 = 1,545,000 tokens. Time is 30 x 6 = 180 s.
 - Three subagents: each reads 10 x 3,500 + 3,000 x 45 = 170,000. Three give 510,000. The parent adds 8,000 + (8,000 + 3 x 2,000) = 22,000. Total 532,000 tokens, about a third. Time is (10 + 2) x 6 = 72 s, because the three run at once.
 
 <Ai6SubSim client:visible />
 
-Now raise "repeated work" to 200%. The saving disappears and then reverses. Drop the calls per topic to 1 and the parent's fixed cost dominates. The model shows the shape: subagents win when each topic is deep and independent, and lose when topics are shallow, overlapping, or coupled.
+Now raise "repeated work" to 200%. The saving disappears and then reverses. Drop the calls per topic to 1 and the parent's fixed cost dominates. The model shows the shape. Subagents win when each topic is deep and independent. They lose when topics are shallow, overlapping, or coupled.
 
 ## Limits you set
 
-Claude decides on its own how many subagents to start, and a subagent can start its own. The SDK docs give three caps (as of 2026-10-16). Depth defaults to 3 layers of nesting, set by `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`. Concurrency defaults to 20 running at once, set by `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`, and at the limit a spawn call returns `Concurrent subagent limit reached`. Spend is capped by `max_budget_usd` (`maxBudgetUsd` in TypeScript), which counts subagent requests too. Without a budget there is no limit. Set all three in production, as lesson [A6.1](/learn/ai/a6-agents/agent-loop/) argued for single agents. The docs also say that subagents run in the background by default when the call omits `run_in_background`.
+Claude decides on its own how many subagents to start, and a subagent can start its own. The SDK docs give three caps (as of 2026-10-16). Depth defaults to 3 layers of nesting, set by `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`. Concurrency defaults to 20 running at once. This default is set by `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`. At the limit, a spawn call returns `Concurrent subagent limit reached`. Spend is capped by `max_budget_usd` (`maxBudgetUsd` in TypeScript), which counts subagent requests too. Without a budget there is no limit. Set all three in production, as lesson [A6.1](/learn/ai/a6-agents/agent-loop/) argued for single agents. The docs also say that subagents run in the background by default when the call omits `run_in_background`.
 
 ## When not to use them
 
-Anthropic says some domains "are not a good fit for multi-agent systems today": those where all agents need the same context or have many dependencies between them. They add that most coding tasks have fewer truly parallelizable parts than research does. If step B needs the exact details of step A, a handoff by summary will lose something. Also skip a subagent when the whole task fits in a small window: you pay overhead for nothing. Orchestration patterns for fleets of agents are the topic of lesson [A7.6](/learn/ai/a7-agents-prod/multi-agent-orchestration/).
+Anthropic says some domains "are not a good fit for multi-agent systems today". Those are domains where all agents need the same context or have many dependencies between them. They add that most coding tasks have fewer truly parallelizable parts than research does. If step B needs the exact details of step A, a handoff by summary will lose something. Also skip a subagent when the whole task fits in a small window: you pay overhead for nothing. Orchestration patterns for fleets of agents are the topic of lesson [A7.6](/learn/ai/a7-agents-prod/multi-agent-orchestration/).
 
 ## Trade-offs
 
@@ -102,7 +102,7 @@ Anthropic says some domains "are not a good fit for multi-agent systems today": 
 ## Interview lens
 
 <Callout type="tip">
-Say it as isolation plus a contract: "A subagent gets a fresh window and only the brief I pass. It returns a short summary, so the parent window stays small and independent work runs in parallel. The brief has a goal, an output format, tools, and a stop rule. It costs more tokens overall, Anthropic reports about 15 times chat for its research system, so I cap depth, concurrency, and spend, and I do not use it for tightly coupled work."
+Say it as isolation plus a contract: "A subagent gets a fresh window and only the brief I pass. It returns a short summary, so the parent window stays small and independent work runs in parallel. The brief has a goal, an output format, tools, and a stop rule. It costs more tokens overall. Anthropic reports about 15 times chat for its research system. So I cap depth, concurrency, and spend, and I do not use it for tightly coupled work."
 </Callout>
 
 <Callout type="mistake">

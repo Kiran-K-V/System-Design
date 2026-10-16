@@ -10,7 +10,7 @@ import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import PostSearchBuild from '../../../components/anim/lessons/PostSearchBuild.tsx';
 import PostSearchCompare from '../../../components/anim/lessons/PostSearchCompare.tsx';
 
-A social site has billions of posts. A user types two words and expects the best matches in half a second. This case study follows the six steps of [lesson 0.3](/learn/00-orientation/design-method/). The new idea is to treat search as a **derived copy** of the posts, fed by a change stream, and to keep the fast-changing signal (likes) out of that copy.
+A social site has billions of posts. A user types two words and expects the best matches in half a second. This case study follows the six steps of [lesson 0.3](/learn/00-orientation/design-method/). The new idea is to treat search as a **derived copy** of the posts. A change stream feeds that copy. The idea also keeps the fast-changing signal (likes) out of that copy.
 
 ## Requirements
 
@@ -36,8 +36,8 @@ Lesson [1.4](/learn/01-one-machine/estimation/) gives the method. Show the math,
 - Posts per day: 10,000 x 86,400 s = 864 million.
 - Posts in ten years: 864,000,000 x 365 x 10 = about 3.15 trillion.
 - Raw text: assume 500 bytes per post with its metadata. Then 3.15 x 10^12 x 500 B = about 1.6 PB.
-- Index size: assume 20 distinct terms per post and 8 bytes per entry in a posting list (a 64-bit post id). That is 160 bytes per post, so 3.15 x 10^12 x 160 B = about 500 TB.
-- Shards: lesson [8.5](/learn/08-technologies/elasticsearch/) gives 10 GB to 50 GB per shard. 500 TB / 50 GB = 10,000 shards at the very best. That is the full ten-year index, and it already says something: we cannot ask every shard on every search.
+- Index size: assume 20 distinct terms per post. Assume each entry in a posting list takes 8 bytes (a 64-bit post id). That is 160 bytes per post, so 3.15 x 10^12 x 160 B = about 500 TB.
+- Shards: lesson [8.5](/learn/08-technologies/elasticsearch/) gives 10 GB to 50 GB per shard. At the very best, 500 TB / 50 GB = 10,000 shards. That is the full ten-year index, and it already says something: we cannot ask every shard on every search.
 - Likes: 100,000 per second is 10 times the post rate. Likes will be the main write load, not posts.
 
 ## Core entities
@@ -76,11 +76,11 @@ Step through the build. Each step names its requirement.
 
 ### Sharding the index
 
-Lesson 8.5 showed the engine's default: documents are spread over shards by id, and a search asks every shard (scatter-gather, lesson [4.7](/learn/04-data/sharding/)). That is simple and spreads load evenly. With 10,000 shards it is too much work for every query.
+Lesson 8.5 showed the engine's default: documents are spread over shards by id. A search asks every shard (scatter-gather, lesson [4.7](/learn/04-data/sharding/)). That is simple and spreads load evenly. With 10,000 shards it is too much work for every query.
 
 **Split by time first.** Put posts into time slices, such as one slice per week, and shard each slice by post id. The default sort is recency, so a search asks the newest slice first. It stops as soon as it has a full page. Most searches touch a few slices.
 
-**The likes sort is harder.** The best post by likes may be in any slice. Two honest choices: limit the likes sort to a recent window (a product decision, so ask), or keep a second, smaller index that holds only posts above a like threshold.
+**The likes sort is harder.** The best post by likes may be in any slice. Two honest choices are available. You can limit the likes sort to a recent window (a product decision, so ask). Or you can keep a second, smaller index that holds only posts above a like threshold.
 
 An alternative is to split by **term** instead of by post: each shard owns some terms. A one-word query then asks one shard. But a multi-word query needs lists from several shards, which must be shipped to one place to intersect. And a very common term makes its shard hot. Most engines choose split-by-post for these reasons.
 
@@ -96,9 +96,9 @@ The honest cost: the first stage orders posts only up to a factor of 2. A post a
 
 ### Hot terms and the result cache
 
-Search terms follow a skewed pattern. A few queries ("world cup final") arrive again and again. Without help, each repeat does a full scatter-gather. Put a result cache in front of the query service. The key is the normalized query plus the sort order and the page. Use a short TTL, chosen from the freshness budget above (lesson [5.2](/learn/05-caching/cache-placement/) covers placement, and lesson [5.5](/learn/05-caching/invalidation-stampede/) covers a popular key expiring: use one refresher per key, not one per user).
+Search terms follow a skewed pattern. A few queries ("world cup final") arrive again and again. Without help, each repeat does a full scatter-gather. Put a result cache in front of the query service. The key is the normalized query plus the sort order and the page. Use a short TTL, chosen from the freshness budget above. Lesson [5.2](/learn/05-caching/cache-placement/) covers placement, and lesson [5.5](/learn/05-caching/invalidation-stampede/) covers a popular key expiring. In that case, use one refresher per key, not one per user.
 
-Posting lists also have a hot-term problem. A common word has a huge list. When intersecting, start with the shortest list and test those ids against the longer ones, so the cost follows the rare term.
+Posting lists also have a hot-term problem. A common word has a huge list. When intersecting, start with the shortest list. Test those ids against the longer ones, so the cost follows the rare term.
 
 ## Numbers
 
@@ -153,7 +153,7 @@ Do not write to the database and the index from the application and call it done
 </Callout>
 
 <Callout type="deep" title="Phrase queries">
-A search for "new york" as an exact phrase needs word positions in the posting lists, or an index of word pairs. Both make the index bigger. If the interviewer asks, say you would store positions and accept the larger index. That is a stated cost, not a free feature.
+A search for "new york" as an exact phrase needs word positions in the posting lists. Or the search needs an index of word pairs. Both make the index bigger. If the interviewer asks, say you would store positions and accept the larger index. That is a stated cost, not a free feature.
 </Callout>
 
 ## Check yourself

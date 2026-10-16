@@ -24,7 +24,7 @@ Each sample is a 64-bit timestamp and a 64-bit value: 16 bytes. That is 8.64 bil
 The workload has an unusual shape.
 
 - Writes are **appends**. New samples always carry the newest time. Old samples never change.
-- Reads ask for **one series over a time window**, or an aggregate over many series: "p99 latency of the checkout service, last 6 hours".
+- Reads ask for **one series over a time window**, or an aggregate over many series. For example, "p99 latency of the checkout service, last 6 hours".
 - Old data is not wanted. You delete it **by age**.
 
 ## The data model
@@ -38,7 +38,7 @@ A **time series** is a stream of values for one thing over time. A sample has fo
 | Timestamp | `2026-10-14T02:01:02Z` |
 | Value | `1873` |
 
-One metric name plus one exact set of tags is one **series**. Change one tag value, or add a tag, and you have a new series. Prometheus describes it this way: a sample is a float64 value and a millisecond timestamp, and each unique label combination is a new series.
+One metric name plus one exact set of tags is one **series**. Change one tag value, or add a tag, and you have a new series. Prometheus describes it this way: a sample is a float64 value and a millisecond timestamp. Each unique label combination is a new series.
 
 ## Naive solution: a SQL table
 
@@ -74,13 +74,13 @@ Facebook's Gorilla paper (VLDB 2015) describes two tricks. Both rest on the same
 
 The paper reports that about 96% of timestamps compress to a single bit.
 
-**Values: XOR.** Take the value as a 64-bit float. XOR it with the previous value. If the values match, the result is all zeros: store a single `0` bit. If they differ only a little, the XOR has long runs of zero bits at both ends. Store only the middle part ("the meaningful bits") with two small numbers that say where it starts and how long it is. About 51% of values in the paper's sample cost one bit.
+**Values: XOR.** Take the value as a 64-bit float. XOR it with the previous value. If the values match, the result is all zeros: store a single `0` bit. If they differ only a little, the XOR has long runs of zero bits at both ends. Store only the middle part ("the meaningful bits"). Two small numbers say where that part starts and how long it is. About 51% of values in the paper's sample cost one bit.
 
 Step through the paper's own example. Three samples go in. A block comes out.
 
 <TsGorilla client:visible />
 
-The total is 167 bits for 3 samples, from 384. That is only 2.3 times, because a tiny block pays for its header and its first raw value. A long block pays them once. The paper's production average is **1.37 bytes per point**, against 16 bytes raw: a 12-fold reduction (16 / 1.37 = 11.7).
+The total is 167 bits for 3 samples, from 384. That is only 2.3 times, because a tiny block pays for its header and its first raw value. A long block pays them once. The paper's production average is **1.37 bytes per point**. Against 16 bytes raw, that is a 12-fold reduction (16 / 1.37 = 11.7).
 
 The cost of this trick: **decoding is sequential**. To read point 500 of a block you decode points 1 to 499. That is why blocks are short.
 
@@ -93,13 +93,13 @@ Prometheus shows the layout (its TSDB is one real example).
 - **Compaction** merges small blocks into bigger ones. It stops at the smaller of 10% of retention or 31 days.
 - **Retention** is a rule such as "keep 15 days", the Prometheus default. Blocks older than that are deleted as files. No row-by-row delete runs.
 
-Gorilla itself uses the same two-hour block and keeps 26 hours in memory as a cache in front of slower storage.
+Gorilla itself uses the same two-hour block. Gorilla keeps 26 hours in memory as a cache in front of slower storage.
 
 ### Downsampling
 
 A graph of 90 days with one point every 10 seconds has 90 × 8,640 = 777,600 points per series. A screen shows about a thousand. Old data rarely needs full detail.
 
-**Downsampling** (also called a **rollup**) replaces old raw samples with fewer points. For example, keep one point per 5 minutes, holding the count, sum, min, and max of the raw points in that window. Then you can still compute an average or a maximum. A plain average alone hides spikes.
+**Downsampling** (also called a **rollup**) replaces old raw samples with fewer points. For example, keep one point per 5 minutes. That point holds the count, sum, min, and max of the raw points in that window. Then you can still compute an average or a maximum. A plain average alone hides spikes.
 
 A typical policy is "raw data for a few weeks, rolled-up data for a year". The exact windows are your choice. Do not quote a default: it differs by product.
 
@@ -107,7 +107,7 @@ A typical policy is "raw data for a few weeks, rolled-up data for a year". The e
 
 Cost follows the **number of series**, not the number of samples you think about. Each unique tag combination is a series. Tag values multiply.
 
-The Prometheus naming guide warns: do not use labels for values with high cardinality, such as user IDs or email addresses. Try it. Start at 10 hosts × 5 endpoints = 50 series. Then turn on a `user_id` label.
+The Prometheus naming guide warns: do not use labels for values with high cardinality. Such values include user IDs or email addresses. Try it. Start at 10 hosts × 5 endpoints = 50 series. Then turn on a `user_id` label.
 
 <TsCardinality client:visible />
 
@@ -140,11 +140,11 @@ The Prometheus docs give the capacity formula: disk = retention seconds × sampl
 ## Interview lens
 
 <Callout type="tip">
-Describe the workload first: "append-only, newest timestamps, read by series and window, deleted by age". Then give the design: "group by series, compress with delta-of-delta timestamps and XOR values, cut into 2-hour blocks, drop whole blocks at retention". Quote the number: "Gorilla gets about 1.37 bytes per point instead of 16". Raise cardinality before the interviewer does: "I would keep user IDs out of the tags".
+Describe the workload first: "append-only, newest timestamps, read by series and window, deleted by age". Then give the design. Say: "group by series, compress with delta-of-delta timestamps and XOR values, cut into 2-hour blocks, drop whole blocks at retention". Quote the number: "Gorilla gets about 1.37 bytes per point instead of 16". Raise cardinality before the interviewer does: "I would keep user IDs out of the tags".
 </Callout>
 
 <Callout type="mistake">
-Do not say "1.37 bits per point". The paper says bytes. Do not use `user_id` or `request_id` as a tag so you can graph one user: it makes one series per user. And do not say delta-of-delta is always small. It is small only when samples arrive at regular intervals. A collector that scrapes at jittery times pays 9 to 36 bits per timestamp, as the table shows.
+Do not say "1.37 bits per point". The paper says bytes. Do not use `user_id` or `request_id` as a tag so you can graph one user. Doing so makes one series per user. And do not say delta-of-delta is always small. It is small only when samples arrive at regular intervals. A collector that scrapes at jittery times pays 9 to 36 bits per timestamp, as the table shows.
 </Callout>
 
 <Callout type="deep" title="Why not compress each value alone?">
@@ -219,7 +219,7 @@ A float64 has 64 bits of detail, and a gauge such as CPU temperature rarely uses
 
 ## Further reading
 
-- [Pelkonen et al., "Gorilla: A Fast, Scalable, In-Memory Time Series Database" (VLDB 2015)](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf) (the delta-of-delta and XOR scheme, Figure 2)
+- [Pelkonen et al., "Gorilla: A Fast, Scalable, In-Memory Time Series Database" (VLDB 2015)](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf). The paper's delta-of-delta and XOR scheme appears in Figure 2.
 - [Prometheus: Storage](https://prometheus.io/docs/prometheus/latest/storage/) (blocks, WAL, retention, bytes per sample)
 - [Prometheus: Data model](https://prometheus.io/docs/concepts/data_model/) (series, labels, samples)
 - [Prometheus: Metric and label naming](https://prometheus.io/docs/practices/naming/) (the cardinality warning)

@@ -23,7 +23,7 @@ A **token** is a chunk of text, roughly three-quarters of an English word. A mod
 
 **Below the line.** Editing or branching messages, images, audio, tool calls, web browsing, sharing, and searching history.
 
-**Non-functional.** The scale below is my assumption. I do not use any company's user count here, because I could not get a figure I could verify and date. If you quote one in an interview, say where and when it was published.
+**Non-functional.** The scale below is my assumption. I do not use any company's user count here. The reason is that I could not get a figure I could verify and date. If you quote one in an interview, say where and when it was published.
 
 - **Time to first token** matters more than total time. The user sees words in about a second, then reads as they arrive.
 - GPUs are the scarce, costly resource. Allocate them on purpose.
@@ -50,7 +50,7 @@ A **token** is a chunk of text, roughly three-quarters of an English word. A mod
 
 ### Why SSE and not a WebSocket
 
-Data flows one way: tokens go from server to client. The client sends one prompt, then waits. Server-sent events (lesson [2.5](/learn/02-networking/real-time-transport/)) fit this. It is plain HTTP, it passes through proxies and load balancers, and it has a built-in resume: each event may carry an `id`, and a browser that reconnects sends `Last-Event-ID`. OpenAI's API docs describe streaming over server-sent events with `stream=true`. They also say that without it, the API generates the whole output before it sends anything.
+Data flows one way: tokens go from server to client. The client sends one prompt, then waits. Server-sent events (lesson [2.5](/learn/02-networking/real-time-transport/)) fit this. It is plain HTTP, and it passes through proxies and load balancers. It has a built-in resume: each event may carry an `id`, and a browser that reconnects sends `Last-Event-ID`. OpenAI's API docs describe streaming over server-sent events with `stream=true`. They also say that without it, the API generates the whole output before it sends anything.
 
 A WebSocket works too, but you must build reconnect and resume yourself. Choose it only if the client sends frequent messages in the middle of a run.
 
@@ -58,15 +58,15 @@ A WebSocket works too, but you must build reconnect and resume yourself. Choose 
 
 ### GPU scheduling
 
-A GPU runs a model one **iteration** at a time. Each iteration makes one token for every request in the current batch. Batching matters because the cost of an iteration grows slowly with batch size: the GPU reads the model weights once and uses them for many requests. A bigger batch means more tokens per second per GPU.
+A GPU runs a model one **iteration** at a time. Each iteration makes one token for every request in the current batch. Batching matters because the cost of an iteration grows slowly with batch size. The reason is that the GPU reads the model weights once and uses them for many requests. A bigger batch means more tokens per second per GPU.
 
 The simple way is **static batching**: fill a batch, run it until every request finishes, then start the next. It wastes capacity, because requests differ in length. Step through both ways.
 
 <ChatgptBatching client:visible />
 
-The Orca paper (OSDI 2022) named the better scheme **iteration-level scheduling**. The scheduler decides again after every iteration, so a finished request leaves at once and a waiting one joins. Other systems call it continuous batching. The paper describes the static problem in the same terms: requests that finish early cannot return to the client, and new requests wait for the whole batch.
+The Orca paper (OSDI 2022) named the better scheme **iteration-level scheduling**. The scheduler decides again after every iteration, so a finished request leaves at once and a waiting one joins. Other systems call it continuous batching. The paper describes the static problem in the same terms: requests that finish early cannot return to the client. New requests wait for the whole batch.
 
-Memory is the second limit. For each running request the GPU holds a cache of the attention data for every token so far, called the **KV cache**. Long conversations use more of it. So the number of requests a GPU can hold at once depends on memory and context length, not just on speed. The scheduler admits a request only if there is room.
+Memory is the second limit. For each running request the GPU holds a cache of the attention data for every token so far. This cache is called the **KV cache**. Long conversations use more of it. So the number of requests a GPU can hold at once depends on memory and context length. Speed is not the only factor. The scheduler admits a request only if there is room.
 
 Three more rules finish the picture.
 
@@ -82,24 +82,24 @@ Separate the **run** from the **connection**. This is the long-running task patt
 
 1. The API creates a run with an id and returns it.
 2. The GPU worker writes each token to a buffer under that run id, with an increasing sequence number. A log or a Redis stream serves.
-3. The stream gateway reads the buffer and sends each token as an SSE event, with the sequence number as the event `id`.
+3. The stream gateway reads the buffer and sends each token as an SSE event. The gateway uses the sequence number as the event `id`.
 4. The connection dies. The run does not. The worker keeps writing.
 5. The client reconnects, to any gateway, with `Last-Event-ID: 212`. The gateway reads the buffer from 213 and continues.
-6. When the run ends, the final message is written once to the conversation store, keyed by the run id, so a retry cannot store it twice (lesson [3.4](/learn/03-api-design/idempotency/)).
+6. When the run ends, the final message is written once to the conversation store, keyed by the run id. So a retry cannot store the message twice (lesson [3.4](/learn/03-api-design/idempotency/)).
 
 A gateway deploy now costs a reconnect, not an answer. Keep the buffer for some minutes after the run ends, so a late reconnect still gets the tail.
 
 ### Limits per tier
 
-Counting requests is not enough. One request with a 100,000-token prompt costs a thousand times more than one with 100. OpenAI's rate-limit guide lists limits in requests per minute, requests per day, and tokens per minute, and says you can hit any of them first. These are API limits, but the lesson is general: limit what costs money.
+Counting requests is not enough. One request with a 100,000-token prompt costs a thousand times more than one with 100. OpenAI's rate-limit guide lists limits in requests per minute, requests per day, and tokens per minute. The guide says you can hit any of them first. These are API limits, but the lesson is general: limit what costs money.
 
-Use two token buckets per user (lesson [7.4](/learn/07-reliability/rate-limiting/)), one for requests and one for tokens. The token cost is unknown until the answer ends. So charge a worst-case amount at admission, which is prompt tokens plus the maximum answer length, and refund the unused part when the run ends. The buckets live in Redis, which can answer in a millisecond. An empty bucket gets `429` with a `Retry-After` header, as OpenAI's guide describes.
+Use two token buckets per user (lesson [7.4](/learn/07-reliability/rate-limiting/)), one for requests and one for tokens. The token cost is unknown until the answer ends. So charge a worst-case amount at admission. That amount is prompt tokens plus the maximum answer length. Refund the unused part when the run ends. The buckets live in Redis, which can answer in a millisecond. An empty bucket gets `429` with a `Retry-After` header, as OpenAI's guide describes.
 
 ### Conversation storage and context cost
 
 Messages are written once and read in order. The access pattern fits a wide-column or key-value store (lessons [8.3](/learn/08-technologies/cassandra/) and [8.4](/learn/08-technologies/dynamodb/)). Use the conversation id as the partition key and a sequence number as the sort key. The chat list is a second table keyed by user, sorted by last activity.
 
-The model has no memory. Each turn, the context builder sends the history again. That is the cost driver. Suppose 20 turns, each adding about 300 tokens (a question and an answer). Turn n sends about 300 x n tokens. The total over 20 turns is 300 x (1 + 2 + ... + 20) = 300 x 210 = 63,000 tokens, but only 6,000 are new. That is 10.5 times the new text.
+The model has no memory. Each turn, the context builder sends the history again. That is the cost driver. Suppose 20 turns, each adding about 300 tokens (a question and an answer). Turn n sends about 300 x n tokens. The total over 20 turns is 300 x (1 + 2 + ... + 20). That is 300 x 210 = 63,000 tokens, but only 6,000 are new. That is 10.5 times the new text.
 
 Keep the history inside a budget. Drop the oldest turns, or replace them with a short summary. Say the price out loud: the model forgets what you trimmed, and a summary can lose detail.
 
@@ -142,7 +142,7 @@ Do not answer "add more GPUs" first. Queue and batching come before that. Do not
 </Callout>
 
 <Callout type="deep" title="Time to first token and the prompt">
-The first token is slow because the model must read the whole prompt before it can write anything. This step is called prefill. After it, each new token needs one iteration. A 60,000-token prompt makes prefill long, and a prefill running on a GPU can slow the decode iterations of other requests in the same batch. Some systems run the two phases on different machines for this reason. For an interview, one sentence is enough: first-token time grows with prompt length, and long prompts are the expensive ones.
+The first token is slow because the model must read the whole prompt before it can write anything. This step is called prefill. After it, each new token needs one iteration. A 60,000-token prompt makes prefill long. Prefill running on a GPU can slow the decode iterations of other requests in the same batch. Some systems run the two phases on different machines for this reason. For an interview, one sentence is enough: first-token time grows with prompt length, and long prompts are the expensive ones.
 </Callout>
 
 ## Check yourself

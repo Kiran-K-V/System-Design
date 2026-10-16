@@ -32,9 +32,9 @@ The first problem has a direct fix. Make each step of the search consume a whole
 
 ## The mechanism: the B-tree
 
-A **B-tree** is a tree where every node is exactly one page. A node holds sorted keys and, between them, pointers to child pages. To find a key, read the root, pick the child whose range contains the key, read that child, and repeat until you reach a **leaf**. A leaf holds the key and a pointer to the table row.
+A **B-tree** is a tree where every node is exactly one page. A node holds sorted keys and, between them, pointers to child pages. To find a key, read the root. Pick the child whose range contains the key. Read that child, and repeat until you reach a **leaf**. A leaf holds the key and a pointer to the table row.
 
-Most databases use the **B+tree** variant. Only leaves hold row pointers. Leaves are also chained in a doubly linked list in key order, so a range query (`BETWEEN`) finds the first key and then walks along the leaves. The tree is **balanced**: every leaf is at the same depth. That is the property that keeps lookups predictable.
+Most databases use the **B+tree** variant. Only leaves hold row pointers. Leaves are also chained in a doubly linked list in key order. So a range query (`BETWEEN`) finds the first key and then walks along the leaves. The tree is **balanced**: every leaf is at the same depth. That is the property that keeps lookups predictable.
 
 ### Height: do the arithmetic
 
@@ -59,13 +59,13 @@ root     :                           1 page
 
 <BTreeHeight />
 
-Read the figure from the bottom. The leaves hold 99.75% of the pages, which agrees with the PostgreSQL docs ("typically, over 99% of all pages are leaf pages"). The three upper levels total 6,267 pages, ~51 MB. That fits in RAM on any server, and it is the part every lookup touches. So a real lookup does **no disk reads for the top three levels**. It does one SSD read for the leaf and one for the table page: 2 × ~100 µs, **~0.2 ms**. Against ~50 s for the scan, that is about 250,000 times faster.
+Read the figure from the bottom. The leaves hold 99.75% of the pages. This agrees with the PostgreSQL docs ("typically, over 99% of all pages are leaf pages"). The three upper levels total 6,267 pages, ~51 MB. That fits in RAM on any server, and it is the part every lookup touches. So a real lookup does **no disk reads for the top three levels**. It does one SSD read for the leaf and one for the table page: 2 × ~100 µs, **~0.2 ms**. Against ~50 s for the scan, that is about 250,000 times faster.
 
 How sensitive is the answer to my guess of F? Height stays 4 for any F from 178 up to 999, because 178^4 is about 10^9 and 1,000^3 is 10^9. Halve the entry size or double it: still 4. Drop F to 100 and it becomes 5 (100^4 = 10^8 is too small). Use The Index Luke says real indexes on millions of rows have a depth of 4 or 5, which matches.
 
 ### Insert: the split
 
-Inserting a key means finding its leaf and adding it in sorted order. If the leaf has room, one page changes. If the leaf is full, it **splits**: half the keys move to a new page, and the middle key moves up into the parent as a new pointer. If the parent is full it splits too. Splits cascade upward. When the root splits, the tree grows one level taller. That is the only way a B-tree gets taller, so it stays balanced by construction.
+Inserting a key means finding its leaf and adding it in sorted order. If the leaf has room, one page changes. If the leaf is full, it **splits**. Half the keys move to a new page. The middle key moves up into the parent as a new pointer. If the parent is full it splits too. Splits cascade upward. When the root splits, the tree grows one level taller. That is the only way a B-tree gets taller, so it stays balanced by construction.
 
 Try it. The nodes below hold 3 keys so splits are easy to see. Insert 10, 20, 30, then 40. Keep going and watch the root.
 
@@ -75,13 +75,13 @@ Notice how rare a split is. In a real index with F = 400, a leaf that just split
 
 ### What an index costs on write
 
-A lookup got cheap. A write got dearer. A row insert touches the table page **and one leaf page in every index** on the table. A table with 6 indexes writes 1 table page plus 6 index leaf pages for each insert, all in place (lesson 4.2) and all recorded in the log. An update that changes an indexed column must change that index as well.
+A lookup got cheap. A write got dearer. A row insert touches the table page **and one leaf page in every index** on the table. A table with 6 indexes writes 1 table page plus 6 index leaf pages for each insert. All of these writes happen in place (lesson 4.2) and are recorded in the log. An update that changes an indexed column must change that index as well.
 
 That is why the rule is **not** "index every column". Index the columns that the hot queries filter, join, or sort on. Drop the rest.
 
 ## Which queries can use an index?
 
-An index on **several columns** is one tree sorted by the first column, then by the second inside each first-column value. It is a phone book: sorted by surname, then by first name. You cannot look someone up by first name alone. Use The Index Luke makes the same point: a two-column index "does not support searching on the second column alone".
+An index on **several columns** is one tree. It is sorted by the first column, then by the second inside each first-column value. It is a phone book: sorted by surname, then by first name. You cannot look someone up by first name alone. Use The Index Luke makes the same point: a two-column index "does not support searching on the second column alone".
 
 Three rules follow. Use the widget to check each one. Pick an index, pick a query, and watch how many of the 200 entries get read.
 
@@ -101,7 +101,7 @@ Step through it. Watch the read in steps 7 and 8.
 
 <LsmFlow client:visible />
 
-A read must check the memtable, then files from newest to oldest. To avoid useless disk reads, each file carries a **Bloom filter**: a small in-memory summary that can say "this key is definitely not in this file". It never says "not here" wrongly, but it can say "maybe here" wrongly. RocksDB documents the exchange: 9.9 bits per key gives a 1% false-positive rate, and 15.5 bits gives 0.1%. At 1% and 20 files, a read for a missing key wastes about 20 × 0.01 = 0.2 disk reads on average.
+A read must check the memtable, then files from newest to oldest. To avoid useless disk reads, each file carries a **Bloom filter**. It is a small in-memory summary that can say "this key is definitely not in this file". It never says "not here" wrongly, but it can say "maybe here" wrongly. RocksDB documents the exchange: 9.9 bits per key gives a 1% false-positive rate, and 15.5 bits gives 0.1%. At 1% and 20 files, a read for a missing key wastes about 20 × 0.01 = 0.2 disk reads on average.
 
 The memory cost is real. At 9.9 bits per key, 1 billion keys need 9.9 × 10^9 bits, ~1.2 GB of filters.
 

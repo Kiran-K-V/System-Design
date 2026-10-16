@@ -15,7 +15,7 @@ import Ai3LimitStorm from '../../../../components/anim/lessons/Ai3LimitStorm.tsx
 
 Your app calls a model API. At 10:00 a campaign starts and traffic triples. The API returns 429. Your client retries at once. The retries also get 429. Every retry adds load. The queue grows, users wait, and the provider keeps saying no.
 
-An LLM API has more ways to say no than an ordinary API. There are three kinds of limit. There is a monthly spend cap. There is an overload error that is not your fault. And a retried call can do harm that a retried read cannot: the model may ask for a tool that sends an email, and the second try may ask for it again.
+An LLM API has more ways to say no than an ordinary API. There are three kinds of limit. There is a monthly spend cap. There is an overload error that is not your fault. And a retried call can do harm that a retried read cannot. The model may ask for a tool that sends an email. The second try may ask for that tool again.
 
 This lesson covers the limits, the retry rules that fit them, and how to keep side effects safe. Facts about Anthropic come from its rate limits and errors pages, fetched on 2026-10-16. OpenAI facts are marked.
 
@@ -35,7 +35,7 @@ It fails in three ways.
 
 ### Three limits, three buckets
 
-The Messages API measures usage in requests per minute (RPM), input tokens per minute (ITPM), and output tokens per minute (OTPM). Exceed any one and you get a 429 that names it. Limits are per organization and per model class. Here are the Opus 5.5 rows (the page lists other models with their own rows), as of 2026-10-16 ([rate limits](https://platform.claude.com/docs/en/api/rate-limits)):
+The Messages API measures usage in requests per minute (RPM). It also measures input tokens per minute (ITPM) and output tokens per minute (OTPM). Exceed any one and you get a 429 that names it. Limits are per organization and per model class. Here are the Opus 5.5 rows (the page lists other models with their own rows), as of 2026-10-16 ([rate limits](https://platform.claude.com/docs/en/api/rate-limits)):
 
 | Tier | RPM | ITPM | OTPM | Monthly spend cap |
 |---|---|---|---|---|
@@ -43,7 +43,7 @@ The Messages API measures usage in requests per minute (RPM), input tokens per m
 | Build | 5,000 | 5,000,000 | 1,000,000 | $1,000 |
 | Scale | 10,000 | 10,000,000 | 2,000,000 | $200,000 |
 
-The API uses a token bucket. Capacity refills continuously up to the maximum. It does not reset at the minute mark. The page says a limit of 60 RPM may be enforced as 1 request per second, so a short burst can trigger a 429 even when the minute total is low. The backend lesson on [rate limiting](/learn/backend/07-reliability/rate-limiting/) explains the bucket. This lesson uses it from the client side.
+The API uses a token bucket. Capacity refills continuously up to the maximum. It does not reset at the minute mark. The page says a limit of 60 RPM may be enforced as 1 request per second. So a short burst can trigger a 429 even when the minute total is low. The backend lesson on [rate limiting](/learn/backend/07-reliability/rate-limiting/) explains the bucket. This lesson uses it from the client side.
 
 <Ai3LimitWalk client:visible />
 
@@ -51,11 +51,11 @@ What the walk shows. Which bucket runs dry first depends on the shape of your re
 
 ### Cache-aware ITPM, and what it does and does not mean
 
-On most Claude models, only uncached input counts toward ITPM. `cache_read_input_tokens` does not count. `input_tokens` and `cache_creation_input_tokens` do. The page's example: with 2M ITPM and an 80% cache hit rate you can process 10M total input tokens per minute. The formula is 2M / (1 - 0.8) = 10M. A cache is also a rate-limit tool. Lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/) covers how caching works.
+On most Claude models, only uncached input counts toward ITPM. `cache_read_input_tokens` does not count. `input_tokens` and `cache_creation_input_tokens` do. The page's example has 2M ITPM and an 80% cache hit rate. With that setup, you can process 10M total input tokens per minute. The formula is 2M / (1 - 0.8) = 10M. A cache is also a rate-limit tool. Lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/) covers how caching works.
 
 Do not assume other providers do the same. OpenAI's [prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching) says the opposite: cached input tokens still count toward its tokens-per-minute (TPM) limit (as of 2026-10-16). Caching there cuts cost, not rate-limit usage. Read your provider's page, and check the response headers, before you plan around it.
 
-OTPM is counted as tokens are produced. Anthropic says `max_tokens` does not count toward OTPM, so a high `max_tokens` has no rate-limit cost. OpenAI's page says the opposite for its limit: the rate used is the larger of `max_tokens` and an estimate, so set it close to the expected size. Same field, different rule.
+OTPM is counted as tokens are produced. Anthropic says `max_tokens` does not count toward OTPM, so a high `max_tokens` has no rate-limit cost. OpenAI's page says the opposite for its limit. The rate used is the larger of `max_tokens` and an estimate. So set that value close to the expected size. Same field, different rule.
 
 ### Which error is which
 
@@ -68,7 +68,7 @@ OTPM is counted as tokens are produced. Anthropic says `max_tokens` does not cou
 | 529 | `overloaded_error` | High load across all users | Yes, with backoff |
 | 504 | `timeout_error` | Request timed out. Use streaming for long calls. | With care |
 
-The spend-cap row is the trap. Its error type is `rate_limit_error`, the same as an ordinary limit. Only `error.details.error_code` tells them apart. The page states that retrying, including the SDK's automatic retries, fails until access resumes at 00:00 UTC on the first of the next month. A client that reads only the status code will retry for weeks.
+The spend-cap row is the trap. Its error type is `rate_limit_error`, the same as an ordinary limit. Only `error.details.error_code` tells them apart. The page states that retrying fails, including the SDK's automatic retries. Retrying keeps failing until access resumes at 00:00 UTC on the first of the next month. A client that reads only the status code will retry for weeks.
 
 The 429 headers help you pace. `retry-after` gives seconds to wait, and earlier retries will fail. The `anthropic-ratelimit-*-remaining` and `-reset` headers show how much of each bucket is left. Read them before you hit zero.
 
@@ -80,7 +80,7 @@ Retry only transient failures, at one layer, with exponential backoff and jitter
 
 The LLM-specific parts:
 
-- Wait at least `retry-after` when it is present. OpenAI's page says to treat it as a minimum, add a small random delay, and bound both the attempts and the total time. It also says failed requests still count toward your per-minute limit.
+- Wait at least `retry-after` when it is present. OpenAI's page says to treat it as a minimum. The page also says to add a small random delay. It also says to bound both the attempts and the total time. It also says failed requests still count toward your per-minute limit.
 - Honor the header and still add jitter. All clients rejected at the same moment get the same value, so they return at the same moment.
 - Never retry a spend-cap 429 or a 400. OpenAI's page also says not to retry quota or billing errors.
 - The Anthropic SDK retries twice by default, with backoff, and honors `retry-after`. That is one layer. If your gateway and your job queue also retry, you have three.
@@ -90,20 +90,20 @@ The simulator below runs the same load through five policies against a token-buc
 
 <Ai3LimitStorm client:visible />
 
-What to notice. Fixed timers and unjittered backoff keep clients in lockstep, so the peak per second stays at the full client count and many clients give up. Jitter spreads the retries and serves more clients inside the same retry budget. Full jitter shows the highest one-second peak, because some short random waits land inside the first second, but its later seconds are flatter. Honoring `retry-after` alone looks like a fixed 1 s timer here, because the header is the same for everyone. With the spend cap on, every policy loses. Only stopping at once avoids the wasted attempts.
+What to notice. Fixed timers and unjittered backoff keep clients in lockstep. So the peak per second stays at the full client count. And many clients give up. Jitter spreads the retries and serves more clients inside the same retry budget. Full jitter shows the highest one-second peak. The reason is that some short random waits land inside the first second. But its later seconds are flatter. Honoring `retry-after` alone looks like a fixed 1 s timer here, because the header is the same for everyone. With the spend cap on, every policy loses. Only stopping at once avoids the wasted attempts.
 
 ### Retry amplification
 
-Each layer that retries multiplies the others. Take a user tap, a job worker with 3 attempts, a gateway with 3 attempts, and the SDK with 3 attempts (1 try and 2 retries). If the provider fails every call, one tap causes 3 x 3 x 3 = 27 provider calls. Count each layer you own. Retry in one place, usually the one closest to the provider, and let the rest fail fast.
+Each layer that retries multiplies the others. Take a user tap, a job worker with 3 attempts, and a gateway with 3 attempts. The SDK also makes 3 attempts, which is 1 try and 2 retries. If the provider fails every call, one tap causes 3 x 3 x 3 = 27 provider calls. Count each layer you own. Retry in one place, usually the one closest to the provider, and let the rest fail fast.
 
 ### An LLM call is not idempotent
 
-Idempotent means that repeating an operation gives the same end state. Calling the model twice with the same prompt can give two different texts. Sampling is random. Even if you lower the temperature, do not rely on identical output. So you cannot use "retry until it works" as a safe pattern for the model call. The pages I read do not describe an idempotency key for the Messages API, so check before you assume one exists.
+Idempotent means that repeating an operation gives the same end state. Calling the model twice with the same prompt can give two different texts. Sampling is random. Even if you lower the temperature, do not rely on identical output. So you cannot use "retry until it works" as a safe pattern for the model call. The pages I read do not describe an idempotency key for the Messages API. So check before you assume one exists.
 
 You can make the effects idempotent. The model call itself has no side effect. Your code does, when it runs a tool.
 
 <CrossTrackLink id="03-api-design/idempotency">
-An idempotency key is a client-made id. The server stores the result of the first request with that key and returns it on repeats. Stripe, for example, keeps keys up to 255 characters, prunes them after at least 24 hours, and errors if a reused key comes with different parameters. The backend lesson shows the server side.
+An idempotency key is a client-made id. The server stores the result of the first request with that key and returns it on repeats. Stripe, for example, keeps keys up to 255 characters. It prunes them after at least 24 hours. It also errors if a reused key comes with different parameters. The backend lesson shows the server side.
 </CrossTrackLink>
 
 The danger case looks like this. A worker calls the model. The model returns a `tool_use` block: send a refund. The worker runs the refund, then crashes before it saves progress. The job restarts, calls the model again, and gets a new `tool_use` block with a new id. The refund runs a second time. Retrying the model gave a different answer, so no key from the model output can stop it.
@@ -147,7 +147,7 @@ A queue in front of the model, with a worker rate set below the limit, is better
 ## Interview lens
 
 <Callout type="tip">
-Say it in order: "I would read the 429 body first. A rate limit gets backoff with jitter and `retry-after`, at one layer. A spend-cap error gets no retry and a page to a human. For tool calls, I log the model response before I run the tool, and I pass a key built from the logged tool id downstream." Then give one number, such as 27 attempts from three layers of three.
+Say it in order: "I would read the 429 body first. A rate limit gets backoff with jitter and `retry-after`, at one layer. A spend-cap error gets no retry and a page to a human. For tool calls, I log the model response before I run the tool. I pass a key built from the logged tool id downstream." Then give one number. That number is 27 attempts from three layers of three.
 </Callout>
 
 <Callout type="mistake">

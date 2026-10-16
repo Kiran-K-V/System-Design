@@ -14,9 +14,9 @@ import Ai2CacheCalc from '../../../../components/anim/lessons/Ai2CacheCalc.tsx';
 
 ## The problem
 
-An assistant sends the same 20,000 tokens at the start of every call: a system prompt, a tool list, and a few examples. The user's actual question is 300 tokens. You pay for the 20,000 on every call, and the model re-reads them on every call.
+An assistant sends the same 20,000 tokens at the start of every call. Those tokens are a system prompt, a tool list, and a few examples. The user's actual question is 300 tokens. You pay for the 20,000 on every call, and the model re-reads them on every call.
 
-The money first. At Sonnet 5.5's $2 per million input tokens, 20,000 tokens cost 20,000 x $2 / 1,000,000 = $0.04 per call. At 1,000 calls a day, that is $40 a day for text that never changes (derived). The time next: the provider must run the prefill pass over all 20,000 tokens before the first output token (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)). That is the wait you feel as time to first token.
+The money first. At Sonnet 5.5's $2 per million input tokens, 20,000 tokens cost 20,000 x $2 / 1,000,000 = $0.04 per call. At 1,000 calls a day, that is $40 a day for text that never changes (derived). The time next: the provider must run the prefill pass over all 20,000 tokens. This happens before the first output token (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)). That is the wait you feel as time to first token.
 
 ## Naive solution: send it and pay again
 
@@ -33,7 +33,7 @@ A cache stores the result of expensive work under a key and serves repeats from 
 How a hit works:
 
 1. A request arrives. The provider compares the start of the prompt with stored prefixes.
-2. If a stored prefix matches token for token, the provider loads its KV entries and runs prefill only on the rest.
+2. If a stored prefix matches token for token, the provider loads its KV entries. It then runs prefill only on the rest.
 3. If nothing matches, it runs the full prefill and may store the prefix for next time.
 
 The match is by **prefix**. One changed token in the middle ends the match at that point, and everything after it is a miss. Order matters: put what stays the same first, what changes last. Lesson [A4.5](/learn/ai/a4-context/cache-friendly-layout/) teaches how to lay out a prompt for hits. Here we only need the rule.
@@ -47,14 +47,14 @@ All numbers are USD per 1M input tokens, as of 2026-10-16, from each provider's 
 **Anthropic** ([prompt caching docs](https://platform.claude.com/docs/en/docs/build-with-claude/prompt-caching)):
 
 - Prefix order is tools, then system, then messages. A change at one level invalidates that level and every level after it. Editing a tool invalidates all three.
-- A write costs 1.25x the base price for the default 5-minute lifetime, or 2x for the 1-hour lifetime. A read costs 0.1x on most models, 0.05x on Sonnet 5.5 and Opus 5.5, and 0.025x on Fable 5.1 and Mythos 5.1.
+- A write costs 1.25x the base price for the default 5-minute lifetime, or 2x for the 1-hour lifetime. A read costs 0.1x on most models. It costs 0.05x on Sonnet 5.5 and Opus 5.5, and 0.025x on Fable 5.1 and Mythos 5.1.
 - Each use refreshes the timer at no cost. The lifetime counts from the start of the request, so a long streamed answer eats into it.
 - Minimum cacheable prompt: 512 tokens on Sonnet 5.5, Opus 5.5, and Haiku 5.5. It is 1,024 to 4,096 on other models. A shorter prompt runs uncached and raises no error. Check `cache_creation_input_tokens` and `cache_read_input_tokens` in the response; both 0 means no caching happened.
 - Cache hits are not deducted from your rate limit.
 
 **OpenAI** ([prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)):
 
-- Caching is automatic. On GPT-5.6 and later, the minimum is 1,024 tokens, a read costs 0.1x (0.05x for GPT-6.1 Sol), and a write costs 1.25x. The default lifetime is 30 minutes and each reuse extends it.
+- Caching is automatic. On GPT-5.6 and later, the minimum is 1,024 tokens. A read costs 0.1x (0.05x for GPT-6.1 Sol). A write costs 1.25x. The default lifetime is 30 minutes and each reuse extends it.
 - Earlier models have a model-dependent read price and no write fee. Retention is `in_memory` (about 5 to 10 minutes idle, up to 1 hour) or `24h`. Organizations without Zero Data Retention default to `24h`.
 - Cached tokens still count toward the tokens-per-minute limit. This differs from Anthropic.
 - Changing the model, the tools, `text.format`, or `reasoning.effort` breaks the match.
@@ -62,8 +62,8 @@ All numbers are USD per 1M input tokens, as of 2026-10-16, from each provider's 
 **Google Gemini** ([caching guide](https://ai.google.dev/gemini-api/docs/caching), [pricing](https://ai.google.dev/gemini-api/docs/pricing), last updated 2026-10-15):
 
 - Implicit caching is on by default for Gemini 2.5 and newer. The minimum is 2,048 tokens on 2.5 Flash and 2.5 Pro, and 4,096 on newer models. Savings pass on automatically; the guide gives no percentage.
-- Explicit caches take a lifetime as a duration string such as `"300s"`. The guide does not state a default. They also carry a storage fee: $1.00 per 1M tokens per hour on 2.5 Flash, $4.50 on 2.5 Pro. A 20,000-token explicit cache on 2.5 Flash costs 20,000 / 1e6 x $1.00 = $0.02 per hour just to keep (derived).
-- Cached input is $0.03 on 2.5 Flash (base $0.30) and $0.125 on 2.5 Pro (base $1.25, prompts up to 200K).
+- Explicit caches take a lifetime as a duration string such as `"300s"`. The guide does not state a default. They also carry a storage fee: $1.00 per 1M tokens per hour on 2.5 Flash, $4.50 on 2.5 Pro. A 20,000-token explicit cache on 2.5 Flash costs 20,000 / 1e6 x $1.00 = $0.02 per hour. This is the cost just to keep it (derived).
+- Cached input is $0.03 on 2.5 Flash (base $0.30). On 2.5 Pro it is $0.125 (base $1.25, prompts up to 200K).
 
 ## Numbers: the break-even
 
@@ -83,7 +83,7 @@ Now watch three calls on Sonnet 5.5. A fourth call after a 6-minute gap shows th
 
 <Ai2CacheWalk client:visible />
 
-Try your own numbers. Start with the default (Sonnet 5.5, 20,000 tokens, 4 reads per write), then set reads to 0, then switch the TTL to 1 hour and find where the saving turns positive.
+Try your own numbers. Start with the default (Sonnet 5.5, 20,000 tokens, 4 reads per write). Then set reads to 0. Then switch the TTL to 1 hour and find where the saving turns positive.
 
 <Ai2CacheCalc client:visible />
 
@@ -93,7 +93,7 @@ What to notice:
 2. **The 1-hour option needs more traffic to pay**, but it survives gaps that kill a 5-minute entry. Pick the lifetime from your request spacing, not by habit.
 3. **The saving has a cap.** The calculator prices only the prefix. Output tokens and new input are the same either way, so a short shared prefix saves little in total.
 
-Assumptions: every read lands inside the lifetime, the prefix is above the minimum length, and the prefix is identical each time.
+Assumptions: every read lands inside the lifetime. The prefix is above the minimum length and identical each time.
 
 ### Latency
 
@@ -101,7 +101,7 @@ A hit skips the prefix prefill, so time to first token should drop. We do not qu
 
 ## A different cache: semantic caching
 
-Semantic caching stores whole answers and reuses one when a new question looks similar to an old one, usually by comparing embeddings. It is a different tool. A provider cache never changes the answer: the model still runs on every request, only the prefill is cheaper. A semantic cache can skip the model call entirely, so it saves more, and it can also return an answer meant for a different question or a different user. We have no sourced hit rate or error rate for it, so this lesson gives none. If you build one, measure the wrong-reuse rate on your own eval (lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/)) before shipping.
+Semantic caching stores whole answers and reuses one when a new question looks similar to an old one. It usually finds this match by comparing embeddings. It is a different tool. A provider cache never changes the answer: the model still runs on every request, only the prefill is cheaper. A semantic cache can skip the model call entirely, so it saves more. It can also return an answer meant for a different question or a different user. We have no sourced hit rate or error rate for it, so this lesson gives none. If you build one, measure the wrong-reuse rate on your own eval (lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/)) before shipping.
 
 ## Trade-offs
 
@@ -120,7 +120,7 @@ Say it with numbers: "Our 20K-token prefix costs $0.04 per call uncached. A 5-mi
 </Callout>
 
 <Callout type="mistake">
-Do not cache a prompt that changes every call: you pay the write premium and never get a read. Do not edit the tool list or the top of the prompt on each request, because that invalidates everything after it. Do not assume cached tokens are free of rate limits on every provider: OpenAI counts them toward tokens per minute.
+Do not cache a prompt that changes every call: you pay the write premium and never get a read. Do not edit the tool list or the top of the prompt on each request. The reason is that the edit invalidates everything after it. Do not assume cached tokens are free of rate limits on every provider: OpenAI counts them toward tokens per minute.
 </Callout>
 
 ## Check yourself

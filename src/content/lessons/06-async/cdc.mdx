@@ -29,19 +29,19 @@ The application updates Postgres, then the search index, then the cache. This is
 
 <AsyncOutboxWalk mode="dual" client:visible />
 
-Swapping the order does not help. If you publish first and the database then rejects the write, you have told the world about a change that never happened. A retry loop cannot help after the process itself is gone. The Microservices.io outbox write-up names the root cause: a service cannot easily update its database and send a message **atomically**, and two-phase commit (lesson 4.4) is often not available.
+Swapping the order does not help. If you publish first and the database then rejects the write, you have told the world about a change. That change never happened. A retry loop cannot help after the process itself is gone. The Microservices.io outbox write-up names the root cause. A service cannot easily update its database and send a message **atomically**. Two-phase commit (lesson 4.4) is often not available.
 
 **2. A race.** Two requests change the same row at nearly the same time. Their writes reach the two systems in different orders. The copies disagree for good.
 
 <DualWriteRace client:visible />
 
-**3. Coupling and blind spots.** Every new consumer means a change in the app. A batch script, an admin tool, or a second service that writes to the same table skips the app's code and so skips the extra writes.
+**3. Coupling and blind spots.** Every new consumer means a change in the app. A batch script, an admin tool, or a second service that writes to the same table skips the app's code. So that writer also skips the extra writes.
 
 ## The mechanism: read the log
 
 The database already has an ordered record of every committed change: the write-ahead log (WAL, lesson 4.2). Replication (lesson 4.6) already depends on it. **Change data capture** (CDC) reads that log and turns each change into an event. The app writes one place. Whatever commits to the database shows up in the log, no matter which code path wrote it. And the log is in commit order.
 
-Debezium is a common open source tool. Its MySQL connector reads the binlog. Its PostgreSQL connector reads a logical replication stream through a **replication slot**, which is a bookmark the database keeps for one reader so it does not delete log that reader still needs. It decodes the log with a plug-in: `pgoutput`, which is built in, or `decoderbufs`. The position in the log is the **LSN** (log sequence number).
+Debezium is a common open source tool. Its MySQL connector reads the binlog. Its PostgreSQL connector reads a logical replication stream through a **replication slot**. A replication slot is a bookmark the database keeps for one reader. The database keeps it so it does not delete log that reader still needs. It decodes the log with a plug-in: `pgoutput`, which is built in, or `decoderbufs`. The position in the log is the **LSN** (log sequence number).
 
 <AsyncCdcFlow client:visible />
 
@@ -49,17 +49,17 @@ What the connector does, from the Debezium docs:
 
 - **First start: a snapshot.** PostgreSQL purges old WAL after some time, so the log alone cannot rebuild the table. The connector takes a consistent snapshot of the existing rows, then streams changes from that point. The `snapshot.mode` default is `initial`.
 - **It stores each event's LSN.** After a restart it resumes from the last stored position.
-- **Output.** It usually runs inside Kafka Connect and writes one topic per table by default. Debezium Server and an embedded engine are alternatives. The stream is the log of lesson 6.2, so any number of consumers can read it, each with its own offset.
+- **Output.** It usually runs inside Kafka Connect and writes one topic per table by default. Debezium Server and an embedded engine are alternatives. The stream is the log of lesson 6.2. So any number of consumers can read it, each with its own offset.
 
 What it does **not** promise:
 
-- **At-least-once, not exactly-once.** In normal operation and graceful shutdown, consumers see each event once. After a failure, Debezium's FAQ says consumers can see an event at least once, and "may likely see at least some messages duplicated during recovery". The walk above shows how. Make consumers idempotent (lesson 6.3).
+- **At-least-once, not exactly-once.** In normal operation and graceful shutdown, consumers see each event once. After a failure, Debezium's FAQ says consumers can see an event at least once. The FAQ adds that consumers "may likely see at least some messages duplicated during recovery". The walk above shows how. Make consumers idempotent (lesson 6.3).
 - **No DDL events.** Schema changes are not sent as events.
 - **Commit-time publishing.** Changes appear when the transaction commits.
 - **Generated columns.** `pgoutput` does not capture them.
 
 <Callout type="deep" title="The cost of a bookmark: WAL on the primary">
-A replication slot keeps WAL until its reader confirms it. The PostgreSQL manual warns that slots "will prevent removal of required resources even when there is no connection using them", and that a slot nobody needs should be dropped. The setting `max_slot_wal_keep_size` caps how much WAL slots may keep. Its default is `-1`, which means no limit. So a stopped connector can fill the primary's disk with WAL (lesson 4.6). Alert on slot lag. Drop slots you no longer use.
+A replication slot keeps WAL until its reader confirms it. The PostgreSQL manual warns that slots "will prevent removal of required resources even when there is no connection using them". The manual also says a slot nobody needs should be dropped. The setting `max_slot_wal_keep_size` caps how much WAL slots may keep. Its default is `-1`, which means no limit. So a stopped connector can fill the primary's disk with WAL (lesson 4.6). Alert on slot lag. Drop slots you no longer use.
 </Callout>
 
 ## The outbox pattern
@@ -70,9 +70,9 @@ The **transactional outbox** fixes this. In the same transaction that changes th
 
 <AsyncOutboxWalk mode="outbox" client:visible />
 
-Debezium ships an outbox event router for this. It expects a table with the columns `id`, `aggregatetype`, `aggregateid`, `type`, and `payload`. By default it sends events to a topic named `outbox.event.${routedByValue}`. It uses `aggregateid` as the message key, so all events of one aggregate, such as one order, go to the same partition and keep their order (lesson 6.2). It ignores delete events on the outbox table, so you can clean old rows without publishing anything.
+Debezium ships an outbox event router for this. It expects a table with the columns `id`, `aggregatetype`, `aggregateid`, `type`, and `payload`. By default it sends events to a topic named `outbox.event.${routedByValue}`. It uses `aggregateid` as the message key. So all events of one aggregate, such as one order, go to the same partition. Events in that group keep their order (lesson 6.2). It ignores delete events on the outbox table, so you can clean old rows without publishing anything.
 
-The costs, from the Microservices.io pattern page: a developer can forget to write the outbox row, and the relay can publish a message more than once, so consumers must be idempotent. You also run a cleanup job.
+The costs come from the Microservices.io pattern page. A developer can forget to write the outbox row. The relay can publish a message more than once, so consumers must be idempotent. You also run a cleanup job.
 
 ## Numbers
 
@@ -101,7 +101,7 @@ Say: "I never write to the database and the broker separately. I write the busin
 </Callout>
 
 <Callout type="mistake">
-Do not say "write to the DB, then publish to Kafka, and retry on failure". A crash between the steps loses the event. Do not say "CDC is exactly-once". Plan for duplicates. And do not forget the operational side: a stopped connector with an active replication slot makes the database keep WAL without limit by default.
+Do not say "write to the DB, then publish to Kafka, and retry on failure". A crash between the steps loses the event. Do not say "CDC is exactly-once". Plan for duplicates. And do not forget the operational side. A stopped connector with an active replication slot makes the database keep WAL without limit by default.
 </Callout>
 
 ## Check yourself

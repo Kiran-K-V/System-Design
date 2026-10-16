@@ -20,7 +20,7 @@ Three things make it hard at scale.
 - **Other people's servers.** Every fetch uses a site's bandwidth and CPU. A crawler that fetches too fast looks like an attack, and sites block it.
 - **Messy input.** Pages fail, time out, repeat, link in circles, and sometimes generate endless links on purpose.
 
-This case adds four ideas: a **URL frontier** [mid] (the list of URLs still to fetch) with a queue per host, politeness rules including `robots.txt`, dedupe by URL and by content hash, and DNS caching. It builds on queues (lesson [6.1](/learn/06-async/queues/)), retries and dead-letter queues (lesson [6.4](/learn/06-async/backpressure-dlq/)), and the Bloom filter from lesson [10.3](/learn/10-advanced/big-data-structures/).
+This case adds four ideas. One is a **URL frontier** [mid] (the list of URLs still to fetch) with a queue per host. Others are politeness rules including `robots.txt`, dedupe by URL and by content hash, and DNS caching. It builds on queues (lesson [6.1](/learn/06-async/queues/)), retries and dead-letter queues (lesson [6.4](/learn/06-async/backpressure-dlq/)), and the Bloom filter from lesson [10.3](/learn/10-advanced/big-data-structures/).
 
 ## Requirements
 
@@ -39,7 +39,7 @@ This case adds four ideas: a **URL frontier** [mid] (the list of URLs still to f
 
 ### Derive the load
 
-Assume 10 billion pages. Assume the average page costs 2 MB of transfer with its inline resources, of which the HTML is about 30 KB (assumptions).
+Assume 10 billion pages. Assume the average page costs 2 MB of transfer with its inline resources. Of that, the HTML is about 30 KB (assumptions).
 
 - Total transfer: 10,000,000,000 x 2 MB = 20,000,000,000 MB = **20 PB**.
 - Time budget: 5 days x 86,400 s = 432,000 s.
@@ -85,13 +85,13 @@ Notice that queues carry only small messages, such as a URL or a blob id. The bi
 
 The naive frontier is one first-in-first-out queue. Pages link to pages on the same site, so the queue fills with runs of URLs from one host. Several workers then hit that host at once.
 
-The Stanford information retrieval book describes a common design. Front queues order URLs by priority. Back queues each hold URLs from a **single host**. A table maps hosts to back queues. A heap holds, for each back queue, the earliest time that host may be contacted again. A worker takes the queue with the earliest ready time, fetches one URL, and puts the host back with a new ready time. The book notes a rule of thumb: wait about ten times as long as the last fetch took.
+The Stanford information retrieval book describes a common design. Front queues order URLs by priority. Back queues each hold URLs from a **single host**. A table maps hosts to back queues. A heap holds, for each back queue, the earliest time that host may be contacted again. A worker takes the queue with the earliest ready time. The worker fetches one URL, then puts the host back with a new ready time. The book notes a rule of thumb: wait about ten times as long as the last fetch took.
 
-A simple version fits in Redis (lesson [8.2](/learn/08-technologies/redis/)): one key per host holds a rate limit or lock, set with an expiry of one second. Compare with the rate limiters of lesson [7.4](/learn/07-reliability/rate-limiting/). A fetcher that cannot take the key picks another host.
+A simple version fits in Redis (lesson [8.2](/learn/08-technologies/redis/)). One key per host holds a rate limit or lock, set with an expiry of one second. Compare with the rate limiters of lesson [7.4](/learn/07-reliability/rate-limiting/). A fetcher that cannot take the key picks another host.
 
-Do the math on what politeness costs. At 1 request per second per host, the crawler needs at least 23,148 hosts in flight to reach 23,148 pages per second. A host with 10,000,000 pages needs 10,000,000 / 86,400 = about **116 days** by itself. So set a page budget per host, or crawl its pages at a lower priority.
+Do the math on what politeness costs. At 1 request per second per host, the crawler needs at least 23,148 hosts in flight. The goal is to reach 23,148 pages per second. A host with 10,000,000 pages needs 10,000,000 / 86,400 = about **116 days** by itself. So set a page budget per host, or crawl its pages at a lower priority.
 
-**`robots.txt`.** Before the first fetch from a host, download `/robots.txt` and cache the rules. RFC 9309 says a crawler should not use a cached copy for more than 24 hours unless the file is unreachable. It says a parser must read at least 500 kibibytes. If the file is unreachable because of server or network errors (status 500 to 599), the crawler must assume **complete disallow**. If the file is simply unavailable (a client error such as 404), the crawler may access any resource. Mix these up and you either crawl a site that said no, or skip a site that said yes. Note the order: a failing server blocks you, a missing file frees you.
+**`robots.txt`.** Before the first fetch from a host, download `/robots.txt` and cache the rules. RFC 9309 says a crawler should not use a cached copy for more than 24 hours. The exception is when the file is unreachable. It says a parser must read at least 500 kibibytes. If the file is unreachable because of server or network errors, the crawler must assume **complete disallow**. These errors are status 500 to 599. If the file is simply unavailable (a client error such as 404), the crawler may access any resource. Mix these up and you either crawl a site that said no, or skip a site that said yes. Note the order: a failing server blocks you, a missing file frees you.
 
 **DNS.** Each fetch needs the host's IP address (lesson [2.2](/learn/02-networking/dns/)). If a lookup takes about 20 ms (assumption) and you do 23,148 per second, that is 23,148 x 0.02 = about **463 lookups in flight** all the time. Cache the answer per host and honor its TTL. One lookup then serves thousands of pages on the same host. Run a local resolver cache so workers share the result.
 
@@ -99,7 +99,7 @@ Do the math on what politeness costs. At 1 request per second per host, the craw
 
 The naive crawler fetches, parses, and stores in one process. A crash in parsing throws away a download that took time and used someone else's bandwidth.
 
-Split it into stages. The fetcher writes raw HTML to blob storage and hands over an id. The parser reads that id. Each stage reads from a queue with a visibility timeout (lesson [6.1](/learn/06-async/queues/)). If a worker dies, the message becomes visible again and another worker takes it. Delivery is at least once (lesson [6.3](/learn/06-async/delivery-semantics/)), so the stages must be **idempotent**: processing the same URL twice must give the same result, and not two copies.
+Split it into stages. The fetcher writes raw HTML to blob storage and hands over an id. The parser reads that id. Each stage reads from a queue with a visibility timeout (lesson [6.1](/learn/06-async/queues/)). If a worker dies, the message becomes visible again and another worker takes it. Delivery is at least once (lesson [6.3](/learn/06-async/delivery-semantics/)), so the stages must be **idempotent**. Processing the same URL twice must give the same result, and not two copies.
 
 Retry a failed fetch with backoff and jitter (lesson [7.2](/learn/07-reliability/timeouts-retries/)). After 5 tries (assumption) move the URL to a dead-letter queue (lesson [6.4](/learn/06-async/backpressure-dlq/)). Retry some errors and not others. A timeout is worth another try. A 404 is not.
 
@@ -107,12 +107,12 @@ Retry a failed fetch with backoff and jitter (lesson [7.2](/learn/07-reliability
 
 There are two different duplicates.
 
-**The same URL, seen twice.** Many pages link to the same page. Without a check, the crawl loops forever. First **normalize** the URL: lower-case the host, drop the fragment (the part after `#`), sort query parameters, and remove tracking parameters. Then check whether it has been seen.
+**The same URL, seen twice.** Many pages link to the same page. Without a check, the crawl loops forever. First **normalize** the URL. Lower-case the host, drop the fragment (the part after `#`), sort query parameters, and remove tracking parameters. Then check whether it has been seen.
 
 An in-memory set of 10 billion URLs does not fit on one machine. Hash each URL to 8 bytes and the hashes alone are 10,000,000,000 x 8 B = **80 GB**. Two ways to hold that:
 
 - A sharded key-value store, split by hash (lesson [4.7](/learn/04-data/sharding/)). Exact, but each check is a network call.
-- A **Bloom filter** (lesson [10.3](/learn/10-advanced/big-data-structures/)). With a 1% false positive rate it needs about 9.6 bits per item, so 10,000,000,000 x 9.6 bits = about **12 GB**. A Bloom filter never says "unseen" about a URL it has seen, so it never causes a repeat fetch. But 1% of new URLs are wrongly called "seen". That is about 100 million pages never crawled. For a crawl of the web that loss is often acceptable. State it as a choice.
+- A **Bloom filter** (lesson [10.3](/learn/10-advanced/big-data-structures/)). With a 1% false positive rate, the filter needs about 9.6 bits per item. So 10,000,000,000 x 9.6 bits = about **12 GB**. A Bloom filter never says "unseen" about a URL it has seen, so it never causes a repeat fetch. But 1% of new URLs are wrongly called "seen". That is about 100 million pages never crawled. For a crawl of the web that loss is often acceptable. State it as a choice.
 
 **Different URLs, the same page.** Mirrors, tracking links, and print versions have different URLs and the same content. Store a **content hash** [mid]: a fixed-size fingerprint of the page text, such as a 32-byte SHA-256. Index it, and skip pages whose hash is already known. 10,000,000,000 x 32 B = **320 GB**. This finds exact copies only. Pages that differ slightly need near-duplicate methods such as shingling; the Stanford book has a chapter on it.
 

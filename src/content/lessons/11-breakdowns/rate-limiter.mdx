@@ -16,7 +16,7 @@ Lesson [7.4](/learn/07-reliability/rate-limiting/) taught the algorithms. A toke
 
 Now build the whole service. A company runs 50 gateway servers. One customer is allowed 100 requests a second. Which server counts? If each server counts alone, the customer can send 100 to each and get 5,000 in total. If one server counts for everyone, it becomes a bottleneck and a single point of failure.
 
-This case study is about three parts the algorithm lesson skipped: where the state lives, how a check stays correct under a race, and how the system scales and fails.
+This case study is about three parts the algorithm lesson skipped. Part one is where the state lives. The second part is how a check stays correct under a race. Part three is how the system scales and fails.
 
 ## Requirements
 
@@ -28,14 +28,14 @@ This case study is about three parts the algorithm lesson skipped: where the sta
 
 **Below the line.** Analytics dashboards, long-term storage of counts, and exact agreement across regions.
 
-**Non-functional.** The check adds under 10 ms. The limiter is highly available. Counts may differ a little between nodes (eventual consistency is accepted), but one client must not get far above its limit.
+**Non-functional.** The check adds under 10 ms. The limiter is highly available. Counts may differ a little between nodes. Eventual consistency is accepted. But one client must not get far above its limit.
 
 **Scale.** These are interview assumptions, not company data.
 
 - Peak of 1 million requests a second across all clients. Every request needs one check.
 - One Redis instance sustains about 50,000 limiter calls a second. Lesson [8.2](/learn/08-technologies/redis/) warns that no single ops-per-second number is universal, and a script costs more than a plain `GET`. So this is a planning number. Benchmark your own hardware.
 
-Derive the shard count. At 1M checks a second and 50K per shard, you need 1,000,000 ÷ 50,000 = 20 shards just to carry the load. Redis near 100% busy has no room for a burst. Many designs aim for about half load. That gives 40 shards. Say "20 at the minimum, about 40 for headroom". The exact number matters less than showing the division.
+Derive the shard count. At 1M checks a second and 50K per shard, you need enough shards just to carry the load. The math is 1,000,000 ÷ 50,000 = 20 shards. Redis near 100% busy has no room for a burst. Many designs aim for about half load. That gives 40 shards. Say "20 at the minimum, about 40 for headroom". The exact number matters less than showing the division.
 
 <Ballpark
   client:visible
@@ -109,13 +109,13 @@ Details that matter:
 
 ## Deep dive 2: scale and keys
 
-Twenty to forty shards need a rule that sends every call for one client to one shard. Redis Cluster does this with 16,384 hash slots: the slot is `CRC16(key) mod 16384`, and each primary owns a range of slots ([lesson 8.2](/learn/08-technologies/redis/)). Because each script touches one key, it never spans two shards. Resizing moves whole slots, in the spirit of [lesson 4.8](/learn/04-data/consistent-hashing/).
+Twenty to forty shards need a rule that sends every call for one client to one shard. Redis Cluster does this with 16,384 hash slots. The slot is `CRC16(key) mod 16384`. Each primary owns a range of slots ([lesson 8.2](/learn/08-technologies/redis/)). Because each script touches one key, it never spans two shards. Resizing moves whole slots, in the spirit of [lesson 4.8](/learn/04-data/consistent-hashing/).
 
 Latency has two parts. The gateway keeps a pool of open connections to Redis, so no call pays for a new TCP handshake. The shard sits in the same region as the gateway, so one round trip is short. Our 10 ms budget covers the round trip and a script that does a few hash operations.
 
 **Hot keys.** One abusive client sending 200,000 calls a second would saturate its shard and hurt the other clients on it. Options: block it at the edge once it is far over limit, so most of its traffic never reaches Redis; let each gateway take a batch of 10 tokens at a time and spend them locally; or give heavy customers their own shards. Each option trades some accuracy for less load.
 
-**Many regions.** A global bucket needs a slow round trip across oceans on every request. Most designs give each region its own limit, such as a share of the total, and accept that a client can reach the sum of the regional limits. That is the eventual-consistency trade we accepted in the requirements.
+**Many regions.** A global bucket needs a slow round trip across oceans on every request. Most designs give each region its own limit, such as a share of the total. These designs accept that a client can reach the sum of the regional limits. That is the eventual-consistency trade we accepted in the requirements.
 
 ## Deep dive 3: when Redis fails
 
@@ -142,7 +142,7 @@ Set a short timeout on the Redis call, around a few milliseconds. When it expire
 | Regions | Per-region limits | No cross-ocean call | A client can exceed the global limit |
 
 <Callout type="tip">
-Say the race out loud: "If I read the count, add one, and write it back, two gateways can both read 1 and both pass. So the refill, check, and take run in one Lua script inside Redis. Redis runs one script at a time." Then give the shard math: "1M checks a second, 50K per shard, so 20 shards, about 40 with headroom."
+Say the race out loud. "If I read the count, add one, and write it back, two gateways can both read 1. And both can pass. So the refill, check, and take run in one Lua script inside Redis. Redis runs one script at a time." Then give the shard math: "1M checks a second, 50K per shard, so 20 shards, about 40 with headroom."
 </Callout>
 
 <Callout type="mistake">

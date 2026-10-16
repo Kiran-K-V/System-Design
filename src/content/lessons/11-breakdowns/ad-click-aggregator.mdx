@@ -35,7 +35,7 @@ Assume 100 million clicks a day. Lesson [1.4](/learn/01-one-machine/estimation/)
 
 - Average rate: 100,000,000 / 86,400 s = about 1,160 clicks per second.
 - Peak is 10,000 per second, about 8.6 times the average. The design must handle the peak, so size for 10,000.
-- Raw volume: at 100 bytes per event (assumption), 100,000,000 x 100 B = 10 GB per day, about 3.65 TB per year. The stream carries 10,000 x 100 B = 1 MB per second at peak. That is small for Kafka.
+- Raw volume: at 100 bytes per event (assumption), 100,000,000 x 100 B = 10 GB per day. That is about 3.65 TB per year. The stream carries 10,000 x 100 B = 1 MB per second at peak. That is small for Kafka.
 - Aggregated volume: a row is (ad id, minute, count). A day has 1,440 minutes. A single ad has at most 1,440 rows a day. In total there are at most 100 million non-empty rows a day, because each click lands in one row. Real counts are far smaller, because many clicks share a row.
 
 ## Core entities
@@ -90,21 +90,21 @@ If the sink cannot upsert, use a transactional sink that commits with the checkp
 
 ### Deduplicate by click id
 
-Duplicates come from three places: a browser that retries, a user who double-clicks, and a bad actor who replays a link.
+Duplicates come from three places. The sources are a browser that retries, a user who double-clicks, and a bad actor who replays a link.
 
 **Naive:** dedupe by user id. That throws away real clicks. A user can click two different ads, or the same ad on two days, and both are valid.
 
 **Better:** dedupe by **click id**. The id is unique per ad impression, and it is signed. Because a token binds one click id to one ad id, a repeat always lands on the same Flink task. That task keeps a set of recent click ids in its checkpointed state and drops a repeat. The state restarts with the job, so the set survives a crash.
 
-How long must it remember? Only as long as a token is valid. Assume a one-hour expiry. At peak that is 10,000 x 3,600 = 36 million ids. At 16 bytes each (assumption) that is 36,000,000 x 16 B = 576 MB across the whole job, a few MB per task. Without the token expiry we would have to remember ids forever.
+How long must it remember? Only as long as a token is valid. Assume a one-hour expiry. At peak that is 10,000 x 3,600 = 36 million ids. At 16 bytes each (assumption), that is 36,000,000 x 16 B = 576 MB across the whole job. Per task, that is a few MB. Without the token expiry we would have to remember ids forever.
 
-Do not dedupe in the click service with "check a cache, then write to Kafka". If you mark the id first and the write fails, the retry is dropped and the click is lost. If you write first and the mark fails, the retry duplicates. Both orders have a gap. State inside the stream has no such gap, because the id set and the log offsets are saved by the same checkpoint. Lesson [3.4](/learn/03-api-design/idempotency/) covers the key idea.
+Do not dedupe in the click service with "check a cache, then write to Kafka". If you mark the id first and the write fails, the retry is dropped and the click is lost. If you write first and the mark fails, the retry duplicates. Both orders have a gap. State inside the stream has no such gap. The reason is that the id set and the log offsets are saved by the same checkpoint. Lesson [3.4](/learn/03-api-design/idempotency/) covers the key idea.
 
 ### Reconcile with a batch recount
 
-A stream result can be wrong in ways the stream cannot see: an event that arrives after its window was finalized, a bug in the job, or a bad deploy. The cure is a second path.
+A stream result can be wrong in ways the stream cannot see. These include an event that arrives after its window was finalized, a bug in the job, or a bad deploy. The cure is a second path.
 
-Every raw event is copied to the lake. After an hour is finished, a batch job recounts that hour from the raw events, drops duplicate click ids, and compares the result to the rows from the stream. Where they differ, it overwrites the row. This is the **Lambda** style: a fast path with a small error, and a slow path that is correct. You pay for two code paths. You buy a number you can defend.
+Every raw event is copied to the lake. After an hour is finished, a batch job recounts that hour from the raw events. The job drops duplicate click ids and compares the result to the rows from the stream. Where they differ, it overwrites the row. This is the **Lambda** style: a fast path with a small error, and a slow path that is correct. You pay for two code paths. You buy a number you can defend.
 
 A small window of "allowed lateness" in Flink handles late events cheaply (lesson 8.7 explains watermarks). The batch job handles the rest.
 

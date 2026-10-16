@@ -14,9 +14,9 @@ import TicketmasterHold from '../../../components/anim/lessons/TicketmasterHold.
 
 Tickets for a big concert go on sale at 10:00. The arena has 50,000 seats. Millions of fans open the page in the same minute. Each wants a specific seat, and two fans will click the same one.
 
-This breaks two ways. The first is **double booking**: two people pay for seat 12A. That is not a slow page, it is a broken promise, so booking needs strong consistency. The second is **load**: a crowd that is far bigger than the number of seats floods every part of the system.
+This breaks two ways. The first is **double booking**: two people pay for seat 12A. That is not a slow page, it is a broken promise, so booking needs strong consistency. The second is **load**. A crowd that is far bigger than the number of seats floods every part of the system.
 
-Lesson [9.4](/learn/09-patterns/contention/) taught the general ideas for fights over one row. This case study applies them and adds two things: a seat hold that expires on its own, and a virtual waiting room.
+Lesson [9.4](/learn/09-patterns/contention/) taught the general ideas for fights over one row. This case study applies them and adds two things. One is a seat hold that expires on its own. The other is a virtual waiting room.
 
 ## Requirements
 
@@ -76,7 +76,7 @@ Step through it. Early steps are easy reads. The hard part appears at step 4.
 
 **Reads and bookings are separate paths.** Browsing and search are read-heavy, so they use the standard tools: a cache ([lesson 5.3](/learn/05-caching/cache-strategies/)), a search index fed by change data capture ([lesson 6.5](/learn/06-async/cdc/) and [lesson 8.5](/learn/08-technologies/elasticsearch/)), and replicas. Staleness here is harmless. If a new event appears in search three seconds late, nobody is hurt.
 
-**The seat table is one source of truth.** All booking writes go to one primary. You cannot scale the booking path by adding read replicas, since a replica may not yet know a seat was just taken. The table is also small: 50,000 rows for one event. The problem is contention, not size.
+**The seat table is one source of truth.** All booking writes go to one primary. You cannot scale the booking path by adding read replicas. The reason is that a replica may not yet know a seat was just taken. The table is also small: 50,000 rows for one event. The problem is contention, not size.
 
 ## Deep dive 1: claiming a seat
 
@@ -95,13 +95,13 @@ WHERE event_id = $event AND seat_id = $seat
        OR (status = 'held' AND hold_expires_at < now()));
 ```
 
-If the statement reports 1 row changed, the fan holds the seat. If it reports 0, someone else does. The database makes this safe. In PostgreSQL's default isolation level, a second `UPDATE` on the same row waits for the first to finish, then re-checks the `WHERE` clause against the new version of the row. The docs say the condition "is re-evaluated to see if the updated version of the row still matches the search condition". So the second statement sees the hold and matches nothing. Lesson [4.4](/learn/04-data/transactions/) explains these isolation rules. Other databases offer the same idea as a conditional write.
+If the statement reports 1 row changed, the fan holds the seat. If it reports 0, someone else does. The database makes this safe. In PostgreSQL's default isolation level, a second `UPDATE` on the same row waits for the first to finish. Then the second update re-checks the `WHERE` clause against the new version of the row. The docs say the condition "is re-evaluated to see if the updated version of the row still matches the search condition". So the second statement sees the hold and matches nothing. Lesson [4.4](/learn/04-data/transactions/) explains these isolation rules. Other databases offer the same idea as a conditional write.
 
 **Why not lock the row for the whole checkout?** A fan may take minutes to type a card number. A lock held that long blocks everyone else and can freeze the table if the fan walks away. A hold is not a lock held by a connection. It is data in a row, with a clock.
 
-**Expiry needs no job.** The `WHERE` clause already treats a hold with `hold_expires_at < now()` as free. So when a fan abandons checkout, nothing has to run. A cron job that frees expired holds once a minute would leave seats stuck for up to a minute, and it would need its own care. Implicit expiry is exact. A background sweep can still tidy old rows for the seat map, but correctness does not depend on it.
+**Expiry needs no job.** The `WHERE` clause already treats a hold with `hold_expires_at < now()` as free. So when a fan abandons checkout, nothing has to run. A cron job that frees expired holds once a minute would leave seats stuck for up to a minute. That job would need its own care. Implicit expiry is exact. A background sweep can still tidy old rows for the seat map, but correctness does not depend on it.
 
-**Redis as an alternative.** You can keep the hold as a key: `SET seat:42:12A user NX EX 600` ([lesson 8.2](/learn/08-technologies/redis/)). `NX` means set only if absent, and `EX 600` expires it after 600 seconds. It is fast and it expires natively. The cost is a second system. The seat's final state still has to be written to the database, and Redis can lose a key in a failover. So many designs use the key as a fast first gate and the database as the truth.
+**Redis as an alternative.** You can keep the hold as a key: `SET seat:42:12A user NX EX 600` ([lesson 8.2](/learn/08-technologies/redis/)). `NX` means set only if absent, and `EX 600` expires it after 600 seconds. It is fast and it expires natively. The cost is a second system. The seat's final state still has to be written to the database. Redis can lose a key in a failover. So many designs use the key as a fast first gate and the database as the truth.
 
 **Several seats at once.** A fan holds 4 seats together. Do it in one transaction, and take the seats in a fixed order, such as sorted by seat id. If two fans want overlapping seats and each takes them in a different order, they can deadlock. A fixed order prevents that.
 
@@ -111,13 +111,13 @@ If the statement reports 1 row changed, the fan holds the seat. If it reports 0,
 
 With 200 fans per seat, most fans will lose. The question is how to fail them gracefully and cheaply.
 
-A **virtual waiting room** puts fans in a queue before the booking path. A fan who arrives gets a place in line, and the page shows their position. A sorted set ([lesson 8.2](/learn/08-technologies/redis/)) ordered by arrival time can hold the line. A controller admits a batch at a fixed rate, and gives each admitted fan a signed token with an expiry time. The booking service refuses any request without a valid token. The token check is cheap and needs no database call.
+A **virtual waiting room** puts fans in a queue before the booking path. A fan who arrives gets a place in line, and the page shows their position. A sorted set ([lesson 8.2](/learn/08-technologies/redis/)) ordered by arrival time can hold the line. A controller admits a batch at a fixed rate. The controller gives each admitted fan a signed token with an expiry time. The booking service refuses any request without a valid token. The token check is cheap and needs no database call.
 
 The admission rate is the control knob. Choose it from what booking can handle, such as 67 new fans a second above. Raise it as seats stay available, and lower it when holds pile up.
 
 A queue does not remove the seat fight. Admitted fans still compete for seats, so the conditional hold stays. The queue protects the system. The conditional update protects the data.
 
-**Live seat map.** Polling the seat map from 10 million browsers is out of the question. Stream changes with SSE ([lesson 2.5](/learn/02-networking/real-time-transport/)), but only to admitted fans, who number in the thousands. Waiting fans see only their queue position. Treat the map as a hint: if a fan clicks a seat that was taken a moment ago, the hold returns 409 and the page refreshes that seat. The hold step is always the judge.
+**Live seat map.** Polling the seat map from 10 million browsers is out of the question. Stream changes with SSE ([lesson 2.5](/learn/02-networking/real-time-transport/)), but only to admitted fans, who number in the thousands. Waiting fans see only their queue position. Treat the map as a hint. If a fan clicks a seat that was taken a moment ago, the hold returns 409. The page refreshes that seat. The hold step is always the judge.
 
 **Search and the event page** at this scale are mostly cacheable. Cache the event page and common searches for a few seconds, and serve the page from a CDN ([lesson 2.7](/learn/02-networking/cdn-proxies/)). Postgres full-text search is enough at first. Move to a search index with change data capture only when the volume or ranking needs demand it.
 
@@ -133,15 +133,15 @@ A queue does not remove the seat fight. Admitted fans still compete for seats, s
 | Search | Eventual consistency | Fast, cacheable | A new event appears a little late |
 
 <Callout type="tip">
-Name the hot row first: "Everything else scales by caching and replicas. The seat row is the contention point, so booking goes to one source of truth. A hold is one conditional update with an expiry time. It wins the seat or learns it lost. No long locks, and no job to free expired holds." Then add the waiting room as the answer to load, and say it does not replace the hold.
+Name the hot row first: "Everything else scales by caching and replicas. The seat row is the contention point, so booking goes to one source of truth. A hold is one conditional update with an expiry time. It wins the seat or learns it lost. No long locks, and no job to free expired holds." Then add the waiting room as the answer to load. Say the waiting room does not replace the hold.
 </Callout>
 
 <Callout type="mistake">
-Do not read the seat and then write it in two steps. Do not hold a database lock while the fan types a card number. Do not rely on a cron sweeper as the only way to free seats. Do not use eventual consistency for seat status. And do not say a queue solves double booking: it limits traffic, and the conditional hold still decides who gets the seat.
+Do not read the seat and then write it in two steps. Do not hold a database lock while the fan types a card number. Do not rely on a cron sweeper as the only way to free seats. Do not use eventual consistency for seat status. And do not say a queue solves double booking. The queue limits traffic, and the conditional hold still decides who gets the seat.
 </Callout>
 
 <Callout type="deep" title="Why the condition lives in the WHERE clause">
-The check and the write must be one indivisible step. A condition in the application code runs before the write, with a gap in between where another fan can slip in. A condition in the statement is evaluated by the database while it holds the row. This is the same shape as a compare-and-swap in memory: change the value only if it still equals what I expect. Whenever a design says "check, then change", ask where the gap is.
+The check and the write must be one indivisible step. A condition in the application code runs before the write. There is a gap in between, where another fan can slip in. A condition in the statement is evaluated by the database while it holds the row. This is the same shape as a compare-and-swap in memory. Change the value only if it still equals what I expect. Whenever a design says "check, then change", ask where the gap is.
 </Callout>
 
 ## Check yourself

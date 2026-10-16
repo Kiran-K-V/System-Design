@@ -20,7 +20,7 @@ The cause is the one from [lesson A1.5](/learn/ai/a1-model-function/sampling-dec
 
 The simple pattern is: write the format in the prompt, call the model, `JSON.parse` the text, and handle errors. Three habits make it a little better. Show an example of the format. Put a `json` fence in the answer and strip it. Retry on a parse error.
 
-Retry helps, but every retry is a full extra call. It also repeats the same failure when the cause is systematic, such as a field name the model keeps changing. And a parse error is only the loudest failure. A reply with valid JSON, a missing field, and a wrong type passes `JSON.parse` and breaks your code three layers down.
+Retry helps, but every retry is a full extra call. It also repeats the same failure when the cause is systematic, such as a field name the model keeps changing. And a parse error is only the loudest failure. A reply with valid JSON, a missing field, and a wrong type passes `JSON.parse`. Such a reply breaks your code three layers down.
 
 ## The mechanism: mask the invalid tokens
 
@@ -76,24 +76,24 @@ Watch what the mask does at each token. The probabilities here are illustrative,
 
 <Ai3StructMask client:visible />
 
-Look at how this connects to sampling. Temperature, top-k, and top-p still work on the tokens that remain. The mask only removes options. In the walk, "negative" went from 45% to 69.2%, because the 35% that belonged to invalid tokens was shared among the valid ones. That means the model still picks the label itself. You only took away the ways to be malformed.
+Look at how this connects to sampling. Temperature, top-k, and top-p still work on the tokens that remain. The mask only removes options. In the walk, "negative" went from 45% to 69.2%. The reason is that the 35% that belonged to invalid tokens was shared among the valid ones. That means the model still picks the label itself. You only took away the ways to be malformed.
 
-A backend engineer can think of this as a compiler front end. The schema is the grammar, the model is a very fast typist who keeps hitting wrong keys, and the grammar is a keyboard that locks the wrong keys.
+A backend engineer can think of this as a compiler front end. The schema is the grammar. Here, the model is a very fast typist who keeps hitting wrong keys. The grammar is a keyboard that locks the wrong keys.
 
-The mask also lets the server skip work. SGLang's compressed finite state machine (FSM, a machine with a fixed set of states and allowed moves) finds stretches where only one token is possible, such as the `{` and `}` in the walk, and fills them in as a block without sampling. Its authors report up to 2 times lower latency and up to 2.5 times higher throughput than two other constrained-decoding stacks, measured on llama-7B on one A10 GPU (LMSYS blog, 2024). Hosted providers do not publish how they do it. Treat the SGLang numbers as one open implementation's result.
+The mask also lets the server skip work. SGLang's compressed finite state machine (FSM) finds stretches where only one token is possible. An FSM is a machine with a fixed set of states and allowed moves. Such stretches include the `{` and `}` in the walk. The machine fills each stretch in as a block without sampling. Its authors report up to 2 times lower latency and up to 2.5 times higher throughput. The comparison covers two other constrained-decoding stacks. The tests ran on llama-7B on one A10 GPU (LMSYS blog, 2024). Hosted providers do not publish how they do it. Treat the SGLang numbers as one open implementation's result.
 
 ## What it costs
 
-- **Compile time.** The first request with a new schema pays to compile the grammar. The Anthropic docs say compiled grammars are cached for 24 hours from last use, and there is a compile timeout of 180 seconds. OpenAI's guide says the first request with a schema has added latency and later ones do not. A schema that changes on every call (for example, one built from user input) pays the compile cost every time and never gets the cache. Changing only a `name` or `description` does not invalidate the cache, but changing the structure does.
-- **Limits on schemas.** The Anthropic page lists what is not supported: recursive schemas, numeric constraints such as `minimum`, `maximum`, and `multipleOf`, string constraints `minLength` and `maxLength`, array constraints beyond a `minItems` of 0 or 1, and any `additionalProperties` other than `false`. Using an unsupported feature returns a 400 error. Across all strict schemas in one request, the limits are 20 strict tools, 24 optional parameters, and 16 parameters with union types. Past them, you get "Schema is too complex for compilation". Some SDK helpers move unsupported constraints into field descriptions and still validate them after the reply, so a limit you cannot enforce in the grammar can still be enforced in your code.
+- **Compile time.** The first request with a new schema pays to compile the grammar. The Anthropic docs say compiled grammars are cached for 24 hours from last use. The docs also say there is a compile timeout of 180 seconds. OpenAI's guide says the first request with a schema has added latency and later ones do not. A schema that changes on every call pays the compile cost every time. One example is a schema built from user input. Such a schema never gets the cache. Changing only a `name` or `description` does not invalidate the cache, but changing the structure does.
+- **Limits on schemas.** The Anthropic page lists what is not supported: recursive schemas, numeric constraints such as `minimum`, `maximum`, and `multipleOf`, string constraints `minLength` and `maxLength`, array constraints beyond a `minItems` of 0 or 1, and any `additionalProperties` other than `false`. Using an unsupported feature returns a 400 error. Across all strict schemas in one request, the limits are 20 strict tools, 24 optional parameters, and 16 parameters with union types. Past them, you get "Schema is too complex for compilation". Some SDK helpers move unsupported constraints into field descriptions and still validate them after the reply. So a limit you cannot enforce in the grammar can still be enforced in your code.
 - **OpenAI strict rules.** `additionalProperties: false` on every object, every property listed in `required`, and optional fields written as a type that includes `null`.
-- **Providers differ.** Gemini also takes a JSON Schema for structured output. Its page warns that very large or deeply nested schemas may be rejected and says to validate values in your app. Always check the current limits for the provider and model you use.
+- **Providers differ.** Gemini also takes a JSON Schema for structured output. Its page warns that very large or deeply nested schemas may be rejected. The page also says to validate values in your app. Always check the current limits for the provider and model you use.
 
 ## Failure modes that remain
 
 Constrained decoding fixes the **syntax**. Four failures stay.
 
-1. **Truncation.** If the reply hits `max_tokens`, the JSON stops mid-object. The Anthropic docs say the output "may be incomplete and not match your schema", and tell you to retry with a higher `max_tokens`. The grammar cannot add the closing brace the token cap cut off. Set the cap from the largest valid reply, not the average one, and treat `stop_reason: "max_tokens"` as a failure before you parse.
+1. **Truncation.** If the reply hits `max_tokens`, the JSON stops mid-object. The Anthropic docs say the output "may be incomplete and not match your schema". The docs also tell you to retry with a higher `max_tokens`. The grammar cannot add the closing brace the token cap cut off. Set the cap from the largest valid reply, not the average one. Treat `stop_reason: "max_tokens"` as a failure before you parse.
 2. **Refusal.** On a refusal the HTTP status is 200 and the stop reason is `refusal`. The docs say the refusal message takes precedence over the schema, and you are billed for the tokens generated. OpenAI adds a `refusal` content part for the same case. Check for it before you parse.
 3. **Enum capitalization.** The docs say the capitalization of `enum` and `const` strings is not guaranteed. A value may differ from your schema in capitalization, typically in the first letter of a word after a space. The reply completes with no error. Compare enum values case-insensitively and avoid values that differ only in capitalization.
 4. **Valid shape, wrong content.** This is the big one. A schema says `label` is one of three words. It cannot say it is the right word. A hacked-account ticket labeled "neutral, not urgent" passes every check. Only an eval (module A8) or a second check can catch it.
@@ -113,10 +113,10 @@ Each repair is an extra call, so count it in your cost model. Try each failure, 
 
 <Ai3StructRepair client:visible />
 
-The loop has a built-in limit. It fixes shape problems. It does not fix a refusal, and it does not fix a confidently wrong label. Those need a fallback route and an eval. This is also why you should log the failure rate for each class (truncation, refusal, validation error, repaired) as a metric.
+The loop has a built-in limit. It fixes shape problems. It does not fix a refusal, and it does not fix a confidently wrong label. Those need a fallback route and an eval. This is also why you should log the failure rate for each class. The classes are truncation, refusal, validation error, and repaired. Track each one as a metric.
 
 <Callout type="deep" title="Does the mask slow generation?">
-It adds work at every token, because the grammar state must be checked and the vocabulary filtered. Hosted providers do not publish the overhead, so measure it on your own calls. The arithmetic is simple. If the mask added 10 ms per token (an assumption, not a measured figure), a 200-token reply would take 10 ms x 200 = 2 s longer. The SGLang result above points the other way for long fixed stretches: skipping forced tokens can make constrained output faster, not slower.
+It adds work at every token, because the grammar state must be checked and the vocabulary filtered. Hosted providers do not publish the overhead, so measure it on your own calls. The arithmetic is simple. If the mask added 10 ms per token (an assumption, not a measured figure), a 200-token reply would take 10 ms x 200 = 2 s longer. The SGLang result above points the other way for long fixed stretches. For those stretches, skipping forced tokens can make constrained output faster, not slower.
 </Callout>
 
 ## Numbers
@@ -143,7 +143,7 @@ It adds work at every token, because the grammar state must be checked and the v
 ## Interview lens
 
 <Callout type="tip">
-Name the layers: "I use structured output so the shape is guaranteed, I check stop_reason before parsing so truncation and refusal are caught, I validate with my own rules, and I allow up to two repairs. Correctness of the content is a separate problem, so I sample outputs against a golden set." Say what each layer catches.
+Name the layers: "I use structured output so the shape is guaranteed. I check stop_reason before parsing so truncation and refusal are caught. I validate with my own rules, and I allow up to two repairs. Correctness of the content is a separate problem. So I sample outputs against a golden set." Say what each layer catches.
 </Callout>
 
 <Callout type="mistake">

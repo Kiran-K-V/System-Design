@@ -19,7 +19,7 @@ Because a call is two jobs with different limits. If you tune one and measure th
 
 ## Naive solution: "latency is cost per token times tokens"
 
-[Lesson A1.3](/learn/ai/a1-model-function/forward-pass/) gave one cost per token: about 2N FLOPs. A single number per token predicts that a 20,000-token prompt and a 20,000-token answer cost the same. They do not. The prompt tokens go through the model **together**. The answer tokens go through **one at a time**, because each one depends on the one before it ([sampling and decoding](/learn/ai/a1-model-function/sampling-decoding/)).
+[Lesson A1.3](/learn/ai/a1-model-function/forward-pass/) gave one cost per token: about 2N FLOPs. A single number per token predicts that a 20,000-token prompt and a 20,000-token answer cost the same. They do not. The prompt tokens go through the model **together**. The answer tokens go through **one at a time**. The reason is that each one depends on the one before it ([sampling and decoding](/learn/ai/a1-model-function/sampling-decoding/)).
 
 ## The mechanism: two phases, two ceilings
 
@@ -40,11 +40,11 @@ So intensity is about the number of tokens T that share one read of the weights.
 
 <Ai2PdRoof client:visible />
 
-The consequence: decode is **memory-bound**, prefill is **compute-bound**. A prompt shorter than about 295 tokens is still on the slope. The attention term and the KV cache reads move the real ridge, so treat 295 as a first estimate (the roofline here is our model, in the style Databricks describes).
+The consequence: decode is **memory-bound**, prefill is **compute-bound**. A prompt shorter than about 295 tokens is still on the slope. The attention term and the KV cache reads move the real ridge. So treat 295 as a first estimate. The roofline here is our model, in the style Databricks describes.
 
 ### The decode floor: derive it
 
-Every decode step reads all the weights once. Let W be the weight bytes, n the GPUs sharing them (tensor parallel, A2.1), and BW the bandwidth of one GPU. Each GPU holds W/n and reads it in parallel, so:
+Every decode step reads all the weights once. Let W be the weight bytes, n the GPUs sharing them (tensor parallel, A2.1). And let BW be the bandwidth of one GPU. Each GPU holds W/n and reads it in parallel, so:
 
 <Math block tex="t_{\text{step}} \;\ge\; \frac{W / n}{BW} \;=\; \frac{W}{n \cdot BW}" />
 
@@ -68,16 +68,16 @@ Real servers reach a fraction of peak, so TTFT is longer. Move the sliders to se
 
 <Ai2PdTimeline client:visible />
 
-Try 2,048 tokens in and 512 out on 2 x H100: TTFT about 0.15 s, TPOT about 21 ms, total about 10.9 s. Decode is 99% of the time. This is why output length drives latency: the Databricks guide says so too. To speed up a slow answer, first ask for fewer output tokens.
+Try 2,048 tokens in and 512 out on 2 x H100. The results are TTFT about 0.15 s, TPOT about 21 ms, and total about 10.9 s. Decode is 99% of the time. This is why output length drives latency: the Databricks guide says so too. To speed up a slow answer, first ask for fewer output tokens.
 
 ## Measuring: MFU and MBU, not "utilization"
 
-NVIDIA's own docs define the GPU percentage in nvidia-smi as the percent of time over the sample period during which one or more kernels was executing. It does not say how much of the math units or the memory bandwidth the kernel used. A decode loop keeps a kernel running all the time, so it reads near 100% while it wastes most of the chip.
+NVIDIA's own docs define the GPU percentage in nvidia-smi. It is the percent of time over the sample period during which one or more kernels was executing. It does not say how much of the math units or the memory bandwidth the kernel used. A decode loop keeps a kernel running all the time. So it reads near 100% while it wastes most of the chip.
 
 Two better numbers:
 
 - **MFU** [mid] (model FLOPs utilization): achieved FLOP/s over peak FLOP/s. Good for prefill and training. Llama 3 405B pre-training reached 38 to 43 percent on H100s (41% at 16K GPUs). That is training, not serving.
-- **MBU** [mid] (model bandwidth utilization): achieved bytes/s over peak bytes/s, where bytes are weights plus KV cache per step divided by TPOT. Databricks' example: a 7B BF16 model at 14 ms TPOT moves 14 GB in 14 ms, which is 1 TB/s, so 50% of a 2 TB/s GPU. Good for decode.
+- **MBU** [mid] (model bandwidth utilization): achieved bytes/s over peak bytes/s. Here, bytes are weights plus KV cache per step, divided by TPOT. Databricks' example: a 7B BF16 model at 14 ms TPOT moves 14 GB in 14 ms. That is 1 TB/s, so 50% of a 2 TB/s GPU. Good for decode.
 
 At batch 1, decode MFU is tiny by design. Judge decode by MBU.
 
@@ -105,7 +105,7 @@ At batch 1, decode MFU is tiny by design. Judge decode by MBU.
 ## Interview lens
 
 <Callout type="tip">
-Split every latency answer into the two phases: "TTFT is prefill, compute-bound, grows with prompt length. TPOT is decode, memory-bound, set by weight bytes over bandwidth. For 70B on two H100s that is about 21 ms per token, so a 500-token answer takes at least 10 seconds." Then say which phase you would shorten first.
+Split every latency answer into the two phases: "TTFT is prefill, compute-bound, grows with prompt length. TPOT is decode, memory-bound, set by weight bytes over bandwidth. For 70B on two H100s, that is about 21 ms per token. So a 500-token answer takes at least 10 seconds." Then say which phase you would shorten first.
 </Callout>
 
 <Callout type="mistake">
@@ -113,7 +113,7 @@ Do not quote GPU utilization as evidence that a deployment is efficient. Do not 
 </Callout>
 
 <Callout type="deep" title="Why a bigger batch does not slow the step much">
-At batch 1, a step takes about W / (n x BW) whatever the batch is, as long as compute stays below the roof. Going from 1 to 16 tokens per step adds a little KV reading and some math, but not 16 times the time. That is why batching raises throughput nearly for free, until the ridge or the KV cache stops it. Lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/) builds on this.
+At batch 1, a step takes about W / (n x BW) whatever the batch is. This holds as long as compute stays below the roof. Going from 1 to 16 tokens per step adds a little KV reading and some math. But the time does not grow 16 times. That is why batching raises throughput nearly for free, until the ridge or the KV cache stops it. Lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/) builds on this.
 </Callout>
 
 ## Check yourself

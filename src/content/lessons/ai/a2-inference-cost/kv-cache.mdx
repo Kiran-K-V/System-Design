@@ -13,7 +13,7 @@ import Ai2KvPaged from '../../../../components/anim/lessons/Ai2KvPaged.tsx';
 
 ## The problem
 
-[Lesson A1.4](/learn/ai/a1-model-function/attention-cost/) introduced the KV cache and its size formula. This lesson asks the operations question. You have 4 H100s, the weights are loaded, and 148 GB of memory is left (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). Users start sessions with different lengths and different answer lengths, and you do not know in advance how long any of them will run. How do you hand out that memory without wasting most of it or running out?
+[Lesson A1.4](/learn/ai/a1-model-function/attention-cost/) introduced the KV cache and its size formula. This lesson asks the operations question. You have 4 H100s, the weights are loaded, and 148 GB of memory is left (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). Users start sessions with different lengths and different answer lengths. You do not know in advance how long any of them will run. How do you hand out that memory without wasting most of it or running out?
 
 ## Naive solution: recompute, then reserve
 
@@ -21,7 +21,7 @@ Two naive moves, and both fail.
 
 **Recompute.** Skip the cache. Each new token recomputes Keys and Values for the whole text so far. Work per token grows with length, and the whole answer costs about n²/2 K/V computations. For 1,000 tokens that is 500,500 against 1,000 with a cache.
 
-**Reserve the maximum.** Keep the cache, but give each request one contiguous slab sized for its longest possible length, because GPU kernels usually want one contiguous tensor. The slab is booked for the request's whole life. Most requests stop earlier, so most of the slab is never used.
+**Reserve the maximum.** Keep the cache, but give each request one contiguous slab sized for its longest possible length. The reason is that GPU kernels usually want one contiguous tensor. The slab is booked for the request's whole life. Most requests stop earlier, so most of the slab is never used.
 
 Step through the first failure and what the cache costs in memory.
 
@@ -29,13 +29,13 @@ Step through the first failure and what the cache costs in memory.
 
 ## The mechanism: the cache is a per-session cache
 
-For a backend engineer the KV cache is a per-session cache. It holds work already done (Keys and Values for a session's tokens), it is keyed by session, and it grows with the session.
+For a backend engineer the KV cache is a per-session cache. It holds work already done (Keys and Values for a session's tokens). The cache is keyed by session. It grows with the session.
 
 <CrossTrackLink id="05-caching/eviction">
-A cache has limited space, so you need a rule for what to drop. For the KV cache the rule is harsh: dropping part of a running request's cache means redoing that work. Servers instead make new requests wait, or throw away or swap out the cache of a whole sequence and rebuild it later.
+A cache has limited space, so you need a rule for what to drop. For the KV cache the rule is harsh: dropping part of a running request's cache means redoing that work. Servers instead make new requests wait. Or they throw away or swap out the cache of a whole sequence and rebuild it later.
 </CrossTrackLink>
 
-The vLLM paper uses an all-or-nothing rule: evict every block of a sequence or none, because a sequence needs all its blocks at each step.
+The vLLM paper uses an all-or-nothing rule: evict every block of a sequence or none. The reason is that a sequence needs all its blocks at each step.
 
 ### Size per token
 
@@ -52,7 +52,7 @@ The 2 is for K and V. L is layers, H_kv the number of KV heads, d_head the head 
 
 Sources: Llama 3 paper Table 3, Mixtral paper Table 1. All use 8 KV heads and head width 128. Derived with the formula above.
 
-The 8 KV heads matter. Llama 3 70B has 64 query heads. With **grouped-query attention** [mid] (GQA), several query heads share one K/V head. Without it the cache would be 64 / 8 = 8 times bigger: 2.5 MiB per token, 20 GiB for an 8K sequence. The GQA paper reports that converting a model costs about 5% of its original pre-training compute and keeps quality close to full multi-head attention. Cache size drove that design.
+The 8 KV heads matter. Llama 3 70B has 64 query heads. With **grouped-query attention** [mid] (GQA), several query heads share one K/V head. Without it the cache would be 64 / 8 = 8 times bigger. That is 2.5 MiB per token. The cache would be 20 GiB for an 8K sequence. The GQA paper reports that converting a model costs about 5% of its original pre-training compute. The converted model keeps quality close to full multi-head attention. Cache size drove that design.
 
 Now scale it by users:
 
@@ -61,13 +61,13 @@ Now scale it by users:
 
 ## Allocation: paging fixes waste
 
-The vLLM paper profiled existing serving systems and found that only **20.4% to 38.2%** of KV memory held real token data. The rest was reservation that was never used, plus gaps. The vLLM launch post says such systems waste 60% to 80% of memory. Three kinds of waste appear:
+The vLLM paper profiled existing serving systems. It found that only **20.4% to 38.2%** of KV memory held real token data. The rest was reservation that was never used, plus gaps. The vLLM launch post says such systems waste 60% to 80% of memory. Three kinds of waste appear:
 
 - **Reserved:** space booked for tokens that have not been generated yet.
 - **Internal fragmentation** [mid]: space reserved that the request never uses.
 - **External fragmentation** [mid]: free space split into holes too small for any new request.
 
-The fix comes from operating systems. **PagedAttention** splits each sequence's cache into small fixed-size blocks and keeps a **block table** per sequence that maps its logical blocks to physical ones. The blocks need not touch. The paper's own analogy: blocks are pages, tokens are bytes, and requests are processes. Blocks are taken on demand, one at a time as the sequence grows. All blocks are the same size, so there is no external fragmentation. Waste only happens in the last block of each sequence. vLLM reports under 4% waste. (The mechanics of the kernel are elective E3.2.)
+The fix comes from operating systems. **PagedAttention** splits each sequence's cache into small fixed-size blocks. It keeps a **block table** per sequence that maps its logical blocks to physical ones. The blocks need not touch. The paper's own analogy: blocks are pages, tokens are bytes, and requests are processes. Blocks are taken on demand, one at a time as the sequence grows. All blocks are the same size, so there is no external fragmentation. Waste only happens in the last block of each sequence. vLLM reports under 4% waste. (The mechanics of the kernel are elective E3.2.)
 
 The demo below is a toy: six requests share a 16,384-token pool, with illustrative sizes. Move the slider and watch the two allocators. Then tick the box to let B and D finish.
 

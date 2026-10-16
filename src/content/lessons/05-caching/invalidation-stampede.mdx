@@ -16,7 +16,7 @@ A cache holds a copy. Two things can go wrong with a copy.
 1. **It is stale.** The database changed. The copy did not. Readers see old data.
 2. **It disappears at a bad moment.** The entry expires or is deleted while thousands of readers want it. All of them miss together, and all of them go to the database.
 
-Lesson 5.3 showed how a write can leave a stale copy behind. Lesson 5.4 showed how a full cache drops entries. This lesson is about the rest: how to remove stale copies on purpose, and what to do so that removing a copy does not hurt more than keeping it.
+Lesson 5.3 showed how a write can leave a stale copy behind. Lesson 5.4 showed how a full cache drops entries. This lesson is about the rest. The lesson covers how to remove stale copies on purpose. It also covers what to do so that removing a copy does not hurt more than keeping a copy.
 
 ## Part 1: Getting stale copies out
 
@@ -41,7 +41,7 @@ A TTL alone fails when staleness hurts sooner. A user changes her display name a
 Combine them. A common pattern: **delete on write plus a TTL as a safety net**. The delete gives freshness in the normal case. The TTL bounds the damage when the delete fails.
 
 <Callout type="deep" title="No scheme gives a guarantee">
-Facebook's memcache paper is plain about it: the system provides *best-effort eventual consistency*, and invalidation and replication are not transactional. They chose performance and availability over a guarantee. If a value must be exactly fresh, such as an account balance during a transfer, read it from the source of truth. Do not read it from a cache and try to make the cache perfect.
+Facebook's memcache paper is plain about it: the system provides *best-effort eventual consistency*, and invalidation and replication are not transactional. They chose performance and availability over a guarantee. If a value must be exactly fresh, read it from the source of truth. For example, an account balance during a transfer is such a value. Do not read it from a cache and try to make the cache perfect.
 </Callout>
 
 ## Part 2: The stampede
@@ -52,7 +52,7 @@ A product page key gets 5,000 reads per second. It is cached with a TTL. Rebuild
 
 Most of the time the database sees none of these reads. Then the TTL runs out. For the next 200 ms, until the first rebuild finishes, every read misses. How many?
 
-**5,000 reads per second × 0.2 seconds = 1,000 reads.** All 1,000 find an empty cache. All 1,000 query the database for the same row. This is the same rule as Little's law (lesson 1.3): the number of requests in flight equals arrival rate times time spent.
+**5,000 reads per second × 0.2 seconds = 1,000 reads.** All 1,000 find an empty cache. All 1,000 query the database for the same row. This is the same rule as Little's law (lesson 1.3). The number of requests in flight equals arrival rate times time spent.
 
 This is a **cache stampede**, also called a **thundering herd**. A popular entry expires, and many requests try to rebuild it at the same time. It gets worse in a loop. The extra load slows the database. The rebuild now takes 2 seconds instead of 200 ms. That is 10,000 misses instead of 1,000, so the database slows more. A slow rebuild feeds the herd.
 
@@ -62,23 +62,23 @@ Watch the same expiry under three rules. Step through all five steps. Compare th
 
 <StampedeCompare client:visible />
 
-All three are the same idea at different costs. The herd exists because *every reader does the rebuild*. Fix that, and you only choose what the *other* readers do while one rebuilds: **wait** (single-flight, lock, lease), or **take the old value** (stale-while-revalidate).
+All three are the same idea at different costs. The herd exists because *every reader does the rebuild*. Fix that, and you only choose what the *other* readers do while one rebuilds. Your options are **wait** (single-flight, lock, lease), or **take the old value** (stale-while-revalidate).
 
 ### Fix 1: Single-flight, also called request coalescing
 
-Inside one server, keep a table of loads in progress, one per key. The first request for a missing key starts the load and stores a **promise**: an object that will hold the result later. Every later request for that key finds the promise and awaits it. When the load ends, all of them get the same value. Hello Interview calls this "request coalescing" and names it the most effective solution.
+Inside one server, keep a table of loads in progress, one per key. The first request for a missing key starts the load and stores a **promise**. A promise is an object that will hold the result later. Every later request for that key finds the promise and awaits it. When the load ends, all of them get the same value. Hello Interview calls this "request coalescing" and names it the most effective solution.
 
 It is cheap. It needs no network call. It has a limit: it works per process. With 50 app servers, 50 requests still reach the database, one from each. That is 50, not 1,000, and often enough. When it is not enough, you need a lock that all servers share.
 
 ### Fix 2: A lock in the cache
 
-Use the cache as the coordinator. The first reader to miss takes a lock with an expiry. Other readers wait a few milliseconds and look in the cache again, or return stale or default data, or fail fast. In Redis, the lock is one command:
+Use the cache as the coordinator. The first reader to miss takes a lock with an expiry. Other readers wait a few milliseconds and look in the cache again. Or they return stale or default data, or they fail fast. In Redis, the lock is one command:
 
 ```text
 SET lock:popular_key <random-token> NX PX 5000
 ```
 
-`NX` means "only set if the key does not exist", so only one client wins. `PX 5000` means "expire in 5,000 ms", so a client that crashes while holding the lock cannot block the key forever. When you release, delete the lock only if its value still equals your token. Otherwise your lock may have expired and now belongs to someone else, and you would delete theirs. The Redis team's page on stampede prevention recommends starting with a lock like this for most applications.
+`NX` means "only set if the key does not exist", so only one client wins. `PX 5000` means "expire in 5,000 ms". So a client that crashes while holding the lock cannot block the key forever. When you release, delete the lock only if its value still equals your token. Otherwise your lock may have expired and now belongs to someone else, and you would delete theirs. The Redis team's page on stampede prevention recommends starting with a lock like this for most applications.
 
 Two risks: the lock must expire (a crashed holder), and if the rebuild takes longer than the lock lifetime, a second client may take the lock and rebuild too. Set the lock time above the 99th percentile rebuild time.
 
@@ -90,7 +90,7 @@ Facebook's memcache builds the lock into the cache. When a get misses, memcache 
 
 The token does two jobs. It lets one client rebuild. And a delete by a writer voids the token, so a slow reader's late fill is refused. That is the stale-set race from lesson 5.3. The paper compares it to load-link/store-conditional in a CPU.
 
-Facebook limits how fast tokens leave: by default a server returns a token once every 10 seconds per key. Any request in that window gets "wait a short time". The paper's own data for keys prone to herds shows a peak database query rate of 17K per second without leases and 1.3K per second with leases.
+Facebook limits how fast tokens leave: by default a server returns a token once every 10 seconds per key. Any request in that window gets "wait a short time". The paper's own data covers keys prone to herds. That data shows a peak database query rate of 17K per second without leases. With leases, that peak is 1.3K per second.
 
 ### Fix 4: Serve stale while you refresh
 
@@ -100,9 +100,9 @@ Waiting costs latency. Another choice: let readers have the **old** value while 
 Cache-Control: max-age=600, stale-while-revalidate=30
 ```
 
-The response is fresh for 600 seconds. For the next 30 seconds a cache may still serve it while it checks for a new one. The same idea works in your own cache layer: store the value with a logical expiry inside it, keep the entry alive longer than that, and let the first reader after the logical expiry start a refresh.
+The response is fresh for 600 seconds. For the next 30 seconds a cache may still serve it while it checks for a new one. The same idea works in your own cache layer. Store the value with a logical expiry inside it. Keep the entry alive longer than the logical expiry. Let the first reader after the logical expiry start a refresh.
 
-Facebook does a version of it. A deleted value moves to a small structure of recently deleted items for a short time, and a get can return it marked as stale. The paper notes that applications that can make progress with stale data do not need to wait for the latest value. Their experience was that most applications could use a stale value without changes.
+Facebook does a version of it. A deleted value moves to a small structure of recently deleted items for a short time. In that structure, a get can return the value marked as stale. The paper notes the following. Applications that can make progress with stale data do not need to wait for the latest value. Their experience was that most applications could use a stale value without changes.
 
 The cost: readers can see data up to one refresh older. Do not use this where a stale read does harm.
 
@@ -142,9 +142,9 @@ Each key alone is harmless. Together they are a stampede that is 10,000 keys wid
 
 <TtlJitterLab client:visible />
 
-Jitter is the cheapest fix in this lesson. One line of code: `ttl = base * (1 + random() * 0.1)`. The expiry is spread over a window, the rebuilds are spread with it, and the database sees a ramp, not a wall.
+Jitter is the cheapest fix in this lesson. One line of code: `ttl = base * (1 + random() * 0.1)`. The expiry is spread over a window. The rebuilds are spread with it. Meanwhile, the database sees a ramp, not a wall.
 
-For a cache that restarts or loses a node, jitter does not help. The keys vanish at once. The cold cache trap in lesson 5.1 needs other defenses: replicate the cache so one node loss does not empty it, warm it before you send traffic, and **cap the concurrency** that can reach the database, so extra misses wait or fail fast instead of crushing it.
+For a cache that restarts or loses a node, jitter does not help. The keys vanish at once. The cold cache trap in lesson 5.1 needs other defenses. Replicate the cache, so one node loss does not empty it. Warm it before you send traffic. **Cap the concurrency** that can reach the database, so extra misses wait or fail fast instead of crushing it.
 
 ## Part 4: Requests for keys that do not exist
 
@@ -153,7 +153,7 @@ A cache stores what exists. What if the key is not in the database either? A scr
 Two fixes:
 
 - **Negative caching.** Cache the *absence* too: store "not found" with a short TTL. The second request for the same missing id hits the cache. The risk: if the row is created later, the cache says "not found" until the TTL ends. Delete the negative entry when you create the row, and keep its TTL short.
-- **Bloom filter.** A Bloom filter (lesson 10.3) is a small bit table that answers "definitely not in the set" or "maybe in the set". Put all valid ids in it. Check it first. If it says "definitely not", reject the request without touching the cache or the database. A "maybe" can be a false alarm, so the database check stays.
+- **Bloom filter.** A Bloom filter (lesson 10.3) is a small bit table. It answers "definitely not in the set" or "maybe in the set". Put all valid ids in it. Check it first. If it says "definitely not", reject the request without touching the cache or the database. A "maybe" can be a false alarm, so the database check stays.
 
 Validation helps too: reject an id with a wrong format before it reaches any cache.
 
@@ -199,7 +199,7 @@ When you add a cache for a hot read path, add the failure story in one breath. "
 </Callout>
 
 <Callout type="tip">
-Ask the question "the cache goes down, what happens?". Answer with the cold cache: the database sees full load. Then give the defenses: replicas of the cache, warming, and a limit on how many queries can reach the database at once.
+Ask the question "the cache goes down, what happens?". Answer with the cold cache: the database sees full load. Then give the defenses. They are replicas of the cache, warming, and a limit on how many queries can reach the database at once.
 </Callout>
 
 <Callout type="mistake">

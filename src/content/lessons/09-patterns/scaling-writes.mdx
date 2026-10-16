@@ -12,7 +12,7 @@ import ScalingWritesLab from '../../../components/anim/lessons/ScalingWritesLab.
 
 ## The problem
 
-Reads are easy to copy. Writes are not. Every write must reach the one place that owns the data, and read replicas do not help: each replica has to apply every write too (lesson [4.6](/learn/04-data/replication/)). So a cache and replicas lift the read ceiling and leave the write ceiling where it was.
+Reads are easy to copy. Writes are not. Every write must reach the one place that owns the data. Read replicas do not help: each replica has to apply every write too (lesson [4.6](/learn/04-data/replication/)). So a cache and replicas lift the read ceiling and leave the write ceiling where it was.
 
 Lesson [1.5](/learn/01-one-machine/numbers-to-know/) puts one database node at about 5K to 20K simple writes per second. Now picture a ticket sale, a flash sale, or a game event. Writes jump to 30,000 per second for a minute. One primary cannot take that. Its queue grows, latency climbs, and clients time out.
 
@@ -53,7 +53,7 @@ Work through the walk below. It follows one burst through the four moves, in the
 
 ### Move 1: less work per write
 
-**Batch.** Every commit has a fixed part, the flush of the log to disk, and a per-row part. If a worker commits 100 rows together, it pays the fixed part once. The PostgreSQL manual says this directly for bulk loads: do one commit at the end, because letting each row commit separately makes the database do a lot of work per row. It also says `COPY` is optimized for loading many rows with much less overhead than separate `INSERT` statements.
+**Batch.** Every commit has a fixed part, the flush of the log to disk, and a per-row part. If a worker commits 100 rows together, it pays the fixed part once. The PostgreSQL manual says this directly for bulk loads: do one commit at the end. The reason is that letting each row commit separately makes the database do much work per row. It also says `COPY` is optimized for loading many rows with much less overhead than separate `INSERT` statements.
 
 Batching has a cost. A batch is acknowledged together, so each row waits for the batch to fill. A bad row can fail the whole transaction. And a bigger batch gives smaller gains each time, because the fixed part shrinks next to the per-row part. The lab below shows the curve.
 
@@ -68,7 +68,7 @@ This is **write-behind**: the write is acknowledged before it lands in its final
 - The ack means "accepted", not "readable". A reader who checks at once may see nothing. That is the read-your-writes problem again (lesson [4.10](/learn/04-data/consistency-models/)). Return the new value from the write path, or read through the queue's state.
 - The queue must be durable, such as a replicated log. A write-behind cache in volatile memory loses acknowledged writes on a crash.
 - Delivery is at-least-once (lesson [6.3](/learn/06-async/delivery-semantics/)), so the worker may apply a write twice. Make writes idempotent (lesson [3.4](/learn/03-api-design/idempotency/)).
-- The queue must drain. If the average write rate is above the drain rate, the backlog grows without end, and you need backpressure (lesson [6.4](/learn/06-async/backpressure-dlq/)).
+- The queue must drain. If the average write rate is above the drain rate, the backlog grows without end. In that case, you need backpressure (lesson [6.4](/learn/06-async/backpressure-dlq/)).
 
 ### Move 3: shard
 
@@ -93,11 +93,11 @@ Set a hot key to 20% of writes with 8 shards and no salts. Then raise the salts.
 
 <ScalingWritesLab client:visible />
 
-**The model.** One commit costs 0.08 ms fixed plus 0.02 ms per row, so one row per commit gives 1000 / 0.10 = 10,000 rows per second. A batch of 100 costs 0.08 + 2.0 = 2.08 ms for 100 rows, which is about 48,000 rows per second. The ceiling is 1 / 0.02 ms = 50,000. With `N` shards and a hot key that takes a share `p`, spread over `k` salts, the hottest shard gets `p / k + (1 - p) / N` of all writes, and the cluster limit is one shard's capacity divided by that share.
+**The model.** One commit costs 0.08 ms fixed plus 0.02 ms per row. So one row per commit gives 1000 / 0.10 = 10,000 rows per second. A batch of 100 costs 0.08 + 2.0 = 2.08 ms for 100 rows. That works out to about 48,000 rows per second. The ceiling is 1 / 0.02 ms = 50,000. With `N` shards, a hot key takes a share `p`. Using `k` salts, the hottest shard gets `p / k + (1 - p) / N` of all writes. The cluster limit is one shard's capacity divided by that share.
 
 **Assumptions.** The two costs are illustrative round numbers, not measurements of any database. Other keys spread evenly. Shards are equal. Salts land on different shards. There are no cross-shard transactions and no network cost. The burst numbers use 4,000 writes per second of normal traffic.
 
-Check it by hand. With 8 shards, batches of 100, and a hot key at 20%: one shard handles 48,077. Unsalted, the hottest shard gets 0.2 + 0.8 / 8 = 0.3 of all writes, so the cluster takes 48,077 / 0.3 = about 160,000 per second, not the 8 x 48,077 = 385,000 an even spread would give. With 8 salts the hot share is 0.2 / 8 + 0.1 = 0.125, so the cluster takes about 385,000 again.
+Check it by hand. With 8 shards, batches of 100, and a hot key at 20%: one shard handles 48,077. Unsalted, the hottest shard gets 0.2 + 0.8 / 8 = 0.3 of all writes. So the cluster takes 48,077 / 0.3 = about 160,000 per second. The cluster does not take the 8 x 48,077 = 385,000 an even spread would give. With 8 salts the hot share is 0.2 / 8 + 0.1 = 0.125. So the cluster takes about 385,000 again.
 
 ## Numbers
 
@@ -127,11 +127,11 @@ Say which problem you have before you pick a fix. "Is it total volume or one hot
 </Callout>
 
 <Callout type="mistake">
-Do not say "add replicas" for a write problem. Do not shard by a low-cardinality key such as country or date. Do not put a queue in front and call it done: say what the ack means, and what happens when the backlog does not drain. And do not forget that salting breaks the simple read.
+Do not say "add replicas" for a write problem. Do not shard by a low-cardinality key such as country or date. Do not put a queue in front and call it done. Say what the ack means, and what happens when the backlog does not drain. And do not forget that salting breaks the simple read.
 </Callout>
 
 <Callout type="deep" title="Sharded counters">
-A like counter for a viral post is a hot key by design. One row updated thousands of times a second is also slow on its own, because every update makes a new row version in PostgreSQL (lesson 8.1). Split the counter into `k` rows. A like increments a random one. A read adds them all, or a background job adds them into one cached total. The count is a little late and never lost.
+A like counter for a viral post is a hot key by design. One row updated thousands of times a second is also slow on its own. The reason is that every update makes a new row version in PostgreSQL (lesson 8.1). Split the counter into `k` rows. A like increments a random one. A read adds them all, or a background job adds them into one cached total. The count is a little late and never lost.
 </Callout>
 
 ## Check yourself

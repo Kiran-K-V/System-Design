@@ -27,7 +27,7 @@ Ten thousand pairs of limited-edition shoes go on sale at noon. Ten million peop
 - **Zero oversell.** Never sell a unit that does not exist.
 - 10,000 units. 10 million users arrive within seconds of the start.
 - An abandoned reservation returns its unit to stock. No unit is held forever.
-- The admission rule is fair and stated in advance: arrival order, or a lottery among everyone who joined before the start.
+- The admission rule is fair and stated in advance. The rule is arrival order, or a lottery among everyone who joined before the start.
 - The database and the payment provider must not fall over.
 
 For a sense of real peaks: Shopify's engineering team wrote that on its cloud in 2021 its Black Friday and Cyber Monday peak "surpassed 32 million app server requests per minute", and that one flash sale used over 20% of its total computing capacity at its peak. That is about 32,000,000 / 60 = 533,000 requests per second across all merchants. Our single sale is a spike of the same order, aimed at one item.
@@ -60,9 +60,9 @@ Start with the obvious design, then the fix.
 
 <FlashSaleOversell client:visible />
 
-The naive design reads, checks, and writes in three steps. Between the read and the write, the world changes. This is the check-then-act race from lesson [9.4](/learn/09-patterns/contention/). Making the row lock bigger is the usual first fix: `SELECT ... FOR UPDATE` on the product row. It is correct. It is also a queue of one. If each reservation holds the lock for 5 ms, the best case is 1 / 0.005 = 200 reservations per second. For 10 million users that is hopeless.
+The naive design reads, checks, and writes in three steps. Between the read and the write, the world changes. This is the check-then-act race from lesson [9.4](/learn/09-patterns/contention/). Making the row lock bigger is the usual first fix: `SELECT ... FOR UPDATE` on the product row. It is correct. It is also a queue of one. If each reservation holds the lock for 5 ms, the best case is one over the hold time. That is 1 / 0.005 = 200 reservations per second. For 10 million users that is hopeless.
 
-Redis (lesson [8.2](/learn/08-technologies/redis/)) runs commands one at a time on one thread, so a single `DECR` is atomic, and it takes microseconds, not milliseconds. A few details matter.
+Redis (lesson [8.2](/learn/08-technologies/redis/)) runs commands one at a time on one thread. So a single `DECR` is atomic, and it takes microseconds, not milliseconds. A few details matter.
 
 - **Seed the key first.** Redis docs say that if the key does not exist, it is set to 0 before the decrement. An unseeded counter starts at -1. Set it to 10,000 before the sale opens.
 - **A negative result means "none left".** The API sends `INCR` to put the unit back, and answers `409`. The counter dips below zero for a moment, but nobody is ever given a unit from it.
@@ -82,7 +82,7 @@ return -1
 
 Payment can take 10 seconds or more. Do not hold a database lock for that time. The reservation row is the hold. It has an `expires_at`, set to about 5 minutes from creation.
 
-Two things can happen to a `held` reservation, and they can happen at the same moment: the user pays, or the sweeper expires it. Make both moves conditional on the status. Payment runs `UPDATE ... SET status='paid' WHERE id=? AND status='held'`. The sweeper runs `SET status='expired' WHERE status='held' AND expires_at < now()`. Whichever statement runs first wins. The other changes zero rows. The sweeper adds 1 to the counter only for rows it changed.
+Two things can happen to a `held` reservation, and they can happen at the same moment. The user pays, or the sweeper expires it. Make both moves conditional on the status. Payment runs `UPDATE ... SET status='paid' WHERE id=? AND status='held'`. The sweeper runs `SET status='expired' WHERE status='held' AND expires_at < now()`. Whichever statement runs first wins. The other changes zero rows. The sweeper adds 1 to the counter only for rows it changed.
 
 ### Surviving the burst
 
@@ -135,7 +135,7 @@ Do not answer "just add more servers". The bottleneck is one counter. Do not rea
 </Callout>
 
 <Callout type="deep" title="Sharding the counter">
-If one Redis shard is still the limit, split the stock: 10 shards with 1,000 units each. A request picks a random shard and falls through to the next if it is empty. Contention drops tenfold. The cost: the last units are scattered, and a request may see "empty" on one shard while another has 3 left. Use this only when one counter truly cannot keep up. For 2,000 admissions a second, it cannot be the answer.
+If one Redis shard is still the limit, split the stock: 10 shards with 1,000 units each. A request picks a random shard and falls through to the next if it is empty. Contention drops tenfold. The cost: the last units are scattered. A request may see "empty" on one shard while another has 3 left. Use this only when one counter truly cannot keep up. For 2,000 admissions a second, it cannot be the answer.
 </Callout>
 
 ## Check yourself

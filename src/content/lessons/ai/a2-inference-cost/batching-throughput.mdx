@@ -28,17 +28,17 @@ The next idea is to group requests. That is **batching** [junior]: run several r
 
 Decode is memory-bound: its time is set by reading the weights, not by math. A step with 1 token and a step with 16 tokens read the same 140 GB. So the extra 15 tokens are nearly free until compute or the KV cache becomes the limit. The weights are read once, and every request in the batch uses them.
 
-Databricks measured this on one A100 with MPT-7B, static batching, 512 input and 64 output tokens. Throughput in requests per second: 0.9 at batch 1, 3.2 at batch 4, 5.3 at batch 8, 8.0 at batch 16, 10.5 at batch 32, 12.5 at batch 64. That is 14x more throughput at batch 64. Move the slider.
+Databricks measured this on one A100 with MPT-7B, static batching, 512 input and 64 output tokens. Throughput in requests per second is 0.9 at batch 1, 3.2 at batch 4, and 5.3 at batch 8. It is 8.0 at batch 16, 10.5 at batch 32, and 12.5 at batch 64. That is 14x more throughput at batch 64. Move the slider.
 
 <Ai2BatSlider client:visible />
 
 Read three things off it.
 
 1. **Throughput rises fast, then flattens.** Doubling from 8 to 16 adds 51%. Doubling from 32 to 64 adds 19%. Past the compute-bound point, Databricks says, every doubling of batch size increases latency without increasing throughput.
-2. **Latency per user rises.** Databricks reports about 4x more latency at batch 64. Our own estimate from the table is 4.6x: a full static batch finishes together, so latency = batch / throughput = 64 / 12.5 = 5.1 s against 1 / 0.9 = 1.1 s. The two agree on the size, not on the last digit.
+2. **Latency per user rises.** Databricks reports about 4x more latency at batch 64. Our own estimate from the table is 4.6x. A full static batch finishes together, so latency = batch / throughput = 64 / 12.5 = 5.1 s. Compare that with 1 / 0.9 = 1.1 s. The two agree on the size, not on the last digit.
 3. **There is a knee.** A service picks a batch size that meets its latency target, not the biggest one.
 
-Two more limits stop the batch from growing. The KV cache ([lesson A2.3](/learn/ai/a2-inference-cost/kv-cache/)) grows with every user: on 4 x H100 with 70B the pool holds 55 sequences of 8K tokens, and only 3 of 128K. And the ridge point (295 on an H100) caps how many tokens help.
+Two more limits stop the batch from growing. The KV cache ([lesson A2.3](/learn/ai/a2-inference-cost/kv-cache/)) grows with every user. On 4 x H100 with 70B, the pool holds 55 sequences of 8K tokens. The same pool holds only 3 sequences of 128K tokens. And the ridge point (295 on an H100) caps how many tokens help.
 
 <CrossTrackLink id="01-one-machine/throughput-vs-latency">
 Throughput and latency are different numbers, and a queue links them. As load rises, a server does more total work, but each request waits longer. A batch size is the same trade: more work per second, more wait per user. Little's Law ties them together.
@@ -49,7 +49,7 @@ Throughput and latency are different numbers, and a queue links them. As load ri
 Requests do not all have the same length. That is where the scheduler matters. There are three common styles, as Databricks describes them.
 
 - **Static batching:** the client packs a group and the response returns when every sequence in it is done. The batch is as slow as its longest member.
-- **Dynamic batching** [mid]: the server collects requests on the fly for a short window and runs them as a batch. It can be near-optimal for short or uniform responses. Typically it performs worse than static batching on uniform loads.
+- **Dynamic batching** [mid]: the server collects requests on the fly for a short window. The server then runs them as a batch. It can be near-optimal for short or uniform responses. Typically it performs worse than static batching on uniform loads.
 - **Continuous batching** [mid]: the scheduler decides at every decode step. A finished request leaves at once and a waiting one takes its place. Databricks reports 10x to 20x better throughput than dynamic batching.
 
 The animation uses six requests with output lengths 3, 12, 5, 4, 6, and 3 steps on four slots.
@@ -77,7 +77,7 @@ Price used here: Lambda lists an NVIDIA H100 SXM 80 GB at **$3.99 per GPU per ho
 - **At 1,500 tokens/s per GPU, 100% busy:** 3.99 / (1,500 x 3,600) x 10^6 = **$0.74** per million. (1,500 is a round figure for the example, not a measured result for any model.)
 - **Same GPU, 30% busy:** 0.74 / 0.30 = **$2.46** per million.
 - **Batch 1 on 2 x H100 (70B, 48 tokens/s):** 2 x 3.99 / (48 x 3,600) x 10^6 = **$46** per million.
-- **32 streams sharing the step, if the step time held at 21 ms:** 32 x 48 = 1,536 tokens/s gives about **$1.44** per million. This is an upper bound on the gain. The KV reads and the ridge point make real systems slower.
+- **32 streams sharing the step, if the step time held at 21 ms:** 32 x 48 = 1,536 tokens/s. That gives about **$1.44** per million. This is an upper bound on the gain. The KV reads and the ridge point make real systems slower.
 
 Doubling throughput halves the cost per token. That is why the scheduler is a cost lever, not only a speed lever. Internals such as Orca's iteration-level scheduling and PagedAttention are elective E3.1 and E3.2.
 
@@ -113,7 +113,7 @@ Do not say "more users, same speed for everyone". Per-user TPOT rises with batch
 </Callout>
 
 <Callout type="deep" title="Why throughput eventually stops rising">
-The step time is roughly max(time to read weights and KV, time to do the math). While memory dominates, more tokens in the step are almost free. Once the math dominates, each extra token adds its own time, so a doubled batch doubles the step and throughput stays flat. KV reads grow with batch and context, so the real knee comes earlier than the 295 estimate.
+The step time is roughly max(time to read weights and KV, time to do the math). While memory dominates, more tokens in the step are almost free. Once the math dominates, each extra token adds its own time. So a doubled batch doubles the step, and throughput stays flat. KV reads grow with batch and context, so the real knee comes earlier than the 295 estimate.
 </Callout>
 
 ## Check yourself

@@ -32,7 +32,7 @@ The scores the model outputs are called **logits**. A logit can be any real numb
 
 <Math block tex="p_i = \frac{e^{x_i / T}}{\sum_j e^{x_j / T}}" />
 
-In words: divide every score by T, raise e to that power, and divide by the total so everything sums to 1. At T = 1 this is the plain softmax. A small T makes the top token win by more. A large T flattens the list. As T goes to 0 the result is greedy decoding, and most APIs treat T = 0 as exactly that.
+In words: divide every score by T. Raise e to that power. Then divide by the total, so everything sums to 1. At T = 1 this is the plain softmax. A small T makes the top token win by more. A large T flattens the list. As T goes to 0 the result is greedy decoding, and most APIs treat T = 0 as exactly that.
 
 Two more tools cut the tail of the list. Long tails matter: with a 128K vocabulary, thousands of tokens are each unlikely, but together they hold real mass, and sampling from all of them sometimes picks nonsense.
 
@@ -41,7 +41,7 @@ Two more tools cut the tail of the list. Long tails matter: with a 128K vocabula
 
 After each cut, the kept probabilities are scaled so they sum to 1 again. Then the sampler draws one token.
 
-Here is a worked example with ten illustrative scores for the next token after "The capital of France is". At T = 1, softmax gives Paris 76.5%, the 8.5%, a 4.7%, and a small tail. Check the first number by hand: the scores are 5.0, 2.8, 2.2, 1.9, 1.5, 1.2, 0.8, 0.5, 0.1, and -0.3. The value e^5 is 148.4, and the sum of all ten e^x is 194.0, so Paris is 148.4 / 194.0 = 0.765.
+Here is a worked example with ten illustrative scores for the next token after "The capital of France is". At T = 1, softmax gives Paris 76.5%, the 8.5%, a 4.7%, and a small tail. Check the first number by hand: the scores are 5.0, 2.8, 2.2, 1.9, 1.5, 1.2, 0.8, 0.5, 0.1, and -0.3. The value e^5 is 148.4. The sum of all ten e^x is 194.0. So Paris is 148.4 / 194.0 = 0.765.
 
 Now cut. With top-k = 3, the kept values are 148.4, 16.4, and 9.0, which sum to 173.8. Paris becomes 148.4 / 173.8 = 85.4%. With top-p = 0.9 at T = 1, the running total is 76.5%, 84.9%, 89.6%, 93.0%. The first three are below 0.9 and the fourth passes it, so four tokens stay. Try it.
 
@@ -51,7 +51,7 @@ What to notice:
 
 1. **Temperature changes shape, not order.** The ranking of tokens never changes. At T = 0.5 Paris holds 98.1%. At T = 2 it holds 40.0% and the tail wakes up.
 2. **Cuts are applied in order.** This widget runs temperature, then top-k, then top-p. Libraries differ in the exact order and in tie handling, so read the docs of the one you use.
-3. **The grey bar shows what was cut.** The blue bar is bigger than the grey bar for every kept token, because the cut mass is shared among the survivors.
+3. **The grey bar shows what was cut.** The blue bar is bigger than the grey bar for every kept token. The reason is that the cut mass is shared among the survivors.
 4. **Counts match the bars.** Press "Draw 1,000 samples". With T = 1 and no cuts, Paris should get about 765 of 1,000 draws.
 
 Now watch decoding run. The sampler needs one random number per token. It lines up the probabilities as a strip from 0 to 1 and picks the token whose segment holds the number.
@@ -70,14 +70,14 @@ Set T = 0 and you expect the same output every time. In production it often is n
 
 Why does a fixed model with no random number give different text? The reason is in how computers add numbers. **Floating-point** addition is not associative: the order of the additions changes the result. Here is a case in 32-bit floats. Add 1 to 100,000,000 first, then subtract 100,000,000: the 1 is lost to rounding, and the answer is 0. Subtract first, then add 1: the answer is 1. Same three numbers, two answers.
 
-A GPU adds up thousands of numbers inside every matrix multiply. How it splits that work depends on the shape of the input. The shape depends on the **batch**, which is the group of requests the server runs together to keep the GPU busy. Your request shares a batch with other users' requests (lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/) covers batching in detail). So the order of additions, and the last bits of every score, depend on how many other people are on the server right now. As the paper puts it, "the load (and thus batch-size) nondeterministically varies".
+A GPU adds up thousands of numbers inside every matrix multiply. How it splits that work depends on the shape of the input. The shape depends on the **batch**. A batch is the group of requests the server runs together to keep the GPU busy. Your request shares a batch with other users' requests (lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/) covers batching in detail). So the order of additions depends on how many other people are on the server right now. The last bits of every score depend on that too. As the paper puts it, "the load (and thus batch-size) nondeterministically varies".
 
-Most of the time the last bits do not matter. But at some token the top two scores are almost tied, and a change in the 7th digit flips which one wins. Once one token differs, every token after it can differ. This is a backend idea you know: a result that depends on the **hidden state of a shared system**, like a cache hit that changes a timing, but here it changes the output.
+Most of the time the last bits do not matter. But at some token the top two scores are almost tied. A change in the 7th digit flips which one wins. Once one token differs, every token after it can differ. This is a backend idea you know: a result that depends on the **hidden state of a shared system**, like a cache hit that changes a timing, but here it changes the output.
 
-The fix exists. Batch-invariant kernels compute each request the same way regardless of batch size. It costs speed. On one GPU with Qwen-3-8B and 1,000 sequences of about 100 tokens, the paper measured 26 seconds for default vLLM, 55 seconds for the unoptimized deterministic version, and 42 seconds with an improved attention kernel. That is 1.6 times slower in the best case (42 / 26 = 1.6).
+The fix exists. Batch-invariant kernels compute each request the same way regardless of batch size. It costs speed. On one GPU, the paper tested Qwen-3-8B with 1,000 sequences of about 100 tokens. Default vLLM took 26 seconds. The unoptimized deterministic version took 55 seconds. With an improved attention kernel, the run took 42 seconds. That is 1.6 times slower in the best case (42 / 26 = 1.6).
 
 <Callout type="deep" title="Seed, temperature 0, and what you can promise">
-A seed fixes the random number u. It does not fix the scores that go into the strip. If the scores move by a tiny amount, the same u can land on a different token. So "temperature 0" and "seed = 42" are both **best effort** on a shared hosted model, unless the provider documents a stronger guarantee. Check the provider's docs. Do not build a system that fails if two calls differ. Build one that checks the output (see below) and treats a rare difference as normal.
+A seed fixes the random number u. It does not fix the scores that go into the strip. If the scores move by a tiny amount, the same u can land on a different token. So "temperature 0" and "seed = 42" are both **best effort** on a shared hosted model. The exception is when the provider documents a stronger guarantee. Check the provider's docs. Do not build a system that fails if two calls differ. Build one that checks the output (see below) and treats a rare difference as normal.
 </Callout>
 
 ## Numbers
@@ -90,7 +90,7 @@ A seed fixes the random number u. It does not fix the scores that go into the st
 | Repetition penalty about 1.2 | Divides the score of tokens already used | Stops loops. The CTRL paper reports 1.2 as a good balance |
 | Constrained decoding | Sets the probability of tokens that break a format to zero before the draw | JSON, a fixed label set |
 
-Cost: sampling is cheap. A softmax over a 128K vocabulary is on the order of 5e5 operations (derived: 128K values times a few steps each). The forward pass of a 70B model is 2 x 70e9 = 1.4e11 FLOPs per token. Sampling is about 300,000 times smaller. Nobody picks greedy to save compute.
+Cost: sampling is cheap. A softmax over a 128K vocabulary is on the order of 5e5 operations. The figure is derived: 128K values times a few steps each. The forward pass of a 70B model is 2 x 70e9 = 1.4e11 FLOPs per token. Sampling is about 300,000 times smaller. Nobody picks greedy to save compute.
 
 ## Trade-offs
 
@@ -105,7 +105,7 @@ Cost: sampling is cheap. A softmax over a 128K vocabulary is on the order of 5e5
 ## Interview lens
 
 <Callout type="tip">
-Say what you set, and why: "Temperature 0 and a fixed label set for the classifier, plus a validator that rejects anything outside the set and retries once. I measure the label flip rate on a golden set of 500 tickets, and I expect it to be low, not zero." That answer names a setting, a check, and a rate.
+Say what you set, and why: "Temperature 0 and a fixed label set for the classifier, plus a validator that rejects anything outside the set and retries once. I measure the label flip rate on a golden set of 500 tickets. I expect the rate to be low, not zero." That answer names a setting, a check, and a rate.
 </Callout>
 
 <Callout type="mistake">

@@ -25,7 +25,7 @@ Now two failures show up.
 - **Step 3 fails after step 2 committed.** The card is charged and there is no item to ship. The customer is angry and support must find the charge by hand.
 - **The process dies between steps.** Step 2 committed, and the process that should call step 3 is gone. Nobody records that step 3 is still owed.
 
-A **multi-step process** is any business action that crosses more than one system and must end in a sensible state even when a step fails. This lesson shows how to build one from parts you already know.
+A **multi-step process** is any business action that crosses more than one system. The process must end in a sensible state even when a step fails. This lesson shows how to build one from parts you already know.
 
 ## What this pattern is made of
 
@@ -47,7 +47,7 @@ This pattern adds almost nothing new. It is a recipe that combines earlier lesso
 
 The first idea is to wrap all three steps in one transaction, using two-phase commit (2PC, [lesson 4.4](/learn/04-data/transactions/)). A coordinator asks every participant to prepare. Each participant writes its change durably, keeps its locks, and votes yes. When all vote yes, the coordinator records "commit" and tells everyone.
 
-Look at the protocol to see why this blocks. After a participant votes yes, it has promised to commit if told to. It may not decide alone, because the coordinator may already have told another participant to commit. So it keeps its locks and waits. If the coordinator crashes after the votes, every participant sits there holding locks until the coordinator comes back and reads its log. Every other request that needs those rows waits too.
+Look at the protocol to see why this blocks. After a participant votes yes, it has promised to commit if told to. It may not decide alone, because the coordinator may already have told another participant to commit. So it keeps its locks and waits. If the coordinator crashes after the votes, every participant sits there holding locks. Each participant keeps those locks until the coordinator comes back and reads its log. Every other request that needs those rows waits too.
 
 That is one cost. There are two more.
 
@@ -56,7 +56,7 @@ That is one cost. There are two more.
 
 Microservices.io, which documents the saga pattern, states the same conclusion in its forces list: "2PC is not an option."
 
-The second naive idea is to call the three services in order from one request handler, with a retry on each. That fails when the handler dies. Nothing remembers how far the order got. It is the dual-write problem from [lesson 6.5](/learn/06-async/cdc/) with three writes instead of two.
+The second naive idea is to call the three services in order from one request handler. Each service call gets its own retry. That fails when the handler dies. Nothing remembers how far the order got. It is the dual-write problem from [lesson 6.5](/learn/06-async/cdc/) with three writes instead of two.
 
 ## The mechanism: a saga
 
@@ -88,11 +88,11 @@ A rule of thumb: choreography suits two or three steps with little branching. Or
 
 Every step does two things: change its database and publish an event. If it does them as two separate writes, a crash between them breaks the saga ([lesson 6.5](/learn/06-async/cdc/) shows that failure). The fix is the **transactional outbox**. The step writes its business row and an outbox row in one local transaction. A relay reads the outbox, by polling it or by tailing the database log, and publishes to the broker. The event exists if and only if the change committed.
 
-The relay can publish the same row twice, for example if it crashes before marking the row sent. So the next step must be idempotent. It can store the event id and skip a repeat ([lesson 6.3](/learn/06-async/delivery-semantics/)). I give no polling interval here, because the right value depends on your latency target and load, and I found no primary source that fixes one.
+The relay can publish the same row twice, for example if it crashes before marking the row sent. So the next step must be idempotent. It can store the event id and skip a repeat ([lesson 6.3](/learn/06-async/delivery-semantics/)). I give no polling interval here, because the right value depends on your latency target and load. I also found no primary source that fixes one.
 
 ## Workflow engines: the orchestrator you do not build
 
-Writing a durable orchestrator yourself means writing a state table, a retry timer, a recovery scan, and a way to resume after a crash. A **workflow engine** gives you that. [Temporal](/learn/08-technologies/temporal/) (lesson 8.9) keeps an Event History of every step. If a worker dies, another worker replays the workflow code against that history and continues from the last recorded step. Your saga becomes ordinary code:
+Writing a durable orchestrator yourself means writing a state table, a retry timer, and a recovery scan. You also write a way to resume after a crash. A **workflow engine** gives you that. [Temporal](/learn/08-technologies/temporal/) (lesson 8.9) keeps an Event History of every step. If a worker dies, another worker replays the workflow code against that history and continues from the last recorded step. Your saga becomes ordinary code:
 
 ```ts
 // Pseudocode, not a real SDK call.
@@ -132,15 +132,15 @@ The point is that compensation is a normal path with real traffic, not a rare ed
 | Workflow engine | Durable state and retries built in | Determinism rules. Workflow versioning. One more system to run | Flows that run long or are business critical |
 
 <Callout type="tip">
-Say: "I will not use 2PC across services, since a coordinator crash leaves participants holding locks. I will run a saga. Each step is a local transaction that writes an outbox row. If step 3 fails, earlier steps run idempotent compensations, like a refund. For control and visibility I will use an orchestrator, a workflow engine like Temporal, so a crash resumes from durable state." Then name the visible middle state and how the UI shows it.
+Say: "I will not use 2PC across services, since a coordinator crash leaves participants holding locks. I will run a saga. Each step is a local transaction that writes an outbox row. If step 3 fails, earlier steps run idempotent compensations, like a refund. For control and visibility I will use an orchestrator. The orchestrator is a workflow engine like Temporal, so a crash resumes from durable state." Then name the visible middle state and how the UI shows it.
 </Callout>
 
 <Callout type="mistake">
-Do not say "roll back the database". The earlier steps already committed in other databases. Do not write "write the DB, then publish to the broker" as the plan: a crash between the two loses the event. And do not forget the compensation of the compensation: a refund can fail, so it needs retries and an alert, not a shrug.
+Do not say "roll back the database". The earlier steps already committed in other databases. Do not write "write the DB, then publish to the broker" as the plan. A crash between those two steps loses the event. And do not forget the compensation of the compensation. A refund can fail, so it needs retries and an alert, not a shrug.
 </Callout>
 
 <Callout type="deep" title="Why sagas are not ACID">
-Atomicity is replaced by "eventually all steps done or all compensated." Consistency holds at the end, not during. Isolation is gone: another request can read the PENDING order or try to spend the same stock. Durability is per step. Common fixes for the missing isolation are a status field that acts as a soft lock, and ordering the steps so the scarce resource is claimed first. They reduce the problem. They do not remove it.
+Atomicity is replaced by "eventually all steps done or all compensated." Consistency holds at the end, not during. Isolation is gone: another request can read the PENDING order or try to spend the same stock. Durability is per step. Common fixes for the missing isolation are a status field that acts as a soft lock. A second fix orders the steps so the scarce resource is claimed first. They reduce the problem. They do not remove it.
 </Callout>
 
 ## Check yourself

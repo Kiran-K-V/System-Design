@@ -124,9 +124,9 @@ SET highest_bid = :amount, highest_bidder = :user, version = version + 1
 WHERE id = :id AND highest_bid < :amount AND status = 'open' AND end_at > now();
 ```
 
-The database locks the row for the length of the statement, so two bids on one auction run one after the other. In PostgreSQL at the default READ COMMITTED level, the second one re-checks the row after the first commits. If it affects 0 rows, the bid was too low, the auction was closed, or time ran out. The service returns 409 with the current high bid. The bid log insert goes in the same transaction.
+The database locks the row for the length of the statement. So two bids on one auction run one after the other. In PostgreSQL at the default READ COMMITTED level, the second one re-checks the row after the first commits. If it affects 0 rows, the bid was too low, the auction was closed, or time ran out. The service returns 409 with the current high bid. The bid log insert goes in the same transaction.
 
-This is **optimistic concurrency**: assume no conflict, and detect one at write time. It holds no lock while the client thinks. It works well when conflicts are rare for most auctions and bounded for one auction. The `version` column is for cases where the rule is more than "higher than". If a bid must be at least 5 above the current high, the service reads the row, computes, and writes with `WHERE version = :seen`. A 0-row result means "retry with fresh data".
+This is **optimistic concurrency**: assume no conflict, and detect one at write time. It holds no lock while the client thinks. It works well when conflicts are rare for most auctions and bounded for one auction. The `version` column is for cases where the rule is more than "higher than". If a bid must be at least 5 above the current high, the service reads the row. The service then computes and writes with `WHERE version = :seen`. A 0-row result means "retry with fresh data".
 
 What are the other options?
 
@@ -140,7 +140,7 @@ Do not lock the whole table. That makes every auction wait for every other aucti
 
 ## Deep dive: telling everyone
 
-Each viewer wants the new price. The first idea is to poll. With 5,000 viewers polling once a second, one auction row takes 5,000 reads a second, and a viewer sees a new price up to a second late.
+Each viewer wants the new price. The first idea is to poll. With 5,000 viewers polling once a second, one auction row takes 5,000 reads a second. A viewer sees a new price up to a second late.
 
 Push is better. After a bid commits, the service publishes it to a **channel** for that auction, using pub/sub (lesson [6.2](/learn/06-async/pubsub-logs/)). **Gateway** servers hold the viewers' WebSocket connections (lesson [9.3](/learn/09-patterns/real-time-updates/)). Each gateway subscribes to the channels of the auctions its viewers watch, and pushes each message to those viewers.
 
@@ -148,7 +148,7 @@ Two details matter. A gateway that restarts loses its connections. Clients recon
 
 ## Deep dive: when the auction ends
 
-A cron job that scans all auctions every minute is late by up to a minute, and it scans millions of rows. Use a timer per auction instead. When an auction is created, schedule a close event at its end time in a delay queue or scheduler (lesson [11.15](/learn/11-breakdowns/job-scheduler/) shows one).
+A cron job that scans all auctions every minute is late by up to a minute. It scans millions of rows. Use a timer per auction instead. When an auction is created, schedule a close event at its end time in a delay queue or scheduler. One example is in lesson [11.15](/learn/11-breakdowns/job-scheduler/).
 
 Two rules protect the end.
 

@@ -13,7 +13,7 @@ import Ai5RrfCalc from '../../../../components/anim/lessons/Ai5RrfCalc.tsx';
 
 ## The problem
 
-A user types `ERR_4012`. Or a part number, `XK-440-B`. Or the name of a person. A dense vector search embeds that string and returns chunks that are close in meaning: pages about errors in general, other part numbers, other people. The exact page that holds the string may not be in the top 10, because the embedding model never learned that this code is special.
+A user types `ERR_4012`. Or a part number, `XK-440-B`. Or the name of a person. A dense vector search embeds that string. The search returns chunks that are close in meaning: pages about errors in general, other part numbers, other people. The exact page that holds the string may not be in the top 10. The reason is that the embedding model never learned that this code is special.
 
 The opposite failure also exists. A user asks "how do I get my money back?" The policy page says "refund". A keyword search finds no page that contains "money back" and returns nothing useful.
 
@@ -23,13 +23,13 @@ Each method fails where the other works. A production search usually needs both.
 
 **Dense search** is what lessons [A5.1](/learn/ai/a5-rag/embedding-models/) and A5.2 built. The query and each chunk become vectors, and the nearest vectors win. It matches meaning, and it handles paraphrase.
 
-**BM25** [mid] is a keyword ranking function. It scores a chunk by how often the query words occur in it, and gives more weight to rare words and less to long chunks. It is the usual scoring behind a classic inverted-index search engine.
+**BM25** [mid] is a keyword ranking function. It scores a chunk by how often the query words occur in it. It gives rare words more weight, and long chunks less. It is the usual scoring behind a classic inverted-index search engine.
 
 <CrossTrackLink id="08-technologies/elasticsearch">
 Elasticsearch keeps an inverted index: for every word, the list of documents that contain it. A query looks up its words and merges the lists, and Lucene ranks the results with BM25. Writes become searchable after a refresh, about a second later by default. For RAG you can use it as the keyword half of hybrid search.
 </CrossTrackLink>
 
-Elastic documents the BM25 defaults: `k1` = 1.2 controls how fast extra occurrences of a word stop adding score, and `b` = 0.75 controls how much a long document is penalized ([Elastic similarity docs](https://www.elastic.co/docs/reference/elasticsearch/index-settings/similarity)). BM25 has no idea that "refund" and "money back" are related. It also needs no GPU and no model, and it never mistakes `XK-440-B` for another code.
+Elastic documents the BM25 defaults. `k1` = 1.2 controls how fast extra occurrences of a word stop adding score. `b` = 0.75 controls how much a long document is penalized ([Elastic similarity docs](https://www.elastic.co/docs/reference/elasticsearch/index-settings/similarity)). BM25 has no idea that "refund" and "money back" are related. It also needs no GPU and no model, and it never mistakes `XK-440-B` for another code.
 
 | | Dense | BM25 |
 |---|---|---|
@@ -40,7 +40,7 @@ Elastic documents the BM25 defaults: `k1` = 1.2 controls how fast extra occurren
 
 ## Naive solution: add the scores
 
-Run both, then add the scores. It sounds right. It fails, because the scores are not on one scale. A cosine similarity lives between -1 and 1 and in practice clusters in a narrow band. A BM25 score is unbounded and depends on the corpus and the query length. A BM25 score of 14 and a cosine of 0.82 cannot be added in any honest way. You can normalize each and add a weight, but then you must tune the weight, and the best weight changes with the query.
+Run both, then add the scores. It sounds right. It fails, because the scores are not on one scale. A cosine similarity lives between -1 and 1 and in practice clusters in a narrow band. A BM25 score is unbounded and depends on the corpus and the query length. A BM25 score of 14 and a cosine of 0.82 cannot be added in any honest way. You can normalize each score and add a weight. But then you must tune the weight. The best weight changes with the query.
 
 ## The mechanism: merge by rank
 
@@ -48,7 +48,7 @@ Run both, then add the scores. It sounds right. It fails, because the scores are
 
 <Math block tex="\text{score}(d) = \sum_{\text{lists}} \frac{1}{k + \text{rank}(d)}" />
 
-A document that is not in a list adds nothing for that list. Sort by the total. Elastic's default for `k` (the `rank_constant`) is 60. Elastic says RRF "requires no tuning" and that the signals "do not have to be related", which is the point: you can fuse any rankings, such as dense, BM25 and a recency list, without making their scores comparable.
+A document that is not in a list adds nothing for that list. Sort by the total. Elastic's default for `k` (the `rank_constant`) is 60. Elastic says RRF "requires no tuning" and that the signals "do not have to be related". The point is that you can fuse any rankings. For example, you can fuse dense, BM25 and a recency list, without making their scores comparable.
 
 Step through one merge. Watch document A, and then the full table.
 
@@ -61,7 +61,7 @@ The constant `k` sets how fast credit falls off with rank. Take a document at ra
 - With k = 60: 1/61 + 1/70 = 0.01639 + 0.01429 = **0.0307**. A document at rank 1 in both scores 2/61 = **0.0328**. The first is 94% of the second.
 - With k = 1: 1/2 + 1/11 = 0.5909. Rank 1 in both is 1/2 + 1/2 = 1.0. The first is 59% of the second.
 
-With small k the top ranks dominate: being first in one list is worth a lot, and ranks past 10 are nearly worthless. With k = 60 the curve is nearly flat, so being in both lists matters more than how high you rank. Elastic says that a higher value gives lower-ranked documents more influence. The value 60 is Elastic's documented default. The original RRF paper (Cormack, Clarke and Buettcher, 2009) is the usual citation for the method. We could not read it, so we do not credit the constant to it.
+With small k, the top ranks dominate. Being first in one list is worth a lot. Ranks past 10 are nearly worthless. With k = 60, the curve is nearly flat. That is why being in both lists matters more than how high you rank. Elastic says that a higher value gives lower-ranked documents more influence. The value 60 is Elastic's documented default. The original RRF paper (Cormack, Clarke and Buettcher, 2009) is the usual citation for the method. We could not read it, so we do not credit the constant to it.
 
 Drag the ranks and `k` below. Make doc B first in one list only, then raise `k`.
 
@@ -69,11 +69,11 @@ Drag the ranks and `k` below. Make doc B first in one list only, then raise `k`.
 
 ## Where the rank window fits
 
-Each search returns a limited list, and RRF only sees those. Elastic names this `rank_window_size`, which "defaults to the `size` parameter", and says "a higher value will improve result relevance at the cost of performance." In a design that reads: if you want 10 results, fetch 50 from each searcher, fuse, and cut to 10. A document that is rank 30 in one list and rank 2 in the other can only win if the window includes rank 30. The deeper window costs more work per search, which is the same cascade logic as lesson [A5.6](/learn/ai/a5-rag/reranking-rewriting/).
+Each search returns a limited list, and RRF only sees those. Elastic names this `rank_window_size`, which "defaults to the `size` parameter". Elastic says "a higher value will improve result relevance at the cost of performance." In a design, that reads: if you want 10 results, fetch 50 from each searcher. Then fuse them and cut to 10. A document that is rank 30 in one list and rank 2 in the other can only win if the window includes rank 30. The deeper window costs more work per search, which is the same cascade logic as lesson [A5.6](/learn/ai/a5-rag/reranking-rewriting/).
 
 ## What does hybrid gain?
 
-The sources we loaded do not contain a clean hybrid-versus-dense-only number. The closest evidence is in Anthropic's contextual retrieval test (lesson [A5.4](/learn/ai/a5-rag/chunking-contextual/)): adding a keyword signal, contextual BM25, moved top-20 failures from 3.7% to 2.9% (source: [Anthropic](https://www.anthropic.com/news/contextual-retrieval)). That is a specific setup on one data set, so do not quote it as the size of hybrid gain. Measure on your own queries. Queries full of identifiers gain the most, and a corpus of chatty prose may gain little.
+The sources we loaded do not contain a clean hybrid-versus-dense-only number. The closest evidence is in Anthropic's contextual retrieval test (lesson [A5.4](/learn/ai/a5-rag/chunking-contextual/)). Adding a keyword signal, contextual BM25, moved top-20 failures from 3.7% to 2.9% (source: [Anthropic](https://www.anthropic.com/news/contextual-retrieval)). That is a specific setup on one data set, so do not quote it as the size of hybrid gain. Measure on your own queries. Queries full of identifiers gain the most, and a corpus of chatty prose may gain little.
 
 ## Numbers
 
@@ -99,11 +99,11 @@ The sources we loaded do not contain a clean hybrid-versus-dense-only number. Th
 ## Interview lens
 
 <Callout type="tip">
-Say why you merge by rank: "Dense and BM25 scores are on different scales, so I fuse by rank with RRF. It needs no tuning, and k = 60 is the Elasticsearch default. I would check on a gold set whether hybrid beats dense alone." Then name the cost: two indexes to keep fresh.
+Say why you merge by rank: "Dense and BM25 scores are on different scales. That is why I fuse by rank with RRF. It needs no tuning, and k = 60 is the Elasticsearch default. I would check on a gold set whether hybrid beats dense alone." Then name the cost: two indexes to keep fresh.
 </Callout>
 
 <Callout type="mistake">
-Do not add a cosine score to a BM25 score. Do not say RRF is always better than a tuned weighted sum: it is a robust default, not a proven optimum. And do not forget that a document missing from a list adds 0, so a narrow rank window can hide a document that one searcher found.
+Do not add a cosine score to a BM25 score. Do not say RRF is always better than a tuned weighted sum. RRF is a robust default, not a proven optimum. And do not forget that a document missing from a list adds 0. So a narrow rank window can hide a document that one searcher found.
 </Callout>
 
 ## Check yourself

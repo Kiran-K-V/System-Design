@@ -14,7 +14,7 @@ import Ai5AclSim from '../../../../components/anim/lessons/Ai5AclSim.tsx';
 
 You build an internal assistant over the company drive. It indexes wiki pages, tickets and HR files. An engineer asks, "What are the salary bands for my level?" The retriever finds the best match by meaning. The best match is a spreadsheet only HR can open. The model reads it and writes the numbers into the answer.
 
-No one broke a rule in the code that checks file access. The file system said no. The index never asked. A vector index ranks by similarity, and it has no idea who is asking. The model also cannot keep a secret it has been handed: whatever is in the prompt can end up in the reply. So the rule must be enforced before text reaches the prompt.
+No one broke a rule in the code that checks file access. The file system said no. The index never asked. A vector index ranks by similarity, and it has no idea who is asking. The model also cannot keep a secret it has been handed. The reason is that whatever is in the prompt can end up in the reply. So the rule must be enforced before text reaches the prompt.
 
 <CrossTrackLink id="03-api-design/auth">Authentication says who the caller is. Authorization says what that caller may do. Tokens carry an identity and claims such as roles or groups, and the service checks them on every request. Here the check moves from the API to the data: the identity decides which chunks may be read.</CrossTrackLink>
 
@@ -26,8 +26,8 @@ The first idea is to leave the search alone and check each hit against the permi
 
 It does not leak chunks. It fails in other ways.
 
-1. **Too few results, or none.** The top 10 were chosen without regard to the user. If the best matches are all private, the user gets 0 or 2 chunks while 50 readable ones exist further down. Lesson [A5.3](/learn/ai/a5-rag/vector-db-filters/) showed the same effect for metadata filters in pgvector, where the filter is applied after the index scan ([pgvector README](https://github.com/pgvector/pgvector)).
-2. **Side channels.** A page that says "10 matches, 1 shown", a citation count, or a different latency tells the user that restricted material exists on the topic. That can be a leak by itself.
+1. **Too few results, or none.** The top 10 were chosen without regard to the user. If the best matches are all private, the user gets 0 or 2 chunks. But 50 readable ones exist further down. Lesson [A5.3](/learn/ai/a5-rag/vector-db-filters/) showed the same effect for metadata filters in pgvector. In pgvector, the filter is applied after the index scan ([pgvector README](https://github.com/pgvector/pgvector)).
+2. **Side channels.** A page that says "10 matches, 1 shown" tells the user that restricted material exists on the topic. A citation count or a different latency tells the user the same thing. That can be a leak by itself.
 3. **Cost.** You fetch and check chunks you will throw away. For an unlucky user the check runs on every hit.
 
 Step through two users with the same query.
@@ -38,7 +38,7 @@ Step through two users with the same query.
 
 ### Pre-filter
 
-A **pre-filter** is a condition on the search itself: "the nearest chunks among those where `allowed_groups` contains one of my groups." The index returns k readable chunks. The user never receives a forbidden chunk, and the list is full when enough readable chunks exist. Whether the index applies the filter during graph traversal or afterwards depends on the store. Lesson [A5.3](/learn/ai/a5-rag/vector-db-filters/) covers how filters hurt graph search and how stores answer. Check your store's filter path before you trust it with a restrictive ACL.
+A **pre-filter** is a condition on the search itself. It reads: "the nearest chunks among those where `allowed_groups` contains one of my groups." The index returns k readable chunks. The user never receives a forbidden chunk, and the list is full when enough readable chunks exist. Whether the index applies the filter during graph traversal or afterwards depends on the store. Lesson [A5.3](/learn/ai/a5-rag/vector-db-filters/) covers how filters hurt graph search and how stores answer. Check your store's filter path before you trust it with a restrictive ACL.
 
 Store the ACL as fields on each chunk: tenant, and a list of group ids or user ids. At query time load the caller's groups from your identity system and pass them as the filter. Two limits to know:
 
@@ -53,7 +53,7 @@ Store the ACL as fields on each chunk: tenant, and a list of group ids or user i
 | One index per tenant | A bug cannot cross tenants; delete a tenant by deleting its index | Many indexes to build, size and monitor | Few large tenants, strict contracts |
 | Per-tenant index plus group filter inside | Hard wall between tenants, fine control within | Both costs | Regulated tenants with internal roles |
 
-A per-tenant index is the "strict logical and access partitioning" OWASP asks for. It does not remove the need for ACLs inside the tenant: Ana and Raj work at the same company and see different files. The simulator below shows both layers.
+A per-tenant index is the "strict logical and access partitioning" OWASP asks for. It does not remove the need for ACLs inside the tenant. For example, Ana and Raj work at the same company and see different files. The simulator below shows both layers.
 
 <Ai5AclSim client:visible />
 
@@ -68,12 +68,12 @@ This is the freshness problem from lesson [A5.8](/learn/ai/a5-rag/freshness-upda
 1. **Source of truth.** The identity system or file system. Updated at once.
 2. **ACL fields in the index.** Updated by the same CDC path as content, or by a dedicated, faster path. The delay is a leak window.
 3. **Group membership cache.** If your service caches a user's groups, a removed user keeps old groups until the entry expires.
-4. **Answer and result caches.** A cached answer was built under old permissions. If the cache key is only the question, the next user with the same question gets the answer built for someone else.
+4. **Answer and result caches.** A cached answer was built under old permissions. If the cache key is only the question, the next user with the same question gets the answer. That answer was built for someone else.
 5. **Eventual reads.** If the store serves stale reads, the ACL change can lag. turbopuffer says eventual-consistency queries can show staleness of "up to about one hour in the worst case" and that strong consistency is the default ([turbopuffer](https://turbopuffer.com/docs/architecture)).
 
 Treat access removal as a high-priority event. Ship it on its own queue, and measure the time from revoke to "no query can return this chunk". Set a target, such as seconds, not minutes. Key answer caches by the set of groups, or skip them for restricted content.
 
-A different design avoids copying ACLs into the index. Cursor's secure indexing keeps a copy of the client's Merkle tree on the server as "content proofs" and drops search results for files the client cannot prove it has ([Cursor](https://cursor.com/blog/secure-codebase-indexing)). The check uses proof of possession rather than a stored ACL. It suits code on a user's own disk. For shared drives with explicit sharing rules you usually need ACL fields.
+A different design avoids copying ACLs into the index. Cursor's secure indexing keeps a copy of the client's Merkle tree on the server as "content proofs". It drops search results for files the client cannot prove it has ([Cursor](https://cursor.com/blog/secure-codebase-indexing)). The check uses proof of possession rather than a stored ACL. It suits code on a user's own disk. For shared drives with explicit sharing rules you usually need ACL fields.
 
 ## Trade-offs
 
@@ -85,7 +85,7 @@ A different design avoids copying ACLs into the index. Cursor's secure indexing 
 | Index per tenant | Not across tenants | Yes | Operations cost; still needs ACLs inside |
 
 <Callout type="tip">
-In an interview, say the rule in one sentence: "the model can only leak what is in its prompt, so permissions are enforced at retrieval, inside the query." Then name the failure of the post-filter, the tenant layout, and the revocation path with its leak window.
+In an interview, say the rule in one sentence. Say: "the model can only leak what is in its prompt, so permissions are enforced at retrieval, inside the query." Then name the failure of the post-filter, the tenant layout, and the revocation path with its leak window.
 </Callout>
 
 <Callout type="mistake">

@@ -12,11 +12,11 @@ import Ai6CtxSim from '../../../../components/anim/lessons/Ai6CtxSim.tsx';
 
 ## The problem
 
-A chat adds a few hundred tokens per turn. An agent adds far more, because every step ends with a tool result: a file, a search page, a test log. The model reads the whole history on every call, so each step is more expensive than the one before.
+A chat adds a few hundred tokens per turn. An agent adds far more. The reason is that every step ends with a tool result. The result can be a file, a search page, or a test log. The model reads the whole history on every call, so each step is more expensive than the one before.
 
 Anthropic's multi-agent write-up says agents "typically use about 4× more tokens than chat interactions" ([source](https://www.anthropic.com/engineering/multi-agent-research-system)). Picture a coding agent that reads files and runs tests for two hours. Its window is 200,000 tokens. If it adds 4,500 tokens a step, it hits the wall near step 44, in the middle of the job.
 
-Lesson [A4.3](/learn/ai/a4-context/context-budgeting/) taught how to budget a window and why quality drops as it fills (context rot). Lesson [A4.4](/learn/ai/a4-context/compaction/) taught the three general levers: clear stale tool results, compact, and keep facts in files. This lesson does not repeat them. It covers what is different for an agent that runs a loop for a long time, and how to combine the levers into one design.
+Lesson [A4.3](/learn/ai/a4-context/context-budgeting/) taught how to budget a window and why quality drops as it fills (context rot). Lesson [A4.4](/learn/ai/a4-context/compaction/) taught the three general levers: clear stale tool results, compact, and keep facts in files. This lesson does not repeat them. It covers what is different for an agent that runs a loop for a long time. It also shows how to combine the levers into one design.
 
 ## What grows in an agent loop
 
@@ -24,7 +24,7 @@ Each step adds three things: the model's output (reasoning and a tool call), the
 
 Which part is the largest? No source I could find ranks the parts of an agent's context. So do not assume. Measure it for your agent, by logging tokens per message type. In the examples here I set tool results to 4,000 of 4,500 tokens added per step. That is our assumption, and it fits an agent that reads files. A chatty agent with small tool results will look different.
 
-What the source does say: Anthropic describes context as an "attention budget", where "every new token introduced depletes this budget by some amount", and it ties this to attention cost, "n² pairwise relationships for n tokens" ([Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)). So the cost of a long run is not only money. A fuller window can also make the model worse at finding the fact it needs.
+What the source does say: Anthropic describes context as an "attention budget". The source says "every new token introduced depletes this budget by some amount". Anthropic ties this budget to attention cost: "n² pairwise relationships for n tokens" ([Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)). So the cost of a long run is not only money. A fuller window can also make the model worse at finding the fact it needs.
 
 ## Tactic 1: cap what comes in
 
@@ -32,27 +32,27 @@ The cheapest token is the one that never enters. Cap and paginate tool output, a
 
 ## Tactic 2: clear old tool results
 
-Once the agent has used a result, the raw text rarely matters again. Anthropic calls tool result clearing "one of the safest lightest touch forms of compaction". It is safe because the data is usually not lost: a file can be read again, a search can be run again. A4.4 explained the API feature and its defaults. The design question for an agent is when to clear.
+Once the agent has used a result, the raw text rarely matters again. Anthropic calls tool result clearing "one of the safest lightest touch forms of compaction". It is safe. The reason is that the data is usually not lost. A file can be read again, and a search can be run again. A4.4 explained the API feature and its defaults. The design question for an agent is when to clear.
 
 Clear in batches, not on every step. Say your trigger is 100,000 tokens. The agent runs freely up to it, then drops all but the newest few results in one move. This is our reasoning, not a quoted rule: a prompt cache (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) matches an unchanged prefix. Clearing a little on each step would change the prefix on each step. One big clear changes it once and then leaves it stable until the next trigger. Keep the system prompt and tool definitions in front so they stay cached, as in lesson [A4.5](/learn/ai/a4-context/cache-friendly-layout/).
 
 ## Tactic 3: notes outside the window
 
-Clearing removes the data. It does not remove the decision you made from the data. If the agent read a 4,000-token config file at step 8 and decided "use the adapter pattern", the decision must live somewhere that survives.
+Clearing removes the data. It does not remove the decision you made from the data. If the agent read a 4,000-token config file at step 8, it reached a decision. The decision was "use the adapter pattern". That decision must live somewhere that survives.
 
-Anthropic names the pattern: "Like Claude Code creating a to-do list, or your custom agent maintaining a NOTES.md file". Agents write notes to a file outside the window and pull them back later. In its long-running harness post, Anthropic uses a `claude-progress.txt` file that "keeps a log of what agents have done", plus git history. A new session is told to "read the git logs and progress files to get up to speed", because "each new session begins with no memory of what came before".
+Anthropic names the pattern: "Like Claude Code creating a to-do list, or your custom agent maintaining a NOTES.md file". Agents write notes to a file outside the window and pull them back later. In its long-running harness post, Anthropic uses a `claude-progress.txt` file that "keeps a log of what agents have done", plus git history. A new session is told to "read the git logs and progress files to get up to speed". The reason is that "each new session begins with no memory of what came before".
 
 For a backend engineer, this is a write-ahead log and a checkpoint. The window is volatile memory. The notes file is the durable store you replay from. Lesson [A6.7](/learn/ai/a6-agents/agent-memory/) covers memory in general. Here the point is narrow: notes are cheap, and they decide what clearing and compaction can safely drop.
 
 ## Tactic 4: just-in-time retrieval
 
-You can load everything up front, or keep light identifiers and load on demand. Anthropic calls the second approach just-in-time: the agent keeps "file paths, stored queries, web links", and tools such as glob and grep "allow it to navigate its environment and retrieve files just-in-time". It also uses Bash commands such as `head` and `tail` to look at big data without loading all of it.
+You can load everything up front, or keep light identifiers and load on demand. Anthropic calls the second approach just-in-time. The agent keeps "file paths, stored queries, web links". Tools such as glob and grep "allow it to navigate its environment and retrieve files just-in-time". It also uses Bash commands such as `head` and `tail` to look at big data without loading all of it.
 
 The trade-off is speed against tokens. Preloading is one fast step but fills the window with data you may not use. Just-in-time costs extra tool calls, and each call is a model round trip. A path costs a few tokens. The file it points to may cost thousands.
 
 ## Tactic 5: send the wide work to a subagent
 
-If a task needs a wide search, do not run it in the main window. A subagent explores in its own window and returns a short summary. Anthropic says the exploration "might use tens of thousands of tokens or more", and the sub-agent "returns only a condensed, distilled summary of its work (often 1,000-2,000 tokens)". Lesson [A6.10](/learn/ai/a6-agents/subagents/) covers this in full.
+If a task needs a wide search, do not run it in the main window. A subagent explores in its own window and returns a short summary. Anthropic says the exploration "might use tens of thousands of tokens or more". Anthropic also says the sub-agent "returns only a condensed, distilled summary of its work (often 1,000-2,000 tokens)". Lesson [A6.10](/learn/ai/a6-agents/subagents/) covers this in full.
 
 Now watch one run with and without clearing and notes.
 
@@ -60,7 +60,7 @@ Now watch one run with and without clearing and notes.
 
 ## The cost of a long run
 
-Cost is the sum of the context size at every call, not the final size. In the walk above, the plain run sends 5,000 + 4,500 x (k - 1) tokens at call k. Over 44 calls that is 44 x 5,000 + 4,500 x (0 + 1 + ... + 43) = 220,000 + 4,500 x 946 = 4,477,000 input tokens. Add 44 x 500 = 22,000 output tokens. At Claude Sonnet 5.5 prices of $2 per million input and $10 per million output (as of 2026-10-16, [claude.com/pricing](https://claude.com/pricing)), that is $8.95 + $0.22 = $9.17, and the run still fails at call 45.
+Cost is the sum of the context size at every call, not the final size. In the walk above, the plain run sends 5,000 + 4,500 x (k - 1) tokens at call k. Over 44 calls, the total is 44 x 5,000 + 4,500 x (0 + 1 + ... + 43). That is 220,000 + 4,500 x 946 = 4,477,000 input tokens. Add 44 x 500 = 22,000 output tokens. At Claude Sonnet 5.5 prices, input costs $2 per million and output costs $10 per million. These prices are as of 2026-10-16 ([claude.com/pricing](https://claude.com/pricing)). The cost is $8.95 + $0.22 = $9.17, and the run still fails at call 45.
 
 The managed run clears when the next call reaches 100,000 tokens, and keeps the newest 3 results in full. It completes 50 calls with 2,902,100 input tokens: $5.80 + $0.25 = $6.05. It used a third less input, and it finished. Try your own numbers below. The model is ours: cleared results shrink to 20 tokens, no cache, notes add 200 tokens every 5 steps.
 
@@ -70,7 +70,7 @@ Notice two things. First, with large tool results the plain run dies early, and 
 
 ## Numbers
 
-Suppose each turn adds 6,000 tokens, all of it tool results, and the window is 200,000. With no action, 200,000 / 6,000 = 33.3, so 33 turns. Suppose clearing removes 70% of each result. Then the net growth is 6,000 x 0.30 = 1,800 tokens per turn, and 200,000 / 1,800 = 111 turns. Real agents also carry a system prompt and a reserve for the answer, and clearing is not instant, so treat 111 as an upper bound.
+Suppose each turn adds 6,000 tokens, all of it tool results, and the window is 200,000. With no action, 200,000 / 6,000 = 33.3, so 33 turns. Suppose clearing removes 70% of each result. Then the net growth is 6,000 x 0.30 = 1,800 tokens per turn, and 200,000 / 1,800 = 111 turns. Real agents also carry a system prompt and a reserve for the answer. Clearing is not instant, so treat 111 as an upper bound.
 
 <Ballpark
   client:visible

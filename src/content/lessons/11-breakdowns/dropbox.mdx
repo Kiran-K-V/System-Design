@@ -14,7 +14,7 @@ import DropboxChunks from '../../../components/anim/lessons/DropboxChunks.tsx';
 
 You edit a 2 GB video project on your laptop and save. Your phone and your teammate's computer must show the new version soon. The naive plan is to upload the whole file after each save and let every device download the whole file. That sends 2 GB for a change that may touch a few megabytes.
 
-A file sync service has to move large files, over weak links, to many devices, without sending bytes it already has. Lesson [8.11](/learn/08-technologies/blob-storage/) taught the storage parts: pre-signed URLs, multipart upload, and a CDN. Lesson [9.6](/learn/09-patterns/large-blobs/) turned them into a pattern. This lesson puts them together and adds three ideas: chunking by hash, content-based dedupe, and cursor-based sync.
+A file sync service has to move large files over weak links to many devices. It must do this without sending any bytes it already has. Lesson [8.11](/learn/08-technologies/blob-storage/) taught the storage parts: pre-signed URLs, multipart upload, and a CDN. Lesson [9.6](/learn/09-patterns/large-blobs/) turned them into a pattern. This lesson puts them together and adds three ideas: chunking by hash, content-based dedupe, and cursor-based sync.
 
 ## Requirements
 
@@ -33,9 +33,9 @@ A file sync service has to move large files, over weak links, to many devices, w
 
 - Chunks in a 50 GiB file: 50 × 1,024 MiB ÷ 8 MiB = **6,400 chunks**. That is under the 10,000-part limit of one S3 multipart upload, so one multipart upload can carry the file.
 - Upload time at 100 Mbit/s: 50 GB is 400 gigabits. 400 ÷ 0.1 = 4,000 seconds, about **67 minutes**. A link failure in that hour is likely. So uploads must resume, which is why chunks matter.
-- Chunk list size: each SHA-256 hash is 32 bytes. 6,400 × 32 B = 204,800 B, about **200 KB** of metadata for a 50 GiB file. Tiny next to the file.
+- Chunk list size: each SHA-256 hash is 32 bytes. The list is 6,400 × 32 B = 204,800 B, about **200 KB** of metadata for a 50 GiB file. Tiny next to the file.
 
-One company claim as context: Dropbox's engineering blog says every file is split into 4 MB blocks, each identified by a SHA-256 hash, and a file is the ordered list of those hashes. This is a claim from their article on streaming file synchronization, not our measurement. Our 8 MiB chunks are our own choice. The idea is the same.
+One company claim, as context: Dropbox's engineering blog says every file is split into 4 MB blocks. Each block is identified by a SHA-256 hash. A file is the ordered list of those hashes. This is a claim from their article on streaming file synchronization, not our measurement. Our 8 MiB chunks are our own choice. The idea is the same.
 
 <Ballpark
   client:visible
@@ -76,7 +76,7 @@ Step through it. Note that the app servers never touch file bytes.
 
 <DropboxBuild client:visible />
 
-**Why direct upload.** Suppose file bytes went through the API servers. Each would hold a long connection for an hour, and an API gateway often caps a request at about 10 MB ([lesson 8.10](/learn/08-technologies/api-gateway/)). A pre-signed URL lets the client write to object storage directly. The service only signs the URL, and the signature expires quickly. Use a short expiry, such as minutes, so a leaked URL stops working soon.
+**Why direct upload.** Suppose file bytes went through the API servers. Each would hold a long connection for an hour. An API gateway often caps a request at about 10 MB ([lesson 8.10](/learn/08-technologies/api-gateway/)). A pre-signed URL lets the client write to object storage directly. The service only signs the URL, and the signature expires quickly. Use a short expiry, such as minutes, so a leaked URL stops working soon.
 
 **Two writes can disagree.** The file row and the chunk objects are in two systems. Mark a file `pending` until `complete` succeeds and every chunk is confirmed present. A cleanup job aborts stale uploads so unused parts stop costing money. Lesson [8.11](/learn/08-technologies/blob-storage/) covers this.
 
@@ -84,9 +84,9 @@ Step through it. Note that the app servers never touch file bytes.
 
 ## Deep dive 1: big files and resume
 
-One `POST` of a whole 50 GiB file fails at once: it exceeds any gateway limit, and a drop at minute 66 restarts from zero. The fix is the multipart pattern from lesson [9.6](/learn/09-patterns/large-blobs/). The client cuts the file into chunks. Each chunk is its own request. Parts go in parallel. After a failure, the client asks which parts exist (S3 offers `ListParts`) and sends only the missing ones. Finally one `complete` call joins them.
+One `POST` of a whole 50 GiB file fails at once: it exceeds any gateway limit. A drop at minute 66 restarts from zero. The fix is the multipart pattern from lesson [9.6](/learn/09-patterns/large-blobs/). The client cuts the file into chunks. Each chunk is its own request. Parts go in parallel. After a failure, the client asks which parts exist (S3 offers `ListParts`) and sends only the missing ones. Finally one `complete` call joins them.
 
-Resume is why 8 MiB beats 5 GB: a failed chunk costs a few seconds, not an hour. Too small is also bad. At 8 KiB there would be 6.5 million chunks for 50 GiB, a metadata row for each, and a request for each. Chunk size trades retry cost against bookkeeping cost.
+Resume is why 8 MiB beats 5 GB: a failed chunk costs a few seconds, not an hour. Too small is also bad. At 8 KiB there would be 6.5 million chunks for 50 GiB. There would be a metadata row for each chunk, and a request for each chunk. Chunk size trades retry cost against bookkeeping cost.
 
 ## Deep dive 2: dedupe and delta sync
 
@@ -105,13 +105,13 @@ With **content-defined chunking**, a chunk boundary depends on the bytes near it
 
 Hashing needs a strong function. SHA-256 makes an accidental match practically impossible, so equal hash can mean equal bytes.
 
-**A privacy probe.** If one user's upload is skipped because the hash exists, then upload speed tells that user the content is stored. Someone holding a file's hash could learn whether another account has the file. Interviewers like this question. Answers: dedupe only inside one account or organization, or require the client to prove it holds the bytes before the server skips the upload.
+**A privacy probe.** If one user's upload is skipped because the hash exists, then upload speed tells that user the content is stored. Someone holding a file's hash could learn whether another account has the file. Interviewers like this question. Answers: dedupe only inside one account or organization. Or require the client to prove it holds the bytes before the server skips the upload.
 
 ## Deep dive 3: sync
 
 A device must learn about changes made elsewhere. Polling `GET /files` every second for every user is wasteful: most polls find nothing. Instead each device keeps a **cursor**, a number that grows with every change in that user's account. The device asks `GET /changes?cursor=1840` and receives only entries after 1840, plus a new cursor. If the device was offline for a week, the same call catches it up.
 
-To avoid a poll loop, add a push channel. When the sync service sees a change, it sends a small nudge ("something changed") over a long-lived connection ([lesson 2.5](/learn/02-networking/real-time-transport/)), and the device then calls `/changes`. The nudge carries no data, so a missed nudge costs only delay: the device still polls now and then as a safety net. After `/changes`, the device compares chunk hashes and downloads only chunks it lacks.
+To avoid a poll loop, add a push channel. When the sync service sees a change, it sends a small nudge ("something changed") over a long-lived connection ([lesson 2.5](/learn/02-networking/real-time-transport/)). The device then calls `/changes`. The nudge carries no data, so a missed nudge costs only delay. The device still polls now and then as a safety net. After `/changes`, the device compares chunk hashes and downloads only chunks it lacks.
 
 If two devices change the same file while offline, you have a conflict. A simple rule is to keep both: save the second version under a new name, such as "report (conflicted copy)". Do not discard a user's edit silently.
 
@@ -135,7 +135,7 @@ Do not store files in the database. Do not push the bytes through your API serve
 </Callout>
 
 <Callout type="deep" title="A hash as an address">
-When a chunk is named by its hash, the name is also a checksum. After a download the client re-hashes the bytes. If the result differs from the name, the chunk is corrupt, and the client can fetch it again. This gives an integrity check for free. It also makes chunks immutable: the same name always means the same bytes, so chunks are easy to cache and safe to share.
+When a chunk is named by its hash, the name is also a checksum. After a download the client re-hashes the bytes. If the result differs from the name, the chunk is corrupt, and the client can fetch it again. This gives an integrity check for free. It also makes chunks immutable: the same name always means the same bytes. So chunks are easy to cache and safe to share.
 </Callout>
 
 ## Check yourself

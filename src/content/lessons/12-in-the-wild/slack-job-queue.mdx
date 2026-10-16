@@ -19,9 +19,9 @@ This is a queue (lesson [6.1](/learn/06-async/queues/)). A queue only protects y
 
 ## Before: jobs in Redis memory
 
-**What Slack says.** The web app picks one of the configured Redis hosts "based on a hash" of the job identifier and the logical queue. Workers poll Redis. A worker moves a job from the pending queue to an in-flight list and starts a task. Failed jobs go to a retry queue a set number of times. Jobs that never succeed go to a list of permanently failed jobs, which people inspect by hand (lesson [6.4](/learn/06-async/backpressure-dlq/)).
+**What Slack says.** The web app picks one of the configured Redis hosts "based on a hash". The hash is computed over the job identifier and the logical queue. Workers poll Redis. A worker moves a job from the pending queue to an in-flight list and starts a task. Failed jobs go to a retry queue a set number of times. Jobs that never succeed go to a list of permanently failed jobs, which people inspect by hand (lesson [6.4](/learn/06-async/backpressure-dlq/)).
 
-The outage began with database contention. Jobs ran slowly, so they piled up, "which caused Redis to reach its maximum configured memory limit". New jobs could not be enqueued. Then came the nasty part: "our system actually required a bit of free Redis memory in order to dequeue a job". The queue stayed locked after the database recovered.
+The outage began with database contention. Jobs ran slowly, so they piled up, "which caused Redis to reach its maximum configured memory limit". New jobs could not be enqueued. Then came the nasty part. The post says "our system actually required a bit of free Redis memory in order to dequeue a job". The queue stayed locked after the database recovered.
 
 The post lists more limits. Redis had little operational headroom, "particularly with respect to memory". Connections formed "a complete bipartite graph", since every client talks to every Redis host. Workers "couldn't scale independently of Redis". And "dequeuing a job requires work proportional to the length of the queue".
 
@@ -33,7 +33,7 @@ The post lists more limits. Redis had little operational headroom, "particularly
 
 Two stateless Go services connect the pieces.
 
-- **Kafkagate** takes an HTTP POST with a topic, partition, and content, and writes to Kafka with the Sarama driver. It waits only for the partition leader: "we only wait for the leader to acknowledge the request, and not for replication". The post says this carries a small risk of losing a job if a broker dies first.
+- **Kafkagate** takes an HTTP POST with a topic, partition, and content, and writes to Kafka with the Sarama driver. It waits only for the partition leader. The post says "we only wait for the leader to acknowledge the request, and not for replication". The post says this carries a small risk of losing a job if a broker dies first.
 - **JQRelay** moves jobs from Kafka to Redis. At startup it tries to take a Consul lock on a key for the topic. The winner relays all partitions of that topic. It "only advances the offset if the job is successfully written to Redis". For a Redis outage it retries without end. For a job-specific error it re-enqueues the job to Kafka. Rate limits live in Consul.
 
 When enqueues outpace dequeues, Kafka holds the backlog. Operators can lower JQRelay's rate limit or pause writes to Redis.
@@ -74,7 +74,7 @@ Waiting for only the leader favors enqueue availability over durability. The pos
 ## Interview takeaways
 
 <Callout type="tip">
-Say: "I would put a durable log in front of the memory-bound store so a spike becomes a backlog on disk. A relay drains it at a tunable rate and commits the offset only after the write succeeds. Workers are idempotent." Then state your ack choice and why.
+Say: "I would put a durable log in front of the memory-bound store. As a result, a spike becomes a backlog on disk. A relay drains it at a tunable rate and commits the offset only after the write succeeds. Workers are idempotent." Then state your ack choice and why.
 </Callout>
 
 <Callout type="mistake">
