@@ -1,0 +1,244 @@
+---
+summary: 'An LLM gateway puts one internal API in front of several providers. It adds aliases, fallback on 429, 529, and 5xx, routing by cost or capability, tenant keys and quotas, a cache, and logs. A fallback model needs its own eval.'
+requires: ['ai/a3-llm-apis/limits-retries-idempotency', '08-technologies/api-gateway']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai3GwWalk from '../../../../components/anim/lessons/Ai3GwWalk.tsx';
+import Ai3GwRouter from '../../../../components/anim/lessons/Ai3GwRouter.tsx';
+
+## The problem
+
+Your product calls one model provider. One afternoon the provider is overloaded. Anthropic's error page says a 529 `overloaded_error` "can occur when the API experiences high traffic across all users". Your users see errors. Your retries make the load worse (lesson [A3.6](/learn/ai/a3-llm-apis/limits-retries-idempotency/)).
+
+Three other pains come from the same root. Each team in the company keeps its own provider key, so you cannot say who spent what. A model upgrade means a code change in ten services. And a tenant with a loop bug can burn the whole account's rate limit.
+
+A provider outage is your outage, unless a layer between your code and the providers can absorb it. That layer is a gateway.
+
+## What you already know
+
+<CrossTrackLink id="08-technologies/api-gateway">
+An API gateway is the one front door for client traffic. It ends TLS, checks identity, limits rates, and routes each request to a service. It runs a fixed chain of cheap checks first, so bad traffic never reaches expensive work.
+</CrossTrackLink>
+
+An LLM gateway is the same idea turned around. It sits on the **outbound** side: between your services and the model providers. It still authenticates, limits, routes, caches, and logs. What changes is that the backends are not copies of one service. They are different vendors with different request formats, prices, and behavior. That is the new part of this lesson.
+
+## The mechanism
+
+### One internal API and model aliases
+
+The gateway exposes one request shape to your code. Inside, an adapter per provider translates to that provider's format and translates the answer back. Your code asks for an **alias** such as `chat-main` or `summarize-cheap`. The gateway config says which provider and model each alias means today.
+
+This is a lookup table you already know from service discovery. It buys two things. A model change is a config edit, not a deploy. And the alias is the unit you evaluate, budget, and report on.
+
+### Fallback on provider errors
+
+Step through one request where the primary provider fails.
+
+<Ai3GwWalk client:visible />
+
+A fallback should fire on errors that another target can fix: 429 (rate limited), 529 (overloaded), 5xx, and timeouts. It should not fire on a 400, because a malformed request fails everywhere. Check the default of your product. Portkey's docs say that without `on_status_codes` "fallback triggers on any non-2xx status code". Cloudflare AI Gateway triggers a fallback "if a model request returns an error", and can also trigger on timeouts. Set the list on purpose.
+
+Two cases need care.
+
+- **Spend-cap 429.** Anthropic's errors page says a tier spend-cap 429 has no `retry-after` header and "keeps failing until access resumes". Retrying the same provider cannot work. A second provider can.
+- **Retry multiplication.** The Anthropic SDK retries twice by default. If your gateway also retries, and your app retries, one user request can become many provider calls. Decide which layer owns retries.
+
+### The fallback model needs its own eval
+
+Here is the trap. The gateway makes the swap invisible to the app. It does not make the *answers* equal. A prompt tuned on model A runs on model B with different wording, different length, and sometimes a different format.
+
+Tool calls show it clearly. Anthropic returns `tool_use` blocks, OpenAI returns `function_call` items, and Gemini returns `function_call` steps (lesson A3.4). The gateway can translate shapes, but if it translates one parameter badly, a request that worked on A fails on B. Prompt caches also stay with one provider, so the first calls after a failover pay full input price.
+
+So a fallback target is not ready until you run your golden set (lesson A0.2) against it and see it clear your quality bar. Otherwise the gateway turns a loud outage into a quiet quality drop. Log which model answered, so that drop is visible.
+
+### Routing by cost, latency, or capability
+
+Routing picks the target for each request. Three common rules:
+
+- **Cheapest capable.** Send easy requests to a small model and hard ones to a strong model. A cascade tries the cheap model first and escalates when a check fails.
+- **Fastest.** Prefer the target with the lowest recent latency.
+- **Strongest.** Prefer the best model, and fall back down the list.
+
+The simulator below uses three Claude models. Try the cheapest policy with all targets up. Then switch Haiku off and watch the route move to Sonnet. Then take down every capable model for a hard task. The prices are real (as of 2026-10-16). The capability levels and latencies are made up, so only the shape of the behavior transfers.
+
+<Ai3GwRouter client:visible />
+
+Cost per request at one price point:
+
+<Math block tex="c = \frac{n_{\text{in}} \times p_{\text{in}} + n_{\text{out}} \times p_{\text{out}}}{10^{6}}" />
+
+In words: tokens in times the input price, plus tokens out times the output price, per million. For 3,000 input and 500 output tokens: Opus 5.5 ($4 in, $20 out) costs $0.0120 + $0.0100 = $0.0220. Haiku 5.5 ($0.10 in, $0.50 out, prompts up to 100K tokens) costs $0.0003 + $0.00025 = $0.00055. If a share <Math tex="s" /> of traffic can go to the cheap model, the blend is:
+
+<Math block tex="c_{\text{blend}} = s \cdot c_{\text{cheap}} + (1 - s) \cdot c_{\text{strong}}" />
+
+With s = 0.7: 0.7 x $0.00055 + 0.3 x $0.0220 = $0.0070 per request. That is 32% of the all-Opus price. The 70% is only safe if an eval shows the cheap model clears the bar on that share of requests. Routing without an eval is a guess.
+
+Prices: [claude.com/pricing](https://claude.com/pricing), as of 2026-10-16.
+
+### Tenant keys, quotas, cache, and logs
+
+- **Keys and quotas.** Give each tenant (or team or feature) its own gateway key. The gateway holds the real provider keys. A tenant over its quota gets a 429 from the gateway, before any provider cost. This is the token bucket of lesson 7.4, applied per tenant and per tokens, not only per request.
+- **Cache.** An exact-match cache hashes the whole request and returns the stored answer on a repeat. Cloudflare's docs say its cache is "based on exact match of the entire request", with a TTL from 60 seconds to one month, and that semantic caching is planned, not shipped. Put the tenant id in the cache key. If you leave it out, one tenant can be served another tenant's answer.
+- **Logs.** Log tenant, alias, the model that really answered, token counts, latency, status, and a `fell_back` flag. Prompts hold user data, so decide retention and redaction first. These records are the input to cost metering (lesson A3.9).
+
+## Products
+
+All facts below come from each product's docs on 2026-10-16.
+
+| Product | Routing and fallback | Notes |
+|---|---|---|
+| LiteLLM | Strategies named `simple-shuffle` (default), `latency-based-routing`, `least-busy`, `cost-based-routing`, `usage-based-routing`. Priority `order` levels escalate on connection errors, 404, and 429. | Library or proxy you run. Its docs disagree on cooldown and retry defaults, so set your own and test them. |
+| OpenRouter | Hosted. By default spreads load across providers, weighted by the inverse square of price. `sort` or `order` turns that off. `allow_fallbacks` is `true` by default. | `require_parameters` is `false` by default, so a provider can ignore a parameter without an error. Set it to `true` if you rely on tools or a response format. |
+| Portkey | `strategy.mode` set to `fallback` with a target list. Optional `on_status_codes`. | Default is any non-2xx, so list the codes yourself. |
+| Cloudflare AI Gateway | Fallback is an array of request objects. The `cf-aig-step` header says which step answered, 0 for the primary. | Exact-match cache with `cf-aig-cache-status` of `HIT` or `MISS`. |
+| Envoy AI Gateway | Named here only. | I could not confirm its fallback or quota features from its docs. Check before you rely on it. |
+
+## Build or buy
+
+Buy (or adopt open source) first. Aliases, fallback, and key management are solved problems, and a product gives them in a day. Build when one of these holds: data may not leave your network and no product fits that rule, you need routing logic tied to your own eval results, or the gateway must sit inside an existing platform team's proxy. Even then, a thin layer over an open library often beats a from-scratch build. Two cautions apply to both paths. The gateway is a shared hop and a single point of failure, so run it as several stateless copies. And keep business logic out of it, as in the backend lesson.
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| One provider, no gateway | Fewest moving parts | Outage is your outage, no per-tenant view | Prototype or internal tool |
+| Gateway with fallback | Survives 429, 529, 5xx | Eval per target, extra hop, format drift | Customer-facing product |
+| Cost routing | Blended cost falls | Quality risk, needs an eval per route | Large share of easy traffic |
+| Exact-match cache | Repeat calls cost nothing | Low hit rate on free text, tenant leak if key is wrong | FAQ-like or batch traffic |
+| Self-hosted fallback | Works when all vendors fail | Ops, weaker model, GPU cost | Strict uptime or privacy rules |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I would put an LLM gateway in front of the providers, with aliases so code never names a model. It falls back on 429, 529, and 5xx, but I would only list a fallback model after it passes the same eval. I would log which model answered and meter tokens per tenant." Then give the blended-cost number with its assumption.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we have a fallback provider, so we are safe" without saying that the fallback was evaluated. Do not retry in the app, the SDK, and the gateway at once. Do not cache without the tenant in the key. And do not fall back on a 400.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="a3-8-fallback-format"
+  title="Failover worked, but the parser breaks"
+  scenario="A provider outage starts at 14:00. The gateway falls back to a second provider and every request returns 200. At 14:05 the order service starts throwing parse errors on the model's tool calls. Before 14:00 there were none."
+  steps={[
+    {
+      prompt: 'What most likely differs between the two providers?',
+      options: [
+        'The HTTP status code the gateway returns to the order service',
+        'The shape of the tool call and the exact output format the model produces',
+        'The tenant key the order service sends to the gateway',
+        'The cache TTL that the gateway applies to repeat requests',
+      ],
+      answer: 1,
+      explain: 'The 200 shows the transport works. Providers return tool calls in different shapes, and a different model may format fields differently even after translation. The tenant key and cache TTL would not change a parse of the answer.',
+    },
+    {
+      prompt: 'Which fix prevents the next incident?',
+      options: [
+        'Remove the fallback so that errors stay loud and visible',
+        'Retry the failed parse on the same provider until it works',
+        'Evaluate the fallback on the golden set before routing to it',
+        'Raise the primary provider’s rate limit with the vendor',
+      ],
+      answer: 2,
+      explain: 'The fallback was never tested for the output the downstream code needs. An eval on the fallback finds the break before an outage does. Removing it brings the outage back. A retry on the same provider does not touch the cause.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Blended cost with routing"
+  scenario="A gateway routes 70% of requests to Claude Haiku 5.5 ($0.10 in, $0.50 out per million tokens) and 30% to Claude Opus 5.5 ($4 in, $20 out per million). Each request has 3,000 input and 500 output tokens. Prices as of 2026-10-16."
+  steps={[
+    {
+      prompt: 'Cost of one request on Opus 5.5, in dollars?',
+      unit: 'dollars',
+      answer: 0.022,
+      within: 1.1,
+      explain: '3,000 x $4 / 1,000,000 = $0.012. 500 x $20 / 1,000,000 = $0.010. Total $0.022.',
+    },
+    {
+      prompt: 'Cost of one request on Haiku 5.5, in dollars?',
+      unit: 'dollars',
+      answer: 0.00055,
+      within: 1.1,
+      explain: '3,000 x $0.10 / 1,000,000 = $0.0003. 500 x $0.50 / 1,000,000 = $0.00025. Total $0.00055.',
+    },
+    {
+      prompt: 'Blended cost per request with a 70/30 split, in dollars?',
+      unit: 'dollars',
+      answer: 0.006985,
+      within: 1.1,
+      explain: '0.7 x $0.00055 + 0.3 x $0.022 = $0.000385 + $0.0066 = $0.006985. About $7,000 per million requests, against $22,000 for all Opus.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'a3-8-q-fallback-codes',
+      q: 'Which response from a provider should make a gateway try the next target?',
+      options: [
+        'A 400 error, because the request was refused',
+        'A 529 overloaded error: the next target may have room',
+        'A 200 with a short answer, because short answers are often wrong',
+        'A 401 error, because the next provider shares the same key',
+      ],
+      answer: 1,
+      explain: 'A 529, like a 429 or 5xx, is about the provider’s state, so another target can succeed. A 400 is about the request, so every provider would refuse it. A 401 points at a credential problem you must fix, not a capacity problem. A short 200 is a quality matter, not a fallback trigger.',
+    },
+    {
+      id: 'a3-8-q-blend',
+      q: 'A route sends 70% of requests to a model at $0.00055 per request and 30% to a model at $0.022. What is the blended cost per request?',
+      options: ['About $0.0165', 'About $0.0070', 'About $0.0156', 'About $0.0113'],
+      answer: 1,
+      explain: '0.7 x 0.00055 + 0.3 x 0.022 = 0.000385 + 0.0066, about $0.0070. $0.0156 swaps the shares. $0.0113 is a plain average of the two prices, which ignores the split.',
+    },
+    {
+      id: 'a3-8-q-cache-key',
+      q: 'A gateway caches by a hash of the request body only. Two tenants send the same prompt. What can go wrong?',
+      options: [
+        'The second tenant is billed twice for the same tokens',
+        'The provider rejects the repeated prompt as a duplicate',
+        'The second tenant gets the first tenant’s stored answer',
+        'The cache TTL resets and the entry expires at once',
+      ],
+      answer: 2,
+      explain: 'An exact-match cache returns any stored answer whose key matches. With no tenant in the key, tenants share entries, and an answer built from one tenant’s context can reach another. Billing and TTL are not affected by the key.',
+    },
+    {
+      id: 'a3-8-q-fallback-eval',
+      q: 'Why does a fallback model need its own eval, even if the gateway translates the request format?',
+      options: [
+        'Translation removes the need for any caching on the fallback path',
+        'The gateway cannot send traffic to a model that was never tested for latency',
+        'Providers charge more for a model that has no eval record on file',
+        'The same prompt can behave differently on another model',
+      ],
+      answer: 3,
+      explain: 'Format translation fixes the wire shape, not the behavior of the model. A prompt tuned on one model can break a parser or lower quality on another. The other options describe things that are not true or are unrelated.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [LiteLLM, Router: load balancing and fallbacks](https://docs.litellm.ai/docs/routing): routing strategy names and priority levels.
+- [OpenRouter, Provider routing](https://openrouter.ai/docs/guides/routing/provider-selection): default load balancing, `allow_fallbacks`, `require_parameters`.
+- [Portkey, Fallbacks](https://portkey.ai/docs/product/ai-gateway/fallbacks): `strategy.mode` and `on_status_codes`.
+- [Cloudflare AI Gateway, Fallbacks](https://developers.cloudflare.com/ai-gateway/configuration/fallbacks/) and [Caching](https://developers.cloudflare.com/ai-gateway/features/caching/).
+- [Claude API errors](https://platform.claude.com/docs/en/api/errors): 429, 529, spend-cap behavior, SDK retries.
+- [Claude pricing](https://claude.com/pricing): the prices used above.

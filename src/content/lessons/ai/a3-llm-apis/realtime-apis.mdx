@@ -1,0 +1,217 @@
+---
+summary: 'Voice and live apps need a persistent two-way connection, not request and response. Learn speech-to-speech against a cascade, WebRTC against WebSocket, turn detection, barge-in with transcript truncation, and a latency budget.'
+requires: ['ai/a3-llm-apis/streaming', '02-networking/real-time-transport']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai3RtTurn from '../../../../components/anim/lessons/Ai3RtTurn.tsx';
+import Ai3RtBudget from '../../../../components/anim/lessons/Ai3RtBudget.tsx';
+
+## The problem
+
+A user talks to a voice assistant. With the tools you know so far, the app would record the whole sentence, send it as a request, wait for the full answer, and play it. Two things go wrong.
+
+- **It feels slow.** The user waits for the end of the request, for the model, and for the audio.
+- **The user cannot interrupt.** A person who hears a wrong answer says "no, I meant Tuesday" at once. A request and response call has no way to hear that while the answer plays.
+
+Voice needs a connection that stays open and carries audio **both ways at the same time**. Events flow up (microphone chunks) and down (transcripts, model audio, signals about who is speaking). That is a different API shape from lesson A3.2, where the server streams one answer to one request.
+
+Module A12 covers voice in depth, including the latency numbers. This lesson covers the API side: the connection, the events, and the cancel.
+
+## Two ways to build a voice agent
+
+A **cascaded** pipeline chains three components: speech to text (STT), a text LLM, and text to speech (TTS). A **speech-to-speech** model takes audio in and gives audio out in one model.
+
+| | Cascaded (STT, LLM, TTS) | Speech to speech |
+|---|---|---|
+| Parts | Three services you can swap one by one | One model and one session |
+| Text in the middle | Yes: log it, filter it, run guardrails and tools on it | The API gives transcripts, but the model works on audio |
+| Delay | Each stage adds time before the next can start | One model, so fewer hops to first audio |
+| Debugging | You can inspect each stage | You see events and transcripts only |
+
+The table is design reasoning, not a benchmark. Which one wins depends on your eval and your latency budget. OpenAI's Realtime guide describes its speech-to-speech session as one where "the agent handles audio turns, tools, interruptions, and handoffs inside that session". Gemini's Live API is also a speech-to-speech style API on a persistent connection. A cascade stays useful when you need full control of each stage or must run a text-only guardrail on every sentence.
+
+## The connection: WebRTC or WebSocket
+
+<CrossTrackLink id="02-networking/real-time-transport">
+HTTP only answers questions. SSE, WebSocket, and WebRTC let the server speak first. WebSocket is one long two-way connection through your servers. WebRTC sends media straight between peers, with NAT traversal and a relay as fallback.
+</CrossTrackLink>
+
+For model APIs, the choice follows from who holds the API key. As of 2026-10-16:
+
+| API | Browser or phone | Your own server |
+|---|---|---|
+| OpenAI Realtime | WebRTC, with an ephemeral client secret that your server requests (`/v1/realtime/client_secrets`) | WebSocket |
+| Gemini Live | A stateful WebSocket (WSS) straight from the client is allowed. The page recommends ephemeral tokens over standard API keys in production | Server to server over the same WebSocket |
+
+The rule is the same for both. **Never ship a long-lived API key to a browser.** Your server mints a short-lived token, and the client uses it. A second difference matters for interruption. On WebRTC and SIP, OpenAI says "the server manages a buffer of output audio". On a WebSocket, the client controls playback. That decides who must act at barge-in, as the next section shows.
+
+## Events, turns, and barge-in
+
+### Turn detection
+
+Who decides that the user has finished? **Voice activity detection** (VAD) listens to the audio and detects speech start and stop. OpenAI's VAD guide says it is on by default in speech-to-speech sessions, emits `input_audio_buffer.speech_started` and `input_audio_buffer.speech_stopped`, and is set with `session.update` at `session.audio.input.turn_detection`. It has two modes:
+
+- `server_vad` splits turns on silence. `silence_duration_ms` is the silence needed to end a turn, and "shorter values end turns faster". `threshold` and `prefix_padding_ms` tune loudness and the audio kept from before speech.
+- `semantic_vad` uses a classifier that judges from the words whether the user is done. `eagerness` is `low`, `medium`, `high`, or `auto`. Trailing-off speech gets a longer wait than a complete sentence.
+
+This is a trade-off you set. A short silence limit makes replies come sooner, and it cuts off people who pause to think. A long limit does the opposite. The silence wait is also the first slice of your latency budget, as the widget below shows.
+
+### One voice turn with a barge-in
+
+Step through the events of a turn in which the user interrupts. Event names are the ones on OpenAI's Realtime pages on 2026-10-16.
+
+<Ai3RtTurn client:visible />
+
+Three rules come out of this.
+
+1. **Playback is separate from generation.** The model may have produced 10 seconds of speech while the user heard 3. At barge-in the app must stop the speaker at once, not wait for the queue to drain.
+2. **Truncate the transcript to what was heard.** OpenAI's conversations guide says that on WebSocket the client must stop audio itself and send a truncation request, and that on WebRTC the server truncates unplayed audio. If you skip it, the model's memory says it spoke words the user never heard.
+3. **Mute is not cancel.** OpenAI's WebSocket page for its newer GPT-Live endpoint says "Muting input does not cancel backend work or stop generated speech". Use the cancel and truncate path to stop an answer.
+
+OpenAI's current pages show two event vocabularies. The Realtime guide uses names such as `input_audio_buffer.append`, `response.output_audio.delta`, `response.cancel`, and `conversation.item.truncate`. The GPT-Live page uses `session.input_audio.append`, `session.output_audio.delta`, `session.input_transcript.delta`, and `response.create`. Pick one endpoint and read its own event reference. Do not mix names.
+
+### Sessions and state
+
+A realtime session holds state: its instructions, the conversation items so far, and the turn settings. A dropped connection can lose that state unless your server rebuilds it. The pages I read do not state session time limits. Check the current docs for the limit on your model, and design the reconnect path first.
+
+## Numbers
+
+**Audio on the wire.** Raw audio is cheap next to video, but it adds up. OpenAI's GPT-Live page lists `audio/pcm` at 24,000 Hz (the default) or 16,000 Hz, and `audio/pcmu` or `audio/pcma` at 8,000 Hz. Gemini Live takes 16-bit PCM at 16 kHz in and gives 16-bit PCM at 24 kHz out. At 24 kHz, 16 bits, one channel:
+
+<Math block tex="24{,}000 \times 2 \text{ bytes} = 48{,}000 \text{ bytes per second}" />
+
+That is 384 kilobits per second of raw PCM, before any codec. On a WebSocket the audio is base64 text inside JSON, which adds a third: 48,000 x 4/3 = 64,000 bytes per second.
+
+**Price.** OpenAI's pricing page lists realtime prices per million tokens, as of 2026-10-16:
+
+| Model | Modality | Input | Cached input | Output |
+|---|---|---|---|---|
+| gpt-realtime-2.1 | Audio | $32.00 | $0.40 | $64.00 |
+| gpt-realtime-2.1 | Text | $4.00 | $0.40 | $24.00 |
+| gpt-realtime-2.1-mini | Audio | $10.00 | $0.30 | $20.00 |
+| gpt-realtime-2.1-mini | Text | $0.60 | $0.06 | $2.40 |
+
+Source: [developers.openai.com/api/docs/pricing](https://developers.openai.com/api/docs/pricing). Audio output costs 2.7 times text output on gpt-realtime-2.1 ($64 against $24). The pages I read do not say how many tokens one second of audio is, so I cannot turn these prices into dollars per minute. Measure it: run a one-minute call and read the usage the session reports (lesson A3.9).
+
+**Latency budget.** The time from the end of user speech to the first audio is the sum of the stages. Move the sliders. Every default is made up for the demo, so replace them with your own measurements.
+
+<Ai3RtBudget client:visible />
+
+With the defaults, the cascade is 500 + 200 + 400 + 250 + 100 = 1,450 ms and speech to speech is 500 + 500 + 100 = 1,100 ms. The shared parts, the silence wait and the network, are 600 ms in both. A real cascade streams each stage into the next, for example it starts TTS on the first LLM tokens, so it runs faster than this sum. The widget leaves that out. Module A12 treats the budget in full.
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| Cascaded pipeline | Control of every stage, text guardrails | More hops, more services | Regulated flows, custom voices |
+| Speech to speech | One session, fewer hops | Less insight, audio token prices | Natural conversation |
+| WebRTC to browser | Media path built for audio, short-lived token | Signaling and NAT work | Browser and mobile clients |
+| WebSocket from server | Simple, you control playback | You must stop audio at barge-in | Phone bridges, server agents |
+| Short VAD silence | Faster replies | Cuts off pausing users | Short commands |
+| Semantic VAD | Fewer cut-offs | Classifier cost and delay | Open conversation |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "Voice needs a persistent duplex connection. I would use WebRTC for browsers with a server-minted ephemeral token, and a WebSocket from my server otherwise. VAD marks turns. On barge-in the client stops playback, truncates the item to what was heard, and the response is cancelled." Then give the latency budget as a sum of stages, and say which numbers you measured.
+</Callout>
+
+<Callout type="mistake">
+Do not treat the end of audio generation as the end of audio playback. Do not use mute to stop a reply. Do not put a long-lived API key in a client. And do not quote a latency target without saying where each slice of it goes.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="a3-10-keeps-talking"
+  title="The model keeps talking over the user"
+  scenario="A voice agent runs over a server-side WebSocket. The user interrupts, and the logs show input_audio_buffer.speech_started arriving. The speaker keeps playing the old answer for several seconds. Later the model refers to details the user never heard."
+  steps={[
+    {
+      prompt: 'Which handler is missing?',
+      options: [
+        'A speech_started handler that stops playback and clears the queue',
+        'A handler that raises the VAD threshold so interruptions are ignored',
+        'A handler that mutes the microphone while the model is speaking',
+        'A handler that reconnects the WebSocket every time a turn starts',
+      ],
+      answer: 0,
+      explain: 'On a WebSocket the client owns playback, so the speech_started event is the signal to stop the speaker and drop queued audio. Raising the threshold or muting hides the interruption instead of handling it.',
+    },
+    {
+      prompt: 'Why does the model refer to details the user never heard?',
+      options: [
+        'The VAD silence limit was set too long for this user',
+        'The item was never truncated to what was played',
+        'The WebSocket carried audio as base64, which hides some words',
+        'The session used semantic VAD instead of server VAD',
+      ],
+      answer: 1,
+      explain: 'Without conversation.item.truncate, the conversation keeps the full answer the model generated, not the part the user heard. The VAD mode and base64 encoding do not change what is stored.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'a3-10-q-transport',
+      q: 'A browser voice app uses OpenAI Realtime. How should the browser connect without exposing your API key?',
+      options: [
+        'WebRTC, with an ephemeral client secret that your server requests',
+        'A WebSocket that carries your standard API key in the page script',
+        'Plain HTTP polling every 100 ms from the page',
+        'Send the key once, then store it in local storage for later use',
+      ],
+      answer: 0,
+      explain: 'The guide says WebRTC is for the browser and uses an ephemeral client secret your server obtains. A key in page script or local storage can be read by any user of the page. Polling is not a duplex audio stream.',
+    },
+    {
+      id: 'a3-10-q-vad',
+      q: 'You shorten silence_duration_ms in server_vad from 700 ms to 300 ms. What is the most likely effect?',
+      options: [
+        'Replies start later, because the server waits for more audio',
+        'Replies come sooner, but pausing users get cut off more',
+        'Audio quality rises, because chunks are cut closer to words',
+        'Nothing changes, because this value only affects billing',
+      ],
+      answer: 1,
+      explain: 'The VAD guide says shorter values end turns faster. A person who pauses for 400 ms to think now ends the turn too early. The wait also drops from the latency budget, which is the gain.',
+    },
+    {
+      id: 'a3-10-q-bandwidth',
+      q: 'Raw PCM at 24,000 Hz, 16 bits, one channel. How many bytes per second does one direction carry, before base64 and codecs?',
+      options: ['24,000', '384,000', '64,000', '48,000'],
+      answer: 3,
+      explain: '24,000 samples per second x 2 bytes per sample = 48,000 bytes per second. 384,000 is the same stream in bits per second. 64,000 is the size after base64 adds one third.',
+    },
+    {
+      id: 'a3-10-q-mute',
+      q: 'The model is speaking and you want it to stop. Which action does the OpenAI GPT-Live WebSocket page say will not do it?',
+      options: [
+        'Truncating the item to the audio already played',
+        'Closing the session with session.close',
+        'Muting the input audio',
+        'Starting a new turn from the user speaking',
+      ],
+      answer: 2,
+      explain: 'The page says "Muting input does not cancel backend work or stop generated speech". Muting changes what the model hears, not what it is saying. Closing the session ends everything, and a new user turn can interrupt.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [OpenAI, Realtime API guide](https://developers.openai.com/api/docs/guides/realtime): transports and ephemeral secrets.
+- [OpenAI, Realtime conversations](https://developers.openai.com/api/docs/guides/realtime-conversations): events, interruption, and truncation.
+- [OpenAI, Voice activity detection](https://developers.openai.com/api/docs/guides/realtime-vad): `server_vad` and `semantic_vad`.
+- [OpenAI, Realtime WebSocket](https://developers.openai.com/api/docs/guides/realtime-websocket): the GPT-Live events and audio formats.
+- [Google, Gemini Live API](https://ai.google.dev/gemini-api/docs/live): WebSocket transport, barge-in, audio formats.
+- [OpenAI API pricing](https://developers.openai.com/api/docs/pricing): realtime token prices.

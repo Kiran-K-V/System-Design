@@ -8,6 +8,7 @@ Read `design/NEXT_LESSONS.md` first. Every rule there applies (lesson contract, 
 - Lesson id: `ai/<module-slug>/<lesson-slug>`, for example `ai/a1-model-function/tokens`.
 - Imports are one level deeper than backend lessons: `../../../../components/lesson/Quiz.tsx`, `../../../../components/anim/lessons/<Name>.tsx`.
 - Components: `src/components/anim/lessons/Ai<module><Name>.tsx`, for example `Ai1BpeMerge.tsx`, `Ai0MethodFlow.tsx`. The prefix stops collisions between parallel writers.
+- Elective modules (optional, last in the track) use ids `ai/e1-classic-ml/<lesson>`, `ai/e2-training/<lesson>`, `ai/e3-inference-deep/<lesson>`. They display as E1, E1.3 (the `label` field in `ai-syllabus.ts`), not A15. A core lesson (A0 to A14) must not require an elective lesson. The build fails if it does. Write a pointer to an elective as plain text, for example "elective E3.4".
 - The lesson spec (Write, Animate, Prove it, sources) for each lesson is in `AI_SYSTEM_DESIGN_PLAN.md` section 3. Follow it. You may improve an animation idea; do not drop the topic list.
 
 ## 2. Links and requires

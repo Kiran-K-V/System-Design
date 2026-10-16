@@ -11,6 +11,8 @@ export interface LessonOutline {
 export interface ModuleOutline {
   slug: string;
   title: string;
+  /** Overrides the number prefix for this module, e.g. "E1" for an elective. Lesson numbers become "E1.3". */
+  label?: string;
   lessons: LessonOutline[];
 }
 
@@ -214,7 +216,7 @@ export interface SyllabusModule {
   title: string;
   /** Position inside the track. */
   number: number;
-  /** Shown to readers: "4" for backend, "A4" for AI. */
+  /** Shown to readers: "4" for backend, "A4" for AI, "E1" for an AI elective. */
   label: string;
   track: TrackKey;
   lessons: SyllabusLesson[];
@@ -229,30 +231,33 @@ export function buildSyllabus(
   offset = 0,
 ): { modules: SyllabusModule[]; flat: SyllabusLesson[] } {
   const flat: SyllabusLesson[] = [];
-  const modules = outline.map((m, mi) => ({
-    slug: m.slug,
-    title: m.title,
-    number: mi,
-    label: `${prefix}${mi}`,
-    track,
-    lessons: m.lessons.map((l, li) => {
-      const id = `${m.slug}/${l.slug}`;
-      const lesson: SyllabusLesson = {
-        id,
-        title: l.title,
-        number: `${prefix}${mi}.${li + 1}`,
-        moduleTitle: m.title,
-        moduleSlug: m.slug,
-        moduleIndex: mi,
-        track,
-        index: offset + flat.length,
-        written: written.some((w) => w.id === id),
-        crossRequires: l.crossRequires ?? [],
-      };
-      flat.push(lesson);
-      return lesson;
-    }),
-  }));
+  const modules = outline.map((m, mi) => {
+    const label = m.label ?? `${prefix}${mi}`;
+    return {
+      slug: m.slug,
+      title: m.title,
+      number: mi,
+      label,
+      track,
+      lessons: m.lessons.map((l, li) => {
+        const id = `${m.slug}/${l.slug}`;
+        const lesson: SyllabusLesson = {
+          id,
+          title: l.title,
+          number: `${label}.${li + 1}`,
+          moduleTitle: m.title,
+          moduleSlug: m.slug,
+          moduleIndex: mi,
+          track,
+          index: offset + flat.length,
+          written: written.some((w) => w.id === id),
+          crossRequires: l.crossRequires ?? [],
+        };
+        flat.push(lesson);
+        return lesson;
+      }),
+    };
+  });
   return { modules, flat };
 }
 

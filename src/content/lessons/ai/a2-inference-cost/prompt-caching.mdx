@@ -1,0 +1,248 @@
+---
+summary: 'Many requests share a long prefix. Providers store its KV entries and charge a small read price on a hit and a write premium on a miss. A write premium of 1.25x repays after 1 reuse, and 2x after 2.'
+requires: ['ai/a2-inference-cost/kv-cache', '05-caching/cache-strategies']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai2CacheWalk from '../../../../components/anim/lessons/Ai2CacheWalk.tsx';
+import Ai2CacheCalc from '../../../../components/anim/lessons/Ai2CacheCalc.tsx';
+
+## The problem
+
+An assistant sends the same 20,000 tokens at the start of every call: a system prompt, a tool list, and a few examples. The user's actual question is 300 tokens. You pay for the 20,000 on every call, and the model re-reads them on every call.
+
+The money first. At Sonnet 5.5's $2 per million input tokens, 20,000 tokens cost 20,000 x $2 / 1,000,000 = $0.04 per call. At 1,000 calls a day, that is $40 a day for text that never changes (derived). The time next: the provider must run the prefill pass over all 20,000 tokens before the first output token (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)). That is the wait you feel as time to first token.
+
+## Naive solution: send it and pay again
+
+Nothing is wrong with the naive call. It is simple, and it works. It wastes work, because the first 20,000 tokens produce the same Keys and Values every time. Lesson [A2.3](/learn/ai/a2-inference-cost/kv-cache/) showed that the KV cache stores those per-token results so the model need not recompute them. Inside one request the server already reuses them. Between requests it throws them away. Prompt caching keeps them.
+
+## The mechanism: store the prefix, match by prefix
+
+The idea is one you know from the backend track.
+
+<CrossTrackLink id="05-caching/cache-strategies">
+A cache stores the result of expensive work under a key and serves repeats from memory. You choose a strategy for reads and writes and accept a risk of stale data. Prompt caching is the same pattern. The key is the exact prefix of the prompt, and the value is the model's KV entries for it.
+</CrossTrackLink>
+
+How a hit works:
+
+1. A request arrives. The provider compares the start of the prompt with stored prefixes.
+2. If a stored prefix matches token for token, the provider loads its KV entries and runs prefill only on the rest.
+3. If nothing matches, it runs the full prefill and may store the prefix for next time.
+
+The match is by **prefix**. One changed token in the middle ends the match at that point, and everything after it is a miss. Order matters: put what stays the same first, what changes last. Lesson A4.5 teaches how to lay out a prompt for hits. Here we only need the rule.
+
+Self-hosted servers do this too. SGLang's paper names the technique RadixAttention: it keeps prompts' KV entries in a tree so shared prefixes are stored once.
+
+### What each provider does
+
+All numbers are USD per 1M input tokens, as of 2026-10-16, from each provider's page.
+
+**Anthropic** ([prompt caching docs](https://platform.claude.com/docs/en/docs/build-with-claude/prompt-caching)):
+
+- Prefix order is tools, then system, then messages. A change at one level invalidates that level and every level after it. Editing a tool invalidates all three.
+- A write costs 1.25x the base price for the default 5-minute lifetime, or 2x for the 1-hour lifetime. A read costs 0.1x on most models, 0.05x on Sonnet 5.5 and Opus 5.5, and 0.025x on Fable 5.1 and Mythos 5.1.
+- Each use refreshes the timer at no cost. The lifetime counts from the start of the request, so a long streamed answer eats into it.
+- Minimum cacheable prompt: 512 tokens on Sonnet 5.5, Opus 5.5, and Haiku 5.5. It is 1,024 to 4,096 on other models. A shorter prompt runs uncached and raises no error. Check `cache_creation_input_tokens` and `cache_read_input_tokens` in the response; both 0 means no caching happened.
+- Cache hits are not deducted from your rate limit.
+
+**OpenAI** ([prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)):
+
+- Caching is automatic. On GPT-5.6 and later, the minimum is 1,024 tokens, a read costs 0.1x (0.05x for GPT-6.1 Sol), and a write costs 1.25x. The default lifetime is 30 minutes and each reuse extends it.
+- Earlier models have a model-dependent read price and no write fee. Retention is `in_memory` (about 5 to 10 minutes idle, up to 1 hour) or `24h`. Organizations without Zero Data Retention default to `24h`.
+- Cached tokens still count toward the tokens-per-minute limit. This differs from Anthropic.
+- Changing the model, the tools, `text.format`, or `reasoning.effort` breaks the match.
+
+**Google Gemini** ([caching guide](https://ai.google.dev/gemini-api/docs/caching), [pricing](https://ai.google.dev/gemini-api/docs/pricing), last updated 2026-10-15):
+
+- Implicit caching is on by default for Gemini 2.5 and newer. The minimum is 2,048 tokens on 2.5 Flash and 2.5 Pro, and 4,096 on newer models. Savings pass on automatically; the guide gives no percentage.
+- Explicit caches take a lifetime as a duration string such as `"300s"`. The guide does not state a default. They also carry a storage fee: $1.00 per 1M tokens per hour on 2.5 Flash, $4.50 on 2.5 Pro. A 20,000-token explicit cache on 2.5 Flash costs 20,000 / 1e6 x $1.00 = $0.02 per hour just to keep (derived).
+- Cached input is $0.03 on 2.5 Flash (base $0.30) and $0.125 on 2.5 Pro (base $1.25, prompts up to 200K).
+
+## Numbers: the break-even
+
+Let P be the base price, w the write multiplier, and r the read multiplier. A write costs wP. A read costs rP. An uncached call costs P.
+
+Caching pays an extra (w - 1)P at the write. Each read then saves (1 - r)P. So the number of reads needed to recover the premium is:
+
+<Math block tex="n_{\text{break-even}} = \frac{w - 1}{1 - r}" />
+
+In words: the write premium divided by the saving per read.
+
+- 5-minute write, w = 1.25, r = 0.1: 0.25 / 0.9 = 0.28. One reuse is enough.
+- 1-hour write, w = 2, r = 0.1: 1.0 / 0.9 = 1.11. You need 2 reuses.
+- On Sonnet 5.5, r = 0.05: 0.26 and 1.05. The whole numbers stay 1 and 2.
+
+Now watch three calls on Sonnet 5.5. A fourth call after a 6-minute gap shows the cost of a lapse.
+
+<Ai2CacheWalk client:visible />
+
+Try your own numbers. Start with the default (Sonnet 5.5, 20,000 tokens, 4 reads per write), then set reads to 0, then switch the TTL to 1 hour and find where the saving turns positive.
+
+<Ai2CacheCalc client:visible />
+
+What to notice:
+
+1. **Zero reads loses money.** A write that is never read costs 25% extra on the prefix. This is the failure case for a prompt that changes every call.
+2. **The 1-hour option needs more traffic to pay**, but it survives gaps that kill a 5-minute entry. Pick the lifetime from your request spacing, not by habit.
+3. **The saving has a cap.** The calculator prices only the prefix. Output tokens and new input are the same either way, so a short shared prefix saves little in total.
+
+Assumptions: every read lands inside the lifetime, the prefix is above the minimum length, and the prefix is identical each time.
+
+### Latency
+
+A hit skips the prefix prefill, so time to first token should drop. We do not quote a figure because it depends on model, prefix size, and load. Measure it: send the same prompt twice and compare. The first request of a session is slow because it writes.
+
+## A different cache: semantic caching
+
+Semantic caching stores whole answers and reuses one when a new question looks similar to an old one, usually by comparing embeddings. It is a different tool. A provider cache never changes the answer: the model still runs on every request, only the prefill is cheaper. A semantic cache can skip the model call entirely, so it saves more, and it can also return an answer meant for a different question or a different user. We have no sourced hit rate or error rate for it, so this lesson gives none. If you build one, measure the wrong-reuse rate on your own eval (lesson A0.2) before shipping.
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| No caching | Simple, no lapse risk | Full price and full prefill each call | Short prompts, or every prompt is unique |
+| 5-minute cache | 0.1x or lower reads, cheap 1.25x write | Lapses if requests are more than 5 minutes apart | Steady traffic, bursts inside a session |
+| 1-hour cache | Survives gaps | 2x write, needs 2 reuses to pay | Sparse traffic with a big shared prefix |
+| Automatic (OpenAI, Gemini implicit) | No code change | Less control, hits you cannot force | Default start |
+| Semantic cache | Skips the model call | Wrong-reuse risk, extra system to run | Repeated near-identical questions, after you measure the risk |
+
+## Interview lens
+
+<Callout type="tip">
+Say it with numbers: "Our 20K-token prefix costs $0.04 per call uncached. A 5-minute write costs 1.25x and a read about 0.05 to 0.1x, so one reuse breaks even. I keep stable content first, check the cache-read field in the response, and alert when it drops to zero."
+</Callout>
+
+<Callout type="mistake">
+Do not cache a prompt that changes every call: you pay the write premium and never get a read. Do not edit the tool list or the top of the prompt on each request, because that invalidates everything after it. Do not assume cached tokens are free of rate limits on every provider: OpenAI counts them toward tokens per minute.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="a25-first-request-slow"
+  title="Slow first request"
+  scenario="A support bot shows a time to first token of 4.1 s on the first message of each session and 0.9 s on later messages. Cache read fields are above zero on later messages. The team asks if caching is broken."
+  facts={['first message: cache_creation_input_tokens = 21,300, cache_read_input_tokens = 0', 'later messages: cache_creation_input_tokens = 0, cache_read_input_tokens = 21,300']}
+  steps={[
+    {
+      prompt: 'What does the data say?',
+      options: [
+        'Caching works as designed: the first message writes the prefix and later ones read it',
+        'Caching is off, because the first message shows zero cache read tokens',
+        'The model is too large, because 4.1 s is slow for any first call',
+        'The provider is dropping cache entries between every pair of messages',
+      ],
+      answer: 0,
+      explain: 'A write on message 1 and 21,300 read tokens afterward is the expected pattern. The first call must run the full prefill. Dropped entries would show a new write on every message.',
+    },
+    {
+      prompt: 'Which change helps the first message most?',
+      options: [
+        'Raise the temperature so the first answer starts sooner',
+        'Warm the cache with a cheap call when the session opens, before the user types',
+        'Move the system prompt after the user message to shorten the prefix',
+        'Switch to a 1-hour lifetime, which removes the write on the first call',
+      ],
+      answer: 1,
+      explain: 'A warm-up request pays the write ahead of the user. A 1-hour lifetime still needs a write, and it costs 2x. Putting the system prompt after the user message breaks prefix order and the match.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Cost of a cached prefix"
+  scenario="A 20,000-token prefix on Sonnet 5.5. Base input $2 per million tokens, 5-minute write 1.25x, read 0.05x. Count only the prefix."
+  steps={[
+    {
+      prompt: 'What does one uncached call cost for the prefix, in dollars?',
+      unit: 'dollars',
+      answer: 0.04,
+      within: 1.1,
+      explain: '20,000 x $2 / 1,000,000 = $0.04.',
+    },
+    {
+      prompt: 'How many reads does a 1-hour write (2x) need at a 0.1x read price to pay for itself? Give the exact fraction.',
+      unit: 'reads',
+      answer: 1.11,
+      within: 1.1,
+      explain: '(2 - 1) / (1 - 0.1) = 1.11. So you need 2 whole reuses.',
+    },
+    {
+      prompt: 'One write and 99 reads inside the lifetime. What is the total prefix cost, in dollars?',
+      unit: 'dollars',
+      answer: 0.248,
+      within: 1.1,
+      explain: '$0.04 x (1.25 + 99 x 0.05) = $0.04 x 6.2 = $0.248. Uncached it would be 100 x $0.04 = $4.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'a25-q-oneh',
+      q: 'A 1-hour Anthropic write costs 2x and a read 0.1x. A prefix is read 1 time before the entry expires. Compared with no caching, the total prefix cost is:',
+      options: [
+        'Lower, because any read at 0.1x beats the base price of the prefix',
+        'Higher: 2.1x cached against 2x for two uncached calls',
+        'Equal, because the write premium cancels the saving exactly here',
+        'Lower, since the 1-hour write is billed only once per day of use',
+      ],
+      answer: 1,
+      explain: 'Cached: 2x + 1 x 0.1x = 2.1x. Uncached, two calls cost 2x. The break-even is 1.11 reads, so one read is not enough. A 5-minute write at 1.25x would already have paid.',
+    },
+    {
+      id: 'a25-q-tools',
+      q: 'An Anthropic app edits one sentence in a tool description between two requests. Everything else is identical. What can the second request reuse?',
+      options: [
+        'The system prompt and messages, since only the tools block changed',
+        'The messages only, because tools sit last in the prefix order',
+        'Nothing from tools, but the system prompt matches in a later breakpoint',
+        'Nothing: tools come first, so all three levels miss',
+      ],
+      answer: 3,
+      explain: 'The order is tools, system, messages, and a change at one level invalidates it and every level after it. Tools are first, so everything misses. Option 1 has the order backwards.',
+    },
+    {
+      id: 'a25-q-short',
+      q: 'A 400-token prefix on Sonnet 5.5 has a cache breakpoint, but both cache token fields are 0 and no error appears. Why?',
+      options: [
+        'It is under the 512-token minimum, so it ran uncached with no error',
+        'The 5-minute lifetime had already expired before the first request ran',
+        'Sonnet 5.5 does not support caching, so the field always stays at zero',
+        'Cache fields only fill in after a hit, and never on the first write',
+      ],
+      answer: 0,
+      explain: 'Sonnet 5.5 needs at least 512 tokens. A shorter prompt is processed uncached and returns no error. A write on the first call would show a creation count above zero.',
+    },
+    {
+      id: 'a25-q-tpm',
+      q: 'A team has a 90% hit rate and still hits its tokens-per-minute limit on OpenAI. What is the likely reason?',
+      options: [
+        'Hits are billed at full price, so the budget empties just as fast',
+        'The hit rate is measured wrongly, since OpenAI never reports hits',
+        'Cached input still counts toward its tokens-per-minute limit',
+        'The lifetime is 30 minutes, which uses limit quota while waiting',
+      ],
+      answer: 2,
+      explain: 'The OpenAI guide says cached input tokens still count toward tokens-per-minute limits. Anthropic says cache hits are not deducted from its rate limits. Cached tokens are discounted in price, not in the limit.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic, Prompt caching](https://platform.claude.com/docs/en/docs/build-with-claude/prompt-caching): prices, minimums, lifetime, prefix order.
+- [OpenAI, Prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching): automatic caching, retention, what breaks a match.
+- [Google, Context caching](https://ai.google.dev/gemini-api/docs/caching) and [pricing](https://ai.google.dev/gemini-api/docs/pricing): implicit and explicit caches.
+- [Zheng et al., SGLang](https://arxiv.org/abs/2312.07104): RadixAttention for self-hosted prefix reuse.

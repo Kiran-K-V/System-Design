@@ -1,0 +1,178 @@
+---
+summary: 'Four ways to question a long document: put it all in the prompt, map-reduce it, chunk and route, or retrieve. Pick by question type, document size, and question count. Put the document first, the question last, and ask for quotes before answers.'
+requires: ['ai/a2-inference-cost/prompt-caching', 'ai/a4-context/context-budgeting']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai4LongWalk from '../../../../components/anim/lessons/Ai4LongWalk.tsx';
+import Ai4LongPicker from '../../../../components/anim/lessons/Ai4LongPicker.tsx';
+
+## The problem
+
+A legal team has a 150,000-token contract bundle. They want answers to 20 questions: "Who can end the agreement, and when?" "Which clauses mention a penalty?" "Summarize the risks." The text is long, the questions differ, and each answer must be right. A wrong answer is worse than a slow one.
+
+You have four ways to feed that document to a model. Each fails in its own way. This lesson names them, prices them, and shows how to choose. Lesson A4.3 ([context budgeting](/learn/ai/a4-context/context-budgeting/)) showed that the window is finite and that more text is not always better. Lesson A2.5 ([prompt caching](/learn/ai/a2-inference-cost/prompt-caching/)) showed how to pay less for a repeated prefix. Here we combine both.
+
+## Option 1: stuff the whole document in
+
+**Stuffing** means putting the entire document in the prompt and asking the question. It is the simplest design: one call, no moving parts, and the model sees everything, so a question that needs the whole text gets it.
+
+It has two costs. The first is money. Each question re-reads 150,000 tokens. At the Sonnet 5.5 input price of $2 per million tokens (as of 2026-10-16, [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)), that is $0.30 per question before the answer. The prompt cache turns this into a $0.015 read after the first question (A4.5 works the 20-question total: $6.00 against $0.66).
+
+The second cost is quality. The same pricing page says 4.6 and later models, except Haiku 5.5, include the full 1M-token window at standard prices. A window of that size can hold the document. It does not guarantee the model uses all of it well. Liu et al. ("Lost in the Middle") found that performance is "often highest when relevant information occurs at the beginning or end of the input context" and "significantly degrades" for information in the middle. Chroma tested 18 models on LongMemEval. Prompts of about 113,000 tokens scored significantly lower than focused prompts of about 300 tokens holding the same needed information. Both studies used older models than the ones you will call today, so measure your own model on your own questions. The direction is the warning: more tokens can mean lower recall.
+
+Also check the price page for your model. Haiku 5.5 charges more for a prompt over 100,000 tokens ($0.50 per million input instead of $0.10), and that rate applies even on a cache hit.
+
+## How to write a stuffed prompt
+
+Anthropic's prompting guide gives three habits for long inputs. These are vendor advice, so test them on your set.
+
+1. **Put the document first and the question last.** The guide says to place long documents "near the top of your prompt, above your query, instructions, and examples", and that queries at the end "can improve response quality by up to 30 percent in tests". That is Anthropic's claim, from tests we cannot see. It also fits the cache: the large, stable part comes first and the small, changing question comes last (lesson A4.5).
+2. **Give each document a structure.** Wrap each one in `<document>` tags with `<document_content>` and `<source>` subtags, so the model can tell documents apart.
+3. **Ask for quotes first.** For long-document tasks, ask the model to quote the relevant parts before it does the task. The guide says this helps the model "focus on the relevant content and ignore the rest of the document".
+
+The **citations feature** automates the third habit. You mark a document block with `citations: {enabled: true}`, and the API returns the exact supporting passages, with pointers into your document. Anthropic documents three effects. `cited_text` does not count toward your output tokens, so quoting is cheaper than asking the model to write the quote. The pointers are guaranteed to be valid locations in the document you sent. And in Anthropic's own tests the feature picked the most relevant quotes more often than prompt-only quoting. The cost is a slight rise in input tokens. Citations also change the system prompt text, so toggling them breaks the prefix cache (lesson A4.5).
+
+## Option 2: map-reduce
+
+When the text is too long, or you want to avoid the whole window, split it. **Map-reduce** has two steps. In the map step, one call per chunk produces a short summary or extraction. In the reduce step, one call reads all the summaries and answers. The names come from data processing: map runs per item, reduce merges the results. A backend engineer will see the shape of a scatter-gather query.
+
+<Ai4LongWalk client:visible />
+
+The OpenAI cookbook ("Summarizing long documents") gives a real run. It splits on a delimiter, with a minimum chunk size of 500 tokens by default and no overlap between chunks. Each chunk is summarized alone. On a document of about 14,631 tokens, the lowest detail setting used 1 chunk, wrote a 235-token summary, and took about 9.7 seconds. The highest detail setting used 31 chunks, wrote a 6,742-token summary, and took about 4 minutes 8 seconds. The page says a summary of a 20,000-token document will not be twice as long as one of a 10,000-token document. It also says a recursive mode costs more but "can increase consistency and coherence".
+
+Map-reduce has a built-in risk. The summarizer of chunk 17 does not know your question. It keeps what looks important to a summary, and a fact you need later can be dropped. The reduce step cannot restore it. **We found no sourced number for how much information map-reduce loses.** The cookbook names the risk but gives no loss rate. Do not quote one. Measure it: ask questions with known answers and count the misses.
+
+Map-reduce is a good fit when the question needs every part, such as "summarize the risks", and the text does not fit in the window. It is a poor fit for "find one clause".
+
+## Options 3 and 4: route and retrieve
+
+**Chunk and route** keeps the chunks, builds a cheap table of contents (one line per chunk), and for each question runs two calls. A router call reads only the table of contents and picks a few chunks. An answer call reads only those chunks. You avoid reading all 150,000 tokens per question, and you need no vector database.
+
+**Retrieval** goes further. It turns each chunk into a numeric vector, stores the vectors in an index, and fetches the nearest chunks for each question. This is the subject of module A5 and we do not teach it here. For now, treat it as a function that returns the best few chunks for a question, at very low cost per question, and with a different failure: it can miss a passage whose words do not resemble the question.
+
+A rule from the plan for this track: use long context for one document, and retrieval for a corpus. Lesson A5.7 gives the full decision.
+
+## Choose by numbers
+
+The picker below prices all four strategies for your inputs, using the Sonnet 5.5 prices above. The recommendation is a rule of thumb. The costs are arithmetic from the stated assumptions.
+
+<Ai4LongPicker client:visible />
+
+What to notice:
+
+1. **Check one cell by hand.** Pick 150K tokens, 20 questions. Stuffing costs $0.66 for the cached input plus 20 x (100 x $2 + 300 x $10) / 10^6 = $0.064 for questions and answers, so $0.724.
+2. **Map-reduce is not cheap.** Each question re-reads every chunk: 30 chunk calls, 156,000 input tokens, and 9,000 output tokens, about $0.42 per question, or $8.47 for 20. It makes sense only when the document does not fit, or when you reuse the summaries (our model does not).
+3. **Retrieval wins on cost.** It reads about 2,700 tokens per question: $0.0084, or $0.168 for 20. It is the cheapest, and it is also the one that can miss a passage.
+4. **At 2M tokens, stuffing is struck out.** The text does not fit in a 1M-token window.
+5. **Switch to "Whole document".** The pick changes to stuffing or map-reduce, because retrieval cannot answer "summarize everything" from five chunks.
+
+## Trade-offs
+
+| Strategy | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Stuff + cache | One call, full text, simple | Re-reading cost, recall dips in long prompts, window limit | One document, up to hundreds of thousands of tokens, whole-text questions |
+| Map-reduce | Handles any size, parallel | Information loss, many calls, high cost per question | The text exceeds the window and the question spans all of it |
+| Chunk and route | No index, reads only chosen chunks | An extra call, a table of contents to maintain | Few questions, scattered passages, no search infrastructure |
+| Retrieval | Lowest cost per question | Index to build, misses on weak matches | Many questions, a corpus, or a document that changes |
+
+## Interview lens
+
+<Callout type="tip">
+Start from the question type, not the tool: "Is this a lookup, a few passages, or the whole document? For one 150K document and 20 questions I stuff and cache it, put the question last, and ask for quotes. For a corpus I retrieve." Then name your quality check: a golden set with known answers, run on each strategy.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the window is 1M tokens, so we just send everything". Fitting is not the same as working. Recall can fall as the prompt grows, and each question pays to re-read the text. Also do not claim a loss rate for map-reduce. No source gives one. Say that you would measure it.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A 400-page report must be summarized in full, and the text is far larger than the model window. Which strategy fits best?',
+      options: [
+        'Retrieval of the five best chunks, because it is the cheapest',
+        'Stuffing the whole report, because one call is simplest',
+        'Chunk and route, because a router call picks the key pages',
+        'Map-reduce, because every part must be read and no single call can hold it',
+      ],
+      answer: 3,
+      explain: 'A whole-document question needs all parts, and the text does not fit. Map-reduce reads every chunk and merges. Retrieval and routing read only a few chunks and would drop most of the report. Stuffing fails because the text exceeds the window.',
+    },
+    {
+      q: 'Which prompt order does Anthropic recommend for a 100,000-token document and one question?',
+      options: [
+        'Question first, then the document, so the model knows the goal',
+        'Document first, question last, with quotes requested before the answer',
+        'Question at the start and again at the end, with no document tags',
+        'Document in the middle, with the question split across both ends',
+      ],
+      answer: 1,
+      explain: 'The guide says to put long data near the top and the query at the end, and to ask for relevant quotes first. The 30 percent figure is Anthropic\'s own test claim. The order also helps caching, since the long stable part forms the prefix.',
+    },
+    {
+      q: 'You enable citations on a document block. Which effect does Anthropic document?',
+      options: [
+        'The model reads fewer input tokens, because the document is compressed',
+        'The prefix cache is kept, because citations do not change the system prompt',
+        'The cited_text field does not count toward output tokens, and input rises slightly',
+        'Output tokens rise sharply, because each quote is written out in full',
+      ],
+      answer: 2,
+      explain: 'The citations page says cited_text does not count toward output tokens, and that citations add a slight rise in input tokens. Toggling citations also changes the system prompt, which invalidates a cached prefix, so the second option is wrong.',
+    },
+    {
+      q: 'A team wants a number for how much information map-reduce loses, to put in a design doc. What is the right move?',
+      options: [
+        'Use 20 percent, since that is a common rule of thumb for summaries',
+        'Quote the OpenAI cookbook figure for the 31-chunk run',
+        'State that no sourced rate exists, and measure it on questions with known answers',
+        'Use 0 percent, because each chunk is summarized by the same model',
+      ],
+      answer: 2,
+      explain: 'The cookbook warns about detail loss but gives no loss rate, and no source we read does. Its 31-chunk figures describe summary length and time. Any fixed percentage would be invented. Measure with a golden set on your own documents.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Map-reduce cost"
+  scenario="A 150,000-token document is split into 30 chunks of 5,000 tokens. Each map call reads its chunk plus a 200-token instruction and writes a 300-token summary. One reduce call reads the 30 summaries plus a 200-token instruction and writes a 300-token answer. Sonnet 5.5 prices as of 2026-10-16: $2 per million input tokens, $10 per million output tokens."
+  steps={[
+    {
+      prompt: 'What do the 30 map calls cost for input tokens, in dollars?',
+      unit: '$',
+      answer: 0.312,
+      within: 1.1,
+      explain: '30 x 5,200 = 156,000 input tokens. 156,000 x $2 / 10^6 = $0.312.',
+    },
+    {
+      prompt: 'What does one question cost in total, map plus reduce, input and output?',
+      unit: '$',
+      answer: 0.4234,
+      within: 1.1,
+      explain: 'Map output: 30 x 300 = 9,000 tokens x $10 / 10^6 = $0.09. Reduce input: 9,200 x $2 / 10^6 = $0.0184. Reduce output: 300 x $10 / 10^6 = $0.003. Sum with the map input: 0.312 + 0.09 + 0.0184 + 0.003 = $0.4234.',
+    },
+    {
+      prompt: 'Stuffing the same document with no cache costs how much per question, input plus a 300-token answer? Ignore the question text.',
+      unit: '$',
+      answer: 0.303,
+      within: 1.1,
+      explain: '150,000 x $2 / 10^6 = $0.30 for input, and 300 x $10 / 10^6 = $0.003 for the answer, so $0.303. Map-reduce costs about 40 percent more for one question, and it can lose detail. It earns its place only when the text does not fit.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic, prompting best practices (long-context tips)](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices)
+- [Anthropic, citations](https://platform.claude.com/docs/en/build-with-claude/citations)
+- [OpenAI Cookbook, summarizing long documents](https://developers.openai.com/cookbook/examples/summarizing_long_documents)
+- [Liu et al., "Lost in the Middle"](https://arxiv.org/abs/2307.03172)
+- [Chroma, "Context Rot"](https://www.trychroma.com/research/context-rot)

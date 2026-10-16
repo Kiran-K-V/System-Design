@@ -1,0 +1,234 @@
+---
+summary: 'Meter cost from the usage fields of each response, not from estimates. Price each token class from a dated price table, tag every call with tenant and feature, and set budgets and alerts on the ledger.'
+requires: ['ai/a3-llm-apis/api-anatomy', 'ai/a2-inference-cost/prompt-caching']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai3MeterLedger from '../../../../components/anim/lessons/Ai3MeterLedger.tsx';
+import Ai3MeterDash from '../../../../components/anim/lessons/Ai3MeterDash.tsx';
+
+## The problem
+
+The invoice from your model provider is one number. It says nothing about which customer, which feature, or which agent loop caused it. Finance asks why the bill doubled in March. You cannot answer.
+
+A backend engineer knows the same pain from cloud bills. The fix there is tags and a cost-allocation report. LLM cost has the same shape, with one twist: the unit is tokens, and a token has four prices, not one.
+
+Scale shows why it matters. A product serves 5 million requests a month. Each has 3,000 input tokens and 500 output tokens, on Claude Sonnet 5.5 ($2 input, $10 output per million tokens, as of 2026-10-16). That is 15 billion input tokens and 2.5 billion output tokens. The bill is $30,000 + $25,000 = **$55,000 a month**. A 10% error in your estimate is $5,500.
+
+## Naive solution: estimate, then divide the invoice
+
+Two shortcuts fail.
+
+- **Estimate tokens before the call.** You count characters, or you call a token-counting endpoint. Anthropic's docs say the count is "an estimate" and that the result may differ by a small amount. Worse, the tokenizer changes. Claude 4.7 and later models "use a newer tokenizer. The same input text produces approximately 30 percent more tokens than on earlier models." An old count used for a new model is 30% too low.
+- **Divide the invoice by request count.** This gives an average. One tenant with long prompts and one with short prompts get the same price. Nobody can act on it.
+
+Both ignore the cache. A call that reads 8,000 tokens from a prompt cache costs a small share of one that does not (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)).
+
+## The mechanism
+
+### Step 1: meter from the usage object
+
+Every response reports what the provider bills. For Anthropic, the fields are `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens`. The prompt caching docs define `input_tokens` as tokens "after the last cache breakpoint", not the whole prompt. The total prompt is:
+
+<Math block tex="n_{\text{total in}} = n_{\text{read}} + n_{\text{write}} + n_{\text{in}}" />
+
+In words: cached reads, plus cache writes, plus the plain input tokens. Each class has its own price. Cost of one request:
+
+<Math block tex="c = \frac{n_{\text{in}}\, p_{\text{in}} + n_{\text{write}}\, p_{\text{write}} + n_{\text{read}}\, p_{\text{read}} + n_{\text{out}}\, p_{\text{out}}}{10^{6}}" />
+
+Step through one request. Watch which row is biggest, and what a cold cache does.
+
+<Ai3MeterLedger client:visible />
+
+### Step 2: a price table with an "as of" date
+
+Keep prices in data, not in code. Every row needs a provider, a model, a unit, each token-class price, and the date you read it. Prices move, and an old row silently gives wrong numbers. Prices below are USD per million tokens, as of 2026-10-16.
+
+| Model | Input | Output | Cache write (5 min) | Cache read |
+|---|---|---|---|---|
+| Anthropic Opus 5.5 | $4 | $20 | $5 | $0.20 |
+| Anthropic Sonnet 5.5 | $2 | $10 | $2.50 | $0.10 |
+| Anthropic Haiku 5.5 (prompts up to 100K tokens) | $0.10 | $0.50 | $0.125 | $0.01 |
+
+Source: [claude.com/pricing](https://claude.com/pricing). Haiku 5.5 has a higher tier above 100K prompt tokens ($0.50 input, $2.50 output), so the table needs a prompt-length column for it.
+
+| Model | Input | Cached input | Output |
+|---|---|---|---|
+| OpenAI gpt-6.1-sol | $2.00 | $0.10 | $10.00 |
+| OpenAI gpt-6-luna | $0.10 | $0.01 | $0.50 |
+| OpenAI gpt-5.6-sol | $4.00 | $0.40 | $20.00 |
+
+Source: [developers.openai.com/api/docs/pricing](https://developers.openai.com/api/docs/pricing), standard text prices for prompts up to 272K tokens, as of 2026-10-16. Look at the cached column. Cached input is 5% of input for gpt-6.1-sol and 10% for gpt-5.6-sol. Anthropic's read price is 5% for Opus 5.5 and Sonnet 5.5 but 10% for Haiku 5.5. So store the cache price per model. Do not hard-code one multiplier.
+
+### Step 3: tag each call and write a ledger row
+
+At the gateway (lesson [A3.8](/learn/ai/a3-llm-apis/multi-provider-gateway/)) or in a thin client wrapper, write one row per call: request id, time, tenant, feature, user, run id, provider, model, the four token counts, and the dollars. Keep the token counts, not only the dollars. If a price was wrong, you can recompute the past. Sum the rows by tenant, feature, or run to get any report.
+
+Reconcile against the invoice each month. The ledger will miss some cases: calls that failed halfway, or traffic that bypassed the gateway. A gap of a few percent is a finding to chase, not to ignore.
+
+### Step 4: budgets and alerts
+
+A budget is a number per tenant per month. Two levels work well: an alert at a share of the budget (say 80%), and a hard cap that makes the gateway answer 429 for that tenant. The alert tells a human. The cap protects the company. Try it below. The default shows Acme at 99% of its budget and Birch at 82%, so two alerts are firing. Push Cobalt's requests up. Turn on a 50% cache share and watch alerts clear.
+
+<Ai3MeterDash client:visible />
+
+Check the first card by hand. For Sonnet 5.5 with 3,000 input and 500 output tokens and no cache: 3,000 x $2 / 1,000,000 = $0.006, and 500 x $10 / 1,000,000 = $0.005, so $0.011. Acme at 60,000 requests a day for 30 days is 1.8 million requests, and 1.8M x $0.011 = $19,800. That is 99% of $20,000.
+
+## Numbers
+
+<Ballpark
+  client:visible
+  title="Monthly cost of 5 million requests"
+  scenario="A product makes 5,000,000 requests a month on Claude Sonnet 5.5. Each has 3,000 input and 500 output tokens. Prices: $2 input, $10 output, $0.10 cache read, per million tokens, as of 2026-10-16."
+  steps={[
+    {
+      prompt: 'Input tokens per month?',
+      unit: 'tokens',
+      answer: 15000000000,
+      within: 1.1,
+      explain: '5,000,000 x 3,000 = 15,000,000,000, or 15 billion.',
+    },
+    {
+      prompt: 'Input cost per month, with no caching?',
+      unit: 'dollars',
+      answer: 30000,
+      within: 1.1,
+      explain: '15,000 million tokens x $2 per million = $30,000.',
+    },
+    {
+      prompt: 'Output cost per month? (2.5 billion output tokens)',
+      unit: 'dollars',
+      answer: 25000,
+      within: 1.1,
+      explain: '5,000,000 x 500 = 2.5 billion tokens, which is 2,500 million. 2,500 x $10 = $25,000. Output is 45% of the $55,000 total.',
+    },
+    {
+      prompt: 'Total per month if 80% of input tokens are cache reads at $0.10 per million?',
+      unit: 'dollars',
+      answer: 32200,
+      within: 1.1,
+      explain: 'Uncached input: 3B tokens x $2 per million = $6,000. Cached: 12B x $0.10 per million = $1,200. Add output $25,000: $32,200. Caching cut the bill 41%, and output is now 78% of what is left.',
+    },
+  ]}
+/>
+
+For agents, the unit of cost changes. One user task is many model calls, and some tasks fail. Track dollars per run and **dollars per successful task**:
+
+<Math block tex="c_{\text{success}} = \frac{\text{total spend}}{\text{successful tasks}}" />
+
+If a run costs $0.40 on average and 80% succeed, each success costs $0.40 / 0.8 = $0.50. A cheaper model with a lower success rate can cost more per success.
+
+## Standard names: OpenTelemetry
+
+OpenTelemetry has a draft set of names for model calls ("semantic conventions" for GenAI). They help your ledger and your tracing tool agree. On 2026-10-16 the inference span page lists these usage attributes, all marked Development (so they can change):
+
+- `gen_ai.usage.input_tokens`: "The number of tokens used in the GenAI input (prompt)."
+- `gen_ai.usage.output_tokens`: "The number of tokens used in the GenAI response (completion)."
+- `gen_ai.usage.cache_read.input_tokens`: "The number of input tokens served from a provider-managed cache."
+- `gen_ai.usage.cache_write.input_tokens`: "The number of input tokens written to a provider-managed cache."
+
+The spec says `gen_ai.usage.input_tokens` should include cached tokens. That clashes with the Anthropic field of the same idea, where `input_tokens` leaves them out. When you map an Anthropic response, send the sum (read + write + input) as `gen_ai.usage.input_tokens`, and send the read and write parts in their own attributes. Page: [client inference spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/client-inference.md).
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| Estimate before the call | Can refuse a call that is too big | Wrong by a few percent or more | A guard, never the bill |
+| Meter from `usage` | Matches the provider's count | Known only after the call | Always, for cost |
+| Meter at the gateway | One place, every provider | Bypass traffic is missed | Several teams or providers |
+| Meter in each service | Works with no gateway | Many copies of the price logic | One service, one provider |
+| Hard cap per tenant | Stops a runaway loop | A real customer can hit it | Free tiers and abuse risk |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I would meter from the usage object of each response, price each token class from a dated table, and write a ledger row tagged with tenant, feature, and run id. Budgets alert at 80% and cap at 100%. I would reconcile against the invoice monthly." Then do one number: 5 million requests at 3K in and 500 out on Sonnet 5.5 is $55,000.
+</Callout>
+
+<Callout type="mistake">
+Do not compute cost from `input_tokens` alone: cache reads and writes are missed. Do not charge cache reads at the full input price. Do not reuse token counts from an older model after you switch. And do not keep a price table with no date.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="a3-9-bill-jump"
+  title="The bill is 30% over the estimate"
+  scenario="A team moves a feature from an older Claude model to a Claude 4.7-or-later model. Prices per token are the same. The traffic is the same. The next invoice is about 30% higher than the team's forecast, which used token counts from before the move."
+  steps={[
+    {
+      prompt: 'Which step did the forecast skip?',
+      options: [
+        'Recounting the prompts on the new model, which makes more tokens per text',
+        'Raising the cache write price, because a model change resets the cache price',
+        'Adding the output price to the input price before multiplying by requests',
+        'Waiting a month so the provider could apply the volume discount',
+      ],
+      answer: 0,
+      explain: 'The token counting page says the same text gives about 30 percent more tokens on Claude 4.7 and later, and tells you to recount against the target model. The price per token did not change, so the token count is what moved.',
+    },
+    {
+      prompt: 'Which control would have caught this in the first hour?',
+      options: [
+        'A lower alert threshold on the provider invoice',
+        'A hard cap per tenant at the gateway',
+        'A rule that all prompts must be shorter than 3,000 tokens',
+        'An alert when metered tokens per request drift from the estimate',
+      ],
+      answer: 3,
+      explain: 'The ledger holds the real token counts from each response. Comparing them with the estimate shows a jump of about 30% at once. The invoice arrives weeks later, a cap does not find a cause, and a length rule does not fix the estimate.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'a3-9-q-ledger-row',
+      q: 'A Sonnet 5.5 response reports input_tokens 1,000, cache_read_input_tokens 8,000, cache_creation_input_tokens 0, and output_tokens 500. At $2 input, $0.10 cache read, and $10 output per million, what did it cost?',
+      options: ['$0.0230', '$0.0050', '$0.0108', '$0.0078'],
+      answer: 3,
+      explain: 'Input 1,000 x $2 = $0.0020. Cache read 8,000 x $0.10 = $0.0008. Output 500 x $10 = $0.0050. The total is $0.0078. $0.0230 prices all 9,000 prompt tokens at the full input price, which ignores the cache discount.',
+    },
+    {
+      id: 'a3-9-q-otel-map',
+      q: 'An Anthropic response has input_tokens 1,000, cache_read_input_tokens 8,000, and cache_creation_input_tokens 0. The OpenTelemetry spec says gen_ai.usage.input_tokens should include cached tokens. What value do you send?',
+      options: ['1,000', '8,000', '9,000', '9,500'],
+      answer: 2,
+      explain: 'Total prompt tokens are the plain input plus the cache reads plus the cache writes, 1,000 + 8,000 + 0 = 9,000. Sending 1,000 hides the cached part. The read part goes in gen_ai.usage.cache_read.input_tokens.',
+    },
+    {
+      id: 'a3-9-q-per-success',
+      q: 'An agent run costs $0.40 on average. 80% of runs finish the task. What is the cost per successful task?',
+      options: ['$0.32', '$0.40', '$0.50', '$0.72'],
+      answer: 2,
+      explain: 'Total spend divided by successes: $0.40 / 0.8 = $0.50. Every failed run still costs money, and the successes must pay for it. $0.32 multiplies instead of dividing.',
+    },
+    {
+      id: 'a3-9-q-meter-source',
+      q: 'Why meter cost from the usage field of the response and not from your own pre-call token count?',
+      options: [
+        'The usage field is the count the provider bills, and your estimate can be off',
+        'The usage field is free, while counting tokens before the call is a paid feature',
+        'The usage field arrives before the call, so it can block an expensive request',
+        'The usage field includes the price in dollars, so no price table is needed',
+      ],
+      answer: 0,
+      explain: 'Billing follows the provider’s count, which can differ from an estimate, for example after a tokenizer change. Token counting is also free. The usage field arrives after the call, and it holds tokens, not dollars, so you still need a dated price table.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Claude pricing](https://claude.com/pricing): the Anthropic prices above, including the Haiku 5.5 tiers.
+- [OpenAI API pricing](https://developers.openai.com/api/docs/pricing): the OpenAI prices above.
+- [Claude prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching): the usage fields and the total input formula.
+- [Claude token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting): the estimate note and the tokenizer change.
+- [OpenTelemetry GenAI client inference conventions](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/client-inference.md): the attribute names.

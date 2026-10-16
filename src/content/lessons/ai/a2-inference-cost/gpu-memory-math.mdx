@@ -1,0 +1,219 @@
+---
+summary: 'Weights take parameters times bytes per value, and they must fit in GPU memory before any KV cache. Work the budget for a 70B model on H100 and H200 GPUs, and see how many users the leftover memory serves.'
+requires: ['ai/a1-model-function/forward-pass', '01-one-machine/request-journey']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai2MemPath from '../../../../components/anim/lessons/Ai2MemPath.tsx';
+import Ai2MemCalc from '../../../../components/anim/lessons/Ai2MemCalc.tsx';
+
+## The problem
+
+Your product team wants Llama 3 70B behind an endpoint, for 50 people at once. Before you ask how fast it will be, ask whether it will run at all. A model that does not fit in GPU memory does not run slowly. It does not run.
+
+Two things must fit. The **weights** (the learned numbers) and, for every user in flight, the **KV cache** (the saved Keys and Values from [lesson A1.4](/learn/ai/a1-model-function/attention-cost/)). This lesson builds the budget. The next lessons use the same numbers to explain speed.
+
+## Naive solution: "it has 70B parameters and the GPU has 80 GB"
+
+That sentence compares two different units. A parameter count is a count of numbers. A memory size is bytes. You must multiply by the bytes per number.
+
+<Math block tex="\text{weight bytes} = \text{parameters} \times \text{bytes per value}" />
+
+Models are usually stored in **BF16** [mid] (a 16-bit floating-point format, 2 bytes per value). So 70 billion x 2 bytes = 140 GB. That is nearly twice an H100's 80 GB. [Lesson A1.3](/learn/ai/a1-model-function/forward-pass/) already warned about this. Now we do it properly.
+
+## The mechanism: where the bytes live
+
+A GPU has two kinds of memory. **HBM** [junior] (high bandwidth memory) is the large memory on the card. **SRAM** [junior] (static RAM) is a small, very fast memory inside the chip. The weights live in HBM. For each step, tiles of them move through SRAM into the **Tensor Cores** [junior], the units that do matrix math.
+
+For a backend engineer: HBM is RAM, SRAM is the CPU cache, and the disk copy at startup is a cold start. The [latency numbers lesson](/learn/backend/01-one-machine/latency-numbers/) has the same hierarchy for CPUs.
+
+<Ai2MemPath client:visible />
+
+### The two GPUs we use
+
+| | H100 SXM | H200 |
+|---|---|---|
+| HBM size | 80 GB | 141 GB |
+| HBM bandwidth | 3.35 TB/s | 4.8 TB/s |
+| NVLink (GPU to GPU) | 900 GB/s | not used here |
+| BF16 peak, as NVIDIA lists it | 1,979 TFLOPS "with sparsity" | sparse figure only |
+
+Source: NVIDIA product pages for the [H100](https://www.nvidia.com/en-us/data-center/h100/) and [H200](https://www.nvidia.com/en-us/data-center/h200/), read 2026-10-16.
+
+Read the last row with care. NVIDIA's headline compute figure assumes **sparsity** [mid]: a trick that skips some zero weights and counts as double the work. Standard dense models do not get it. **Dense compute is half the listed figure**: about 989 TFLOPS for BF16 on the H100. Always say which one you use. We use dense.
+
+### How much precision costs
+
+| Precision | Bytes per value | 70B model |
+|---|---|---|
+| BF16 / FP16 | 2 | 140 GB |
+| FP8 / INT8 | 1 | 70 GB |
+| INT4 | 0.5 | 35 GB |
+
+Lower precision shrinks the weights. The quality price is lesson A2.6.
+
+### Splitting a model over GPUs
+
+One H100 cannot hold 140 GB. The fix is **tensor parallelism** [senior]: split each weight matrix into n slices, so each of n GPUs holds 1/n of the weights and does 1/n of every matrix multiply. The GPUs swap partial results over NVLink at every layer. That traffic is why it stays inside one machine (elective E3.6 covers the details).
+
+Now the budget for Llama 3 70B in BF16. The weights are 140 GB.
+
+| Hardware | Total HBM | Left after weights | Left with a 10% reserve |
+|---|---|---|---|
+| 1 x H100 | 80 GB | none, does not fit | none |
+| 1 x H200 | 141 GB | 1 GB | none, does not fit |
+| 2 x H100 | 160 GB | 20 GB | 4 GB |
+| 4 x H100 | 320 GB | 180 GB | 148 GB |
+| 2 x H200 | 282 GB | 142 GB | 114 GB |
+
+The reserve is our assumption: 10% of total memory for **activations** [mid] (the temporary values between layers), the GPU runtime, and wasted space. Real servers set it by configuration. Treat 10% as a planning number, not a measurement.
+
+Look at the H200 row. A single H200 holds the weights and almost nothing else. It cannot run a useful number of users.
+
+### From room to users
+
+The leftover memory is the KV cache pool. [Lesson A1.4](/learn/ai/a1-model-function/attention-cost/) gave the size: 320 KiB per token for Llama 3 70B in BF16, so an 8,192-token sequence takes 2.5 GiB (a GiB is 2^30 bytes, a bit more than a GB).
+
+- **2 x H100 with 10% reserve:** 4 GB of room holds **1** sequence of 8K tokens. The weights fit. The service does not scale.
+- **4 x H100 with 10% reserve:** 148 GB divided by 2.5 GiB (2.68 GB) gives **55** sequences of 8K.
+- **32 sequences of 8K tokens** need 32 x 2.5 = 80 GiB of KV cache. That fits on 4 x H100 (137.8 GiB of room) or 2 x H200 (106 GiB with the reserve). It does not fit on 2 x H100.
+
+Try your own case. Pick a model, a precision, and a GPU count, and watch where the bar turns red.
+
+<Ai2MemCalc client:visible />
+
+## Memory follows total size, compute follows active size
+
+A **mixture of experts** [mid] (MoE) model has many parallel feed-forward blocks (experts). A router sends each token to a few of them. Mixtral 8x7B has 8 experts, uses 2 per token per layer, holds 47B parameters in total, and uses 13B per token.
+
+- Memory: you must hold all experts, because any token may need any of them. 47B x 2 bytes = **94 GB** in BF16. That is two 80 GB cards.
+- Compute: about 2 x 13B = 26 GFLOPs per token, like a 13B dense model (rule from lesson A1.3).
+
+So an MoE model serves tokens at small-model compute cost but takes large-model memory. Pick the calculator's Mixtral preset to see it.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| H100 SXM memory, bandwidth | 80 GB, 3.35 TB/s | NVIDIA H100 page |
+| H200 memory, bandwidth | 141 GB, 4.8 TB/s | NVIDIA H200 page |
+| H100 BF16 dense | about 989 TFLOPS | Derived: 1,979 sparse / 2 |
+| Llama 3 70B weights, BF16 | 140 GB | Derived: 70e9 x 2 |
+| Mixtral 8x7B weights, BF16 | 94 GB | Derived: 47e9 x 2 |
+| Time to read 80 GB once from H100 HBM | 23.9 ms | Derived: 80 / 3,350 |
+| KV per token, Llama 3 70B | 320 KiB | Derived from the config (lesson A1.4) |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| More GPUs (tensor parallel) | Room for weights and KV | GPU cost, link traffic, one more failure domain | The model does not fit |
+| A bigger-memory GPU (H200) | Fewer GPUs per replica, faster reads | Higher price per card | Memory is the limit, not compute |
+| Lower precision | Smaller weights, more KV room | Quality risk that evals must check | Memory or cost is tight (lesson A2.6) |
+| Shorter max context | More concurrent sequences | Less input per request | Most requests are short |
+| An MoE model | Quality of a big model at small compute | Memory of all experts | You have memory but not compute |
+
+## Interview lens
+
+<Callout type="tip">
+Start every sizing answer with the fit check: "70B in BF16 is 140 GB. It does not fit on one 80 GB H100. Two H100s hold the weights and leave 20 GB for the KV cache, which is one or two long sequences. Four give real room." Then name the next limit, which is speed (lesson A2.2).
+</Callout>
+
+<Callout type="mistake">
+Do not say a 70B model "fits on one H100". Do not forget the KV cache and the runtime reserve. Do not quote the 1,979 TFLOPS figure as H100 compute without the word "sparse". And do not size an MoE model by its active parameters: memory follows the total.
+</Callout>
+
+<Callout type="deep" title="Why the weights are read on every step">
+Nothing in a decode step can skip a layer. Every step multiplies the new token's vector by every weight matrix, so every weight byte crosses the HBM link once per step. That is why bandwidth, not just size, matters, and why lesson A2.2 treats 140 GB over 3.35 TB/s as a hard floor on step time.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Memory math"
+  scenario="Use H100 SXM: 80 GB of HBM and 3.35 TB/s. Mixtral 8x7B has 47B parameters in total. A Llama 3 70B sequence costs 320 KiB of KV cache per token."
+  steps={[
+    {
+      prompt: 'Weight memory for Mixtral 8x7B in BF16?',
+      unit: 'GB',
+      answer: 94,
+      within: 1.1,
+      explain: '47e9 parameters x 2 bytes = 94e9 bytes = 94 GB. Total parameters set memory, even though only 13B are active per token.',
+    },
+    {
+      prompt: 'Time to read 80 GB once from H100 HBM, in milliseconds?',
+      unit: 'ms',
+      answer: 24,
+      within: 1.1,
+      explain: '80 GB / 3,350 GB/s = 0.0239 s = 23.9 ms.',
+    },
+    {
+      prompt: 'Llama 3 70B in BF16 on 2 x H100 with no reserve. How many 8,192-token sequences fit in the KV room?',
+      unit: 'sequences',
+      answer: 7,
+      within: 1.1,
+      explain: '160 GB - 140 GB = 20 GB of room. One sequence is 8,192 x 327,680 bytes = 2.68 GB. 20 / 2.68 = 7.45, so 7 whole sequences.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'You put Llama 3 70B in BF16 on a single H200 (141 GB). What is the main problem?',
+      options: [
+        'The weights do not fit in 141 GB of memory',
+        'HBM on the H200 is slower than on the H100',
+        'Only about 1 GB is left, less than one 8K-token KV cache',
+        'The H200 cannot run BF16 models at all',
+      ],
+      answer: 2,
+      explain: 'The weights are 140 GB, so they just fit, but 141 - 140 = 1 GB remains. One 8,192-token sequence needs 2.5 GiB of KV cache. The H200 is faster (4.8 TB/s) and runs BF16 fine. With a typical reserve even the weights would not fit.',
+    },
+    {
+      q: 'NVIDIA lists 1,979 TFLOPS of BF16 for the H100 SXM, "with sparsity". What do you use for a normal dense model?',
+      options: [
+        'About 989 TFLOPS, half the listed figure',
+        'The listed 1,979 TFLOPS, unchanged',
+        'About 3,958 TFLOPS, twice the listed figure',
+        'About 400 TFLOPS, a fifth of the listed figure',
+      ],
+      answer: 0,
+      explain: 'The sparse figure counts skipped zero weights as double work. Dense math is half: 1,979 / 2 = 989. The 3,958 figure is the FP8 sparse number, which is a different precision.',
+    },
+    {
+      q: 'Mixtral 8x7B has 47B total parameters and 13B active per token. Which statement is right in BF16?',
+      options: [
+        'It needs 26 GB of weights, like a 13B model',
+        'It needs 26 GB of weights and 94 GB of compute',
+        'It needs 47 GB because experts share weights',
+        'It needs about 94 GB of weights and computes like a 13B model',
+      ],
+      answer: 3,
+      explain: 'Every expert must be in memory because any token may route to it: 47e9 x 2 = 94 GB. Compute follows the 13B that run per token. Weights are not shared between experts, and memory and compute are different units.',
+    },
+    {
+      q: 'You move Llama 3 70B from BF16 to INT8 on 2 x H100 with a 10% reserve. Roughly how does the KV room change?',
+      options: [
+        'From 4 GB to 40 GB',
+        'From 4 GB to 74 GB',
+        'From 20 GB to 22 GB',
+        'It stays the same, since only compute changes',
+      ],
+      answer: 1,
+      explain: 'Total 160 GB, reserve 16 GB. BF16 weights take 140 GB, leaving 4 GB. INT8 weights take 70 GB, leaving 160 - 16 - 70 = 74 GB. Memory, not just compute, changes with precision.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [NVIDIA H100 Tensor Core GPU](https://www.nvidia.com/en-us/data-center/h100/): memory, bandwidth, NVLink, and the "with sparsity" labels.
+- [NVIDIA H200 Tensor Core GPU](https://www.nvidia.com/en-us/data-center/h200/): 141 GB and 4.8 TB/s.
+- [Mixtral of Experts](https://arxiv.org/abs/2401.04088): the 47B total and 13B active figures, Table 1.
+- [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783): model configs in Table 3.

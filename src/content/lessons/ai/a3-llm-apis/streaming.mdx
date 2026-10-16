@@ -1,0 +1,279 @@
+---
+summary: 'Users feel the time to the first token, not the time to the last one. Stream the reply over server-sent events, assemble the pieces on the client, parse tool JSON only when its block ends, and plan for errors that arrive after HTTP 200 and for users who leave mid-reply.'
+requires: ['ai/a3-llm-apis/api-anatomy', '02-networking/real-time-transport']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai3StreamSeq from '../../../../components/anim/lessons/Ai3StreamSeq.tsx';
+import Ai3StreamTimeline from '../../../../components/anim/lessons/Ai3StreamTimeline.tsx';
+import Ai3StreamAssemble from '../../../../components/anim/lessons/Ai3StreamAssemble.tsx';
+
+## The problem
+
+A model writes text one token at a time ([lesson A1.5](/learn/ai/a1-model-function/sampling-decoding/)). A 500-token answer at 40 tokens per second takes 12.5 seconds to write. If your server waits for the last token before it answers, the user stares at a spinner for 12.5 seconds plus the time to first token.
+
+The model does not need to wait. The first token exists after a short delay. So the fix is to send each piece as soon as it exists. This is **streaming**. The new questions are on the edges: what the pieces look like, what breaks when you act on a piece too early, and what happens when the user leaves or the stream fails halfway.
+
+<CrossTrackLink id="02-networking/real-time-transport">
+HTTP only answers questions. SSE (server-sent events) keeps one HTTP response open and lets the server write events into it, one at a time, in a plain text format. It is one-way, runs over normal HTTP, and works through most proxies. LLM streaming uses exactly this. This lesson adds what is new for models: the event vocabulary, partial tool JSON, and cancel.
+</CrossTrackLink>
+
+## What the user feels
+
+Two times matter. **TTFT** (time to first token) is the delay until the first piece of text shows up. **Output speed** is how fast tokens arrive after that, in tokens per second. Lesson A2.2 explains why the two differ: TTFT is dominated by reading the prompt, and speed by writing the reply.
+
+Without streaming, the user's wait is TTFT + N / speed for N output tokens. With streaming, the wait for something to read is TTFT alone. The total time is the same. The perceived time is not. Use the sliders to see it.
+
+<Ai3StreamTimeline client:visible />
+
+At 40 tokens per second the stream outpaces most people's reading, so by the time the user finishes the first lines, more text is usually ready. Streaming turns a 13-second wait into a half-second wait followed by reading. The 40 tokens per second and 0.5 second TTFT here are assumptions. Measure your own provider, model, and prompt size.
+
+## The event stream
+
+Set `"stream": true` and the Anthropic API answers with server-sent events. Each event has a name and a JSON body. The docs give this flow:
+
+1. `message_start`: a Message object with empty `content`.
+2. For each content block: `content_block_start`, one or more `content_block_delta`, and `content_block_stop`. Each block has an `index`.
+3. One or more `message_delta` events with top-level changes, such as the `stop_reason`.
+4. A final `message_stop`.
+
+`ping` events can show up at any point. New event types may be added, so your code must ignore unknown ones. A raw stream, from the docs, looks like this:
+
+```text title="stream.sse"
+event: message_start
+data: {"type": "message_start", "message": {"id": "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY", "type": "message", "role": "assistant", "content": [], "model": "claude-opus-5-5", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 25, "output_tokens": 1}}}
+
+event: content_block_start
+data: {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}
+
+event: content_block_stop
+data: {"type": "content_block_stop", "index": 0}
+
+event: message_delta
+data: {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 15}}
+
+event: message_stop
+data: {"type": "message_stop"}
+```
+
+The `usage` in `message_delta` is **cumulative**. Do not add it to earlier counts. Use the last value. Step through a short stream:
+
+<Ai3StreamSeq client:visible />
+
+OpenAI's Responses API streams too. The docs name `response.created`, `response.output_text.delta` (the text is in `event.delta`), `response.completed`, and `error` as the common events. The idea is the same: a start, many small deltas, an end, and an error channel. Your client code should translate both into one internal event type, so the UI does not care which provider is behind it.
+
+## Partial JSON is a trap
+
+Text is forgiving. If you show "Hel" and then "lo!", the user reads "Hello!". Tool calls are not. A tool call arrives as `input_json_delta` events, and each carries a `partial_json` string. The docs say the deltas "are partial JSON strings, whereas the final `tool_use.input` is always an object". You can accumulate the strings and parse once you receive `content_block_stop`.
+
+The docs add a detail that matters for latency: current models emit one complete key and value at a time, so the stream can pause for a while mid-call while the model works on the next value. A pause is not a failure.
+
+Try the assembler. Press "Next delta" and watch what each parser says.
+
+<Ai3StreamAssemble client:visible />
+
+Three lessons from it:
+
+1. **`JSON.parse` on a partial buffer always throws.** That is fine. It is a signal that you are not done.
+2. **A tolerant partial parser always succeeds, and its value can be wrong.** After the first delta it says the city is "San Fra". If you run the tool on that, you query a city that does not exist. Use a partial parser only for display, such as a progress label, never to trigger an action.
+3. **A dropped stream leaves a half-built call.** Without `content_block_stop`, the input is incomplete. Do not run the tool. The docs say tool-use and thinking blocks cannot be partially recovered, only text blocks can.
+
+This is the same rule as a database transaction: nothing counts until the commit. Here the commit is `content_block_stop`.
+
+## Failures after HTTP 200
+
+In a normal REST call, the status code tells you if the call failed. A stream is different. The status line (200) is sent first, before the model has produced anything. A failure later has no status code to use. The Anthropic docs say an error can occur after the API returns a 200 response, and give an example event:
+
+```text title="error.sse"
+event: error
+data: {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+```
+
+An `overloaded_error` is HTTP 529 in a non-streaming call. In a stream it is an event. A client that checks the status once and then reads the body will treat the cut text as the full answer.
+
+<Ai3StreamSeq client:visible mode="error" />
+
+So the stream loop needs three exits: `message_stop` (success), `error` (failure), and the connection closing without either (also failure). Mark partial output as unfinished in the UI.
+
+**Resume.** The docs describe recovery for an interrupted stream. Save the text you received, then start a new request that asks the model to continue. For Claude 4.5 and earlier, the partial text goes in as the start of an assistant message. For 4.6 and later, prefill is rejected, so you send a user message with the partial text and an instruction to continue from where it stopped. Resume costs a new prompt (you pay the input again, less any cache hit), and the model may phrase the join differently. For a short answer, retrying the whole request is often simpler.
+
+## Cancel when the user leaves
+
+Users close tabs, press Stop, and navigate away. If your server keeps reading the model's stream for nobody, you pay for tokens that no one reads. The fix has two parts.
+
+1. **Detect it.** Your server sees the client connection close, or an explicit cancel request.
+2. **Propagate it.** Close the upstream connection to the provider. In an HTTP proxy this means aborting the outbound request when the inbound one ends. A gateway that forgets this keeps generating.
+
+What does closing the connection stop on the provider side? The pages I read for this lesson do not say. The Anthropic streaming page and the OpenAI streaming guide do not describe cancellation. So do not promise savings in a design. Measure it: start a long stream, cancel at 5 seconds, and compare the output tokens in your usage logs against the full length. If you run the model yourself, aborting a request when the client leaves is a feature you build and test (a self-host decision, lesson A2.7).
+
+The widget above shows the arithmetic. With 500 tokens at 40 tokens per second and a 0.5 second TTFT, a user who leaves at 5 seconds has seen 180 tokens. If the server stops on disconnect, 320 tokens (64%) are never generated. If it does not, you pay for all 500.
+
+## Backpressure and connections
+
+A **slow client** reads slower than you write. For text at 40 tokens per second the bytes are tiny, so bandwidth is not the problem. Open connections are. Each stream holds one connection for the whole reply. By Little's law (average concurrency equals arrival rate times time in the system), 100 requests per second at 13 seconds each means about 1,300 connections open at once.
+
+- Bound the buffer per client. If a client falls too far behind, drop it. Do not let one slow phone grow your memory.
+- Reverse proxies and CDNs that buffer a response until it ends break streaming. Turn buffering off for the stream route and test through the real path.
+- Idle connections can be dropped by networks. TCP keep-alive helps. The Anthropic errors page recommends TCP keep-alive on direct integrations and says the SDKs set it.
+- For output that can run over 10 minutes, the SDKs refuse non-streaming requests. Use streaming (or the batch API, lesson A3.7).
+
+## Other things streaming changes
+
+- **Moderation.** OpenAI's streaming guide notes that moderation scores are not included with partial output deltas. Checking a partial reply is harder than checking a complete one. If you must block unsafe text, decide whether to hold back a small window of text before you show it.
+- **Structured output.** A reply that must be valid JSON cannot be validated until it ends. Stream a progress indicator, not the raw JSON (lesson A3.3).
+- **Tool progress.** While a tool runs, the model is not writing. Show "Searching..." from the `tool_use` block's start, not from its end.
+- **Usage.** The final count comes in `message_delta`. If the stream is cut, you may not get it. Keep your own token estimate as a fallback and reconcile with the provider bill.
+
+## Numbers
+
+| Quantity | Value | Source |
+|---|---|---|
+| 500 tokens at 40 tokens/s | 12.5 s to write | derived |
+| Blocking wait with 0.5 s TTFT | 13.0 s | derived, TTFT assumed |
+| Streaming wait for first text | 0.5 s | derived, TTFT assumed |
+| Open streams at 100 req/s, 13 s each | about 1,300 | Little's law, derived |
+| Non-streaming limit enforced by the SDKs | requests expected to take over 10 minutes | Anthropic errors page |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Stream to the user | Half-second perceived wait | More client code, errors after 200 | Any chat or long text |
+| Block and return whole | Simple code, easy validation | Full wait, 10-minute cap on SDKs | Short labels, background jobs |
+| Stream through your gateway | Control, logging, cancel | A proxy to run and keep unbuffered | Many clients, many providers |
+| Resume a broken stream | Saves re-reading a long reply | A new prompt and a seam in the text | Long text, text blocks only |
+| Retry the whole call | Simple, no seam | Pays for the whole reply again | Short replies, tool calls |
+
+## Interview lens
+
+<Callout type="tip">
+Say what the user feels and name both numbers: "TTFT is about half a second, then 40 tokens per second. I stream, so the perceived wait is TTFT, not 13 seconds. The client treats message_stop as success, and an error event or a closed connection as failure. On disconnect my gateway aborts the upstream call." Then name the one thing you would measure: whether a cancel really stops the provider's work.
+</Callout>
+
+<Callout type="mistake">
+Do not act on a partial tool call, and do not trust the HTTP status of a stream. Candidates often say "I will parse the JSON as it streams and call the tool early". A half-arrived value is wrong. Also do not claim "cancelling saves GPU cost" as a fact. It depends on the provider, and you should test it.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A reply has 1,000 output tokens. Speed is 50 tokens per second after a 1 second TTFT. How long until the user sees the first text, blocking against streaming?',
+      options: [
+        'Blocking 21 s, streaming 1 s, because streaming sends text at TTFT',
+        'Blocking 1 s, streaming 21 s, because streaming waits for the end',
+        'Both 21 s, because the total time decides when text appears',
+        'Blocking 20 s, streaming 20 s, because TTFT is part of the speed',
+      ],
+      answer: 0,
+      explain: 'Total time is 1 + 1000 / 50 = 21 s. Blocking shows nothing until then. Streaming shows text at the TTFT of 1 s. The total is the same, but the first text arrives 20 s earlier.',
+    },
+    {
+      q: 'A streamed tool call has delivered {"city": "Par and no content_block_stop yet. A partial JSON parser returns {"city": "Par"}. What should your code do?',
+      options: [
+        'Run the tool now with "Par" to save time on the call',
+        'Fix the city name by guessing the nearest known place',
+        'Throw the buffer away and start the whole request again',
+        'Wait for content_block_stop, then parse once and run the tool',
+      ],
+      answer: 3,
+      explain: 'The value is still growing, so "Par" is not the final input. Parse once at content_block_stop. Guessing the city hides a bug, and discarding the buffer wastes a call that is still going fine.',
+    },
+    {
+      q: 'A stream returned HTTP 200, then sent event: error with an overloaded_error. A handler checked only the status code. What does the user see?',
+      options: [
+        'A clear error page, since the API sets the status to 529 at once',
+        'The full answer, because the error event repeats the last text',
+        'Partial text shown as if it were the whole answer',
+        'Nothing, because the client drops all text after an error',
+      ],
+      answer: 2,
+      explain: 'The 200 status line goes out before the model writes anything. A later failure is an event inside the body. A handler that never reads it keeps the cut text and shows it as final. The status never changes to 529 on an open stream.',
+    },
+    {
+      q: 'Your gateway reads a provider stream and forwards it to browsers. A user closes the tab at 5 s of a 13 s reply. What must the gateway do, and what can you promise about cost?',
+      options: [
+        'Keep reading to the end, and promise that cost is the same',
+        'Abort the upstream request, and promise nothing until you measure it',
+        'Abort the upstream request, and promise the unread tokens are free',
+        'Send a cancel event to the model, which the docs describe in detail',
+      ],
+      answer: 1,
+      explain: 'Aborting the upstream call is the part you control. Whether the provider stops generating, and whether the unread tokens are billed, is not stated in the pages read, so measure it. The docs do not describe a cancel event for this API.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="The wait"
+  scenario="A reply has 500 output tokens. The model writes 40 tokens per second after the first token. Assume the TTFT is 0.5 seconds."
+  steps={[
+    {
+      prompt: 'How many seconds does the user wait for the first text when you stream?',
+      unit: 'seconds',
+      answer: 0.5,
+      within: 1.1,
+      explain: 'Streaming shows text as soon as the first token exists. That is the TTFT, 0.5 s.',
+    },
+    {
+      prompt: 'How many seconds does the user wait for the first text when you block until the whole reply is ready?',
+      unit: 'seconds',
+      answer: 13,
+      within: 1.1,
+      explain: '500 / 40 = 12.5 s to write the tokens, plus 0.5 s TTFT = 13 s.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai3-stream-half-answer"
+  title="Half an answer, no error"
+  scenario="A support bot streams answers. Customers report that some answers end in the middle of a sentence, and the dashboard shows no errors."
+  facts={[
+    'HTTP status for all calls: 200',
+    'stream ends without a message_stop event for 0.4% of calls',
+    'gateway idle timeout: 30 s, long answers take up to 45 s',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The model chose to stop early because the question was hard',
+        'The gateway cut the idle connection, and the client treated a closed stream as success',
+        'The tokenizer split a word badly, so the text looks cut',
+        'The API returned a refusal, which always shows as a 200 status',
+      ],
+      answer: 1,
+      explain: 'A stream with no message_stop was cut. The 30 s idle timeout is shorter than the longest answers. A refusal has its own stop_reason and a message_delta event, and the stream would still end with message_stop.',
+    },
+    {
+      prompt: 'What is the best fix?',
+      options: [
+        'Raise the idle timeout past the longest reply, and count a stream without message_stop as failed',
+        'Switch to blocking calls so there is no stream to cut',
+        'Add a retry that runs the whole call twice for every user, every time',
+        'Strip the last sentence from every answer so cuts are hidden',
+      ],
+      answer: 0,
+      explain: 'Fix the timeout, and make the success rule explicit: only message_stop means done. Blocking calls hit the same timeout and add a longer wait. Retrying everything doubles cost. Stripping text hides the bug.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: streaming messages](https://platform.claude.com/docs/en/build-with-claude/streaming)
+- [Anthropic: errors, long requests and keep-alive](https://platform.claude.com/docs/en/api/errors)
+- [OpenAI: streaming responses](https://developers.openai.com/api/docs/guides/streaming-responses)
+- [MDN: using server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events)

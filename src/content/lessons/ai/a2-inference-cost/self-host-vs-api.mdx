@@ -1,0 +1,249 @@
+---
+summary: 'GPUs = peak tokens per second / (tokens per second per GPU x target utilization). You pay for peak capacity all day, so average utilization sets the real cost per token. Measure throughput on your own model before you trust any planner.'
+requires: ['ai/a2-inference-cost/batching-throughput', 'ai/a2-inference-cost/quantization-small-models', 'ai/a0-orientation/build-buy-finetune']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai2HostDay from '../../../../components/anim/lessons/Ai2HostDay.tsx';
+import Ai2HostPlanner from '../../../../components/anim/lessons/Ai2HostPlanner.tsx';
+
+## The problem
+
+Lesson [A0.4](/learn/ai/a0-orientation/build-buy-finetune/) gave you the break-even: an H100 at $3.99 an hour serving a small model at its measured speed beats a $0.50-per-million API only above about 26% utilization. That lesson stopped at one GPU and one utilization number. A real product has a traffic curve, a peak, a failure budget, and a team. This lesson turns the break-even into a plan: how many GPUs, what they cost over a month, and what you give up.
+
+The question to answer is not "which is cheaper per token?" It is "what do I pay for a month of this traffic on each path, and what else changes?"
+
+## Naive solution: divide the price by the speed
+
+The naive plan takes the hourly price, divides by tokens per hour at full speed, and compares the result to the API price. At 100% busy the H100 looks cheap. It is wrong in three ways.
+
+First, no GPU is busy 100% of the time. You must leave room for bursts. Second, you must rent for the peak and pay for the quiet hours. Third, the speed figure came from one model on one setup. Change any of them and the number moves.
+
+## The mechanism: size for the peak
+
+Capacity planning is the estimation chain from the backend track applied to tokens: requests become tokens per second, and tokens per second become GPUs. Lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/) gave the cost formula for one GPU. For a fleet:
+
+<Math block tex="\text{GPUs} = \left\lceil \frac{\text{peak QPS} \times \text{output tokens per request}}{R \times u} \right\rceil" />
+
+In words: the tokens per second you must produce at peak, divided by what one GPU makes at your target utilization u. R is the tokens per second one GPU makes at full load. The target u is below 100% on purpose: it is your headroom for bursts and for latency (a busy server answers each user more slowly, lesson A2.4).
+
+The cost per million tokens depends on the tokens you serve, not on the tokens you could serve:
+
+<Math block tex="c = \frac{\text{GPUs} \times P_{\text{GPU}} \times 730}{\text{tokens served per month} / 10^{6}}" />
+
+Here P is the GPU price per hour and 730 is the hours in a month. A 24-hour day makes the gap obvious.
+
+### One day of traffic
+
+<Ai2HostDay client:visible />
+
+The curve is made up for the lesson, shaped like a product used during working hours. Average load is 53% of peak. Many products with users in one region look like this. Your own traffic is a number you can measure, so measure it.
+
+What the animation shows: a fixed fleet sized for the peak runs at the average, not at the target. An autoscaler can follow the curve, but a new GPU must boot and load tens of gigabytes of weights before it can serve (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/) gave the sizes). We have no sourced start-up time, so measure yours. During that time you either queue requests or hold spare GPUs.
+
+## Numbers
+
+**GPU prices** (per GPU-hour, on demand, as of 2026-10-16):
+
+| Provider and config | Price | Source |
+|---|---|---|
+| Lambda H100 SXM, 8x config | $3.99 | lambda.ai/pricing |
+| Lambda H100 SXM, 4x / 2x / 1x | $4.09 / $4.19 / $4.29 | lambda.ai/pricing |
+| Lambda H100 PCIe | $3.29 | lambda.ai/pricing |
+| RunPod H100 SXM, secure cloud | $3.99 | runpod.io/pricing |
+| RunPod H100 SXM, community cloud | $2.69 | runpod.io/pricing |
+
+RunPod's page (updated 2026-10-08) shows one price for H100 SXM in its visible table. The $2.69 community figure and the tier labels appear only in the page's structured data, so confirm on the console. AWS's p5.48xlarge page lists 8 x H100 and 640 GB of HBM3, with no price, so we quote none for hyperscalers.
+
+**API prices** are in lesson A0.4: Haiku 5.5 $0.50 per million output tokens, Sonnet 5.5 $10, Opus 5.5 $20 (the Anthropic pricing page lists the same figures as of 2026-10-16).
+
+**Throughput R.** The A0.4 figure is 8,399 tokens per second for Llama 3.1 8B on one H100 with vLLM, from the [E2E Networks benchmark](https://docs.e2enetworks.com/docs/tir/benchmarks/inference_benchmarks/), at a request rate of 64 with 128 tokens in and 128 out. That page defines throughput as "the total number of tokens generated per second". We checked it against the same row, which also lists 35.04 completed requests per second. At 128 output tokens each, that is 35.04 x 128 = 4,485 output tokens per second (derived). The two numbers do not agree. The gap, 8,399 / 35.04 = 240 tokens per request, is nearer the 256 tokens of input plus output. So 8,399 may count prompt tokens too. We cannot tell from the page. For capacity planning, 4,485 is the safer output-only number, and it is a reason to measure R yourself. The planner has a button for each.
+
+A second warning on R: the vLLM v0.6.0 release notes report 2.7x more throughput on Llama 3 8B on one H100 than v0.5.3, on their benchmark. Your serving software version can change R by a large factor.
+
+### The planner
+
+Enter your traffic. The default is 50 peak requests per second at 400 output tokens, with average load at 30% of peak.
+
+<Ai2HostPlanner client:visible />
+
+Hand check for the default: peak tokens per second = 50 x 400 = 20,000. At R = 8,399, that is 2.4 GPUs, so 3 before headroom. At a 70% target: 20,000 / (8,399 x 0.7) = 3.4, so 4 GPUs. Monthly cost = 4 x $3.99 x 730 = $11,651. Average load is 6,000 tokens per second, so average utilization is 6,000 / (4 x 8,399) = 18%. Tokens served per month = 6,000 x 3,600 x 730 = 15.8 billion. Cost per million tokens = $11,651 / 15,768 = $0.74. Against Haiku 5.5 at $0.50, that is $7,884 a month for the API. At this traffic shape, the API wins on price. Click "Output only" and 7 GPUs are needed (20,000 / (4,485 x 0.7) = 6.4).
+
+What to notice:
+
+1. **Raise the average-to-peak share.** Flat traffic makes self-hosting far cheaper per token. Spiky traffic makes it expensive.
+2. **Move the target utilization.** Higher targets need fewer GPUs and give users slower answers.
+3. **Compare against Sonnet 5.5.** A $10 API price flips the answer, but an 8B model is not a Sonnet 5.5 substitute. Compare quality on your eval.
+
+The planner counts output tokens only, one model size, one GPU type, and no spare capacity unless you tick the box. It ignores input processing, the KV cache limit on batch size, and the cost of your team.
+
+## What the planner leaves out
+
+- **Operations.** You carry GPU failures, driver and server upgrades, autoscaling, and on-call. One spare GPU for failover is the minimum, and it is a fixed monthly cost.
+- **Quality and eval cost.** Each model change needs the eval run again. An open model of 8B and a frontier API model are different products.
+- **Lock-in.** Prompts tuned to one model drift when you switch. Self-hosting reduces dependence on a provider and adds dependence on your own stack.
+- **Data privacy.** If data may not leave your network, the API is out, whatever the price. This is the most common forcing reason.
+- **Latency control.** You choose the region, the batch size, and the model size. A small quantized model nearby (lesson [A2.6](/learn/ai/a2-inference-cost/quantization-small-models/)) can meet a tight budget that a remote API cannot. You also own the tail: a busy GPU slows every user.
+- **Big models.** A 70B model in BF16 needs two H100s (lesson A2.1). They must talk fast. NVLink is 900 GB/s per H100 (NVIDIA's H100 page). Splitting a model across GPUs (tensor parallelism) stays inside one node. Elective E3.6 covers it.
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| API | No fixed cost, no ops, best models, no idle bill | Per-token price, data leaves, provider limits | Variable or low volume, quality first |
+| Self-host, fixed fleet | Predictable bill, data stays, full control | Pays for peak all day, ops load | Flat, high traffic or strict privacy |
+| Self-host, autoscaled | Lower idle cost | Cold start lag, queueing on ramps, more moving parts | Strong daily pattern, tolerant latency |
+| Hybrid: base load self-hosted, bursts to API | Fleet stays busy | Two paths to test and monitor | High base load with rare peaks |
+
+## Interview lens
+
+<Callout type="tip">
+Say the chain: "Peak is 50 requests per second at 400 tokens, which is 20,000 tokens per second. At about 8,000 tokens per second per GPU and a 70% target, that is 4 GPUs, about $11,650 a month at $3.99 an hour. Average load is 30% of peak, so real utilization is about 18%, and the API costs less. I would measure tokens per second on our own model first, because the benchmark may count input tokens."
+</Callout>
+
+<Callout type="mistake">
+Do not compare a GPU price at 100% utilization with an API price and stop. Do not size for the average and then say p99 is fine. Do not quote a throughput figure without saying which model, hardware, server, and request shape it came from. And do not forget the eval and on-call cost: a saving of a few hundred dollars a month does not pay for a person.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="a27-three-times-api"
+  title="Three times the API price"
+  scenario="A team moved from an API to 6 self-hosted H100s. The GPU bill is three times what the API would have cost for the same tokens. The benchmark said the GPUs were cheaper."
+  facts={['GPU price: $3.99 per hour', 'benchmark: 100% busy, cost well below the API', 'production: average GPU utilization 31%, peak 70%']}
+  steps={[
+    {
+      prompt: 'What is the first thing to check?',
+      options: [
+        'The GPU hourly price, which probably rose after the benchmark',
+        'The tokenizer, because a different one splits text into more tokens',
+        'The network bandwidth between the GPUs and the load balancer',
+        'Utilization: at 31% the cost per token is about 3.2 times the cost at 100%',
+      ],
+      answer: 3,
+      explain: 'Cost per token scales with 1 / utilization. 1 / 0.31 is 3.2, which matches the 3x gap. The benchmark assumed a fully busy GPU. Price and tokenizer effects would not give a factor that matches this closely.',
+    },
+    {
+      prompt: 'Which change attacks the cause?',
+      options: [
+        'Raise average utilization: smaller fleet, autoscaling, or send peaks to the API',
+        'Buy GPUs in a longer term contract to lower the hourly price by a few percent',
+        'Add more GPUs so each request is served faster',
+        'Move every request to a larger model for better answers',
+      ],
+      answer: 0,
+      explain: 'You pay for idle time, so reduce idle time. A small price discount does not close a 3x gap. More GPUs lower utilization further. A larger model would raise the cost per token.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Capacity and cost estimates"
+  scenario="A chat feature peaks at 200 requests per second. Each answer is 600 output tokens. One GPU makes 2,000 output tokens per second (an assumed figure: you must measure yours). GPU price is $3.99 per hour. A month has 730 hours."
+  steps={[
+    {
+      prompt: 'How many output tokens per second at peak?',
+      unit: 'tokens/s',
+      answer: 120000,
+      within: 1.1,
+      explain: '200 x 600 = 120,000.',
+    },
+    {
+      prompt: 'How many GPUs at 100% utilization, rounded up?',
+      unit: 'GPUs',
+      answer: 60,
+      within: 1.1,
+      explain: '120,000 / 2,000 = 60.',
+    },
+    {
+      prompt: 'How many GPUs with a 75% target utilization?',
+      unit: 'GPUs',
+      answer: 80,
+      within: 1.1,
+      explain: '120,000 / (2,000 x 0.75) = 80.',
+    },
+    {
+      prompt: 'What is the monthly GPU bill for those 80 GPUs, in dollars?',
+      unit: 'dollars',
+      answer: 233000,
+      within: 1.2,
+      explain: '80 x $3.99 x 730 = $233,016.',
+    },
+    {
+      prompt: 'Average load is 25% of peak. What is the average utilization of the 80 GPUs, as a percent?',
+      unit: 'percent',
+      answer: 18.75,
+      within: 1.2,
+      explain: 'Average tokens per second = 30,000. Capacity = 80 x 2,000 = 160,000. 30,000 / 160,000 = 18.75%.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'a27-q-gpus',
+      q: 'Peak traffic is 30 requests per second at 500 output tokens each. A GPU makes 6,000 tokens per second and you target 75% utilization. How many GPUs?',
+      options: [
+        '3 GPUs, since 15,000 / 6,000 is 2.5 and rounds up to 3',
+        '4 GPUs: 15,000 / (6,000 x 0.75) = 3.3, rounded up',
+        '5 GPUs, since you add one spare card for every four cards',
+        '2 GPUs, since 15,000 / 6,000 is 2.5 and rounds down to 2',
+      ],
+      answer: 1,
+      explain: 'Peak = 30 x 500 = 15,000 tokens per second. Capacity per GPU at target = 4,500. 15,000 / 4,500 = 3.33, so 4. Option 1 forgets headroom. Rounding down leaves you short at peak.',
+    },
+    {
+      id: 'a27-q-avg',
+      q: 'A fleet is sized for peak, and average load is 40% of peak. At a 100% target, what is the average utilization, and what does it do to cost per token?',
+      options: [
+        '100% busy, and cost per token matches the benchmark figure',
+        '40% busy, and cost per token is 2.5 times the 100% figure',
+        '40% busy, and cost per token is 0.4 times the 100% figure',
+        '60% busy, because the idle share is subtracted from the peak',
+      ],
+      answer: 1,
+      explain: 'Capacity matches peak, so average use is 40% of capacity. You pay for 100% and use 40%, so each used token costs 1 / 0.4 = 2.5 times more. Option 3 flips the direction.',
+    },
+    {
+      id: 'a27-q-bench',
+      q: 'A benchmark row reports 8,399 tokens per second and 35.04 requests per second at 128 output tokens each. What is the best reading?',
+      options: [
+        'It is a firm output rate, so use 8,399 for planning without any checks',
+        'It is exactly 35.04 x 240, so the server adds 112 tokens of padding each',
+        'Output is 35.04 x 128 = 4,485 tokens/s, so the figures conflict: measure',
+        'It counts only the first token of each request, so it is a latency figure',
+      ],
+      answer: 2,
+      explain: 'Output rate must equal requests per second times output length, which is 4,485. The 8,399 figure may include prompt tokens. The page does not say, so measure R on your own setup. Padding and first-token counts are not stated.',
+    },
+    {
+      id: 'a27-q-force',
+      q: 'Which fact alone can force self-hosting even when the API is cheaper per token?',
+      options: [
+        'The GPU price fell by 10% this month',
+        'The API model scores two points higher on your eval',
+        'Your team likes to run its own servers and has spare weekend time',
+        'Customer data is not allowed to leave your network',
+      ],
+      answer: 3,
+      explain: 'A privacy rule can remove the API from the options whatever the price. A price drop is small against a utilization gap. A higher API score argues for the API. Preference is not a requirement.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Lesson A0.4](/learn/ai/a0-orientation/build-buy-finetune/): the break-even this lesson extends.
+- [E2E Networks, inference benchmarks](https://docs.e2enetworks.com/docs/tir/benchmarks/inference_benchmarks/): the Llama 3.1 8B row discussed above.
+- [vLLM, v0.6.0 performance update](https://vllm.ai/blog/2024-09-05-perf-update): how much server software changes throughput.
+- [NVIDIA, H100](https://www.nvidia.com/en-us/data-center/h100/): memory, bandwidth, and NVLink figures.
+- Price pages: [Lambda](https://lambda.ai/pricing), [RunPod](https://www.runpod.io/pricing), [Anthropic pricing](https://claude.com/pricing).

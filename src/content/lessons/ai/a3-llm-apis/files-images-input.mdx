@@ -1,0 +1,265 @@
+---
+summary: 'Images cost one token per 28 by 28 pixel patch, after a downscale cap that depends on the model. A PDF page is read as text and as an image. Upload large files once, check the limits, and shrink or crop before you send.'
+requires: ['ai/a3-llm-apis/api-anatomy']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai3FilePdfWalk from '../../../../components/anim/lessons/Ai3FilePdfWalk.tsx';
+import Ai3FileCalc from '../../../../components/anim/lessons/Ai3FileCalc.tsx';
+
+## The problem
+
+A model reads tokens. An image is not text, so the provider turns it into tokens before the model sees it. You pay for those tokens, and they take up context.
+
+A team builds an invoice reader. A test with ten invoices costs a few cents. In production they send 200,000 scanned pages a month. The bill is five times higher than the estimate, and nobody knows why. The estimate counted words. The pages were sent as images, and images have their own price rule.
+
+This lesson gives that rule, the limits around it, and the choices you control: what format to send, how large, and how often.
+
+Facts about Anthropic's API come from its vision, PDF, and Files pages, fetched on 2026-10-16. Other providers use other formulas. Check their pages before you copy any number here.
+
+## Naive solution: send the raw scan every time
+
+The simple design sends each page exactly as the scanner produced it, as base64 text in the request body. It has three faults.
+
+1. **Cost.** A big image can cost thousands of tokens. A clean text page often costs fewer.
+2. **Payload size.** Base64 inflates the bytes. In a chat, each turn resends the full history, so the same images ride along on every call. Anthropic's vision page says this grows request size and latency as the conversation grows.
+3. **No check.** Nothing stops a 40 MB scan, a Word file, or an image with a hidden instruction in it.
+
+## The mechanism: patches, caps, and file ids
+
+### Images are counted in patches
+
+Claude's vision page says it views images in patches, not pixels. Each patch is 28 by 28 pixels, and each patch is one visual token. The cost of an image is:
+
+<Math block tex="\text{tokens} = \lceil w / 28 \rceil \times \lceil h / 28 \rceil" />
+
+In words: round the width up to whole patches, round the height up to whole patches, and multiply. A 1000 x 1000 image is 36 x 36 patches, so 1,296 tokens. The page's own example says the same.
+
+Older material, and some provider pages, use a pixel-area rule such as "width times height divided by 750". Anthropic's current page does not. It states the patch rule above. If you find the older rule in a blog post or a code sample, check the date before you trust it.
+
+### The downscale cap depends on the model
+
+Large images are resized first, then counted. The page gives two tiers:
+
+| Tier | Models | Max long edge | Max visual tokens |
+|---|---|---|---|
+| High-resolution | Claude 4.7 and later | 2576 px | 4784 |
+| Standard | All other models | 1568 px | 1568 |
+
+An image is resized when it breaks either limit. The token limit often bites first. A 1920 x 1080 screenshot is not cut to 1568 px wide. The standard tier shrinks it to 1456 x 819 so it fits 1,568 tokens, and the cost is 1,560. The high-resolution tier does not resize it, and the cost is 2,691. The same image costs 1.7 times more on the newer models, because they keep more detail. The page says high-resolution images can use about three times more tokens than on a standard-tier model.
+
+After resizing, Claude pads the image up to the next multiple of 28 on the bottom and right. The padding holds no content.
+
+### Try it
+
+The calculator below uses the page's formula and its reference resize rule. Start with the 1920 x 1080 preset on Opus 5.5, then change to Haiku 4.5 and watch the cap. Then drag the downscale slider on the invoice preset. Prices are input prices per 1M tokens, as of 2026-10-16: Opus 5.5 $4, Sonnet 5.5 $2, Haiku 5.5 $0.10 for prompts up to 100K tokens ([claude.com/pricing](https://claude.com/pricing)), and Haiku 4.5 $1 (the example on the [vision page](https://platform.claude.com/docs/en/build-with-claude/vision)).
+
+<Ai3FileCalc client:visible />
+
+What to notice. Doubling both sides of an image roughly quadruples its patches, until the cap stops the growth. Past the cap, extra pixels cost nothing but also add no detail. So send images at or below the cap. A smaller image can read worse, so test text legibility on your own pages.
+
+### A PDF is text plus an image
+
+A PDF page has two sources of information: a text layer, if the file has one, and the page graphics. The PDF page of Anthropic's docs says each page is processed as both text and image. Many Claude models accept PDFs directly. The limits are 32 MB per request and 600 pages, or 100 pages when the context window is under 1M tokens. Dense pages can fill the context before the page limit.
+
+<Ai3FilePdfWalk client:visible />
+
+The page does not give a token count per page for the direct API. It does give one data point for Amazon Bedrock: about 1,000 tokens for a 3-page PDF as text only, and about 7,000 with page images. Do not budget from that figure for another setup. Measure your own files with the token counting endpoint, which accepts base64 images and PDFs. It does not accept `url` or `file` sources.
+
+### Which format, by content
+
+| Content | Best input | Why |
+|---|---|---|
+| Clean text, no layout needed | Extract text yourself, send text | Cheapest. Exact characters. |
+| Tables, forms, stamps, charts | Page image or PDF | Layout carries meaning |
+| Scan with no text layer | OCR first when you need exact values; image when you need layout | The model reads pixels. It can misread digits. |
+| Word, Excel files | Convert to text or PDF | A `docx` is not a supported document block type |
+
+Here is the invoice example with illustrative numbers. Suppose one invoice page is 1240 x 1754 px (an A4 scan at about 150 DPI) and holds about 600 tokens of text. As text, it costs about 600 tokens. As an image on a high-resolution model, it costs 45 x 63 = 2,835 tokens. As a PDF, it costs the text plus a page image, so more than either. At $2 per 1M tokens (Sonnet 5.5 input), that is about $0.0012, $0.0057, and up to about $0.0069 per page. The text figure is an assumption. The image figure follows the formula.
+
+### Upload once, refer by id
+
+The Files API stores a file and returns a `file_id`. An image or document block can then point at the id with `"type": "file"`. This keeps the request small. Facts from the Files page:
+
+- Up to 500 MB per file and 1 TB per organization.
+- Upload, list, get, and delete calls are free. File content used in a Messages request is billed as input tokens, every time.
+- Files persist until you delete them. `expires_in_seconds` can set an expiry from 1 hour to 90 days.
+- About 500 file calls per minute.
+
+Upload does not make an image cheaper. The tokens are the same. It removes the bytes from the request, not the tokens from the bill.
+
+The Files page warns that uploaded files are open to the whole workspace, not to one end user. Never accept a `file_id` from a user. Keep your own map of user to file, and use one workspace per tenant when tenants must be separate.
+
+### Check before you send
+
+Run these checks in your own code. A rejected request wastes a round trip.
+
+- Image count: 100 per request for models with a 200K context window, 600 for others. Max 8000 x 8000 px per image.
+- Over 20 images in one request, a stricter per-image dimension limit applies. It counts images from earlier turns and images inside tool results. Keep each side at or below 2000 px.
+- Image size: 10 MB base64 on the direct API. 5 MB on Bedrock and Google Cloud.
+- Formats: JPEG, PNG, GIF, WebP. An animated GIF uses its first frame only.
+- Request size: 32 MB on the Messages API.
+- Heavy JPEG compression can make small text unreadable. Look at the image you actually send.
+
+Pre-processing is the best saving. Crop to the region that holds the answer. Downscale to the cap. Run OCR for plain text. A crop of a totals box can cost a tenth of the full page and read better. Vision internals are in lesson A12.1.
+
+<Callout type="deep" title="Files can carry instructions">
+An image or PDF can hold text that tells the model what to do, in white-on-white print or tiny type. The model reads it like any other input. Treat file content as untrusted data. Lesson A10.2 covers defenses. For now, keep tools that have side effects out of any call that reads files from unknown senders.
+</Callout>
+
+## Numbers
+
+Here is the chain for a batch of scans. All figures are derived with the formula above. Prices are input prices, as of 2026-10-16.
+
+| Case | Tokens per image | Cost per 1,000 images |
+|---|---|---|
+| 1000 x 1000 on Haiku 4.5 ($1) | 1,296 | $1.30 |
+| 1000 x 1000 on Opus 5.5 ($4) | 1,296 | $5.18 |
+| 4K (3840 x 2160) on Opus 5.5 ($4) | 4,784 | $19.14 |
+| 1240 x 1754 on Sonnet 5.5 ($2) | 2,835 | $5.67 |
+| Same page at 50% (620 x 877) on Sonnet 5.5 | 736 | $1.47 |
+
+The first three rows match the vision page's own cost examples. The last two are derived. These costs are input only. Output tokens and any text you send add to them.
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| Send extracted text | Cheapest, exact characters | Loses layout | Clean digital text |
+| Send full-size image | Maximum detail | Tokens up to the cap | Dense charts, small print |
+| Downscale or crop first | Fewer tokens, faster calls | May lose small text | Most pipelines |
+| Send PDF directly | No rasterizing code | Text plus image per page, page limits | Mixed pages, quick start |
+| Files API `file_id` | Small requests, reuse | Workspace-wide access, storage to manage | Many turns on the same file |
+
+## Interview lens
+
+<Callout type="tip">
+Say the formula and the cap: "An image is patches of 28 by 28, so tokens are the width and height in patches multiplied, capped by the model's tier. I would crop and downscale first, upload once by file id, and run a token count on a sample to set the budget." Then give one number, such as 2,835 tokens for an A4 scan at 150 DPI on a high-resolution model.
+</Callout>
+
+<Callout type="mistake">
+Do not budget images with an old pixel-area rule. Do not assume one number for all models, because the tier changes the cap. Do not accept a `file_id` from a user. And do not forget that a PDF page costs text and image, not one or the other.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="A scan backlog"
+  scenario="You must read 1,000 scanned invoice pages with Sonnet 5.5, a high-resolution model. Each page is 1240 x 1754 px. Input costs $2 per 1M tokens (as of 2026-10-16). Ignore text, prompt, and output tokens."
+  facts={['Tokens per image = ceil(w / 28) x ceil(h / 28), and this page fits the 2576 px and 4784 token limits']}
+  steps={[
+    {
+      prompt: 'How many visual tokens does one page cost?',
+      unit: 'tokens',
+      answer: 2835,
+      within: 1.1,
+      explain: '1240 / 28 = 44.3, rounded up to 45. 1754 / 28 = 62.6, rounded up to 63. 45 x 63 = 2,835. The page is under both limits, so there is no resize.',
+    },
+    {
+      prompt: 'How many input tokens do the 1,000 pages cost in total?',
+      unit: 'tokens',
+      answer: 2835000,
+      within: 1.1,
+      explain: '2,835 x 1,000 = 2,835,000 tokens, about 2.8M.',
+    },
+    {
+      prompt: 'What is the input cost in dollars?',
+      unit: 'dollars',
+      answer: 5.67,
+      within: 1.1,
+      explain: '2.835M tokens x $2 per 1M = $5.67. If you downscale each page to 620 x 877 first, a page costs 23 x 32 = 736 tokens and the total is about $1.47.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="a3-5-pdf-bill"
+  title="The PDF bill"
+  scenario="A team sends 40-page scanned contracts as PDFs. They need only the total on page 38. Their estimate used the word count of the text and came to about $0.02 per contract. The real cost is about five times higher, and the totals are wrong on a few contracts."
+  steps={[
+    {
+      prompt: 'Why is the bill above the word-count estimate?',
+      options: [
+        'The model charges more per token when a file is a PDF instead of text',
+        'Each page is read as text and as an image, so both are billed',
+        'The Files API bills each upload at 40 times the single-page rate',
+        'Base64 encoding multiplies the token count by about four',
+      ],
+      answer: 1,
+      explain: 'Anthropic processes each PDF page as both text and an image. A word count sees only the text. On a scan, the image is the main source and costs patch tokens. The token price is the same. Base64 inflates bytes, not tokens, and Files API calls are free.',
+    },
+    {
+      prompt: 'What fixes both the cost and the wrong totals?',
+      options: [
+        'Send the whole PDF again with a much higher max_tokens value',
+        'Switch to the standard tier so each page image is capped lower',
+        'Crop the totals box on that page and check it with OCR',
+        'Turn on streaming so the model reads pages one at a time',
+      ],
+      answer: 2,
+      explain: 'The answer sits on one page. A crop costs a fraction of 40 pages and is easier to read. OCR text gives an exact check on digits. More max_tokens changes output length only. A lower cap would blur small print and make errors worse. Streaming does not change what is read.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'a3-5-q-patches',
+      q: 'A 560 x 840 px image is under every limit. How many visual tokens does it cost on Anthropic models?',
+      options: ['600', '470', '1,200', '840'],
+      answer: 0,
+      explain: '560 / 28 = 20 and 840 / 28 = 30, so 20 x 30 = 600. The figure 470 comes from an old pixel-area rule, 560 x 840 / 1000, which is not the current formula.',
+    },
+    {
+      id: 'a3-5-q-tier',
+      q: 'A 1920 x 1080 screenshot costs 1,560 tokens on a standard-tier model and 2,691 on a high-resolution one. Why?',
+      options: [
+        'The newer models count every pixel of the image, not every patch',
+        'The standard tier compresses the image file before it counts any tokens',
+        'It is shrunk to 1456 x 819 to meet the 1,568 token cap',
+        'High-resolution models add tokens for the padding on all four edges',
+      ],
+      answer: 2,
+      explain: 'Both tiers use the same patch rule. The standard tier cap is 1,568 tokens, so the image is downscaled first. The high-resolution tier allows 4,784 tokens and keeps 1920 x 1080: 69 x 39 = 2,691. Padding is only added on the bottom and right.',
+    },
+    {
+      id: 'a3-5-q-fileid',
+      q: 'A chat app uploads each image once and sends its file_id on every turn. What does this save?',
+      options: [
+        'The request bytes and the image tokens on every later turn',
+        'The request bytes only. Image tokens are still billed per call',
+        'Nothing at all, because file_id values work only for PDF documents',
+        'The input tokens, though the request bytes still grow every turn',
+      ],
+      answer: 1,
+      explain: 'A file_id keeps the image bytes out of the payload. The Files page says file content in a Messages request is billed as input tokens. So each call that includes the image pays for it again. Images also work with file_id, not only PDFs.',
+    },
+    {
+      id: 'a3-5-q-tenant',
+      q: 'A multi-tenant app lets a user type a file_id into a form to attach a past upload. What is the main risk?',
+      options: [
+        'The id is too long to fit inside one request header field',
+        'The file expires early because the user never set its lifetime',
+        'The model may refuse to read files that it did not upload itself',
+        'A user could name a file that belongs to another tenant',
+      ],
+      answer: 3,
+      explain: 'Files are scoped to the workspace, not to a user. If you accept an id from a user, that user can name a file that belongs to someone else. Keep the user-to-file map on your server, and use one workspace per tenant when you need hard isolation.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic, Vision](https://platform.claude.com/docs/en/build-with-claude/vision): the patch formula, tiers, limits, and cost examples used here.
+- [Anthropic, Coordinates and bounding boxes](https://platform.claude.com/docs/en/build-with-claude/vision-coordinates): the exact resize and padding rule, with reference code.
+- [Anthropic, PDF support](https://platform.claude.com/docs/en/build-with-claude/pdf-support): page limits and how pages are read.
+- [Anthropic, Files API](https://platform.claude.com/docs/en/build-with-claude/files): limits, expiry, billing, and the workspace warning.

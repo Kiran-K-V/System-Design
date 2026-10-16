@@ -11,6 +11,8 @@ export interface Part {
   can: string[];
   /** The gap the next part fills. On the last part, what to do after the track. */
   next: string;
+  /** Not needed for the core path. The track home shows an "optional" tag and a muted line. */
+  optional?: boolean;
 }
 
 export interface Track {
@@ -20,7 +22,7 @@ export interface Track {
   tagline: string;
   outline: ModuleOutline[];
   parts: Part[];
-  /** '' for backend (4.11), 'A' for ai (A5.1). */
+  /** '' for backend (4.11), 'A' for ai (A5.1). A module `label` overrides it (E1.3). */
   numberPrefix: string;
   /** Three "you will be able to" lines. Placeholder copy. */
   bullets: string[];
@@ -66,31 +68,34 @@ export const tracks: Record<TrackId, Track> = {
     id: 'ai',
     name: 'AI System Design',
     short: 'AI',
-    tagline: 'How models are trained, served, grounded and kept safe in production.',
+    tagline: 'How to build with models: APIs, context, retrieval, agents, evals and safety, in production.',
     outline: aiSyllabus,
     numberPrefix: 'A',
     parts: [
       { title: 'Foundations', modules: [0, 1, 2],
-        can: ['Explain what a model does from tokens to output.', 'Say why it hallucinates and what the context window costs.', 'Estimate GPU memory and cost for a model on paper.'],
-        next: 'How models are built, trained and tuned.' },
-      { title: 'Models and training', modules: [3, 4],
-        can: ['Turn a business goal into an ML objective and metrics.', 'Plan a training run across many GPUs.', 'Choose between prompting, RAG and fine-tuning.'],
-        next: 'Serve the model fast and give it the right facts.' },
-      { title: 'Serving and retrieval', modules: [5, 6],
-        can: ['Explain the KV cache, batching and where latency goes.', 'Pick quantization or speculative decoding for a latency goal.', 'Build retrieval that finds the right chunk, with permissions.'],
-        next: 'Turn the model into a product people use.' },
-      { title: 'Applications and agents', modules: [7, 8],
-        can: ['Get structured output and safe tool calls from a model.', 'Add caching, routing and fallbacks across providers.', 'Design an agent loop that you can stop, resume and audit.'],
+        can: ['Explain what a model does from tokens to output.', 'Say why it hallucinates and what the context window costs.', 'Estimate GPU memory, latency and cost for a model call on paper.'],
+        next: 'Call models from your code, and give them the right context.' },
+      { title: 'Building with models', modules: [3, 4, 5],
+        can: ['Wire an LLM API with streaming, structured output, tools, retries and cost metering.', 'Budget the context window and lay out a cache-friendly prompt.', 'Build retrieval that finds the right chunk, with permissions.'],
+        next: 'Let the model act: loops, tools and graphs.' },
+      { title: 'Agents', modules: [6, 7],
+        can: ['Draw an agent as a graph with state, tools and an exit rule.', 'Stop a runaway loop with budgets, and resume a run after a crash.', 'Add approvals, sandboxes and per-user auth to an agent.'],
         next: 'Prove it works, and keep it working.' },
-      { title: 'Running it in production', modules: [9, 10, 11],
-        can: ['Build an eval set and catch a regression before users do.', 'Trace, cost and roll back a model or prompt change.', 'Threat-model prompt injection and lock down tools.'],
-        next: 'Media models, and full designs end to end.' },
-      { title: 'Frontier and practice', modules: [12, 13, 14],
-        can: ['Budget latency for a voice or image pipeline.', 'Drive a full AI design from goal to evals.', 'Compare your design with how real teams built it.'],
+      { title: 'Quality and trust', modules: [8, 9, 10],
+        can: ['Build an eval set and grade agent trajectories.', 'Trace, cost and roll back a model or prompt change.', 'Threat-model prompt injection and lock down tools.'],
+        next: 'Tune the model, and add media and voice.' },
+      { title: 'Customization and media', modules: [11, 12],
+        can: ['Choose between prompting, RAG and fine-tuning.', 'Explain SFT, LoRA, preference tuning and reinforcement fine-tuning.', 'Budget latency for a voice or image pipeline.'],
+        next: 'Full designs end to end.' },
+      { title: 'Practice', modules: [13, 14],
+        can: ['Drive a full agent design from goal to evals.', 'Price and budget a case with live numbers.', 'Compare your design with how real teams built it.'],
         next: 'Ship something small and measure it. That is the real test.' },
+      { title: 'Electives', modules: [15, 16, 17], optional: true,
+        can: ['Design a feature store, a ranking cascade and a fraud scorer.', 'Plan a training run across many GPUs.', 'Explain PagedAttention, speculative decoding and prefill/decode splits.'],
+        next: 'Go deeper in the area your role needs.' },
     ],
     bullets: [
-      'Work out GPU memory and cost per request.',
+      'Call a model from your code, and price each request.',
       'Build retrieval that finds the right page.',
       'Ship an agent you can evaluate and trust.',
     ],

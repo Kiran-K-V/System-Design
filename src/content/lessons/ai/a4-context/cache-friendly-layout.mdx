@@ -1,0 +1,214 @@
+---
+summary: 'A prompt cache reuses only an exact prefix, so order the prompt from most stable to most volatile: tools, system rules, documents, examples, then anything that changes. One timestamp near the top can drop the hit rate to zero.'
+requires: ['ai/a2-inference-cost/prompt-caching', 'ai/a4-context/context-budgeting']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai4CacheWalk from '../../../../components/anim/lessons/Ai4CacheWalk.tsx';
+import Ai4CacheLinter from '../../../../components/anim/lessons/Ai4CacheLinter.tsx';
+
+## The problem
+
+A team ships a document assistant. Each request carries tool definitions, system rules, and a 148,000-token contract, followed by one short question. Lesson A2.5 ([prompt caching](/learn/ai/a2-inference-cost/prompt-caching/)) explained why this is a good fit for a prompt cache: the long part repeats, so the provider can store its work and charge a small read price. The team turns caching on. The bill does not move.
+
+Nothing is broken. The cache is on. Every request still misses. Someone added the current time to the first line of the system rules. This lesson is not about prices or break-even. A2.5 covers those. It is about **layout**: the order of the parts of a prompt, and which edits kill a cached prefix.
+
+<CrossTrackLink id="05-caching/cache-strategies">
+A cache is only useful when a key repeats. In a key-value cache you control the key. In a prompt cache the key is the exact beginning of your prompt, so you control it only through how you build the prompt. A small change to the key is a miss.
+</CrossTrackLink>
+
+## Why only a prefix counts
+
+A **prefix** is the start of a prompt, from the first token up to some point. A provider's cache matches whole prefixes. It cannot reuse a block from the middle of a prompt, because the model's stored work for a token depends on every token before it. The OpenAI guide puts it this way: "Cache reuse requires the entire rendered prefix to match." If one early token changes, all later stored work is useless.
+
+So the layout rule is plain. Put the parts that never change first. Put the parts that change last. The order in a stable prompt, most stable first, looks like this:
+
+1. Tool definitions.
+2. System rules.
+3. Few-shot examples and reference documents.
+4. Conversation history, which grows only at the end.
+5. Per-user data, the current time, and the new question.
+
+Anthropic builds the prefix in a fixed order: `tools`, then `system`, then `messages`. A cache entry covers everything "up to and including the block designated with `cache_control`". A **breakpoint** is that `cache_control` marker. You can set up to 4 breakpoints per request. Automatic caching, a single top-level `cache_control` field, uses one of those 4 slots. If 4 explicit breakpoints already exist, the API returns a 400 error.
+
+## What kills a cache
+
+Anthropic's docs state a general rule: "Changes at each level invalidate that level and all subsequent levels." Read the order again: tools, system, messages. A change in tools breaks all three. A change in the system block breaks system and messages. A change in a message breaks only the messages from that point on. The docs list these causes:
+
+| Edit | What it breaks | Why |
+|---|---|---|
+| Change a tool name, description, or parameter | Everything | Tools come first |
+| Toggle web search or citations | System and messages | Each toggle changes the system prompt text |
+| Change the effort or thinking setting | Message blocks | The setting is part of the rendered prompt |
+| Add or remove an image anywhere | Message blocks | Images are part of messages |
+| Change `tool_choice` | Message blocks only | Tools and system stay valid |
+| Timestamp or per-user text early in the system prompt | System and messages | The text differs on each request |
+| Reorder blocks | Everything from the first moved block | The prefix no longer matches |
+
+Two more rules bite in real systems. First, the lookback: on each breakpoint the system checks at most 20 positions back for an earlier entry. A long conversation that adds many blocks between requests can walk past its own last write. Put a breakpoint in the right place, not only at the end. Second, a prompt shorter than the minimum is not cached, and no error tells you. On Sonnet 5.5 the minimum is 512 tokens (as of 2026-10-16, [prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)). Other models use 1,024, 2,048, or 4,096. Check the response fields `cache_creation_input_tokens` and `cache_read_input_tokens`. They are the only honest signal.
+
+Watch one prefix live through seven requests. Notice that the cost jumps about 24 times between request 2 and request 3, with no change to the document.
+
+<Ai4CacheWalk client:visible />
+
+## Try your own layout
+
+The prompt below starts in a bad order: the current time sits third, and the user profile sits in front of the question. Drag blocks, or use the arrows, and watch the cached prefix. The prefix stops at the first block that changes between requests.
+
+<Ai4CacheLinter client:visible />
+
+What to notice:
+
+1. **Start state.** The cached prefix is only tools and system rules, 2,000 tokens, because the time block is third. Input cost is $0.2972 per request against $0.3010 uncached. Check by hand: 2,000 x $0.10 + 148,500 x $2 = $0.0002 + $0.2970 = $0.2972 per request.
+2. **"Sort: stable first".** The prefix becomes 150,000 tokens. Cost per request: 150,000 x $0.10 + 500 x $2 = $0.0150 + $0.0010 = $0.0160, about 19 times lower than the start state.
+3. **Order inside the stable group does not matter.** Drag the document to the top of the start state. The prefix becomes document, tools, and system rules: 147,000 tokens. Cost: 147,000 x $0.10 + 3,500 x $2 = $0.0147 + $0.0070 = $0.0217. Only the position of the first volatile block counts. (On the real Anthropic API the order tools, system, messages is fixed by the request format. The toy ignores that.)
+4. **Between volatile blocks.** Order among the time, the profile, and the question changes nothing. They all pay full price.
+
+## Worked example: 20 questions on one document
+
+A user asks 20 questions about a 150,000-token document. The questions come within a few minutes of each other. We count input tokens only. Output and the question text are small and the same in both cases. The prices below are Claude Sonnet 5.5, per million input tokens, as of 2026-10-16 from the [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing) (also shown on [claude.com/pricing](https://claude.com/pricing)).
+
+| Item | Price per million tokens |
+|---|---|
+| Base input | $2 |
+| 5-minute cache write | $2.50 |
+| Cache read | $0.10 |
+
+**No cache.** Each question sends the whole document, so 20 x 150,000 = 3,000,000 tokens. At $2 per million:
+
+<Math block tex="20 \times 150{,}000 \times \frac{\$2}{10^{6}} = \$6.00" />
+
+**With a cache.** Question 1 writes the prefix. Questions 2 to 20 read it. That is 19 reads.
+
+<Math block tex="150{,}000 \times \frac{\$2.50}{10^{6}} + 19 \times 150{,}000 \times \frac{\$0.10}{10^{6}} = \$0.375 + \$0.285 = \$0.66" />
+
+The cached run costs about $0.66, a tenth of the plain run. The write premium of $0.075 over the base price is paid back by the first read: one read saves 150,000 x ($2 - $0.10) / 10^6 = $0.285. The saving holds only if each next question arrives within the 5-minute lifetime. Each use refreshes it at no cost, so steady traffic keeps the entry alive. After a quiet gap, the next question pays the write again.
+
+## OpenAI: the same idea, with fewer knobs
+
+OpenAI caches automatically for supported models. The [prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching) (as of 2026-10-16) says the minimum cacheable prompt is 1,024 tokens for GPT-5.6 and later, the default retention is 30 minutes, and cache reads cost 0.1 times the uncached input price on most of these models (0.05 times on GPT-6.1 Sol). Writes cost 1.25 times. In the default implicit mode the system places the breakpoints, at the end of the latest eligible message. Explicit mode, where you mark them, exists on GPT-5.6 and later only. For earlier models, the minimum length varies with request settings, so read the guide for your model.
+
+The layout advice matches Anthropic's. The guide says to put stable developer instructions and shared reference material first, and dynamic content last: timestamps, user details, and the current question. Append new messages. Do not rewrite earlier turns. The usage field `usage.input_tokens_details.cached_tokens` reports how many tokens hit. On earlier models, a `prompt_cache_key` helps route related requests to one cache, but the guide says keys "do not pin requests to a machine or guarantee a cache hit". Treat a hit as likely, not certain.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Static first, dynamic last | High hit rate, stable cost | Dynamic data sits far from the top of the prompt | Always, for any prompt over the minimum length |
+| One breakpoint after the shared prefix | Simple, one write | A change in the prefix rewrites all of it | A single document or fixed instructions |
+| Several breakpoints (up to 4) | A change late in the prompt keeps earlier parts | More writes, a slot budget | Tools, system, document, and history change at different rates |
+| Frozen tool list | A stable first block | You cannot tune tool text freely | Production traffic with a stable tool set |
+| Time or user data in the last block | Full prefix reuse | The model sees that data late | The data does not need to shape the early instructions |
+
+Layout rules also help with correctness. A cached prefix is the same bytes on every request, so a prompt change is a deploy: version it (lesson A4.1) and watch the hit rate after you ship.
+
+## Interview lens
+
+<Callout type="tip">
+Say it as a rule and a metric: "I keep the prompt in stable-to-volatile order, so tools, system rules, and documents come first, and the time, user data, and the question come last. I log cache read tokens divided by total input tokens per route, and I alert when it drops." Naming the metric shows you know a cache can fail silently.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we turned on caching, so it is cheaper". Caching is a property of the layout, not a switch. Also do not put a timestamp, a request ID, or a user name at the top of the system prompt "for context". If the model must know the time, say so in the last block.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A prompt on Claude is built as tools, system, then messages. A developer edits one tool description. Which cached parts still hit?',
+      options: [
+        'None of them, because tools come first and a change there invalidates every later level',
+        'The system block and the messages, because only the tools level changed',
+        'Only the messages, because tools and system are billed separately',
+        'All of them, because a description does not change the cache key',
+      ],
+      answer: 0,
+      explain: 'The docs say a change at one level invalidates that level and all later ones. Tools are first, so everything misses. The edit changes the rendered prefix even though the text is a description only.',
+    },
+    {
+      q: 'A prompt has these blocks in order: system rules (static), current time (changes), reference document of 100,000 tokens (static), question (changes). How many tokens can be cached?',
+      options: [
+        'About 100,000, because the document is the biggest block',
+        'The system rules only, because the time block ends the prefix',
+        'Zero, because the prompt contains a changing block',
+        'All but the question, because static blocks are cached wherever they sit',
+      ],
+      answer: 1,
+      explain: 'A prefix match stops at the first block that differs. Only the system rules sit before the time block. The 100,000-token document comes after it, so it misses. Moving the time to the end would cache the rules and the document.',
+    },
+    {
+      q: 'You ask 20 questions about a 150,000-token document on Sonnet 5.5 with caching. Base input is $2, write is $2.50, read is $0.10 per million tokens. What is the input cost?',
+      options: [
+        'About $6.00, because the write premium cancels the read discount',
+        'About $0.30, because one read costs 150,000 x $2 / 10^6',
+        'About $3.00, because half of the questions will hit',
+        'About $0.66, from one write of $0.375 and 19 reads of $0.015 each',
+      ],
+      answer: 3,
+      explain: 'One write: 150,000 x $2.50 / 10^6 = $0.375. Each read: 150,000 x $0.10 / 10^6 = $0.015, and 19 reads add $0.285. The sum is $0.66. The uncached total is $6.00. After the first request, every request reads the cache.',
+    },
+    {
+      q: 'A prompt is 400 tokens long and uses Sonnet 5.5 with a breakpoint set. The response shows zero cache reads and zero cache writes. What is the most likely reason?',
+      options: [
+        'The API returned an error that you did not log',
+        'The prompt is below the 512-token minimum, so it was processed without caching',
+        'Breakpoints work only after the second request in a session',
+        'The cache expired because 5 minutes passed during the first request',
+      ],
+      answer: 1,
+      explain: 'The docs say a prompt shorter than the minimum is processed without caching, and no error is returned. Sonnet 5.5 has a 512-token minimum. The lesson is to check the usage fields for both counts, not to assume the breakpoint worked.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai4-cache-timestamp-system"
+  title="The hit rate fell to zero"
+  scenario="A contract assistant had a 94% cache hit rate. After Tuesday's release, cache_read_input_tokens is 0 on every request, and the input bill tripled."
+  facts={[
+    'prompt: tools (1,500 tok) + system (500 tok) + contract (148,000 tok) + question',
+    'model: Sonnet 5.5, one breakpoint after the contract',
+    'release diff: system prompt line 1 is now "Current time: 2026-10-13T09:41:07Z"',
+    'traffic: about 4 requests per minute, all within the 5-minute lifetime',
+  ]}
+  steps={[
+    {
+      context: 'Traffic is steady, so the entry should not be expiring. The tool list did not change.',
+      prompt: 'Why does the whole prefix miss, including the contract that did not change?',
+      options: [
+        'The time text differs on each request, so the system block no longer matches, and later blocks cannot hit either',
+        'The 5-minute lifetime ended because the new text made the prompt longer',
+        'Adding text to the system prompt pushed the prompt below the 512-token minimum',
+        'The contract block is re-tokenized differently when a timestamp is present',
+      ],
+      answer: 0,
+      explain: 'A cache entry covers an exact prefix. The system block now changes every second, so it differs from the stored one, and everything after it differs from that point on. The contract text is identical, but it sits behind the changed block. The prompt got longer, not shorter, and the lifetime is refreshed on use.',
+    },
+    {
+      context: 'The product team says the model must know the date, because users ask about deadlines.',
+      prompt: 'What is the fix that keeps both the date and the cache?',
+      options: [
+        'Turn off caching for this route until the date is no longer needed',
+        'Keep the timestamp in the system prompt but round it to the hour',
+        'Move the time into the final user block, after the breakpoint, and keep the system rules static',
+        'Add a second breakpoint after the timestamp so both parts are cached separately',
+      ],
+      answer: 2,
+      explain: 'Anything that changes belongs after the last breakpoint, so the prefix stays identical. Rounding to the hour still changes the system block every hour and costs a full rewrite each time. A second breakpoint does not help because the miss starts at the timestamp, and the contract comes after it.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic, prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- [OpenAI, prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+- [Anthropic, pricing](https://platform.claude.com/docs/en/about-claude/pricing)

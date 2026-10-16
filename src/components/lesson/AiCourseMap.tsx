@@ -17,17 +17,17 @@ const HALF = 264;
 
 // Plain ink everywhere. Only the layer a new reader starts on carries the accent.
 const layers: Layer[] = [
-  { href: '#module-A9', cx: 430, cy: 158, w: WIDE, label: 'Evals and production' },
-  { href: '#module-A8', cx: 430, cy: 224, w: WIDE, label: 'Agents' },
-  { href: '#module-A6', cx: 292, cy: 290, w: HALF, label: 'RAG' },
-  { href: '#module-A7', cx: 568, cy: 290, w: HALF, label: 'LLM apps' },
-  { href: '#module-A4', cx: 292, cy: 356, w: HALF, label: 'Training' },
-  { href: '#module-A5', cx: 568, cy: 356, w: HALF, label: 'Serving' },
-  { href: '#module-A2', cx: 430, cy: 422, w: WIDE, label: 'Hardware' },
+  { href: '#module-A8', cx: 430, cy: 158, w: WIDE, label: 'Evals, LLMOps, safety' },
+  { href: '#module-A6', cx: 292, cy: 224, w: HALF, label: 'Agent foundations' },
+  { href: '#module-A7', cx: 568, cy: 224, w: HALF, label: 'Agents in production' },
+  { href: '#module-A5', cx: 292, cy: 290, w: HALF, label: 'RAG' },
+  { href: '#module-A4', cx: 568, cy: 290, w: HALF, label: 'Context' },
+  { href: '#module-A3', cx: 430, cy: 356, w: WIDE, label: 'LLM APIs and integration' },
+  { href: '#module-A2', cx: 430, cy: 422, w: WIDE, label: 'Inference and cost' },
   { href: '#module-A1', cx: 430, cy: 488, w: WIDE, label: 'The model as a function', start: true },
 ];
 
-const cases = ['Assistant', 'RAG over\ndocs', 'Coding\nagent', '+ more'];
+const cases = ['Support\nagent', 'RAG over\ndocs', 'Coding\nagent', '+ more'];
 
 export default function AiCourseMap() {
   return (

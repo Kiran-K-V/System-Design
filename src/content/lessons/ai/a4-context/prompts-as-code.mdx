@@ -1,0 +1,190 @@
+---
+summary: 'A prompt is an API contract with a callee that answers differently each time. So treat it like code: split it into parts, version it, review diffs, and run a regression eval before each release.'
+requires: ['ai/a3-llm-apis/api-anatomy', 'ai/a1-model-function/hallucination-context']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai4PromptFlow from '../../../../components/anim/lessons/Ai4PromptFlow.tsx';
+import Ai4PromptVersions from '../../../../components/anim/lessons/Ai4PromptVersions.tsx';
+
+## The problem
+
+A support team ships a bot that turns customer emails into a JSON refund ticket. One Friday a user writes in French, and the bot answers in English prose, not JSON. The parser crashes. An engineer opens the prompt, which is now a wall of 900 words, and adds one line: "Always answer in the user's language, keep it short." The French case works.
+
+On Monday, three other kinds of email fail. Long emails come back cut off. Sarcastic ones are tagged as praise. Emails with two requests lose the second. Nobody changed any code. Nobody can say which of the 900 words caused which failure. The fix for one case broke three others. The numbers in this story are an illustration, not data from a real team. The pattern is real, and every prompt that grows by patches meets it.
+
+The cause is that a **prompt** [junior], the text you send to the model, is the contract between your code and a callee that is probabilistic. The callee does not throw an error when you break the contract. It returns a different answer. So you cannot see a break by running the code. You see it only by running cases.
+
+## Naive solution: one long prompt that grows
+
+The first prompt is short and works. Each bug adds a sentence. After 30 patches the prompt holds rules that contradict each other, rules for cases that no longer occur, and a tone nobody chose. Anthropic's context engineering guide gives the target the other way round: aim for "the minimal set of information that fully outlines your expected behavior". It also warns that hard-coding complex, brittle logic into prompts makes them fragile. A patched prompt is the opposite of minimal. (The guide adds that minimal does not mean short: you still give the model enough information up front.)
+
+There is a second trap. A prompt is tuned for one model. Anthropic's prompting guide notes that on Claude Opus 5, verification instructions carried over from prompts for earlier models can cause over-verification, adding tokens and latency, and says to remove them. It also warns that a line such as "If in doubt, use [tool]" causes a tool to be called too often on newer models. So a prompt that was right last year can be wrong after a model change, and you will not know unless you measure.
+
+## The mechanism: split it, version it, test it
+
+**Split the prompt into parts.** Most production prompts have five:
+
+| Part | What it holds | Changes how often |
+|---|---|---|
+| Role | Who the model is, in one or two lines | Rarely |
+| Task | What to do, and what not to do | Per feature |
+| Context | Facts for this call: retrieved text, user data | Every call |
+| Format | The shape of the reply, such as a JSON schema | Rarely, and with the parser |
+| Examples | A few input and output pairs (lesson A4.2) | Per quality fix |
+
+Each part is a small file or a function. The final text is built from a **template** [junior]: a string with named slots, such as `{{ticket_text}}`, that code fills with **variables** at call time. Small parts can be tested one at a time. A change to the format part should not touch the role part.
+
+Put untrusted text, such as the customer email, in a clearly marked slot, for example inside `<email>` tags. Tell the model that this slot holds data, not instructions. This is the basic form of defensive prompting. It does not stop all attacks. The full threat model is in module A10.
+
+**Version the prompt like code.** Store each prompt as a file in git, or in a **prompt registry** [mid]: a service that stores named prompts, keeps every saved version, and lets code fetch a version by name or by a label such as `production`. Langfuse, which offers one, describes its prompt management as covering versioning and labels, caches prompts client-side in its SDK so a lookup is as fast as reading memory, and lets you link prompts to traces to compare performance by prompt version. The rules are the same as for a library:
+
+- Every change is a new version. Never edit a version in place.
+- Each deploy **pins** one version. Production runs "v9", not "latest". A rollback is moving the pin back.
+- Every request logs the prompt version. When quality drops, the log shows which version served the bad answers.
+
+<CrossTrackLink id="07-reliability/observability">
+Logs, metrics, and traces tell you what a running system is doing. For a prompt, add one field to every trace: the prompt version. Without it you cannot tie a bad answer to a change.
+</CrossTrackLink>
+
+A registry label is a deploy switch. Moving `production` from v7 to v9 changes live behavior with no code review and no build (this risk is our reading, not a claim from the registry docs). So gate label changes the way you gate a release.
+
+**Review the diff.** A prompt change goes through a pull request. The reviewer reads a text diff, which is small and clear. Then the reviewer reads the **eval diff**: which test cases changed from pass to fail, and the reverse.
+
+**Run a regression eval on every change.** A **regression eval** [mid] is a fixed set of inputs with automatic checks, run on each new prompt version, to catch a change that makes old cases fail. Anthropic's guidance on tests is to favor volume: more cases with slightly noisier automatic grading beat fewer cases graded by hand. It also asks that the set match your real task mix, including edge cases such as overly long input. Its sample code uses a different model to grade than the one that generates, and calls that best practice. Lesson A8.1 covers eval design. Here, treat the eval as the unit test for the prompt.
+
+Watch one change go through the pipeline. All numbers are illustrative.
+
+<Ai4PromptFlow client:visible />
+
+The gate rule matters. "Total score must not fall" would let a version through that fixes one case and breaks another, as long as the totals are even. "No case that passed may now fail" blocks that, but it can also block a good change that trades away an unimportant case. Pick a rule on purpose, and let a human override it with a written reason. The picker below lets you try both rules on five versions of one prompt.
+
+<Ai4PromptVersions client:visible />
+
+Pick v4, which is the Friday patch from the story. Against v3 it fixes 1 case and breaks 3, and the score falls from 6 to 4. Both gate rules block it. Now pick v5. It fixes the three broken cases by splitting the patch into two rules and adding one example. The score is 7 of 8, and nothing that passed before fails. The eval did the work that nobody could do by reading 900 words.
+
+## Numbers
+
+An eval has a price. Take 200 cases of 2,000 input tokens each: 200 × 2,000 = 400,000 input tokens. At Claude Sonnet 5.5's input price of $2 per million tokens (as of 2026-10-16, [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)), that is 400,000 / 1,000,000 × $2 = $0.80 of input per run, before output tokens and before any grader calls. That is cheap next to one bad release. It is not free, so run the full set on a pull request, and a small smoke set on every commit.
+
+Because outputs vary from run to run, a one-case difference on 8 cases is noise. On 200 cases, a drop of 6 points is more likely to be a real change. A later lesson on evals shows how to size the set and repeat runs.
+
+## Trade-offs
+
+| Option | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Prompt in app code, no eval | Fastest to start | Silent regressions, no rollback | A prototype only |
+| Prompt files in git plus CI eval | Review, history, rollback with the code | A deploy to change a prompt | Engineers own the prompts |
+| Prompt registry with labels | Hot swap, non-engineers can edit, version in traces | One more service, and a label change is a deploy | Many prompts, or fast iteration |
+| Fine-tune instead of prompting | Shorter prompts, fixed style | Training runs, and the same need to eval | Prompting fails a stable task |
+
+## Interview lens
+
+<Callout type="tip">
+Say how a prompt change ships: "Prompts live in git with a version id. Each PR runs a 200-case regression eval. The gate blocks any case that passed and now fails. Production pins one version, and every trace logs it. Rollback is a pin change." Then name the metric: pass rate on the set, and the number of cases that flipped.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we tested it by trying a few examples". A prompt edit has no compiler. Also do not say "we will tune the prompt until it works" without a fixed test set. You will fix one case, break another, and not know. And do not forget the model: a model upgrade is a prompt change, so run the eval again.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A prompt edit fixes 1 failing case and breaks 3 that passed. The set has 20 cases and the old score was 18. What is the new score, and what does a "no new failures" gate do?',
+      options: [
+        '16 of 20, and the gate lets it through because one case was fixed',
+        '16 of 20, and the gate blocks it because three cases broke',
+        '19 of 20, and the gate blocks it because the change is too large',
+        '19 of 20, and the gate lets it through because the score went up',
+      ],
+      answer: 1,
+      explain: 'The score is 18 + 1 - 3 = 16 of 20. A no-new-failures gate looks at broken cases, and three broke, so it blocks. The fix does not cancel the breaks. The score did not rise, so 19 is wrong.',
+    },
+    {
+      q: 'Production quality drops on Tuesday. The prompt registry label `production` was moved from v7 to v9 on Monday. What is the fastest safe action?',
+      options: [
+        'Edit v9 in place to remove the line that you think caused the drop',
+        'Redeploy the whole service from the last tagged build of the code',
+        'Move the pin back to v7, then debug v9 offline against the eval set',
+        'Raise the model temperature so the answers vary less on bad cases',
+      ],
+      answer: 2,
+      explain: 'A pinned version makes rollback a one-step change with no code deploy. Editing a version in place destroys the history you need for debugging. A code redeploy does nothing, because the code did not change. A higher temperature makes answers vary more, not less.',
+    },
+    {
+      q: 'A prompt has role, task, context, format, and examples as separate parts. Which part changes on every call, and where should untrusted user text go?',
+      options: [
+        'Role changes every call, and untrusted text goes in the role slot',
+        'Format changes every call, and untrusted text goes next to the format',
+        'Examples change every call, and untrusted text goes in the examples',
+        'Context changes every call, and untrusted text goes in a marked data slot',
+      ],
+      answer: 3,
+      explain: 'Context holds per-call facts, such as the email, so it changes each call. Untrusted text belongs in a marked slot that the prompt calls data. Put in the role or the format, it reads like an instruction, and role and format should be stable.',
+    },
+    {
+      q: 'You upgrade to a newer model and copy the old prompt unchanged. Vendor guidance says some old instructions can now cause extra tool calls or extra verification. What is the right step?',
+      options: [
+        'Ship it, since a newer model follows any older prompt at least as well',
+        'Run the regression eval on the new model, then trim instructions that now hurt',
+        'Add more emphatic rules in capitals so the new model obeys the old intent',
+        'Skip the eval and compare a few answers by eye, since the model is better',
+      ],
+      answer: 1,
+      explain: 'A model change is a prompt change. The eval shows which old instructions now hurt. Newer models are not guaranteed to do at least as well with an old prompt, and Anthropic says to remove some old lines. Capitals add the over-prompting that the guidance warns about.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai4-prompt-edit-fixes-one-breaks-three"
+  title="One fix, three new failures"
+  scenario="A ticket-tagging prompt scored 18 of 20 on the regression set. An engineer added the line 'Always answer in the user language, keep it short.' to fix a French email. The French case now passes. The next day, three other cases fail in production."
+  facts={[
+    'prompt: 900 words, one block, edited in place in the app config',
+    'regression set: 20 cases, not run before the edit',
+    'new failures: long email, sarcasm, two requests in one',
+    'logs: no prompt version on the traces',
+  ]}
+  steps={[
+    {
+      context: 'The team cannot tell which prompt text served the failing requests, and the old text is gone.',
+      prompt: 'What process gap made this hard to debug?',
+      options: [
+        'The model is too small to follow a 900-word prompt without breaking',
+        'No version, no pin, and no version in the traces, so nothing ties a failure to an edit',
+        'The French email should have been rejected before it reached the model',
+        'The temperature was left at the default, which causes random failures',
+      ],
+      answer: 1,
+      explain: 'An in-place edit with no version leaves no old text to compare with, and no trace field names the version. A small model is not shown to be the cause. Rejecting French is a product choice, not a fix for the process gap. Temperature does not explain three repeatable failures.',
+    },
+    {
+      context: 'The team wants to stop this from happening again, at a low cost per change.',
+      prompt: 'What is the best fix?',
+      options: [
+        'Version each prompt, run the 20-case set on every change, and block any case that flips to fail',
+        'Forbid prompt edits after launch and handle new cases with code branches',
+        'Add 30 more rules to the prompt so that every case is named and covered',
+        'Switch to the largest model so that prompt wording stops mattering',
+      ],
+      answer: 0,
+      explain: 'A version history, a regression set, and a gate catch the break before release and make rollback easy. Forbidding edits freezes the bugs. More rules grow the prompt and make conflicts likelier. A larger model still reacts to wording, and costs more per call.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic, "Effective context engineering for AI agents"](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+- [Anthropic, prompting best practices](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices)
+- [Anthropic, develop your tests](https://platform.claude.com/docs/en/test-and-evaluate/develop-tests)
+- [Langfuse, prompt management overview](https://langfuse.com/docs/prompt-management/overview)
