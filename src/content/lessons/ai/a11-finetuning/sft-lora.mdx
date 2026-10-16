@@ -1,0 +1,297 @@
+---
+summary: 'Fine-tuning turns the model weights a little at a time using example answers. Training a 70B model this way needs about 1.12 TB for its training state alone. LoRA freezes the weights and trains two thin matrices instead, and QLoRA stores the frozen part in 4 bits, so one GPU is enough.'
+requires: ['ai/a11-finetuning/when-to-finetune', 'ai/a2-inference-cost/gpu-memory-math']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai11LoraWalk from '../../../../components/anim/lessons/Ai11LoraWalk.tsx';
+import Ai11LoraMemCalc from '../../../../components/anim/lessons/Ai11LoraMemCalc.tsx';
+
+## The problem
+
+Lesson [A11.1](/learn/ai/a11-finetuning/when-to-finetune/) said: fine-tune when the failure is a stuck habit. Now you must do it. You pick an open-weight model with 70 billion weights. You rent a GPU with 80 GB of memory.
+
+Serving that model in 16-bit numbers takes 140 GB (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). So it already needs two such GPUs just to answer questions. How much does it need to learn?
+
+This lesson answers six questions:
+
+1. What does training actually do to the model?
+2. What is supervised fine-tuning, and what data does it use?
+3. Why does the naive way, changing every weight, need so much memory?
+4. How does LoRA train only a tiny part?
+5. How does QLoRA shrink the rest?
+6. Which settings decide whether it works?
+
+## Question 1: what does training do to the model?
+
+Recall the mixing desk from lesson A11.1: a model is a huge set of **weights**, and each weight is a knob. Training turns the knobs. How does it know which way?
+
+Here is one training step, in plain words.
+
+1. Show the model an example: a prompt and the answer you want.
+2. The model guesses the answer, one word-piece at a time.
+3. Measure how wrong the guess was. That score is the **loss**. A lower loss means a better guess. Think of golf: you want the low score.
+4. For each knob, find which direction to turn it, and how strongly, to lower the loss. That per-knob signal is the **gradient**. Picture standing on a foggy hillside. You cannot see the valley, but you can feel which way the ground slopes under each foot. The gradient is that slope.
+5. Turn every knob a small step downhill. The size of the step is the **learning rate**.
+
+The learning rate is a dial with two ways to go wrong. Too big, and you overshoot the valley and bounce around. Too small, and you creep so slowly that you never arrive.
+
+One concrete step. A weight is 0.50. Its gradient is 2.0, so the loss rises when the weight rises. The learning rate is 0.01. The new weight is 0.50 − 0.01 × 2.0 = 0.48. A real run repeats this for 70 billion weights, thousands of times.
+
+The rule that turns gradients into steps is the **optimizer**. The usual choice is **Adam**. Adam does one extra thing: for every weight it also remembers two running averages of recent gradients. They steady the steps, like a heavy ball rolling downhill. Keep this in mind. Those two extra numbers per weight are the source of the memory bill in Question 3.
+
+## Question 2: what is supervised fine-tuning?
+
+How did the model learn to write in the first place? It was **pretrained**: it read a huge amount of text and learned to predict the next word-piece. The result is an autocomplete engine. Ask it a question, and it may continue with more questions, because that is what text on the web does next.
+
+**Supervised fine-tuning (SFT)** is the same training loop, run on a small set of example pairs: a prompt, and the answer you want. "Supervised" means a human or a script supplied the right answer. Think of a well-read new hire. They know a lot, but they have never written one of your support replies. You show them 1,000 good replies. They pick up the house style.
+
+A typical example is one line in a file, like this:
+
+```json
+{"messages": [
+  {"role": "user", "content": "Can I get a refund after 40 days?"},
+  {"role": "assistant", "content": "Our window is 30 days, so this order is outside it. I can offer store credit instead. Want that?"}
+]}
+```
+
+Trainers usually count the loss only on the assistant's words. The model learns to produce the answer, not to repeat the question.
+
+Why does this exist? Because pretraining gives knowledge, and SFT gives manners. The LIMA study makes the point with numbers: 1,000 carefully chosen pairs turned a 65-billion-weight model into one whose answers people rated equal or better than GPT-4's in 43% of cases. Their reading: the model already knew the content. The examples taught it which kind of answer to give.
+
+So the training data is the product. 200 reviewed examples that show exactly the habit you want beat 20,000 sloppy ones.
+
+## The naive way: change every weight
+
+The simplest plan is to run the loop above on all 70 billion weights. This is **full fine-tuning**. It works. It is also expensive, because each weight needs more than itself in memory. Count it up, one weight at a time.
+
+- **The weight itself.** Stored in a 16-bit format called BF16: 2 bytes.
+- **Its gradient.** The same size as the weight: 2 bytes.
+- **A master copy in 32 bits.** Why? Each step is tiny, like 0.0003. A 16-bit number rounds a change that small away. So the optimizer keeps a precise 32-bit copy and adds the tiny steps to it. Picture a ledger kept in cents, with a balance shown in rounded dollars. Cost: 4 bytes.
+- **Adam's two running averages.** 4 bytes each, 8 in total.
+
+<Math block tex="\text{bytes per weight} = 2 + 2 + 4 + 4 + 4 = 16" />
+
+For 70 billion weights:
+
+```text
+70,000,000,000 weights x 16 bytes = 1,120,000,000,000 bytes = 1.12 TB
+```
+
+That is 8 times the 140 GB needed to serve the same model. On 80 GB GPUs it takes at least 1,120 / 80 = 14 of them, and that is before **activations**. Activations are the in-between results the model saves during its guess, so it can compute gradients afterward. They grow with the **batch** (how many examples you train on at once) and the length of the text.
+
+The 16-byte count is the standard accounting for mixed-precision training with Adam, from Microsoft's ZeRO paper. Other papers count differently, and field note 4 below shows how big the gap can be. Always do your own arithmetic.
+
+Full fine-tuning has a second cost. Every fine-tune produces a full-size copy of the model. Ten customers means ten copies of 140 GB.
+
+## Question 3: what if we train only a thin side path?
+
+Look at what SFT changes. It teaches a habit, such as a tone or a format. Do you need to move all 70 billion knobs for that? The authors of **LoRA** (low-rank adaptation) bet that you do not. The change a task needs is simple, so a small correction can carry it.
+
+Three terms first.
+
+**Matrix.** A matrix is a grid of numbers. Each layer of the model multiplies its input list by a grid. Each output number is a weighted sum of the inputs. Tiny example: weights [0.5, 2] and inputs [4, 1] give 0.5 × 4 + 2 × 1 = 4. Almost all of a model's weights live in such grids. In Llama 3 70B, a typical grid is 8,192 x 8,192, which is 67,108,864 numbers.
+
+**Rank.** Picture a spreadsheet with 8,192 rows. If every row is a mix of the same 16 base rows, the sheet has **rank** 16. It looks big, but it holds only 16 independent patterns. A thin pair of grids can build such a sheet. Grid B is 8,192 rows by 16 columns. Grid A is 16 rows by 8,192 columns. Multiply them and you get a full 8,192 x 8,192 sheet of rank 16.
+
+**Adapter.** The adapter is the pair A and B, plus the rule for adding their product to the layer. The name says what it does: it adapts a frozen layer.
+
+Now the idea in one line. **Freeze** the big grid W: its numbers are read and never changed. Train only A and B. The layer's output becomes the old output plus a small correction:
+
+<Math block tex="h = Wx + \tfrac{\alpha}{r}\, B A x" />
+
+In words: h is the layer's output, x is its input, r is the rank, and the fraction is a fixed scale factor you set once. The picture: a 500-page book you may not reprint. You add a two-page errata sheet and read it alongside.
+
+The size gain, for one 8,192 x 8,192 grid at rank 16:
+
+```text
+full grid:   8,192 x 8,192            = 67,108,864 numbers
+adapter:     16 x (8,192 + 8,192)     =    262,144 numbers
+ratio:       262,144 / 67,108,864     = 1/256, about 0.39%
+```
+
+Put an adapter on every grid of Llama 3 70B (all seven in each of its 80 layers) at rank 16, and the total is 207,093,760 numbers, 0.30% of the model. The LoRA authors report 10,000 times fewer trainable numbers on the 175B GPT-3, with a rank of 4 on two grids per layer.
+
+Step through one layer.
+
+<Ai11LoraWalk client:visible />
+
+### Why training gets cheaper
+
+Memory first. The gradient, the master copy, and Adam's two averages (14 of the 16 bytes per weight) are only kept for numbers you train. For LoRA that is 0.30% of the model. The frozen base needs only its 2 bytes per weight.
+
+Compute next. For each layer, a training pass does three equal-sized multiplications: one forward, one to send the gradient back to the layer's input, and one to get the gradient of the weights. LoRA skips the third one on the big grid, so it does about two thirds of the work. Thinking Machines measured "slightly more than two thirds" of the compute of full fine-tuning. The extra bit is the adapter's own work.
+
+### Why serving gets easier
+
+When training ends, you can add the product into the grid once: W becomes W + (α/r) B A. The layer has its old shape. The model runs at the same speed as the base. The LoRA authors call this "no additional inference latency".
+
+Or keep the adapter as a separate small file. A base model is a shared program, and an adapter is a per-customer config file. The LoRA authors' example: 100 adapted GPT-3 models cost 350 GB + 100 x 35 MB ≈ 354 GB, instead of 35 TB for 100 full copies. The vLLM serving engine can attach adapters per request "with minimal overhead". Thinking Machines built its managed Tinker service on LoRA for this reason: "we can share the same pool of compute between multiple training runs".
+
+## Question 4: can we shrink the frozen part too?
+
+After LoRA, the 140 GB base is the biggest item left. It never changes. So it does not need full precision. **Quantization** stores each weight in fewer bits (lesson [A2.6](/learn/ai/a2-inference-cost/quantization-small-models/)). Think of a JPEG: you only look at the photo, so you can store it smaller.
+
+**QLoRA** is LoRA on top of a 4-bit base. Three tricks make it work:
+
+- **A 4-bit format built for weights.** The authors call it NF4. Model weights bunch near zero in a bell shape, and NF4 spends its 16 levels where the weights are.
+- **Double quantization.** Each block of 64 weights has a scale constant. QLoRA compresses those constants too. That cuts their cost from 0.5 bits per weight to 0.127 bits.
+- **Paged optimizer.** When memory spikes, optimizer data moves out to the computer's main memory for a moment, then back.
+
+During each step, the model un-compresses one block at a time to 16 bits, does the math, and drops it. The adapters stay in 16 bits, and they are what gets trained.
+
+The numbers for 70B:
+
+```text
+base:       70e9 x (4 + 0.127) bits / 8   =  36.1 GB
+adapters:   207,093,760 x 16 bytes        =   3.3 GB
+activations (assumed)                     =  10   GB
+total                                     =  49.4 GB
+```
+
+It fits one 80 GB GPU, with room. It does not fit one 48 GB GPU at this activation size. The QLoRA authors' own headline is a 65B model on a single 48 GB GPU, which is 65e9 x 0.516 = 33.5 GB of base, so there is more room left. They trained their Guanaco chat models in 24 hours on one GPU, and report 99.3% of ChatGPT's score on a chat-quality benchmark (their 2023 result).
+
+Try the three methods side by side. Change the model, the rank, and the activation assumption.
+
+<Ai11LoraMemCalc client:visible />
+
+## Question 5: which settings decide whether it works?
+
+LoRA adds a few dials. Four findings matter. The first three come from Thinking Machines' "LoRA Without Regret" study (2025-09-29).
+
+**Learning rate.** The best learning rate for LoRA was "consistently 10x" the best one for full fine-tuning on the same task. The fitted multiple was 9.8. If you copy the full fine-tuning rate, the adapter learns too slowly, and the loss barely moves.
+
+**Where to put adapters.** Put them on the MLP grids (the large feed-forward block in each layer, which holds most of the weights), and ideally on all grids. Attention-only LoRA "significantly underperforms" MLP-only LoRA.
+
+**Capacity.** LoRA matches full fine-tuning when "the number of trainable parameters exceeds the amount of information to be learned". A set of a few thousand SFT examples is small. A corpus of billions of tokens is not, and LoRA falls behind. A separate study, "LoRA Learns Less and Forgets Less", found that full fine-tuning learns changes of rank 10 to 100 times higher than typical LoRA settings, and that LoRA "substantially underperforms" it in standard settings on hard domains like code and math.
+
+**Forgetting.** The same study found LoRA forgets less of the base model's skills than full fine-tuning does. Less is not none. Run your general test before you ship, as lesson [A11.1](/learn/ai/a11-finetuning/when-to-finetune/) advised.
+
+## Numbers
+
+Training memory, from the calculator's model. Activations assumed at 10 GB. Rank 16. GPUs of 80 GB.
+
+| Model | Full fine-tune | LoRA (16-bit base) | QLoRA (4-bit base) |
+|---|---|---|---|
+| Llama 3 8B | 138 GB (2 GPUs) | 26.7 GB (1) | 14.8 GB (1) |
+| Llama 3 70B | 1,130 GB (15 GPUs) | 153 GB (2) | 49.4 GB (1) |
+| Llama 3 405B | 6,490 GB (82 GPUs) | 830 GB (11) | 229 GB (3) |
+
+Every design needs three more numbers:
+
+- **Quality bar.** Your test score on the target failure, plus a general test that must hold. Measure before and after.
+- **Latency budget.** A merged adapter decodes at base-model speed. An unmerged one adds a small amount of work per layer. Measure both on your serving engine.
+- **Cost per request.** Training is a one-time cost on rented GPUs. Serving cost is the base model's, if you merge or if your engine batches adapters well.
+
+## Trade-offs
+
+| Method | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Full fine-tune | Most capacity to learn | 16 bytes per weight, a full copy per model | You have large data and a big GPU cluster |
+| LoRA | About 0.3% trainable, small files, swappable per customer | A capacity ceiling on very large data | Most SFT jobs |
+| QLoRA | Biggest model on the least memory | Slower steps, and quantization error in the base | The model barely fits, or GPUs are scarce |
+
+## What experienced teams know
+
+1. **Raise the learning rate for LoRA, about 10 times.** A team that copies its full fine-tuning rate sees a flat loss and blames the data. The Thinking Machines sweep found the best LoRA rate near 9.8 times the full fine-tuning one. Try 10x before you change the data or the rank. Source: [LoRA Without Regret](https://thinkingmachines.ai/blog/lora/).
+
+2. **Adapters are not where the memory goes.** In the QLoRA paper's 7B example, the adapter weights took 26 MB. The stored intermediate results for gradients took 567 MB, and the 4-bit base took 5,048 MB. With gradient checkpointing (recompute activations on the way back, instead of storing them), the intermediate results fall to 18 MB per sequence. So halving the rank saves almost nothing. Turn on checkpointing first. Source: [QLoRA paper](https://arxiv.org/abs/2305.14314).
+
+3. **Put adapters on the MLP grids, not only attention.** Many tutorials target only the attention grids. Thinking Machines found attention-only LoRA trails MLP-only LoRA, even at higher rank. Use "all linear layers" in your trainer. Source: [LoRA Without Regret](https://thinkingmachines.ai/blog/lora/).
+
+4. **Published memory ratios disagree, because they count differently.** The QLoRA paper says full 16-bit fine-tuning of a 65B model needs "more than 780 GB". That is 12 bytes per weight. The ZeRO accounting gives 16 bytes, so 1.04 TB for 65B. The LoRA paper's 175B figure, 1.2 TB, is about 7 bytes per weight. None is wrong; they use different optimizers, precisions, and parallelism. Do the sum for your own setup before you rent GPUs. Sources: [QLoRA paper](https://arxiv.org/abs/2305.14314), [ZeRO paper](https://arxiv.org/abs/1910.02054), [LoRA paper](https://arxiv.org/abs/2106.09685).
+
+5. **LoRA learns less and forgets less, so match it to the data.** For a few thousand examples that teach a habit, LoRA matches full fine-tuning. For continued training on a large new domain, it can fall short. Check the size of what you want to teach before you pick the method. Source: [LoRA Learns Less and Forgets Less](https://arxiv.org/abs/2405.09673).
+
+6. **Merging is not always possible, and an adapter fits one base model.** Hugging Face's PEFT docs say AQLM-quantized models cannot merge adapters, and for torchao "merging only works correctly" with int8 weight-only quantization. So with a quantized base, serve the adapter on top of it, or merge into a 16-bit copy (our inference). An adapter corrects one specific base model. When you change the base, train again. Source: [PEFT quantization guide](https://huggingface.co/docs/peft/developer_guides/quantization).
+
+## Interview lens
+
+<Callout type="tip">
+Say: "Full fine-tuning keeps 16 bytes per weight: 2 for the weight, 2 for the gradient, 4 for a master copy, and 8 for Adam's two averages. For 70B that is 1.12 TB. LoRA freezes the base and trains two thin matrices, about 0.3% of the weights, so the training state nearly vanishes. QLoRA stores the frozen base in 4 bits, so a 70B base is about 36 GB. I raise the learning rate about 10x for LoRA, and I test general skills after training." That shows the derivation and the traps.
+</Callout>
+
+<Callout type="mistake">
+Do not say "LoRA makes the model smaller" or "LoRA is always as good as full fine-tuning". The base is the same size, and the gain is in training state. LoRA matches full fine-tuning on small data and trails on large data. Do not forget activations either: the adapter is tiny, but activations can still decide whether a run fits.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'You fully fine-tune a 30B model with Adam in mixed precision at 16 bytes per weight. About how much memory do the weights, gradients, and optimizer state take, before activations?',
+      options: ['60 GB', '240 GB', '480 GB', '960 GB'],
+      answer: 2,
+      explain: '30 billion x 16 bytes = 480 GB. 60 GB would be only the 2-byte weights. 960 GB would be 32 bytes per weight, which no standard accounting uses.',
+    },
+    {
+      q: 'A LoRA adapter sits on a 4,096 x 4,096 grid at rank 8. How many trainable numbers does it hold?',
+      options: ['32,768', '65,536', '16,777,216', '131,072'],
+      answer: 1,
+      explain: 'The adapter has A (8 x 4,096) and B (4,096 x 8): 8 x (4,096 + 4,096) = 65,536. 16,777,216 is the full grid. 32,768 counts only one of the two thin grids.',
+    },
+    {
+      q: 'You train a LoRA adapter with the learning rate that worked for full fine-tuning. The loss barely moves. What is the best first change?',
+      options: [
+        'Raise the rank to 512 so that the adapter has far more room',
+        'Train only the attention grids, because they are smaller',
+        'Run the same steps again with a new random starting seed',
+        'Raise the learning rate to about 10 times the old one',
+      ],
+      answer: 3,
+      explain: 'The best LoRA learning rate was found to be about 10 times the full fine-tuning one. A larger rank adds capacity but does not fix steps that are too small. Attention-only LoRA does worse, not better.',
+    },
+    {
+      q: 'On a 70B QLoRA run, you halve the adapter rank from 16 to 8 to save memory. Why does it save so little?',
+      options: [
+        'The base and the activations dominate; adapter state is small',
+        'Rank only changes the speed, and never the number of trained values',
+        'Adam keeps the same notes for every weight, even the frozen ones',
+        'QLoRA ignores the rank setting and always uses a fixed value',
+      ],
+      answer: 0,
+      explain: 'Adapter state is about 3.3 GB here, against 36 GB of base and the activations. Halving rank saves about 1.7 GB. Rank does change the number of trained values, and Adam keeps no notes for frozen weights.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="QLoRA on a 70B model"
+  scenario="You want to fine-tune a 70-billion-weight model. First size the 4-bit base. Then see what full fine-tuning would have needed."
+  steps={[
+    {
+      prompt: 'How many GB does the 4-bit base take, at 0.5 byte per weight, ignoring scale constants?',
+      unit: 'GB',
+      answer: 35,
+      within: 1.1,
+      explain: '70 billion x 0.5 byte = 35 billion bytes = 35 GB. The scale constants add about 1 GB, which gives the 36.1 GB used earlier.',
+    },
+    {
+      prompt: 'How many GB would full fine-tuning need for weights, gradients, and optimizer state at 16 bytes per weight?',
+      unit: 'GB',
+      answer: 1120,
+      within: 1.1,
+      explain: '70 billion x 16 bytes = 1,120 billion bytes = 1,120 GB, or 1.12 TB.',
+    },
+    {
+      prompt: 'How many 80 GB GPUs does that take at the least?',
+      unit: 'GPUs',
+      answer: 14,
+      within: 1.1,
+      explain: '1,120 / 80 = 14. Activations and the cost of splitting the job across GPUs come on top. QLoRA needs one GPU.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
+- [QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314)
+- [Thinking Machines: LoRA Without Regret](https://thinkingmachines.ai/blog/lora/)
+- [LoRA Learns Less and Forgets Less](https://arxiv.org/abs/2405.09673)

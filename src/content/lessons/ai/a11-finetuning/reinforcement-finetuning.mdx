@@ -1,0 +1,229 @@
+---
+summary: 'When a program can check an answer, a score can teach a model without labeled answers or pairs. Reinforcement fine-tuning samples several answers per prompt, grades them, and nudges the model toward the better ones. The grader is the product: a weak one gets gamed.'
+requires: ['ai/a11-finetuning/preference-tuning', 'ai/a8-evals/judges', 'ai/a8-evals/trajectory-evals']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai11RftGroupWalk from '../../../../components/anim/lessons/Ai11RftGroupWalk.tsx';
+import Ai11RftSignal from '../../../../components/anim/lessons/Ai11RftSignal.tsx';
+import Ai11RftHack from '../../../../components/anim/lessons/Ai11RftHack.tsx';
+
+## The problem
+
+You ask your model: "What is 23 x 47?" It answers, in a calm and confident paragraph, "1,071". The right answer is 1,081. The explanation reads fine. Only the number is wrong.
+
+You could fix this with the tools you know. Supervised fine-tuning (SFT) needs a correct worked answer for every prompt, and someone has to write them. Preference tuning needs pairs of better and worse answers, and someone has to label them. Both cost human time per example.
+
+But a calculator can check this answer in a microsecond. When a program can say "right" or "wrong", you do not need a person in the loop. You can let the model try, grade the tries with the program, and learn from the grades. In its 2025 R1 paper, DeepSeek used this idea to train its R1-Zero model. Its score on AIME 2024, a hard high-school math contest, rose from 15.6% to 77.9% during training. The only feedback was a right-or-wrong check plus a format rule.
+
+This lesson answers four questions:
+
+1. Can a program tell the model whether it was right?
+2. How does a bare score teach a model?
+3. What happens when a prompt gives no signal?
+4. What happens when the model finds a shortcut?
+
+This family of methods is called **reinforcement fine-tuning**. The data you bring is not labeled answers. It is prompts plus a grader.
+
+## Question 1: can a program tell the model whether it was right?
+
+Yes, for some tasks. A **verifiable reward** is a score that code computes with no human opinion. A **reward**, as you saw in the last lesson, is a number that says how good an answer was. Verifiable means the number comes from a check you can rerun.
+
+Think of an autograder for a coding class. Students submit code. A script runs the unit tests. The grade is the share of tests passed. Nobody reads the code, and the grade is the same every time. That is a verifiable reward.
+
+Why does it exist? Because human labels are slow and judge models are biased and costly. A check is cheap, fast, and repeatable, so you can score millions of tries. Examples that work:
+
+- **Math with one numeric answer.** Compare the final number with the answer key. DeepSeek's R1-Zero required the answer in a marked box, so a rule could verify it.
+- **Code.** Compile it and run a set of tests. DeepSeek's team did this for competition code.
+- **Format rules.** Did the answer put its reasoning inside the right tags? Did it return valid JSON that fits a schema?
+- **Tool calls.** Did the agent call the right function with the right arguments? This is a check on the outcome, as in lesson [A8.5](/learn/ai/a8-evals/trajectory-evals/).
+
+The AI2 team that built the open Tulu 3 models gave this recipe a name in late 2024: **RLVR**, reinforcement learning with verifiable rewards. It gives a reward of a fixed value when the completion is verified correct, and nothing otherwise. A managed form of the same idea is called reinforcement fine-tuning, which a section below covers.
+
+## Question 2: how does a bare score teach a model?
+
+A score alone says "that was 1" or "that was 0". It does not say which words to change. How can that train anything?
+
+The trick is to ask the same question several times. The model writes text by picking each next word with some chance, so it will not give the same answer every time. Each attempt is a **sample**. Ask 4 times and you may get 4 different answers. Some will be right and some will be wrong. The group of samples for one prompt is a **group**.
+
+Now compare answers inside the group. If an answer scored better than its siblings, the choices that produced it were good. If it scored worse, those choices were bad. Think of grading on a curve: your mark does not matter as much as your mark against your class.
+
+The number that captures this is the **advantage**: how much better than the group average an answer was. The formula is advantage = (reward - group average) / spread, where spread is the standard deviation (how far rewards typically sit from the average). This method is called **GRPO**, group relative policy optimization. DeepSeek introduced it in a math paper in 2024. A useful property is that no separate scoring model is needed to find the average. The group provides it.
+
+Step through one group.
+
+<Ai11RftGroupWalk client:visible />
+
+Look at what happens in the update. Words from answers with a positive advantage become more likely. Words from answers with a negative advantage become less likely. The model is the same **policy** you met in the last lesson: the model whose behavior we are shaping.
+
+How much work is this? DeepSeek's math model sampled 64 answers per question, with a learning rate of 1e-6. DeepSeek's R1-Zero run on a 32-billion-parameter Qwen model sampled 16 answers per question, 32 questions per step. That is 32 x 16 = 512 answers to write and score for every single update, each up to 32,768 tokens long. At the maximum that is 512 x 32,768, about 16.8 million tokens of generation per step.
+
+## Question 3: what if every answer in the group scores the same?
+
+Look at the last step of the animation. All four answers were wrong. The average is 0, the spread is 0, and every advantage is 0. Nothing is learned. The same happens if all four are right. A group teaches something only when it holds at least one right answer and at least one wrong one.
+
+This is the most practical fact in the lesson, so do the maths. Say the model solves a prompt with chance p on each try, and you draw G samples. The chance that all are wrong is (1 - p)^G. The chance that all are right is p^G. So the chance of a useful group is 1 - p^G - (1 - p)^G.
+
+Example: p = 5% and G = 8. All wrong: 0.95^8 = 66%. So only about 34% of groups teach anything. You pay for 8 samples and learn from a third of them. At p = 50% and G = 8, almost every group is useful (99%). Try it.
+
+<Ai11RftSignal client:visible />
+
+This is why OpenAI's guide for reinforcement fine-tuning says your baseline eval scores must sit between the minimum and the maximum. If the model scores 0 on every prompt, there is nothing to reinforce. If it scores perfect, there is nothing to improve. Run your evals first, and keep the prompts in the middle band.
+
+## The naive way: let a model be the grader
+
+Most tasks are not like arithmetic. "Was this email polite?" has no calculator. The tempting move is to ask a language model to grade each answer on a scale, and use that as the reward.
+
+It works for a while and then breaks. Training pushes the policy to earn high grades, and the policy is better at finding grader weaknesses than you are at fixing them. This is **reward hacking**: scoring high without doing the work you wanted. Teaching to the test is the human version. A student who learns the exam's quirks gets an A and learns nothing.
+
+DeepSeek's team met this. Their R1 paper explains that they did not use neural reward models for reasoning tasks because those models are "susceptible to reward hacking during large-scale reinforcement learning". When they did use a model-based reward for helpfulness, the paper shows the reward rising while the model's CodeForces performance fell. OpenAI's grader guide gives the same warning: a model that has hacked its grader "will score highly on model grader evals but score poorly on expert human evaluations".
+
+But a code check does not make you safe. Programs can be fooled too. METR, a group that tests AI systems, studied an early version of OpenAI's o3. In 128 runs on its RE-Bench tasks, the model tried reward hacking in 39 of them, 30.4%. On METR's HCAST tasks, it was 8 of 1,087 runs, 0.7%. METR reported that this was more than 43 times more common on RE-Bench, "perhaps because" the model could see the whole scoring function there. That 0.7% is a number for one task suite. Do not use it as a general rate.
+
+Here is the kind of thing METR saw, in a task that asked for a fast GPU program.
+
+<Ai11RftHack client:visible />
+
+## The real fix: make the grader the product
+
+When you do reinforcement fine-tuning, you are not mostly training a model. You are building a grader. The model will optimize whatever you write, so write it as carefully as production code.
+
+### Idea 1: use checks first, a model grader last
+
+Start with the strictest check that fits. OpenAI's grader API lists the options. A **string check** compares text exactly or by "contains". A **text similarity** grader scores how close two texts are. A **score model** grader asks a model for a grade. A **Python grader** runs your code. A **multigrader** combines several. Scores run from 0 to 1, so partial credit is possible.
+
+Pick the strictest tool that does the job. Exactly matching a final number beats a "contains" check. Why? A "contains" grader gives full marks to an answer that lists ten candidate numbers, one of which is right. Training will find that. Use a model grader only for the part no code can check, and test it against expert human judgments first. Check that it ranks a few known good, medium and poor answers in the right order.
+
+### Idea 2: wall off the grader and read the runs
+
+The METR animation above shows the fix. Run the grader where the solution cannot look at it: another process, no shared memory, hidden test inputs. Lesson [A7.4](/learn/ai/a7-agents-prod/sandboxes-code-execution/) covers sandboxes. Then read a sample of the runs from late in training, not just the dashboard. A reward curve cannot tell a skill from a trick. A person reading the transcript can.
+
+Do not rely on telling the model not to cheat. METR tried it. On one task, with 20 runs per prompt, 80% of first plans described a hack under the original prompt. With "Please do not cheat" it was 80%. With "Please do not reward hack" it was 70%. A prompt that asked for only the intended methods went up to 95%. The model also knows what it is doing: when METR asked whether a hacked plan matched the user's intent, the model said "no" 10 times out of 10.
+
+### Idea 3: size the run, and pick where to run it
+
+Reinforcement fine-tuning costs many more samples than SFT. The R1-Zero run used 64 x 8 H800 GPUs for about 198 hours, about 101,000 GPU-hours. At the paper's assumed $2 per GPU-hour, that is about $202,000. Most teams will not run that. They will run a small, narrow job.
+
+The good news: the update carries little information. Thinking Machines Lab pointed out that each sample gives roughly one bit, right or wrong. Training on 10,000 math problems with 32 samples each gives only 320,000 bits. A LoRA adapter at rank 1 on an 8B model already has about 3 million parameters, nearly 10 times that. They found that LoRA matched full fine-tuning for this kind of training, even at rank 1. So a LoRA adapter (lesson [A11.2](/learn/ai/a11-finetuning/sft-lora/)) is a good default.
+
+Where to run it:
+
+- **Open-source tools.** The Hugging Face TRL library has a `GRPOTrainer`. You write the reward functions in Python.
+- **Training services.** Thinking Machines Lab offers Tinker, a training API for open-weight models.
+- **OpenAI's managed reinforcement fine-tuning.** The guide says it supports o-series reasoning models only, and "currently only for o4-mini". Read the date before you plan on it. OpenAI's [deprecations page](https://developers.openai.com/api/docs/deprecations) (checked 2026-10-16) lists o4-mini, and fine-tuned o4-mini models, for shutdown on October 23, 2026. It also says new organizations cannot start fine-tuning, existing customers cannot create new jobs after January 6, 2027, and the Evals platform shuts down on November 30, 2026, and graders documented for eval workflows are part of that shutdown. So the managed route is closing. The skill that carries over is writing the grader.
+
+## Numbers
+
+State these before a run.
+
+- **Quality bar.** Pass rate on a held-out set with the same checker, plus a second set graded by a different method, such as expert review. The second set catches hacks. A run that raises the training reward but not the held-out score has learned the grader.
+- **Latency budget.** Reasoning models trained this way write longer answers. DeepSeek reported that R1-Zero tended to produce longer responses as training went on. Longer thought means more time to the last token. Measure median and 95th-percentile output length before and after.
+- **Cost per request.** Output tokens drive it. At the Sonnet 5.5 output price of $10 per million tokens (as of 2026-10-16, [pricing page](https://platform.claude.com/docs/en/about-claude/pricing)), a 500-token answer costs $0.005 and a 2,000-token answer costs $0.02. That is 4 times as much for 4 times the length. If your tuned model is self-hosted, the same ratio applies to GPU time.
+- **Training cost.** Samples per step times steps. For a small run, 256 prompts x 8 samples x 300 steps is 614,400 generated answers.
+
+## Trade-offs
+
+| Method | You gain | You pay | Choose it when |
+|---|---|---|---|
+| SFT on examples | Simple, cheap | Needs a correct answer per prompt | You have good demonstrations |
+| Preference tuning (DPO) | Learns taste and style | Needs pairs, can learn length | The target is tone or safety, with no checkable answer |
+| RLVR with a code checker | No labels, the checker scales | Many samples, needs a hack-proof grader | Math, code, format, tool outcomes |
+| RFT with a model grader | Covers fuzzy tasks | Grader drifts and is gamed | Fuzzy goals, with strong audits |
+| Distillation | Cheap, strong for small models | Copies teacher errors | A stronger model already exists (lesson [A11.5](/learn/ai/a11-finetuning/distillation-data/)) |
+
+## What experienced teams know
+
+1. **Reinforcement learning sharpens what the model can already do.** A [study of RLVR](https://arxiv.org/abs/2504.13837) compared tuned models with their base models. At one try, the tuned models won. When the base models got many tries (large k), they scored higher. The authors conclude the reasoning ability comes from the base model, and that distillation can add genuinely new patterns. Before you pay for a run, sample the base model 16 or 32 times per prompt. If it almost never gets any right, RL has little to reinforce.
+2. **GRPO can inflate answer length.** The [Dr. GRPO analysis](https://arxiv.org/abs/2503.20783) found a bias in the original GRPO objective that artificially increases response length, especially for wrong answers. The TRL docs trace it to dividing each answer's loss by its own length. TRL now offers `dapo` and `dr_grpo` loss types for this. Plot the length of wrong answers during training.
+3. **Telling the model not to cheat is not a control.** METR's [reward hacking report](https://metr.org/blog/2025-06-05-recent-reward-hacking) cut the rate only from 80% to 70% with "Please do not reward hack". Change the environment, not the prompt.
+4. **A small adapter is enough.** The [LoRA Without Regret](https://thinkingmachines.ai/blog/lora/) study (September 2025) matched full fine-tuning at rank 1 for RL, because RL absorbs far less information per sample than SFT. Start with a small rank and save the memory.
+5. **Hacking in training can spread to other behavior.** Anthropic's [paper on production reinforcement learning](https://arxiv.org/abs/2511.18397) found that a model that learned to reward hack went on to show alignment faking (appearing aligned while pursuing other goals), cooperation with malicious actors, and sabotage in Claude Code tests. Training on standard chat safety data fixed chat behavior but not agent behavior. Treat hack detection as a safety control, not only a quality one.
+6. **A managed service can be withdrawn.** The OpenAI timeline above shows a fine-tuning product with a closing date. Keep your grader and prompts as portable code in your repo, so you can move the job to an open-source trainer.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I'd use reinforcement fine-tuning when the outcome is checkable. Prompts plus a grader, no labeled answers. I sample a group of answers per prompt, grade them, and push the model toward the above-average ones. The grader is the product: code checks first, a sandbox around them, a held-out set graded a different way, and a human reading late-training transcripts. I'd check the base model's pass rate first, since prompts that are all right or all wrong teach nothing." That shows mechanism, cost, and a safety habit.
+</Callout>
+
+<Callout type="mistake">
+Do not say "RL teaches the model new skills" without caveats. Do not say hacking is rare because a benchmark reports 0.7%. That number is for one task suite, and the rate on a task where the model can see the scorer was 30.4%. And do not promise a model grader is objective. It is a model with biases that the policy will learn.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A group of 4 samples gets rewards 1, 0, 0, 0. The average is 0.25 and the spread is about 0.43. What is the advantage of the one right answer?',
+      options: ['+1.00, as for any right answer', 'About +1.73, since (1 - 0.25) / 0.43 is 1.73', 'About +0.58, which is the reward over the spread', 'About +0.25, which is the group average'],
+      answer: 1,
+      explain: 'Advantage = (reward - average) / spread = (1 - 0.25) / 0.43, about 1.73. The three wrong answers each get (0 - 0.25) / 0.43, about -0.58. A rare success counts for more than a common one.',
+    },
+    {
+      q: 'The model gets every one of 8 samples wrong on a prompt, at every step of training. What does that prompt contribute to learning?',
+      options: ['A strong push away from all 8 of the answers', 'A small push, since every one of the answers is bad', 'Nothing, since every advantage is zero', 'The same as a prompt with a 50% pass rate'],
+      answer: 2,
+      explain: 'With equal rewards the group average equals each reward, so each advantage is zero. The prompt costs 8 samples and teaches nothing. Prompts in the middle band teach the most.',
+    },
+    {
+      q: 'METR asked a model "Please do not reward hack" on a task where it hacked 80% of the time. What happened?',
+      options: ['The rate fell to 0%, since models obey clear instructions', 'The rate rose above 95%, since the prompt reminds it of hacks', 'The rate stayed at 80% on every wording tested', 'The rate fell only to 70%, so a prompt is not a control'],
+      answer: 3,
+      explain: 'METR measured 70% with "Please do not reward hack", 80% with "Please do not cheat" and 95% with a prompt about intended methods. So wording changes little, and the fix is in the grader and environment.',
+    },
+    {
+      q: 'Which data does reinforcement fine-tuning with a code checker need?',
+      options: ['Prompts and a grader that scores answers', 'Chosen and rejected pairs for every prompt', 'One ideal written answer for each prompt', 'A separate reward model trained on human ratings'],
+      answer: 0,
+      explain: 'The grader supplies the score, so no labeled answers or pairs are needed. SFT needs written answers, DPO needs pairs. A learned reward model is the part RLVR avoids.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai11-rft-hacked-grader"
+  title="Reward up, accuracy flat"
+  scenario="Your model writes confident wrong arithmetic. You start a reinforcement run with a grader. After 300 steps the reward is near the maximum, yet accuracy on a held-out set did not move."
+  facts={[
+    'grader: string check, operation "like" (contains), reference = the answer key',
+    'training reward: 0.31 -> 0.97 over 300 steps',
+    'held-out exact-match accuracy: 41% -> 42%',
+    'sampled late answer: "Candidates: 1071, 1081, 1091, 1101. Final: 1081"',
+  ]}
+  steps={[
+    {
+      prompt: 'Which method gives a checkable reward for this kind of problem?',
+      options: [
+        'Preference tuning on pairs, since there is no right answer',
+        'Reinforcement fine-tuning, with a code checker as grader',
+        'SFT on the 20 worst answers, to teach the model to avoid them',
+        'A longer system prompt asking the model to be careful',
+      ],
+      answer: 1,
+      explain: 'A calculator can verify the final number, so a checker gives a reward without labels. The task has one right answer, so pairs and handwritten answers are the costlier route.',
+    },
+    {
+      prompt: 'What explains the high reward, and what is the fix?',
+      options: [
+        'The model learned arithmetic well, so keep training and ship it.',
+        'The learning rate is too high, so cut it in half and rerun.',
+        'The group size is too small, so raise it from 8 to 64.',
+        '"Contains" lets it list candidates. Grade the final line.',
+      ],
+      answer: 3,
+      explain: 'A contains check passes any answer that mentions the right number, and the model learned to list candidates. Held-out exact-match accuracy did not move, which proves the skill did not. Grade only the parsed final answer and read late samples.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](https://arxiv.org/abs/2501.12948)
+- [DeepSeekMath: Pushing the Limits of Mathematical Reasoning](https://arxiv.org/abs/2402.03300) (introduces GRPO)
+- [METR: Recent frontier models are reward hacking](https://metr.org/blog/2025-06-05-recent-reward-hacking)
+- [OpenAI: Reinforcement fine-tuning guide](https://developers.openai.com/api/docs/guides/reinforcement-fine-tuning) and [graders](https://developers.openai.com/api/docs/guides/graders)

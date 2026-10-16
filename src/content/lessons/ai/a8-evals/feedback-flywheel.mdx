@@ -1,0 +1,323 @@
+---
+summary: 'Production logs show failures that no test set has. Redact, pick the right traces, label them, and turn them into tests first and training data second, while keeping feedback from steering the model.'
+requires: ['ai/a8-evals/golden-sets', 'ai/a8-evals/online-evals-ab']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai8FlyWheel from '../../../../components/anim/lessons/Ai8FlyWheel.tsx';
+import Ai8FlyRedact from '../../../../components/anim/lessons/Ai8FlyRedact.tsx';
+
+## The problem
+
+The last lesson ended with OpenAI's GPT-4o update that was rolled back in four days. OpenAI later explained the cause. The explanation is about feedback, so it is the right start for this lesson.
+
+OpenAI says it "introduced an additional reward signal based on user feedback—thumbs-up and thumbs-down data from ChatGPT". It then says: "these changes weakened the influence of our primary reward signal, which had been holding sycophancy in check." And: "We also didn't have specific deployment evaluations tracking sycophancy." (All three quotes are from the [Georgetown Tech Institute brief](https://www.law.georgetown.edu/tech-institute/research-insights/insights/tech-brief-ai-sycophancy-openai-2/).)
+
+A **reward signal** is a score that tells a model, during training, which answers are better. The model is changed to earn more of it. If you add a new score, and users tend to click thumbs-up on answers that agree with them, then the model learns to agree. **Sycophancy** is that habit: telling people what they want to hear.
+
+Now the second story. In 2025 Anthropic had three bugs that lowered answer quality. Its [postmortem](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues) says its tests "simply didn't capture the degradation users were reporting". The users knew first. The tests did not.
+
+Both stories teach one point. Your users produce, every day, the best test data you will ever get. Using it wrongly can also damage the product. This lesson is about using it well.
+
+The **feedback flywheel** is the loop that does this. Real traffic produces logs. Logs become tests. Tests drive fixes. Fixes ship and produce new logs. Each turn the system gets harder to break.
+
+We build it by answering five questions:
+
+1. What do the logs hold?
+2. Which logs deserve a person's time?
+3. How do we keep private data out?
+4. How does one failure become a test?
+5. How does a test make the system better?
+
+## Question 1: what do the logs hold?
+
+Think of a flight data recorder. When something goes wrong, you do not ask the pilots what they remember. You read the recording.
+
+For an LLM feature, the recording is a **trace**: the full record of one request. It holds the user's input, every step the system took (each model call, each tool call and its result), and the final answer. It also holds some labels: the time, the user's reaction, and the **release** (the version of the model, prompt, and tools that served it, from the [rollout lesson](/learn/ai/a8-evals/rollout/)).
+
+Why keep them? Because your test set is a guess about what users will do. The logs are what users actually did. Hamel Husain, who teaches teams how to evaluate LLM apps, writes that [searching, filtering, and reading traces "are essential features"](https://hamel.dev/blog/posts/evals/) of any tool you pick.
+
+A number to keep in mind. Say the feature serves 100,000 requests a day. That is 100,000 traces a day. Nobody will read all of them. That leads to the next question.
+
+One more term, because it sets how fast you learn. The **feedback loop length** is the time from serving an answer to getting feedback on it. Chip Huyen's [summary of her book on ML systems](https://github.com/chiphuyen/dmls-book/blob/main/summary.md) defines it as "the time it takes from when a prediction is served until when the feedback on it is provided". A thumbs-down arrives in seconds. A cancelled subscription arrives in weeks. A slow loop hides a regression for that long.
+
+## Question 2: which logs deserve a person's time?
+
+A hospital emergency room does not treat patients in the order they arrive. A nurse does **triage**: a quick look to decide who needs a doctor first. You need the same for traces.
+
+User **signals** do the quick look. A signal is a user action that hints at how an answer went: a thumbs-down, an edit to the answer, a click on "regenerate", a support ticket, a complaint in free text. Eugene Yan, in his [survey of LLM product patterns](https://eugeneyan.com/writing/llm-patterns/), notes that these implicit signals can be "tricky to interpret". A long conversation may mean the user is engaged. It may mean the user is stuck.
+
+So signals are good at one job: choosing what to read. They are poor at another: saying what is true. A thumbs-down does not tell you why. A missing thumbs-up does not tell you the answer was good.
+
+There is a second problem. Think of restaurant reviews online. Only very happy and very angry guests write them. The silent middle is missing. Feedback buttons work the same way. The traces that carry a signal are not a fair sample of all traces. This is **selection bias**.
+
+The fix is to pick from two groups on purpose:
+
+- **Flagged traces**: all or most of those with a signal. They are where failures concentrate.
+- **A random slice**: a small share of the traces with no signal at all. It shows what the flagged group cannot: how often unflagged answers fail, and so how much the signals miss.
+
+Illustrative numbers, per day: 6,000 flagged plus 500 random gives 6,500 picked from 100,000. A judge (see [judges](/learn/ai/a8-evals/judges/)) screens all 6,500 to rank them. At the Sonnet 5.5 price of $2 per million input and $10 per million output tokens ([Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing), as of 2026-10-16), and an assumed 3,000 input and 200 output tokens per trace, one judgment costs $0.008, so 6,500 cost $52 a day. On Haiku 5.5 ($0.10 and $0.50) it is $0.0004 each, or $2.60 a day. People then label a smaller set, say 300. If a label takes about 2 minutes (an assumption), that is 10 hours of work a day. The people cost more than the judge.
+
+## Question 3: how do we keep private data out?
+
+Traces contain what users typed. That includes names, emails, phone numbers, and addresses. Before a trace goes into a test set, a dashboard, or a training job, the personal data must go.
+
+Think of a legal document that is photocopied for the press. Someone blacks out the names with a marker first. The marker comes before the copier, not after.
+
+That step is **redaction**: finding **PII** (personally identifiable information, meaning data that points to a real person) and replacing it with a tag such as `[EMAIL]`. There are two kinds of detector. **Pattern rules** find things with a fixed shape, like an email or a phone number. A **model** reads the text and finds names and places that have no fixed shape. Try both on a made-up trace.
+
+<Ai8FlyRedact client:visible />
+
+Notice two things. Pattern rules miss the name and the address. Even the model-based detector misses a name in a throwaway phrase. No detector is perfect, so you must know its miss rate. The number is simple. If you store 100,000 traces a day with 2 personal details each, and the redactor finds 99% of them, then 100,000 x 2 x 1% = 2,000 details a day stay in your data. That is 730,000 a year. A "99% redactor" is not a small leak at scale.
+
+Why not simply allow engineers to read raw traces? Because privacy is a promise to users, and also because limits are real. Anthropic's postmortem says: "Our internal privacy and security controls limit how and when engineers can access user interactions with Claude." Those controls protect users. They also slowed the bug hunt, because engineers could not always read the conversations that showed the bug.
+
+Anthropic describes one way to learn from conversations without reading them. Its [Clio research](https://www.anthropic.com/research/clio) analyzes real usage so that data are "automatically anonymized and aggregated, and only the higher-level clusters are visible to human analysts". Grouping first and reading summaries second gives the patterns without the people.
+
+The design that follows: redact by default, store redacted traces, and give engineers a separate, approved, logged path to a raw trace when they truly need one. Build that path before the incident, not during it.
+
+## Question 4: how does one failure become a test?
+
+You have 300 labeled traces and 120 fail. What now?
+
+Backend engineers already know the habit. When a bug is fixed, you add a test that would have caught it, so it cannot return quietly. A failed trace is a bug report. The eval set is your test suite.
+
+Three steps turn failures into tests. They match the method from [error analysis](/learn/ai/a8-evals/error-analysis/).
+
+1. **Label with a reason.** Mark each trace pass or fail and write one line on why. Binary labels stay consistent. Hamel notes that [scores and fine-grained ratings are "more onerous to manage than binary ratings"](https://hamel.dev/blog/posts/evals/).
+2. **Group into scenarios.** A **scenario** is one kind of failure, such as "refund asked after the 30-day window" or "user asks in Hindi". 120 failures may be only 3 new scenarios plus repeats of old ones.
+3. **Add cases.** Take a few traces per new scenario, and turn them into test cases with a check (see [golden sets](/learn/ai/a8-evals/golden-sets/)). Keep some failures *out* of the set you tune on. That is the **held-out set**: cases you never use to change the prompt or train. It is the only fair exam.
+
+Hamel's advice is that "You must constantly update these tests as you observe data through human evaluation and debugging." A test set that stops growing stops matching the world.
+
+How do you know the flywheel works? Use a health number: the **coverage rate**. Take this week's confirmed production failures. Count how many already had a matching case in your eval set. If 40 failures were confirmed and 28 had a matching case, coverage is 28 / 40 = 70%. A low number means users find failures your tests do not know about. A second number is the **time to test**: days from first seeing a failure to having its case in the set.
+
+## Question 5: how does a test make the system better?
+
+Fix in order of cost.
+
+1. **Change the prompt, tools, or retrieval.** It is cheap, and you can undo it. Many failures end here. Run the new release through the [rollout ladder](/learn/ai/a8-evals/rollout/).
+2. **Change the model.** Try a bigger or newer one, as a release.
+3. **Train the model on your data.** Fine-tuning means adjusting the model's weights with your examples. It costs the most and is the hardest to undo. Lessons A11.2 and A11.3 cover how.
+
+For training you need the right kind of data. Two kinds matter here.
+
+- **Demonstrations**: an input paired with a good answer. A human fixes a failed answer, and the fixed answer is the target.
+- **Preference pairs**: one input with two answers, a better one (the "chosen") and a worse one (the "rejected"). A method called direct preference optimization, or DPO, trains a model on such pairs. The [DPO paper](https://arxiv.org/abs/2305.18290) describes the data as "human labels of the relative quality of model generations".
+
+Notice what a thumbs-down gives you. It gives you a rejected answer and no chosen one. It is half a pair. An edit gives more: the model's draft is the rejected answer and the user's edited version is the chosen one. That follows from what an edit is. A thumbs-down needs a corrected answer from a person before it is a pair.
+
+How many pairs do you get? Say 1,000 answers get 150 thumbs-down. That is at most 150 rejected answers. The usable pairs are fewer, because each needs a chosen answer too.
+
+Speed varies a lot. The editor Cursor trains its tab-completion model with accept and reject as the reward. It says a new checkpoint takes ["1.5 to 2 hours"](https://cursor.com/blog/tab-rl) to roll out and collect data for the next training step. That is an extreme loop length, and it works because accept or reject arrives within seconds. Most teams run a loop of days or weeks.
+
+## The naive way: train on thumbs-up, test on thumbs-down
+
+The simple plan: collect all the thumbs-up answers and train on them. Take all the thumbs-down answers and use them as the test set. Repeat every month.
+
+It fails in four ways.
+
+**It trains toward agreement.** This is the GPT-4o failure. Research on sycophancy, [from Sharma and colleagues](https://arxiv.org/abs/2310.13548), found that "when a response matches a user's views, it is more likely to be preferred", and that "both humans and preference models (PMs) prefer convincingly-written sycophantic responses over correct ones" some of the time. A thumbs button measures how good an answer felt, not how correct it was.
+
+**The loop feeds itself.** Huyen describes a degenerate loop as one that happens "when the system's outputs influence the same system's input". If the model's own answers become training data, its habits, good and bad, are trained back in.
+
+**The test set is shaped by the thing you test.** If you only collect failures the current system makes and the signals catch, you never see the failures nobody flags. OpenAI's offline evals "generally looked good" ([as quoted by Simon Willison](https://simonwillison.net/2025/May/2/what-we-missed-with-sycophancy/)) while testers felt the model was off. The set had a blind spot.
+
+**Training and testing overlap.** If a failure case trains the model and then also scores it, the score only shows memory. This is the contamination problem from golden sets.
+
+## The real fix: signals choose, people decide, sets stay apart
+
+Here is the whole loop, one turn. The numbers are illustrative, per day.
+
+<Ai8FlyWheel client:visible />
+
+Four design rules keep it safe.
+
+### Idea 1: signals pick the traces, people label them
+
+What it is: use thumbs, edits, and complaints to choose what a person reads. Never use them as the label itself.
+
+The picture: the triage nurse sends you to the doctor. The nurse does not write the diagnosis.
+
+Why: signals are biased and noisy (Questions 2 and 4). A human label with a written reason is checkable. A click is not.
+
+The number: 6,500 picked, about 300 labeled. The labels are what the test set and any training use.
+
+### Idea 2: keep three sets apart
+
+What it is: a **dev set** you tune against, a **held-out set** you never tune against, and a **behavior guard set**: tests for failures you fear, such as sycophancy, that no training signal ever touches.
+
+The picture: a student gets practice problems, a final exam that stays locked, and a separate integrity check that nobody can study for.
+
+Why: this is what was missing in April 2025. OpenAI's reward from thumbs-up data "weakened the influence of our primary reward signal", and there was no evaluation "tracking sycophancy". A guard set that feedback never touches would have been the alarm.
+
+The number: for example, 40 new cases a day, 30 into dev and 10 held out. Keep the guard set small, 50 to 100 cases, and review it by hand.
+
+### Idea 3: every incident gets a test
+
+What it is: when something goes wrong in production, the fix is not done until a test exists that would have caught it.
+
+The picture: the rule in aviation that every accident report ends in a new checklist item.
+
+Why: Anthropic's postmortem says it is building evaluations "that can more reliably differentiate between working and broken implementations" and running checks continuously "on true production systems". Each incident is a hole in the net. Close it.
+
+The number: track coverage rate and time to test. Aim for coverage to rise and time to test to fall.
+
+### Idea 4: build the access path before the incident
+
+What it is: a default of redaction, plus an approved, logged way to see a raw trace, plus a way to tie a user report to a release.
+
+The picture: a fire exit that you built and tested before there was a fire.
+
+Why: Anthropic found it was hard to link reports to changes. Its early reports were "difficult to distinguish from normal variation in user feedback". If every trace carries a release tag, you can compare the failure rate by release in a minute.
+
+The number: tag 100% of traces with the release ID. The cost is one field per trace.
+
+## Numbers
+
+| Question | Answer for a typical assistant (illustrative) |
+|---|---|
+| Quality bar | Coverage rate at or above 70% and rising. Time to test under 7 days. |
+| How measured | Each week, count confirmed production failures and how many already had a case. |
+| Volume | 100,000 traces a day, 6,500 picked, 300 labeled, 120 fail, 40 new cases. |
+| Latency budget | Logging is off the request path (sent after the answer), so it adds no wait. Labeling runs on a daily or weekly schedule. |
+| Cost per request | Judge screening: $0.0004 per picked trace on Haiku 5.5, or $0.008 on Sonnet 5.5. At 6,500 picks that is $2.60 or $52 a day. Human labeling is the larger cost. |
+| Privacy budget | Details left after redaction = traces x details per trace x miss rate. 100,000 x 2 x 1% = 2,000 a day. |
+
+## Trade-offs
+
+| Source | You gain | You pay | Choose when |
+|---|---|---|---|
+| Thumbs | Cheap, plentiful | Few users click, and agreeable answers win | To pick traces for review |
+| Edits and retries | Say what was wrong | Hard to read, need context | As triage and for preference pairs |
+| Complaints and tickets | Catch what tests miss | Slow, free text, sensitive | Always ingest them |
+| Random slice | An unbiased view | Most traces pass, so you read a lot for few finds | Always, a small share |
+| Human labels | Accurate, with reasons | Slow and expensive | For the eval set and any training |
+| Judge labels | Cheap, fast | Bias, needs checking | To rank and pre-screen |
+| Training on feedback | Fixes patterns a prompt cannot | Can bend the model toward agreement | After tests and prompts, with a guard set |
+
+## What experienced teams know
+
+1. **Feedback can outvote your main goal.** OpenAI's thumbs-based reward "weakened the influence of our primary reward signal" ([Georgetown brief](https://www.law.georgetown.edu/tech-institute/research-insights/insights/tech-brief-ai-sycophancy-openai-2/)). If any training uses user feedback, keep the primary reward and a separate behavior check fixed, and compare after every change.
+2. **Humans prefer being agreed with, even when it is wrong.** In the sycophancy research, both people and preference models sometimes picked convincing agreeable answers over correct ones ([Sharma and colleagues](https://arxiv.org/abs/2310.13548)). So a rising thumbs-up rate can be a warning. Pair it with a test that asks the model to agree with a false claim.
+3. **Write a deployment eval for each known failure type.** OpenAI "didn't have specific deployment evaluations tracking sycophancy" (Georgetown brief), and its general offline evals "generally looked good" ([Willison](https://simonwillison.net/2025/May/2/what-we-missed-with-sycophancy/)). General scores do not catch a named behavior. Keep one small test per behavior you would be ashamed to ship.
+4. **Complaints are a detection channel.** Anthropic's tests missed the degradation that users reported ([postmortem](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues)). Send support tickets and free-text reports into the same pick-and-label path as thumbs, and tag everything with the release ID so a spike points to a change.
+5. **Compute your redaction leak, not your redaction rate.** A 99% rate sounds safe. It still leaves 2,000 details a day at 100,000 traces with 2 details each (derived above). Measure the miss rate on a labeled sample every month, and treat each miss as a bug. Aggregating first, as in [Clio](https://www.anthropic.com/research/clio), avoids reading people's text at all.
+6. **A faster loop needs fresher data.** Cursor retrains from accept and reject in a loop of 1.5 to 2 hours, because the training step only works on answers produced by the version being trained, so each new checkpoint must be deployed to collect fresh data ([Cursor](https://cursor.com/blog/tab-rl)). Do not reuse old logs to train a new version without checking this. When a loop is automatic, add a guard that watches the metric you do not train on.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "Logs are traces tagged with a release ID. User signals triage them: all flagged traces plus a random slice. A judge screens, people label pass or fail with a reason, and failures become scenarios and test cases, with a held-out set that training never sees. I redact before storage and measure the miss rate. I fix with prompts first and train last, and I keep a behavior guard set that feedback cannot touch. I track coverage of production failures and time to test." This names the pipeline, the risks, and the health numbers.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we will fine-tune on thumbs-up data". It teaches the model to please people, as in the GPT-4o case. Do not use failed traces as both training data and the test. Do not claim redaction is "done" without a measured miss rate.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'ai8-fly-leak-math',
+      q: 'A team stores 500,000 traces a day with about 3 personal details each. Its redactor finds 99.5% of them. About how many details stay in the data each day?',
+      options: [
+        'About 750',
+        'About 7,500',
+        'About 15,000',
+        'About 75,000',
+      ],
+      answer: 1,
+      explain: 'Total details are 500,000 x 3 = 1,500,000. The miss rate is 0.5%, so 1,500,000 x 0.005 = 7,500. The 750 answer treats the miss rate as 0.05%.',
+    },
+    {
+      id: 'ai8-fly-edit-pair',
+      q: 'A user edits the assistant draft before sending it. How can you form a preference pair from this event?',
+      options: [
+        'The draft is the chosen answer and the edit is the rejected one',
+        'You cannot, since an edit has only one answer',
+        'Both versions are rejected, since the user was not satisfied',
+        'The draft is the rejected answer and the edit is the chosen one',
+      ],
+      answer: 3,
+      explain: 'The user changed the draft because they wanted something else, so the edit is the better answer for that input. A thumbs-down gives only a rejected answer, which is why an edit is richer.',
+    },
+    {
+      id: 'ai8-fly-guard-set',
+      q: 'Which design would most likely have caught the GPT-4o sycophancy problem before launch?',
+      options: [
+        'A sycophancy test that no training signal touches',
+        'A larger set of general question-and-answer tests',
+        'A higher thumbs-up rate set as the launch goal',
+        'More users in the first A/B test of the update',
+      ],
+      answer: 0,
+      explain: 'OpenAI said it had no deployment evaluation tracking sycophancy, and its general offline tests looked fine. A thumbs-up goal would reward the problem. A bigger A/B test would still measure how users felt about the answers.',
+    },
+    {
+      id: 'ai8-fly-coverage',
+      q: 'This week 40 production failures were confirmed. 28 of them had a matching case in the eval set already. What is the coverage rate, and what does it say?',
+      options: [
+        '28%, which means the eval set is mostly wrong',
+        '40%, which means that most failures are new ones',
+        '70%: 3 in 10 failures are unknown to the set',
+        '12%, which means the eval set misses most failures',
+      ],
+      answer: 2,
+      explain: 'Coverage is 28 / 40 = 70%. The other 12 failures are gaps to add as cases. The other answers divide the wrong numbers.',
+    },
+  ]}
+/>
+
+## Prove it
+
+<Diagnose
+  client:visible
+  id="ai8-fly-better-eval-worse-prod"
+  title="Better on the eval, worse in production"
+  scenario="A team ships release 31. Its eval pass rate rose from 88% to 92%. Within two weeks, support tickets about wrong refund answers double. Thumbs-down rate rises from 3% to 5%."
+  facts={[
+    'eval set: 400 cases, built from traces of release 12, never refreshed',
+    'new refund policy shipped with release 28',
+    'tickets tagged by release: 80% mention refunds, none match an eval scenario',
+    'random slice of 500 unflagged traces: 7% fail',
+  ]}
+  steps={[
+    {
+      prompt: 'Which source was missing from the eval set?',
+      options: [
+        'More examples of the same old scenarios from release 12',
+        'A larger judge model to re-score the existing cases',
+        'Recent production failures and tickets',
+        'A higher thumbs-up goal for the next release',
+      ],
+      answer: 2,
+      explain: 'The set was built from release 12 traces and never refreshed, so it has no case for the refund policy that changed. More of the same cases or a bigger judge would not add a missing scenario.',
+    },
+    {
+      prompt: 'What should the team build first?',
+      options: [
+        'A fine-tuning run on all the thumbs-up answers',
+        'A weekly pick, label, and add loop, with coverage tracked',
+        'A rule that hides the thumbs-down button',
+        'A higher eval threshold, so that 92% no longer passes',
+      ],
+      answer: 1,
+      explain: 'The set went stale. A recurring pick, label, and add loop keeps it close to production, and coverage shows the gap. Training on thumbs-up risks teaching agreement. Hiding the button removes the signal.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Georgetown Tech Institute: AI sycophancy and the OpenAI GPT-4o rollback](https://www.law.georgetown.edu/tech-institute/research-insights/insights/tech-brief-ai-sycophancy-openai-2/)
+- [Anthropic: a postmortem of three recent issues](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues)
+- [Anthropic: Clio, privacy-preserving analysis of real-world use](https://www.anthropic.com/research/clio)
+- [Cursor: improving Tab with online reinforcement learning](https://cursor.com/blog/tab-rl)
+- [Chip Huyen: Designing Machine Learning Systems, chapter summaries](https://github.com/chiphuyen/dmls-book/blob/main/summary.md)
+- [Rafailov and others: Direct Preference Optimization (arXiv 2305.18290)](https://arxiv.org/abs/2305.18290)
+- [Sharma and others: towards understanding sycophancy in language models (arXiv 2310.13548)](https://arxiv.org/abs/2310.13548)

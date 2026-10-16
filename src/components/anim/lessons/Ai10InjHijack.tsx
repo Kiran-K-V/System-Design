@@ -43,7 +43,7 @@ const STEPS: Step[] = [
     node: { agent: 'accent', priv: 'warn' }, arrow: { read: 'warn' }, rows: 3,
   },
   {
-    caption: 'The agent creates pull request #2 in the public repo and puts what it found in the PR body. Per Invariant, the leak included a private repo name, a relocation plan, and a salary. The PR author shows as the repo owner, because the agent used the owner\'s token.',
+    caption: 'The agent creates pull request #2 in the public repo and puts what it found in the PR body. Per Invariant, the leak included a private repo name, a relocation plan, and a salary. The PR is filed under the repo owner\'s account, because the agent acted with the owner\'s rights.',
     node: { agent: 'idle', pr: 'accent' }, arrow: { write: 'accent' }, rows: 4,
   },
   {
@@ -51,7 +51,7 @@ const STEPS: Step[] = [
     node: { pr: 'bad', attacker: 'bad' }, arrow: {}, rows: 4,
   },
   {
-    caption: 'Where to cut. Cut 1: scope the token to the one repo the task needs, so the private read fails. Cut 2: block writes to a public repo after the session read untrusted text. The attack text itself has no reliable filter, because it is ordinary English.',
+    caption: 'Where to cut. Cut 1: limit the token to the one repo the task needs, so the private read fails. Cut 2: block writes to a public repo after the session read untrusted text. The attack text itself has no reliable filter, because it is ordinary English.',
     node: { priv: 'ok', pr: 'ok' }, arrow: { read: 'ok', write: 'ok' }, rows: 4, cuts: true,
   },
 ];

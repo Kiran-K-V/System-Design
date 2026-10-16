@@ -30,7 +30,7 @@ export default function Ai10ThreatOwasp() {
   const lit = new Set<Part>(cls ? cls.hits : []);
 
   return (
-    <CacheWidgetFrame title="OWASP ten on a reference agent" hint="Pick a class. The mapping is this lesson's reading, not an OWASP table.">
+    <CacheWidgetFrame title="OWASP ten on a reference agent" hint="Pick a risk class. The mapping is this lesson's own reading.">
       <div className="mb-3 flex flex-wrap gap-1.5" role="group" aria-label="OWASP LLM Top 10 class">
         {CLASSES.map((c) => (
           <button
@@ -40,7 +40,7 @@ export default function Ai10ThreatOwasp() {
             onClick={() => setSel(c.id === sel ? null : c.id)}
             className={`rounded-md border px-2 py-1 text-xs ${c.id === sel ? 'border-accent bg-accent font-semibold text-white' : 'border-line text-muted hover:bg-surface'}`}
           >
-            {c.id.replace('LLM', '')} {c.title}
+            {c.title}
           </button>
         ))}
       </div>
@@ -71,7 +71,7 @@ export default function Ai10ThreatOwasp() {
       <div className="mt-2 rounded-lg border border-line bg-surface p-3 text-sm" aria-live="polite">
         {cls ? (
           <>
-            <p className="font-medium">{cls.id}:2025 {cls.title}</p>
+            <p className="font-medium">{cls.title}</p>
             <p className="mt-1">{cls.how}</p>
             <p className="mt-1 text-muted">Parts hit: {cls.hits.map((h) => PARTS.find((p) => p.id === h)!.label).join(', ')}.</p>
           </>

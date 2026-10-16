@@ -13,31 +13,31 @@ interface Step {
 const steps: Step[] = [
   {
     caption:
-      'One pair: a prompt, a chosen answer and a rejected answer. The reference model is a frozen copy of the SFT model. For each answer we track one number: the log-ratio, log(policy probability / reference probability), added over the answer\'s tokens. At the start the policy equals the reference, so both log-ratios are 0, the margin is 0, and the loss is ln 2 = 0.693.',
+      'One pair: a prompt, a chosen answer and a rejected answer. Training has not started, so the model equals its frozen reference copy. Both answers are exactly as likely as before. Both log-ratios are 0, the margin is 0, and the loss is 0.693: the model is guessing which answer is better.',
     state: 0,
     focus: 'none',
   },
   {
     caption:
-      'Early training. The loss pushes the chosen answer\'s log-ratio up and the rejected one\'s down. With beta = 0.1 the margin is 0.1 x (1.0 - (-1.5)) = 0.25. The loss falls to 0.576. Nothing samples from the model here: DPO only re-scores answers that are already in the dataset.',
+      'Early training. The chosen answer is now a little more likely than before (log-ratio +1.0). The rejected answer is less likely (-1.5). With beta = 0.1, the margin is 0.1 x (1.0 - (-1.5)) = 0.25, and the loss falls to 0.576. Nothing is generated here. Training only re-scores answers that are already in the data.',
     state: 1,
     focus: 'both',
   },
   {
     caption:
-      'The model now ranks the pair correctly by a wide gap. The margin is 0.1 x 6 = 0.6 and the loss is 0.437. The pull weight, sigmoid(r_rejected - r_chosen), has dropped from 0.50 to 0.35. A pair the model already gets right pulls less. A pair it still gets wrong pulls harder.',
+      'The model now ranks the pair correctly by a wide gap. The margin is 0.1 x 6 = 0.6 and the loss is 0.437. The pull strength has dropped from 0.50 to 0.35. A pair the model already ranks well pulls less. A pair it ranks wrongly pulls hard.',
     state: 2,
     focus: 'both',
   },
   {
     caption:
-      'Later in training the margin is 1.1 and the loss is 0.287. The rejected answer is now e^-8, about 0.03%, as likely as before. Keep going and the model learns to avoid whole regions of answers, not only this one. That is the point, and also the risk: the loss only measures the gap, not how good the chosen answer is.',
+      'Later the margin is 1.1 and the loss is 0.287. The rejected answer is now about 0.03% as likely as before training (e to the power -8). The model has learned to steer away from that kind of answer. The loss measures only the gap between the two answers. It does not measure whether the chosen answer is good.',
     state: 3,
     focus: 'both',
   },
   {
     caption:
-      'A failure to watch for. Here the chosen log-ratio is -2.0 and the rejected is -9.0. The margin is 0.7, so the loss is 0.403, lower than at the start. But the chosen answer is now less likely than before training. Pal et al. (2024) show the standard DPO loss allows this, most often when the two answers are close in wording. Log the chosen log-ratio, not only the loss.',
+      'A trap. Here the chosen answer is less likely than before (-2.0), and the rejected answer fell much further (-9.0). The margin is 0.7, so the loss is 0.403, lower than at the start. The loss looks better while the chosen answer got worse. The field notes below explain when this happens. Log the chosen answer\'s log-ratio, not only the loss.',
     state: 4,
     focus: 'chosen',
     bad: true,
@@ -73,7 +73,7 @@ export default function Ai11PrefDpoWalk() {
         return (
           <SketchSvg width={720} height={300} label={`Log-ratio of the chosen answer ${st.dw} and the rejected answer ${st.dl}. Loss ${dpoLoss(st.dw, st.dl).toFixed(3)}.`}>
             <HandText x={24} y={22} anchor="start" size={TEXT_SIZES.note} color="var(--muted)">
-              log-ratio = log(policy / reference), in nats. 0 means unchanged.
+              log-ratio: how much more or less likely than before training. 0 = unchanged.
             </HandText>
             <SketchArrow points={[[CX, 44], [CX, 150]]} head="none" seed={seedOf('dpo-axis')} stroke="var(--muted)" dashed />
             <Bar y={78} v={st.dw} label="Chosen" tone={chosenTone} active={s.focus !== 'none'} seed={`dpo-w${s.state}`} />
@@ -88,7 +88,7 @@ export default function Ai11PrefDpoWalk() {
               {`loss = -ln sigmoid(margin) = ${dpoLoss(st.dw, st.dl).toFixed(3)}`}
             </HandText>
             <HandText x={24} y={274} anchor="start" size={TEXT_SIZES.label} mono color="var(--muted)">
-              {`pull weight = ${pullWeight(st.dw, st.dl).toFixed(2)}`}
+              {`pull strength = ${pullWeight(st.dw, st.dl).toFixed(2)}`}
             </HandText>
           </SketchSvg>
         );

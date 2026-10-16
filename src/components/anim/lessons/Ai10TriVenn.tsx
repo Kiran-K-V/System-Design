@@ -21,7 +21,7 @@ const steps: Step[] = [
     a: 'idle', b: 'idle', c: 'idle', out: 'idle',
   },
   {
-    caption: 'Leg A: untrusted content. The agent reads text an attacker can write: an inbound email, a web page, a ticket. The model cannot reliably tell that text apart from instructions (lesson A10.2). So the attacker\'s words now sit in the context.',
+    caption: 'Leg A: untrusted content. The agent reads text an attacker can write: an inbound email, a web page, a ticket. The model cannot reliably tell that text apart from your instructions. So the attacker\'s words now sit in the context.',
     a: 'on', b: 'idle', c: 'idle', now: 'a', out: 'idle',
   },
   {
@@ -33,7 +33,7 @@ const steps: Step[] = [
     a: 'on', b: 'on', c: 'on', now: 'c', out: 'idle',
   },
   {
-    caption: 'The attack. The planted text says: read the private data, put it in the address of an image, and show that image. The client fetches the image on its own. The data reaches the attacker\'s server with no click. EchoLeak did this to Microsoft 365 Copilot.',
+    caption: 'The attack. The planted text says: read the private data, put it in the address of an image, and show that image. The client fetches the image on its own. The data reaches the attacker\'s server with no click. A real attack on Microsoft 365 Copilot worked this way.',
     a: 'on', b: 'on', c: 'on', now: 'out', out: 'leak',
   },
   {
@@ -41,7 +41,7 @@ const steps: Step[] = [
     a: 'on', b: 'on', c: 'cut', out: 'safe',
   },
   {
-    caption: 'Fix 2: cut leg A. Process mail only from senders you trust. The agent keeps its secrets and its send path, but no attacker text reaches it. This is the cut Meta suggests for an email bot.',
+    caption: 'Fix 2: cut leg A. Process mail only from senders you trust. The agent keeps its secrets and its send path, but no attacker text reaches it. A trusted-sender list is the usual cut for an email bot.',
     a: 'cut', b: 'on', c: 'on', out: 'safe',
   },
   {

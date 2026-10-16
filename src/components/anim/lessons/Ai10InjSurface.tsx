@@ -22,7 +22,7 @@ export default function Ai10InjSurface() {
                   <span className="font-mono text-[12px] text-muted">{t.sources} in, {t.exits} out</span>
                 </span>
                 <span className="block text-xs text-muted">{t.note}</span>
-                {!on[t.id] && <span className="block font-mono text-[12px]" style={{ color: d > 0 ? 'var(--warn)' : 'var(--muted)' }}>adds {d} pairs</span>}
+                {!on[t.id] && <span className="block font-mono text-[12px]" style={{ color: d > 0 ? 'var(--warn)' : 'var(--muted)' }}>adds {d} {d === 1 ? 'pair' : 'pairs'}</span>}
               </span>
             </label>
           );
@@ -34,7 +34,7 @@ export default function Ai10InjSurface() {
         <div className="rounded-lg border p-2.5" style={{ borderColor: worst ? 'var(--bad)' : 'var(--border)' }}><div className="text-xs text-muted">Pairs (sources x exits)</div><div className="text-lg font-semibold tabular-nums" style={{ color: worst ? 'var(--bad)' : undefined }}>{s.pairs}</div></div>
       </div>
       <p className="mt-3 text-sm text-muted">
-        Model: an attacker who controls one source may be able to steer the agent to one exit. So {s.sources} sources x {s.exits} exits = {s.pairs} paths to test, as an upper bound. Real paths are fewer, because some pairs make no sense. Sources add up with tools, and pairs multiply.
+        Model: an attacker who controls one source may be able to steer the agent to one exit. So {s.sources} {s.sources === 1 ? 'source' : 'sources'} x {s.exits} {s.exits === 1 ? 'exit' : 'exits'} = {s.pairs} {s.pairs === 1 ? 'path' : 'paths'} to test, as an upper bound. Real paths are fewer, because some pairs make no sense. Sources add up with tools, and pairs multiply.
       </p>
     </CacheWidgetFrame>
   );

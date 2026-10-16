@@ -35,12 +35,12 @@ export default function Ai8OnlineSim() {
   const half = hw(n);
   const diff = p2 - p1;
   const clear = diff > half;
-  const span = Math.max(hw(50), diff) * 1.1;
-  const x = (v: number) => 50 + (v / span) * 50;
+  const span = Math.max(hw(300), diff * 1.5);
+  const x = (v: number) => Math.min(100, Math.max(0, 50 + (v / span) * 50));
   const color = clear ? 'var(--ok)' : 'var(--warn)';
 
   return (
-    <CacheWidgetFrame title="A/B sample-size explorer" hint="two-proportion test, alpha 0.05 two-sided, equal arms">
+    <CacheWidgetFrame title="A/B sample-size explorer" hint="95% interval, two equal arms">
       <div className="mb-3 flex flex-wrap gap-2">
         <Seg label="Power" value={power} options={[{ id: 0.8, label: 'Power 80%' }, { id: 0.9, label: 'Power 90%' }]} onChange={setPower} />
       </div>
@@ -61,7 +61,7 @@ export default function Ai8OnlineSim() {
           <p className="text-xs uppercase tracking-wide text-muted">With {fmt(n)} per arm, 95% interval for the difference</p>
           <div className="relative mt-3 h-10" role="img" aria-label={`Interval for the difference between arms: ${(diff * 100).toFixed(1)} points, plus or minus ${(half * 100).toFixed(1)}.`}>
             <div className="absolute top-0 h-10 w-px bg-[var(--fg)]" style={{ left: '50%' }} />
-            <div className="absolute top-4 h-2 rounded" style={{ left: `${Math.max(0, x(diff - half))}%`, width: `${Math.min(100, x(diff + half)) - Math.max(0, x(diff - half))}%`, background: color, opacity: 0.55 }} />
+            <div className="absolute top-4 h-2 rounded" style={{ left: `${x(diff - half)}%`, width: `${x(diff + half) - x(diff - half)}%`, background: color, opacity: 0.55 }} />
             <div className="absolute top-2 h-6 w-1 rounded" style={{ left: `${x(diff)}%`, background: color }} />
           </div>
           <div className="flex justify-between text-xs text-muted">
@@ -74,7 +74,7 @@ export default function Ai8OnlineSim() {
           </p>
         </div>
         <p className="text-muted">
-          Model: n = (z_a x sqrt(2 p̄ q̄) + z_b x sqrt(p1 q1 + p2 q2))² / (p2 - p1)², with z_a = 1.96. It assumes one independent observation per user. Real users make many requests each, so correlated requests need more data. Elective E1.8 covers variance, sequential tests, and interleaving.
+          Model: the test compares two rates with a normal-curve approximation and a 5% false-alarm rate. It assumes one independent observation per user. Real users make many requests each, and those requests are linked, so real tests need more data. The interval is drawn around the true lift you typed, as if the test measured it exactly.
         </p>
       </div>
     </CacheWidgetFrame>

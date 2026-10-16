@@ -33,7 +33,7 @@ export default function Ai8TrajPassK() {
   const spread = Array.from({ length: 8 }, (_, i) => passHatK(g, i + 1));
 
   return (
-    <CacheWidgetFrame title="One pass rate, many reliabilities" hint="Illustrative task mix. Mean pass rate fixed at 61.2%, the tau-bench retail figure for gpt-4o.">
+    <CacheWidgetFrame title="One pass rate, many reliabilities" hint="Illustrative task mix. The mean single-run pass rate stays at 61.2%, a published figure for gpt-4o on shop tasks.">
       <div className="mb-3 flex flex-wrap gap-2">
         <Seg label="Task mix" value={mix} onChange={setMix} options={[{ id: 'uniform', label: 'Every task passes 61.2% of runs' }, { id: 'spread', label: 'Mixed: solid, flaky, never' }]} />
       </div>
@@ -74,7 +74,7 @@ export default function Ai8TrajPassK() {
           </div>
         </div>
         <p className="text-muted">
-          Model: task groups with a fixed chance per run. pass^k = average over tasks of p^k. pass@k = average of 1 - (1 - p)^k. "Every task 61.2%": pass^8 = 0.612^8 = 2.0%. "Mixed" is 50% of tasks at 0.90, 30% at 0.54, 20% at 0: same mean, pass^8 = 21.7%. The tau-bench paper reports pass^8 below 25% for gpt-4o in retail, so the real task mix is uneven, not uniform.
+          Model: task groups with a fixed chance per run. pass^k = average over tasks of p^k. pass@k = average of 1 - (1 - p)^k. "Every task 61.2%": pass^8 = 0.612^8 = 2.0%. "Mixed" is 50% of tasks at 0.90, 30% at 0.54, 20% at 0: same mean, pass^8 = 21.7%. The published benchmark reports pass^8 below 25% for gpt-4o on shop tasks, so real tasks are uneven, not uniform.
         </p>
       </div>
     </CacheWidgetFrame>

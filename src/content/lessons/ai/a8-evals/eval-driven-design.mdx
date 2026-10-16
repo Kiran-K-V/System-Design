@@ -1,0 +1,294 @@
+---
+summary: 'An eval is a fixed set of test cases plus a grader that turns "this looks better" into a number. Build it before the feature, run it on every change, compare case by case, and treat the pass rate as a product choice, not a demand for 100%.'
+requires: ['ai/a0-orientation/ai-design-method', 'ai/a4-context/prompts-as-code']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai8EddLoop from '../../../../components/anim/lessons/Ai8EddLoop.tsx';
+import Ai8EddCost from '../../../../components/anim/lessons/Ai8EddCost.tsx';
+
+## The problem
+
+You run a support chatbot. A customer writes, "Can I still return the jacket I bought three weeks ago?" The bot answers with a policy. Sometimes the policy is right. Sometimes the bot invents a 30-day window that your company does not have.
+
+You edit the prompt to fix this. You try three questions by hand. All three answers look better. You ship.
+
+A week later, the number of chats that get passed to a human agent is up. What went wrong? Nobody can say, because nobody measured anything. You do not know what the bot did before your change. You do not know which questions got worse. You only know that three examples looked fine.
+
+This lesson answers six questions:
+
+1. How do you know a change helped?
+2. Who decides whether an answer is good?
+3. Why not just try a few examples?
+4. How do you compare two versions fairly?
+5. What pass rate is good enough?
+6. When do you build all of this?
+
+This is the first lesson of the Evals module. It gives you the frame. Each later lesson fills in one part.
+
+## Question 1: how do you know a change helped?
+
+You already know one answer from backend work: a unit test. A test feeds fixed input to code and checks the output. When you change the code, you run all the tests. If one fails, you know what you broke.
+
+An AI feature needs the same thing, with one twist. A model gives different answers on different runs, and "correct" is often fuzzy. Lesson [A0.3](/learn/ai/a0-orientation/probabilistic-components/) showed why.
+
+An **eval** is the AI version of a test suite. It has three parts:
+
+- A fixed list of **test cases**. One test case is one input (a customer question) plus a rule for what counts as a good answer.
+- A **grader**, which is the thing that applies the rule and says pass or fail. You meet the three kinds of grader in Question 2.
+- A **pass rate**: the share of test cases that pass. If 30 of 40 cases pass, the pass rate is 30 / 40 = 75%.
+
+An everyday picture: a driving test. You do not decide a person drives well because they said so, or because they did one smooth left turn. You give everyone the same route and the same checklist. Then you can compare two drivers, or the same driver before and after lessons.
+
+Why does this exist? Because without a fixed set, every change is judged on different examples, and a change that fixes one thing can break another. A fixed set makes the before and after comparable.
+
+One number shows how weak a hand test is. Say all 3 of 3 examples pass. A standard 95% range for the true pass rate runs from about 44% to 100%. (This is the Wilson range, a common formula for a share measured on a small sample.) Three passes cannot tell a bot that is right 45% of the time from one that is right 95% of the time. With 100 cases, the same style of range is about 10 points wide on each side. Question 4 returns to this.
+
+Lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/) put the eval plan at step 2 of the design method, before the architecture. Lesson [A4.1](/learn/ai/a4-context/prompts-as-code/) used a small eval as the unit test for a prompt. This lesson explains how to design the eval itself.
+
+## Question 2: who decides whether an answer is good?
+
+Each test case needs a grader. There are three kinds. They differ in cost, speed, and how well they handle fuzzy answers.
+
+A **code check** is a small program. For example: "the reply is valid JSON", "the reply contains the order id", "the reply does not mention a competitor". It is like a spell-checker: exact, instant, and blind to meaning. It costs almost nothing. Use it for everything a program can check.
+
+A **human label** is a person who reads the answer and writes pass or fail. A good label also has one or two sentences on why. It is like a teacher marking an essay: slow and costly, but it is the reference everything else is measured against.
+
+An **LLM judge** is a second model that reads the answer and grades it against a written rule. It is like a trained teaching assistant who marks the easy essays so the teacher can focus on the hard ones. A judge handles fuzzy rules, such as "the tone is polite and the answer is complete". It is cheap and fast, but it is a model, so it can be wrong in its own ways. Lesson A8.4 shows how to check a judge before you trust it.
+
+Real teams use all three, at different speeds. LinkedIn described its own set-up in a 2024 post about building a generative AI product. Engineers run fast, rough checks to get a direction. Annotators (people paid to label) give finer feedback with about a one-day turnaround. Members, the real users, are the final judges, and some of their signals take 3 or more days for a single change. Hamel Husain, who has helped many companies set up evals, writes the same shape as three levels: unit tests, then model and human review, then A/B tests. An **A/B test** shows version A to some real users and version B to others, then compares what they do. His summary: "The cost of Level 3 > Level 2 > Level 1. This dictates the cadence and manner you execute them."
+
+Read that as a rule. The cheap grader runs on every change. The expensive grader runs less often.
+
+## The naive way: try a few examples
+
+The usual first move is to try a handful of inputs after each edit and see whether they "look right". This is a **vibe check**. It fails in four ways.
+
+- **Too few cases.** Three passes fit a true rate anywhere from 44% to 100%, as above.
+- **Chosen cases.** You pick examples that you expect to work. The failures live in the cases you did not think of.
+- **No memory.** You cannot recall what the bot said last week. So you cannot tell "better" from "different".
+- **Regressions stay hidden.** A **regression** is something that used to work and now fails. You fixed refund questions. You did not re-check address changes. That is how a bot gets worse while every example you try looks good.
+
+There is a second naive plan. It says, "Build the feature first and write the evals once it works". By then, your tests will describe whatever you built. They will pass. They will not catch the cases you would have written if you had started from the user's problem. We come back to this in Idea 6.
+
+## The real fix: an eval run as a loop
+
+The fix has six ideas. The first two are the parts of an eval. The next four are how to use it.
+
+### Idea 1: a fixed set of test cases
+
+**What it is.** A list of test cases that does not change between runs, so that two runs can be compared. A test case holds the input, and either the expected answer or the rule the answer must meet.
+
+**Picture.** A recipe card box. Every time you test a new oven, you bake the same recipes.
+
+**Why it exists.** Without a fixed set, a better score may only mean you picked easier examples today.
+
+**Number.** Anthropic's engineering guide to agent evals (January 2026) says "20-50 simple tasks drawn from real failures is a great start." That is a small number. You can build it in an afternoon.
+
+### Idea 2: each case gets one grader
+
+**What it is.** For each case, pick the cheapest grader that can decide it: code check first, a judge for fuzzy rules, a human where the stakes are high or you need a reference.
+
+**Picture.** A kitchen with a thermometer, a taste test, and a food critic. You use the thermometer on every dish, because it is fast and exact. You use the critic on a few dishes, because the critic is slow.
+
+**Why it exists.** Grading everything with humans is too slow to run on every change. Grading everything with a judge hides the cases where a simple code check would be exact.
+
+**Number.** The calculator below prices a run. At the defaults, 600 model calls plus 600 judge calls cost about $5.58 and take about 5 minutes. A code check costs about nothing.
+
+### Idea 3: compare case by case
+
+**What it is.** After a run, do not stop at the pass rate. List which cases flipped: failed before and pass now (**fixed**), or passed before and fail now (**broken**).
+
+**Picture.** A before-and-after photo of the same room. You do not say "the room is 8% cleaner". You say which shelf got tidier and which drawer is now a mess.
+
+**Why it exists.** A pass rate can rise while a good case breaks. The flips show the trade you are making.
+
+**Number.** Watch the loop below. The pass rate goes from 75% to 82.5%, which looks good. But 5 cases got fixed and 2 broke.
+
+<Ai8EddLoop client:visible />
+
+Is 5 fixed against 2 broken good news? Treat each flip as a coin toss, which is what you would see if the change did nothing. Then ask how often 5 or more of 7 flips would land on "fixed" by luck. That is (21 + 7 + 1) / 128 = 29 / 128, about 23%. One time in four, a change that did nothing looks this good. So v2 is weak evidence, and the team does not ship it. It revises the rule instead. Version v3 fixes the same 5 and breaks none.
+
+Here is the same idea as a rule you can use: **count the flips, not the pass rates.** Two pass rates measured on the same 40 cases are not independent, so their ranges overlap and tell you little. The flips carry the information.
+
+### Idea 4: the pass rate is a product choice
+
+**What it is.** There is no universal good pass rate. Hamel Husain writes: "Unlike traditional unit tests, you don't necessarily need a 100% pass rate. Your pass rate is a product decision, depending on the failures you are willing to tolerate."
+
+**Picture.** A smoke alarm and a car's fuel gauge. The alarm must be near-perfect. The gauge only has to be about right. The cost of a miss decides how strict you are.
+
+**Why it exists.** A set of easy cases passes at 100% and tells you nothing. Hamel's FAQ says: "If you're passing 100% of your evals, you're likely not challenging your system enough." It adds that "a 70% pass rate might indicate a more meaningful evaluation that's actually stress-testing your application."
+
+So keep two kinds of set. A **regression set** holds cases that already work. You expect a pass rate near 100%, and any drop is an alarm. A **capability set** holds cases the system does not yet handle. Anthropic says it should "start at a low pass rate" and give the team "a hill to climb". When a capability set is mostly solved, move it into the regression set and write harder cases.
+
+**Number.** Say the quality bar is: 98% or more on the regression set, with no case allowed to flip from pass to fail, and a capability set that goes from 35% to 60% this quarter. That is a plan you can measure.
+
+### Idea 5: run each case more than once
+
+**What it is.** A model gives a different answer each time, so one run of one case is one sample. A single attempt is a **trial**. Run each case k times. Then you can ask two different questions. Did at least one trial pass? That is called **pass@k**. Did all k trials pass? That is called **pass^k**.
+
+**Picture.** A basketball player who makes one free throw in three tries is not a reliable free-throw shooter. A customer who meets your bot once sees one try. The next customer sees another.
+
+**Why it exists.** A user sees every run, not the best one. For anything customer-facing, reliability across runs is what you promise.
+
+**Number.** Anthropic's guide works the example: if an agent passes a task 75% of the time, the chance it passes 3 trials in a row is 0.75 x 0.75 x 0.75 = 0.42, about 42%. The chance it passes at least once in 3 is 1 - 0.25^3 = 98%. One agent, two very different stories. Choose the one your users live.
+
+### Idea 6: build the eval before the feature, from real failures
+
+**What it is.** Write the first test cases before you write the feature. Draw them from real failures if you have any. If you have no users yet, make them up from your best guesses.
+
+**Picture.** A builder who draws the inspection checklist before laying a brick.
+
+**Why it exists.** An eval written first sets the target. An eval written last checks what you already built.
+
+**Number.** LinkedIn's post says its team reached 80% of the basic experience it was aiming for in the first month, and then spent an additional four months attempting to surpass 95% completion of the full experience. The last stretch took four times as long as the first. An eval is how you see where you are on that slope and what to fix next.
+
+Do not wait for production data. Hamel's guide says: "You don't need to wait for production data to test your system." He often has a model generate the first inputs. Lesson [A8.2](/learn/ai/a8-evals/error-analysis/) shows how to find the right cases by reading real traces. Lesson [A8.3](/learn/ai/a8-evals/golden-sets/) shows how to build and protect the set.
+
+## Numbers
+
+Quality bar for the eval itself: it must run fast enough that people use it. A good target is a pull request gate that finishes in under 10 minutes. It must cost little enough that nobody turns it off. Use the calculator to find your numbers.
+
+<Ai8EddCost client:visible />
+
+Prices as of 2026-10-16, from the [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing), per million tokens (MTok), input and output: Opus 5.5 $4 and $20, Sonnet 5.5 $2 and $10, Haiku 5.5 $0.10 and $0.50. The Batch API takes 50% off both, and it is asynchronous.
+
+Work one case by hand. The defaults are 200 cases, 3 trials, Sonnet 5.5 as the model under test, and Haiku 5.5 as the judge.
+
+- Model calls: 200 x 3 = 600. Input: 600 x 2,000 = 1.2 million tokens, so 1.2 x $2 = $2.40. Output: 600 x 500 = 0.3 million tokens, so 0.3 x $10 = $3.00. Subtotal $5.40.
+- Judge calls: 600. Input: 600 x 2,500 = 1.5 million tokens, so 1.5 x $0.10 = $0.15. Output: 600 x 100 = 0.06 million tokens, so 0.06 x $0.50 = $0.03. Subtotal $0.18.
+- Total: $5.58 per run. At 10 runs a day, that is about $56 a day.
+- Time: 600 calls in waves of 20 is 30 waves. At 8 seconds per wave of model calls and 2 seconds per wave of judge calls, that is 30 x 8 + 30 x 2 = 300 seconds, or 5 minutes.
+
+The token sizes and call times are illustrative. Measure your own. Swap the judge to Opus 5.5 and the judge line jumps from $0.18 to $7.20. A judge that costs more than the model it grades is common, and it is a choice. Turn trials up to 8 to see what pass^k costs: eight times the model calls.
+
+## Trade-offs
+
+| Grader | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Code check | Exact, instant, nearly free, same answer every run | Blind to meaning, brittle when wording changes | The rule is something a program can test: format, ids, banned words, a number in range |
+| LLM judge | Handles fuzzy rules at scale, cheap per case | A model that can be wrong, needs its own checking, can change when the judge model changes | The rule is about meaning or tone, and you have checked the judge against people |
+| Human label | The reference answer, catches what you did not think of | Slow, costly, people disagree | Building the first set, checking a judge, high-stakes rules |
+| Online test (A/B) | Real user behavior | Slow, needs traffic, noisy | After a major change, once offline checks pass |
+
+## What experienced teams know
+
+1. **Count flips, not pass rates.** Two pass rates on the same cases hide which cases moved. The 5 fixed and 2 broken above are 7 flips, and the chance that 5 or more of 7 coin tosses land one way is 29 / 128, about 23%. So the gain is weak. List the flips on every run. Show the broken ones at the top of the review.
+
+2. **Binary pass or fail beats a 1 to 5 scale.** Hamel's [FAQ on evals](https://hamel.dev/blog/posts/evals-faq/) says the gap between adjacent points, such as 3 and 4, "is subjective and inconsistent across annotators", and that annotators "often default to middle values to avoid making hard decisions." His judge guide adds that tracking many 1 to 5 scores "is often a sign of a bad eval process." Ask a yes or no question per failure type, and write a one-sentence reason with each label.
+
+3. **Suspect the grader before the model.** Anthropic's agent-evals guide reports that Opus 4.5 first scored 42% on the CORE-Bench test. After the team fixed rigid grading, vague task specs, and tasks that could not be reproduced, the score rose to 95%. The guide also says a 0% pass rate over many trials "is most often a signal of a broken task, not an incapable agent." Read a sample of failures before you act on a bad score. A fair failure should make clear what the system got wrong.
+
+4. **Reliability is a different number from ability.** In the [tau-bench paper](https://arxiv.org/abs/2406.12045) (2024), agents that call tools for a retail customer succeeded on under 50% of tasks. Run the same task 8 times and the share of tasks where all 8 runs passed was under 25% in the retail domain. Report pass^k for anything a customer sees. Report pass@k only when a retry is free, for example when a person picks the best of several.
+
+5. **A one-sided eval trains a one-sided model.** Anthropic's guide says: "One-sided evals create one-sided optimization." Test both the cases where a behavior should happen and the cases where it should not. Shopify's [post on building its Sidekick agent](https://shopify.engineering/building-production-ready-agentic-systems) (August 2025) lists "reward hacking", where a model games the score it is trained against. One case was a model that dodged: "Instead of attempting difficult tasks, the model would explain why it couldn't help." The same trap waits in your set. If it holds only "must refuse" cases, the cheapest way to score well is to refuse.
+
+6. **Check the judge like you check the product.** Shopify's judge started at a Cohen's kappa of 0.02 against its human labels. Kappa is an agreement score where 0 means no better than chance and 1 means perfect. After rework the judge reached 0.61, and the human baseline was 0.69. Do not use raw agreement to check a judge. Hamel's guide shows why: if 5% of answers fail, "a judge that always predicts Pass still has 95% agreement while detecting none of the errors." Report how many real failures the judge catches and how many good answers it wrongly fails. Lesson A8.4 teaches this in full.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I build the eval first. 20 to 50 cases from real failures, graded by code checks where I can and a validated judge where I cannot. Every change runs the set, and I review the cases that flipped, not just the pass rate. The bar is a number: for example 98% on the regression set with no flips to fail. For customer-facing flows I run each case several times and report how often all runs pass." This names the set, the graders, the loop, and the bar.
+</Callout>
+
+<Callout type="mistake">
+Do not answer "we test it manually" or "we aim for 100%". Do not say "we use an LLM to grade everything" without saying how you checked the grader. Do not report one pass rate with no sample size. A pass rate on 20 cases is a rough guess, not a measurement.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A new prompt passes 33 of 40 cases and the old one passed 30. Comparing case by case, 5 cases went from fail to pass and 2 from pass to fail. If the change had no real effect, how often would 5 or more of the 7 flips go the good way by luck?',
+      options: [
+        'About 5%, so the change is clearly better',
+        'About 23%, so the gain is weak evidence',
+        'About 50%, so the change did nothing',
+        'About 75%, so the change is worse',
+      ],
+      answer: 1,
+      explain: 'Each flip is a coin toss if nothing changed. P(5 or more of 7) = (21 + 7 + 1) / 128 = 0.23. That is common enough that you should not trust the gain. The 5% answer ignores the 2 broken cases. The 50% answer is the chance of exactly the average, not of 5 or more.',
+    },
+    {
+      q: 'A support agent passes any single trial of a task 75% of the time. A customer sees every run. What is the chance that 3 runs in a row all pass?',
+      options: [
+        'About 98%',
+        'About 75%',
+        'About 25%',
+        'About 42%',
+      ],
+      answer: 3,
+      explain: 'All three must pass: 0.75 x 0.75 x 0.75 = 0.42. The 98% figure is the chance that at least one of three passes (1 - 0.25^3), which is pass@3. A customer lives the "all runs" case, not the "best run" case.',
+    },
+    {
+      q: 'An eval has 150 cases and 4 trials per case, and one judge call grades each trial. How many model calls does one run make in total, counting the judge calls?',
+      options: [
+        '1,200, model calls plus judge calls',
+        '600, counting only the model under test',
+        '150, counting one call per case',
+        '750, counting cases plus trials',
+      ],
+      answer: 0,
+      explain: '150 x 4 = 600 calls to the model under test, plus 600 judge calls, so 1,200. Counting only the first group gives 600. Forgetting the trials gives 150. Pass^k with a judge doubles the call count.',
+    },
+    {
+      q: 'A team keeps a regression set at 100% and a capability set at 35%. What should the team conclude?',
+      options: [
+        'The capability set is broken, because every eval should pass at 100%',
+        'The regression set is too easy and should be deleted at once',
+        'Both are healthy: one guards what works, the other has room to grow',
+        'The capability set should be merged into the regression set today',
+      ],
+      answer: 2,
+      explain: 'A regression set is meant to sit near 100% so that any drop is an alarm. A capability set is meant to start low, so it gives the team something to climb. Move cases from capability to regression only after they are mostly solved.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai8-three-examples"
+  title="Shipped after three examples"
+  scenario="A team adds a rule to its support bot prompt: 'Always quote the refund policy.' They try three questions by hand. All three answers improve. They ship. A week later, 11% of chats go to a human agent, up from 8%."
+  facts={[
+    'tested by hand: 3 questions, all better',
+    'eval set: none',
+    'after one week: handoff to human 8% -> 11%',
+    'change log: one prompt edit, no other change',
+  ]}
+  steps={[
+    {
+      prompt: 'What was missing before the change shipped?',
+      options: [
+        'A bigger model, so the answers would not vary',
+        'A fixed set of test cases with a pass rate to compare before and after',
+        'A longer prompt, so the rule is explained in more detail',
+        'A rule that the bot never quotes any policy',
+      ],
+      answer: 1,
+      explain: 'Without a fixed set, nobody knew what the bot did before, which cases got worse, or how big the effect was. A bigger model or longer prompt does not give you a comparison. Three hand-picked examples fit a true pass rate from about 44% to 100%.',
+    },
+    {
+      prompt: 'Which first step would most likely have caught the problem?',
+      options: [
+        'Run the old and new prompt on 40 to 100 real past chats and list the cases that flipped from pass to fail',
+        'Ask three more people to try three more examples each',
+        'Ship to everyone and read the first 10 complaints',
+        'Wait a month for more data and then compare handoff rates',
+      ],
+      answer: 0,
+      explain: 'A fixed set of past chats lets you see broken cases before any customer does. More hand examples have the same flaw as the first three. Waiting for complaints makes users the test set.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Hamel Husain: your product needs evals](https://hamel.dev/blog/posts/evals/)
+- [Anthropic: demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)
+- [LinkedIn: musings on building a generative AI product](https://www.linkedin.com/blog/engineering/generative-ai/musings-on-building-a-generative-ai-product)
+- [Shopify: building production-ready agentic systems](https://shopify.engineering/building-production-ready-agentic-systems)

@@ -32,7 +32,7 @@ interface Step {
 const steps: Step[] = [
   {
     caption:
-      'Error analysis (lesson A8.2) gave five failure types from the golden set. This sort is illustrative. The rule: name the failure first, then pick the cheapest lever that changes that failure. Do not start from "we should fine-tune".',
+      'You read the failed answers from your test set and sort them into five types. This sort is illustrative. The rule: name the failure first, then pick the cheapest lever that changes that failure. Do not start from "we should fine-tune".',
     upto: -1,
     readout: 'Name the failure, then pick the lever',
   },
@@ -68,7 +68,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Tally: two failures went to RAG, one to the prompt, two to fine-tuning. Run the levers in cost order and re-run the eval after each. Most teams find that the first two levers remove most failures, so the tuning set is small and well aimed.',
+      'Tally: two failures went to RAG, one to the prompt, two to fine-tuning. Try the levers in cost order, cheapest first, and re-run the test after each change. Fine-tuning only gets the failures that the cheaper levers cannot fix, so its training set is small and well aimed.',
     upto: 4,
     readout: '2 RAG, 1 prompt, 2 fine-tune',
   },
@@ -85,7 +85,7 @@ export default function Ai11WhenTriage() {
   return (
     <AnimFrame title="Sort each failure to a lever" steps={steps} interval={6000}>
       {(i, s) => (
-        <SketchSvg width={720} height={Y0 + 4 * DY + 98} label="Five failure types are each routed to prompt, retrieval, or fine-tuning">
+        <SketchSvg width={720} height={Y0 + 4 * DY + 128} label="Five failure types are each routed to prompt, retrieval, or fine-tuning">
           <HandText x={FX} y={22} size={TEXT_SIZES.heading} color="var(--muted)">
             Failure from error analysis
           </HandText>
@@ -130,8 +130,8 @@ export default function Ai11WhenTriage() {
               </g>
             );
           })}
-          <SketchBox cx={360} cy={Y0 + 4 * DY + 70} w={620} h={44} r={8} seed={seedOf('wt-read')} fill="var(--accent-soft)" />
-          <HandText x={360} y={Y0 + 4 * DY + 71} size={TEXT_SIZES.label} mono color="var(--accent)">
+          <SketchBox cx={360} cy={Y0 + 4 * DY + 100} w={620} h={44} r={8} seed={seedOf('wt-read')} fill="var(--accent-soft)" />
+          <HandText x={360} y={Y0 + 4 * DY + 101} size={TEXT_SIZES.label} mono color="var(--accent)">
             {s.readout}
           </HandText>
         </SketchSvg>

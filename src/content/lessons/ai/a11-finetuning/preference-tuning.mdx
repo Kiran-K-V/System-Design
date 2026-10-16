@@ -1,0 +1,256 @@
+---
+summary: 'Fine-tuning on examples shows a model what to say. Preference tuning shows it which of two answers is better. DPO does this with a simple loss on chosen and rejected pairs, lets the model act as its own reward model, and needs guards against length bias and a falling chosen answer.'
+requires: ['ai/a11-finetuning/sft-lora', 'ai/a8-evals/feedback-flywheel']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai11PrefDpoWalk from '../../../../components/anim/lessons/Ai11PrefDpoWalk.tsx';
+import Ai11PrefPipe from '../../../../components/anim/lessons/Ai11PrefPipe.tsx';
+import Ai11PrefLenLab from '../../../../components/anim/lessons/Ai11PrefLenLab.tsx';
+
+## The problem
+
+Your support assistant gets this question: "Can I get a refund for a flight I booked 30 hours ago?" Two answers come back. Both are correct. The first is 4 lines, starts with the policy, and gives one next step. The second is 14 lines, apologizes twice, and hides the policy in the third paragraph.
+
+Your team knows which one it wants. But try to write the perfect answer for every possible question. That is the job of supervised fine-tuning (SFT), which the previous lesson covered: you show the model one ideal answer per prompt, and it learns to imitate. Writing 5,000 ideal answers is slow and expensive. Looking at two answers and saying "the first one is better" takes seconds, and it is a more reliable judgment than writing from a blank page.
+
+This lesson answers four questions, and the last one is where most teams get hurt:
+
+1. How does a model put a number on an answer?
+2. Where do "this one is better" labels come from?
+3. How can a model learn from them?
+4. What goes wrong when it does?
+
+The method at the center is called **preference tuning**. Its best-known recipe is **DPO**. By the end you will know how DPO works, why it still needs a safety check on answer length, and when you should skip it.
+
+## Question 1: how does a model put a number on an answer?
+
+A language model writes one **token** at a time. A token is a small piece of text, often a word or part of a word. At each step the model gives every possible next token a **probability**: a number from 0 to 1, like a weather forecast. "70% chance of rain" is a probability of 0.7.
+
+The model then picks a token, usually a likely one, and repeats. So an answer is a chain of picks. The probability of the whole answer is every pick's probability multiplied together. Take a three-token answer with probabilities 0.5, 0.2 and 0.1. The answer has probability 0.5 x 0.2 x 0.1 = 0.01.
+
+Now take a real answer of 100 tokens, each at 0.5. That is 0.5 to the power 100, about 8 x 10^-31. Computers handle such numbers badly, and long multiplications are awkward. So everyone uses the **logarithm** (log) instead. A log turns multiplying into adding. The picture is sound: engineers add decibels instead of multiplying power ratios.
+
+The natural log of 0.5 is -0.69. Of 0.2 it is -1.61. Of 0.1 it is -2.30. Add them: -4.61. That is the log of 0.01. Read it like this: **the log-probability of an answer is always zero or below. The closer to zero, the more likely the answer.** An answer at -10 is far more likely than one at -12. In fact it is e^2, about 7.4 times as likely.
+
+Why does this matter here? Because it lets us ask a precise question about training: did this answer become more likely or less likely? We will subtract one log-probability from another to find out.
+
+## Question 2: where do "this one is better" labels come from?
+
+A **preference pair** has three parts: a prompt, a **chosen** answer (the better one), and a **rejected** answer (the worse one). Think of an eye exam. "Which is clearer, one or two?" You can answer even if you could never grind a lens yourself. That is the whole idea: judging is easier than creating.
+
+Where do pairs come from?
+
+- **Your own product signals.** A user edits your draft: the edited text is chosen, your original is rejected. A user hits "regenerate" and accepts the second try: the second is chosen. Lesson [A8.9](/learn/ai/a8-evals/feedback-flywheel/) shows how to collect these signals safely.
+- **A stronger model as the judge.** The UltraFeedback project asked GPT-4 to rate answers and produced over 1 million pieces of feedback on 250,000 conversations. Separately, the Zephyr project tuned a 7-billion-parameter model on answers ranked by a teacher model, with no human labels. On the MT-Bench chat test it surpassed Llama2-Chat-70B, a model ten times larger.
+- **Comparing two models.** Generate one answer from your model and one from a rival, then let a judge pick. The open Tulu 3 recipe from the Allen Institute for AI used a mix of 354,192 such preference examples.
+
+A judge model costs real money, so do the sum. Say a pair is 1,400 tokens of input (the prompt and both answers) and the judge writes 100 tokens. At Sonnet 5.5 list prices, $2 per million input tokens and $10 per million output tokens (as of 2026-10-16, [pricing page](https://platform.claude.com/docs/en/about-claude/pricing)), one pair costs 1,400 x $2 / 1,000,000 + 100 x $10 / 1,000,000 = $0.0028 + $0.001 = $0.0038. A set of 20,000 pairs costs about $76. Labels are cheap compared with the human hours that SFT answers would take. But there is a catch about who may train on a model's outputs, covered in lesson [A11.5](/learn/ai/a11-finetuning/distillation-data/).
+
+## Question 3: how could a model learn from "better"?
+
+We need a way to turn "this answer is better" into a push on the model. The classic route has two steps.
+
+First, train a second model, the **reward model**. It reads a prompt and an answer and outputs one number, the **reward**: a score for how much people would like that answer. Think of a judge who has studied thousands of your pairs and learned your taste. Its training data is the preference pairs.
+
+Second, train the main model against that judge. The main model is called the **policy**, because it is the part that decides what to say, like a player following a strategy. The policy writes answers, the reward model scores them, and a method called reinforcement learning nudges the policy toward higher scores. A leash keeps the policy near its starting point, so it does not drift into nonsense just to please the judge. This whole recipe is **RLHF**: reinforcement learning from human feedback.
+
+RLHF works. OpenAI's InstructGPT paper reported that humans preferred the outputs of a 1.3-billion-parameter model tuned this way over those of the 175-billion-parameter GPT-3, a model 100 times larger. But RLHF has many moving parts: the policy, a copy that serves as the leash, the reward model, and extra machinery for the reinforcement step. The authors of DPO describe it as "a complex and often unstable procedure".
+
+## The naive way: fine-tune on the chosen answers only
+
+The simple alternative is to throw away the rejected answers and run SFT on the chosen ones. This is a fair first try. It is cheap and uses tools you already have. Many teams should run it before anything fancier.
+
+It leaves information on the table. A rejected answer says which way **not** to move. It is like learning to cook from only the dishes people loved, never the ones sent back. SFT also only raises the probability of the chosen text. It never pushes down the probability of the bad text, so the model can still produce it. The 14-line apology above stays likely.
+
+We want a method that uses both halves of the pair, with fewer moving parts than RLHF.
+
+## The real fix: DPO
+
+**DPO** (direct preference optimization) trains the policy straight from preference pairs, in one stage, with one extra frozen copy of the model. It builds on three ideas.
+
+### Idea 1: keep a frozen copy as a reference
+
+Before training, make a copy of the SFT model and freeze it. Call it the **reference**. It never changes.
+
+Picture a leash on a dog, or the ghost car in a racing game that replays your last best lap. Each training step measures the policy against the reference, not against zero. Why does it exist? Without it, the model could shove probability onto a few pleasing phrases and forget how to write fluent English. The reference keeps changes small and measurable.
+
+The cost: you must run the reference model on every answer once. That is one extra forward pass, and it can be done ahead of time and saved.
+
+### Idea 2: measure change with a log-ratio
+
+For any answer, we can compute its log-probability under the policy and under the reference. Subtract the two. The result is the **log-ratio**: how much more or less likely training made this answer.
+
+Example: an answer scores -12.0 under the reference. After some training the policy scores -10.0. The log-ratio is +2.0, and the answer is about 7.4 times as likely as before. A log-ratio of 0 means nothing changed. A negative one means the answer got less likely.
+
+DPO computes one log-ratio for the chosen answer and one for the rejected answer.
+
+### Idea 3: reward the gap between the two log-ratios
+
+Here is the core trick. DPO wants the chosen answer's log-ratio to rise above the rejected answer's. The gap between them is the **margin**, scaled by a number called **beta** that sets how strict the leash is. DPO's authors use 0.1 as the default:
+
+margin = beta x (chosen log-ratio - rejected log-ratio)
+
+Then the **loss** turns the margin into a penalty. A loss is a number that training tries to push down. It is zero when the model is perfect and grows as the model gets worse. Think of golf: the lower the score, the better. DPO's loss takes the margin through a **sigmoid**, a curve that turns any number into a probability between 0 and 1 (0 maps to 0.5, large positive numbers map near 1). That output is "how likely does the model think chosen beats rejected". The penalty is minus the natural log of it:
+
+loss = -ln( sigmoid(margin) )
+
+Three points show how it behaves. At a margin of 0 the model is guessing, so the loss is 0.693. At a margin of 2.2 the sigmoid gives 0.9, and the loss is 0.105. At a margin of -2.2 the model prefers the wrong answer with 90% confidence, and the loss is 2.30.
+
+There is one more detail the DPO paper proves. The margin acts as a reward. The quantity beta x log-ratio plays the role of the reward-model score. So the policy **is** its own reward model, which is why the paper's title says "your language model is secretly a reward model". DPO does not remove the reward model from the maths. It folds it into the policy, so you never train a separate one. That is why it needs one stage, not two.
+
+The size of each update also depends on how wrong the model is right now. A pair the model already ranks correctly pulls weakly. A pair it ranks backward pulls hard. Step through one pair.
+
+<Ai11PrefDpoWalk client:visible />
+
+Notice that nothing here asks the model to write new text during training. DPO only re-scores answers already in the dataset. That makes it simple and stable. It also means the training data is fixed, which matters in the field notes.
+
+### Idea 4: where it sits in the pipeline, and what it costs
+
+DPO is a middle step. You start from an SFT model, because the reference must already write sensible answers. After DPO you check the result against held-out tests.
+
+<Ai11PrefPipe />
+
+Training cost is modest. Take 20,000 pairs of 1,400 tokens (prompt plus both answers), which is 28 million tokens. A standard rule says training costs about 6 x parameters x tokens in floating-point operations, and the reference's forward pass adds 2 more (lesson [A1.7](/learn/ai/a1-model-function/scaling-laws/) introduced it). For an 8-billion-parameter model that is 8 x 8 x 10^9 x 28 x 10^6, about 1.8 x 10^18 operations. At an assumed 4 x 10^14 operations per second on one good GPU, that is about 4,500 seconds, about 1.2 GPU-hours. The assumption is mine, not a measurement, but the order of magnitude holds: the labels cost more than the training.
+
+Open-source tools do it for you. The Hugging Face TRL library has a `DPOTrainer` that also works with LoRA adapters. The managed route is shrinking: OpenAI's [deprecations page](https://developers.openai.com/api/docs/deprecations) says that since May 7, 2026 organizations that had never run fine-tuning cannot start, and active customers lose the ability to create new fine-tuning jobs on January 6, 2027. If you plan on a vendor, check that date first.
+
+## Question 4: what goes wrong when a model learns from labels?
+
+People and judge models like long answers. A thorough, well-formatted answer often wins a comparison even when it is less useful. If your chosen answers are longer than your rejected ones, DPO will learn that "longer wins". The result is a model that rambles.
+
+Researchers studied this directly. They reported significant length exploitation in DPO, and a simple fix that kept quality gains while stopping the growth. Their win rates improved by up to 20% once length was controlled for, even though the GPT-4 judge has a well-known verbosity bias.
+
+You can test your own data before you train. For each pair, check if the chosen answer is longer. If it is longer in 75% of pairs, a rule that always picks the longer answer would score 75% on your labels. Drag the slider below. It keeps only pairs whose lengths are close. Watch the "longer wins" rate fall toward 50%.
+
+<Ai11PrefLenLab client:visible />
+
+Three fixes exist. Match lengths when you build pairs, as the slider does. Use **length-normalized** DPO, which divides each log-ratio by its answer's length. The Tulu 3 team tried several methods and picked this one for their final models. Or use **SimPO**, a variant that scores an answer by its average log-probability per token, which also removes the reference model. SimPO's authors report gains over DPO of up to 6.4 points on the AlpacaEval 2 chat benchmark, and up to 7.5 on Arena-Hard. Those are "up to" best cases, not averages.
+
+One more variant helps when you have no pairs. **KTO** learns from single answers labeled good or bad, a thumbs-up or thumbs-down. Its authors report that it matches or beats pair-based methods from 1 billion to 30 billion parameters.
+
+## Numbers
+
+Every tuning job needs three numbers fixed before you start.
+
+- **Quality bar and how you measure it.** Win rate against your current SFT model on your own held-out prompts, judged with length controlled, plus no drop on your regression tests. A typical gate: win rate above 55% with the average answer length within 10% of the baseline. The cutoffs are a convention for the lesson, not an industry standard. Pick yours from your golden set ([A8.3](/learn/ai/a8-evals/golden-sets/)).
+- **Latency budget.** Preference tuning does not change model size, so time per token does not change. But time per answer follows answer length. If length grows from 210 to 390 tokens (the case below), generation takes 390 / 210 = 1.86 times as long.
+- **Cost per request.** The same effect hits cost. Output tokens cost more than input tokens (Sonnet 5.5 charges $10 per million output against $2 per million input), so a 1.86x longer answer raises the output part of the bill by 86%.
+
+Training numbers from published recipes, all for full fine-tuning (LoRA uses other values):
+
+| Setting | Value | Source |
+|---|---|---|
+| DPO beta | 0.1 (0.5 for summarization) | DPO paper |
+| DPO learning rate | 1e-6 in the paper, 2e-7 for Tulu 3 | DPO paper, Tulu 3 |
+| SFT learning rate | 5e-6 (8B model, Tulu 3) | Tulu 3 |
+| Preference data | 354,192 pairs | Tulu 3 |
+
+## Trade-offs
+
+| Method | You gain | You pay | Choose it when |
+|---|---|---|---|
+| SFT on chosen answers only | Cheapest, no new tooling | Ignores the rejected answer | A first try, or when pairs are few |
+| DPO | One stage, stable, uses both answers | Pairs, a reference model, a length risk | Tone, format, safety, and refusal style |
+| Length-normalized DPO or SimPO | Weaker length exploit, SimPO needs no reference | Gains reported on chat tests, so check yours | Judge-labeled data that favors long answers |
+| KTO | Needs only thumbs, no pairs | Weaker signal per example | Feedback is single ratings |
+| RLHF with a reward model | Can learn from fresh samples while training | Several models, unstable, costly | Large teams with RL infrastructure |
+| No tuning, fix the prompt | Free, instant | Limited | When a prompt change closes the gap |
+
+Skip preference tuning when a prompt edit fixes the problem, or when the gap is missing facts. Preferences shape style and judgment. They do not add knowledge.
+
+## What experienced teams know
+
+1. **DPO learns length before it learns quality.** Chosen answers tend to be longer, and DPO exploits that. The [length study](https://arxiv.org/abs/2403.19159) found significant exploitation and linked it to what they call out-of-distribution bootstrapping: the model drifts toward answers unlike those in the data. Track mean answer length beside win rate on every run. Report length-controlled win rates, because the judge likes length too.
+2. **Use a learning rate far below your SFT rate.** The [Tulu 3 report](https://arxiv.org/abs/2411.15124) used 5e-6 for SFT on the 8B model and 2e-7 for the final DPO runs, 25 times lower, chosen from a sweep. DPO pushes the policy away from its reference, so large steps break fluency. Start low and sweep upward.
+3. **The chosen answer can get less likely while the loss falls.** The [Smaug team](https://arxiv.org/abs/2402.13228) showed the standard loss allows it, mostly when the two answers differ in only a few words. The fix is DPO-Positive, which adds a penalty. Log the chosen answer's log-ratio as a training metric. If it goes negative, the model is learning to lower the rejected answer, not to say the chosen one.
+4. **Fresh prompts and on-policy pairs beat recycled ones.** In the Tulu 3 ablations, pairs where one answer came from the model being tuned improved the final DPO result, and unused prompts beat prompts reused from the SFT set. Generate rejected answers from your current model, and keep prompts you did not train on for the pairs.
+5. **Thumbs can be enough.** If your product records ratings and not pairs, try [KTO](https://arxiv.org/abs/2402.01306) first. It matched pair-based methods in the authors' tests, so you may not need to build pairs at all.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "SFT shows what to say. Preference tuning shows which answer is better. DPO trains on chosen and rejected pairs with one loss, using a frozen reference. The policy acts as its own reward model, so I train no separate one. I would gate on a length-controlled win rate, track answer length, and log the chosen answer's likelihood." That names the mechanism and three real failure modes.
+</Callout>
+
+<Callout type="mistake">
+Do not say "DPO has no reward model". The paper rewrites the reward model into the policy. Do not report a win rate from an LLM judge without saying how you controlled for length. And do not offer preference tuning to fix missing knowledge. It will change style and may increase confident guessing.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In a DPO training step, the chosen answer has a log-ratio of +1.0 and the rejected answer has -1.5. With beta = 0.1, what is the margin?',
+      options: ['2.5, the plain gap between the two log-ratios', '0.5, which is beta times the chosen log-ratio', '0.25, which is beta times the gap of 2.5', '0.1, which is simply the value of beta'],
+      answer: 2,
+      explain: 'The margin is beta x (chosen - rejected) = 0.1 x (1.0 - (-1.5)) = 0.25. Skipping beta gives 2.5. Using only the chosen log-ratio ignores the rejected answer.',
+    },
+    {
+      q: 'Why does DPO keep a frozen reference copy of the SFT model during training?',
+      options: ['To measure how far the policy has moved', 'To generate fresh answers for each training step', 'To act as a second judge that scores each answer', 'To store the preference pairs for later steps'],
+      answer: 0,
+      explain: 'Log-ratios compare the policy with the reference. That keeps the policy from drifting far from fluent text. DPO does not generate new answers during training.',
+    },
+    {
+      q: 'After DPO, a judge says win rate rose from 58% to 71%, but the mean answer length rose from 210 to 390 tokens and human reviewers see no gain. What should you check first?',
+      options: ['Lower the learning rate and train for more steps to see', 'Add more prompts to the SFT set, then run DPO again', 'Raise beta so the policy is allowed to move further', 'How long chosen answers are against rejected ones'],
+      answer: 3,
+      explain: 'Higher win rate with longer answers and no human-visible gain is the length-bias pattern. Check the length gap in the pairs and re-score with length controlled. The other changes do not address that cause.',
+    },
+    {
+      q: 'Your app logs only thumbs-up and thumbs-down on single answers, with no pairs. Which method fits that data directly?',
+      options: ['DPO, because it works with any kind of feedback', 'KTO, because it learns from a good or bad label on one answer', 'Reward-model RLHF, because it never needs labels', 'SFT on the rejected answers, to teach the model what to avoid'],
+      answer: 1,
+      explain: 'KTO needs only a binary good or bad label per answer. DPO needs chosen and rejected pairs. SFT on rejected answers would teach the model to produce them.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai11-dpo-longer-answers"
+  title="Longer answers, no real gain"
+  scenario="You ran DPO on 20,000 pairs labeled by an LLM judge. The judge-based win rate against the SFT model rose. Human reviewers read 50 answers and see no improvement. Users say replies feel wordy."
+  facts={[
+    'win rate vs SFT (LLM judge): 58% -> 71%',
+    'mean answer length: 210 -> 390 tokens',
+    'training data: chosen answer longer in 15 of 20 sampled pairs (75%)',
+    'human spot check, 50 answers: no improvement',
+  ]}
+  steps={[
+    {
+      prompt: 'Which bias did the data most likely teach?',
+      options: [
+        'Longer answers win, because the labels rewarded length',
+        'A bias against any answer that contains a code block',
+        'A bias toward refusing every question that looks risky',
+        'A bias toward answers copied word for word from the prompt',
+      ],
+      answer: 0,
+      explain: 'Chosen was the longer answer in 75% of pairs and the judge has a known verbosity bias. DPO learned that length is the signal. Nothing in the facts points to code, refusals, or copying.',
+    },
+    {
+      prompt: 'What is the best first fix?',
+      options: [
+        'Train for twice as many steps to push the quality up',
+        'Match pair lengths or normalize by length, then re-score',
+        'Drop the reference model so the policy moves freely',
+        'Raise the learning rate so the model escapes this habit',
+      ],
+      answer: 1,
+      explain: 'The fix removes the length shortcut from the data or the loss, and the new score ignores length. More steps or a higher learning rate would deepen the habit. Dropping the reference removes the leash.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Direct Preference Optimization: Your Language Model is Secretly a Reward Model](https://arxiv.org/abs/2305.18290) (the DPO paper)
+- [Disentangling Length from Quality in Direct Preference Optimization](https://arxiv.org/abs/2403.19159)
+- [Tulu 3: Pushing Frontiers in Open Language Model Post-Training](https://arxiv.org/abs/2411.15124) (a full SFT, DPO, then RL recipe with ablations)
+- [KTO: Model Alignment as Prospect Theoretic Optimization](https://arxiv.org/abs/2402.01306)

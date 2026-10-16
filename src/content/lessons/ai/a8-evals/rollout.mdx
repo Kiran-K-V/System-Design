@@ -1,0 +1,320 @@
+---
+summary: 'A model change is a release you cannot read. Pin the whole bundle, try the new version in shadow, then on a small canary behind gates, and keep a one-switch rollback.'
+requires: ['ai/a8-evals/online-evals-ab', '07-reliability/circuit-breaker']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai8RollGates from '../../../../components/anim/lessons/Ai8RollGates.tsx';
+import Ai8RollDetect from '../../../../components/anim/lessons/Ai8RollDetect.tsx';
+
+## The problem
+
+In August 2025, some Claude users started to say that answers were worse. Anthropic's [postmortem of three recent issues](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues) explains why it took weeks to find the cause. Three separate infrastructure bugs overlapped. One of them sent some requests to servers set up for the wrong context length. It began on August 5 with 0.8% of Sonnet 4 requests. A load-balancing change on August 29 made it worse, and in the worst hour (August 31) 16% of Sonnet 4 requests were hit. Anthropic says about 30% of Claude Code users who sent requests in that period had at least one message misrouted. The first fix shipped on September 4.
+
+Why so slow? The postmortem says the early reports "were difficult to distinguish from normal variation in user feedback". It also says the evaluations "simply didn't capture the degradation users were reporting".
+
+The same week, nothing in the model's name had changed. This is the core problem. In normal software, a release comes with a diff you can read. A model change comes with no diff. The weights are a file of numbers. The only way to know what changed is to measure behavior. So a model release needs a process that measures behavior while limiting how many users get hurt if the measurement fails.
+
+This lesson answers five questions, in order:
+
+1. What exactly are we releasing?
+2. How long does a version live?
+3. How do we try a new version without hurting users?
+4. How many requests does a small trial need before it can tell?
+5. How do we undo it?
+
+## Question 1: what exactly are we releasing?
+
+Think of a recipe card. If a restaurant says "we changed the soup", you want to know: the recipe, the ingredients, the oven setting, and who cooks it. Any of these can change the taste.
+
+An LLM feature is the same. The **release** is the whole bundle that decides behavior:
+
+- the **model ID**: the string you send to the API to pick a model,
+- the prompt and its version (see [prompts as code](/learn/ai/a4-context/prompts-as-code/)),
+- the tool list and the settings around the model, such as the maximum thinking effort,
+- the provider's serving system: the routers, safety checks, and sampling code that run the model.
+
+You control the first three. The provider controls the last one. Now, what does the model ID promise?
+
+Anthropic's [model ID guide](https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions) separates two things.
+
+A **snapshot** is one fixed copy of a model. For the current naming, the ID with no date in it, such as `claude-sonnet-4-6`, is the snapshot. The guide says: "Anthropic does not update the weights or configuration of an existing model ID. When an updated version is available, it ships under a new model ID."
+
+An **alias** is a name that points to a snapshot, and the provider can repoint it. Older Claude models have aliases such as `claude-sonnet-4-5`. The guide says they point "to the most recent dated snapshot for that minor version". Think of the difference between a package version `1.4.2` in a lock file and the tag `latest`. A lock file gives the same code every time. `latest` can change under you.
+
+**Pinning** means using the snapshot ID, not the alias, so the same weights answer your requests until you decide otherwise.
+
+Here is the catch. The same guide says: "the serving infrastructure around the model can change over time". It lists the "request router, safety classifiers, and sampling logic". And it adds: "If you notice unexpected behavioral differences on a previously stable model ID, an infrastructure update is the most likely cause." So a pinned ID does not freeze behavior. It freezes the weights only. That is exactly the gap that the August 2025 bugs used.
+
+The rule for the rest of this lesson: treat the bundle as the release. Give it one version number. Store the model ID, prompt version, tool list, and settings together as one config. Tag every logged request with that release number, so you can later ask "did the answers change when release 42 started?"
+
+## Question 2: how long does a version live?
+
+A model is not permanent. Providers retire old models to make room for new ones. Think of a lease on an apartment. You have a notice period before you must leave. The date is on the contract, and moving takes work.
+
+Anthropic's [deprecation page](https://platform.claude.com/docs/en/about-claude/model-deprecations) names four states: **active**, **legacy**, **deprecated** (still works, but a retirement date is set), and **retired** ("Requests to retired models will fail"). It promises "at least 60 days' notice before model retirement for publicly released models". It also warns that "Deprecated models are likely to be less reliable than active models."
+
+Here is a live example, as of 2026-10-16. Anthropic announced on September 30, 2026 that `claude-sonnet-4-5-20250929` would retire on November 30, 2026. That is 61 days of notice. Today is October 16, so 45 days remain. The page's recommended replacement is `claude-sonnet-5-5`.
+
+OpenAI states its own rule on its [deprecations page](https://developers.openai.com/api/docs/deprecations). Generally available models get "at least 6 months". Specialized variants get "at least 3 months". Preview models "may be retired with much shorter notice, such as 2 weeks". But read each row, not only the headline. A set of GPT-4 family snapshots was announced on 2026-10-14 with a shutdown on January 14, 2027. That is 92 days, about 3 months.
+
+Why does this matter for rollout? Because a forced migration is a model change you did not choose, on a date you did not pick. If your only way to ship a new model is a big, rare, scary event, you will do it badly under a deadline. If you have a routine, tested path for model changes, a retirement notice is just another change.
+
+## Question 3: how do we try a new version without hurting users?
+
+We want to see how the new release behaves on real traffic. But we do not want a bad release to reach everyone. Four ideas do this, in a ladder. Each idea has the same four parts: what it is, an everyday picture, why it exists, and a number.
+
+### Idea 1: shadow traffic
+
+**Shadow** means copying live requests to the new version, grading the answers, and throwing them away. The user only ever sees the old version's answer.
+
+Think of an understudy who stands in the wings and performs every line of the show, while the audience watches the lead.
+
+Why it exists: it is the only way to test the new version on real inputs with zero risk to users. It will not show you how users react, because no user sees the answer.
+
+The number: shadow costs money, because you pay for every extra call. Assume 100,000 requests a day, with about 4,000 input tokens and 400 output tokens each (illustrative sizes). On Claude Sonnet 5.5, priced at $2 per million input tokens and $10 per million output tokens ([Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing), as of 2026-10-16), one request costs 4,000 x 2 / 1M + 400 x 10 / 1M = $0.008 + $0.004 = $0.012. Production costs $1,200 a day. Shadowing 10% of traffic on the same model costs 10,000 x $0.012 = $120 a day. Shadowing a bigger model, Claude Opus 5.5 ($4 and $20 per million), costs $0.024 per request, or $240 a day.
+
+### Idea 2: a canary with a small share
+
+A **canary** is a trial where a small share of real users, say 1%, get the new version.
+
+The name comes from coal mines. Miners carried a canary because it showed the bad air before the miners felt it. The few are hurt first, so the many are not.
+
+Why: only real users can show real reactions, such as retries and complaints. A small share limits the harm.
+
+The number: 1% of 100,000 requests a day is 1,000 requests a day. That is small, and it limits how fast you can learn. Question 4 shows the arithmetic.
+
+### Idea 3: gates
+
+A **gate** is a written rule that the new version must pass before it moves up the ladder. If any gate fails, the rollout stops.
+
+Think of the checks before an airplane takes off. Each item has a yes or no. One "no" stops the flight.
+
+Why: when a person makes the call by feel, they miss slow decline and talk themselves into a launch. Gates are agreed first, when no one is under pressure. Four gates cover an LLM feature:
+
+- **Quality**: the pass rate on graded answers (see [judges](/learn/ai/a8-evals/judges/)) is not below the old version's by more than a set margin.
+- **Latency**: the p95 is not too much above the old version. The **p95** is the time that 95% of requests beat. A few slow answers hide in an average, but p95 shows them.
+- **Cost**: cost per request is not too far above the old version's.
+- **Refusals**: the share of answers where the model declines to help is not above the old version's by more than a point.
+
+The number: an example set of rules is quality within 2 points, p95 at most 1.1 times the old, cost at most 1.2 times, and refusals not above the old rate plus 1 point. These are team choices. Write them down before the canary starts.
+
+Step through a rollout where the new version is worse on quality by 4 points.
+
+<Ai8RollGates client:visible />
+
+### Idea 4: rollback with one switch
+
+**Rollback** means going back to the last good release fast. It should be one change, not a new deploy.
+
+Think of a light switch compared with rewiring the room.
+
+Why: when a gate fails, every minute costs real users. If undoing takes an hour of work, people will hesitate. The next question shows how to build the switch.
+
+## Question 4: how many requests does a small trial need before it can tell?
+
+A canary that sees nothing wrong has not shown that nothing is wrong. It may just have seen too few requests. This is the same sample-size problem as in the [A/B lesson](/learn/ai/a8-evals/online-evals-ab/). It matters more here, because the canary is small on purpose.
+
+Here is the arithmetic for a pass rate. The old version passes 90% of graded requests. The new one passes 86%, a 4-point drop. To catch that with an 80% chance and a 5% false-alarm rate, you need about 490 graded canary requests. At 1% of 100,000 requests a day, you collect 1,000 a day, so you wait 490 / 1,000 x 24 = about 11.8 hours. For a 2-point drop, you need about 1,876 requests at a 1% canary, about 45 hours. A smaller drop needs far more data, because the gap enters the formula squared.
+
+There is a second useful rule for failures that are simple counts, such as crashes. If you see zero failures in n requests, the true failure rate is still not zero. The **rule of three** says: with 95% confidence, it is at most about 3 / n. After 300 clean requests, the failure rate could still be as high as about 1%. Reaching 0.1% needs about 3,000 clean requests.
+
+Use the calculator below. Try a 1% canary and a 2-point drop, then raise the canary share to 10%.
+
+<Ai8RollDetect client:visible />
+
+The trade is plain. A bigger canary finds problems sooner and hurts more users if the new version is bad. A smaller canary hurts fewer and waits longer. Pick the share from the harm of one bad answer.
+
+## Question 5: how do we undo it?
+
+Rollback needs three things to be true before the day you need it.
+
+**The bundle is one object.** If the model ID is in one file, the prompt in another, and the tool list in a third, then "go back" means three changes. Keep one release config with a version. Rollback moves a pointer from release 42 to release 41.
+
+**The old release still works.** Rollback to a retired model fails ("Requests to retired models will fail"). So the rollback target must be on a snapshot that is not due for retirement soon.
+
+**You know the cost of the switch.** Prompt caching ([lesson A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) stores a computed copy of a prompt prefix. A new prompt or model starts with a cold cache, so the first requests cost more and run slower. Rolling back also starts cold. Plan for that spike, and do not read it as a new failure.
+
+The automatic version of rollback is a circuit breaker. A quality gate is its failure signal.
+
+<CrossTrackLink id="07-reliability/circuit-breaker">
+A circuit breaker watches calls to a dependency. When too many fail, it opens and stops calls for a while, then lets one test call through. In a release, the same idea applies with one change: the failure it counts is not a timeout, it is a bad answer, measured by a grader. That makes it slower to trip, because a bad answer is only visible after grading.
+</CrossTrackLink>
+
+## The naive way: swap the string and deploy
+
+The naive release: change the model name in config, run ten test prompts by hand, deploy to everyone, and watch the dashboard.
+
+It fails in four ways, all from this lesson. An alias can move without any deploy on your side. Pinned weights can still see changed behavior from infrastructure. Ten hand checks have no power: a 4-point drop needs hundreds of graded requests. And with no switch, the fix is a rushed deploy. Anthropic's postmortem shows the cost: a bug that began on August 5 had its first fix on September 4, 30 days later.
+
+## The real fix: one ladder, always the same
+
+Put the ideas together into a routine that every change follows, whether the change is a model, a prompt, or a tool.
+
+1. **Version the bundle.** One release config. Tag every logged request with it.
+2. **Pre-check offline.** Run the eval set from [eval-driven design](/learn/ai/a8-evals/eval-driven-design/). It is cheap and catches the big failures.
+3. **Shadow.** Copy 5 to 10% of traffic. Grade the answers with the judge. Disable any tool that writes (see the field notes).
+4. **Canary.** Start at 1%. Wait for the sample size from Question 4. Check all four gates.
+5. **Ramp.** 5%, 25%, then 100%. Hold at each step for a set time, and check the gates again.
+6. **Keep watching.** After full rollout, keep grading a sample of live traffic. Anthropic's postmortem says it will run quality evaluations continuously "on true production systems", not only before launch.
+
+## Numbers
+
+| Question | Answer for a typical assistant |
+|---|---|
+| Quality bar | Pass rate within 2 points of the old release, graded by a judge checked against human labels. |
+| How measured | Judge on every canary request, then a 5% sample after full rollout. |
+| Sample size | About 490 graded requests to see a 4-point drop (80% power). About 1,876 for 2 points. |
+| Time to detect | About 12 hours at a 1% canary and 100,000 requests a day, for a 4-point drop. |
+| Latency budget | Gate: p95 at most 1.1 x old. Shadow adds 0 ms for users, because it runs off the request path. |
+| Cost per request | $0.012 on Sonnet 5.5 for the example sizes. Shadow of 10% adds about $120 a day. |
+| Rollback time | One config change. Expect a cold prompt cache for the first requests. |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Pin the snapshot | Same weights, no surprises | You must migrate before retirement | Always for production |
+| Track an alias | New versions arrive for free | Silent behavior change | Only in a dev environment |
+| Shadow | Real inputs, zero user risk | Extra inference cost, and no user reaction | Before any big change |
+| Canary 1% | Few users hurt | Slow to see small drops | Default first live step |
+| Canary 25% | Fast signal | Many users hurt if it is bad | Low-risk changes, after a clean 1% |
+| Auto rollback | Minutes, not hours | A noisy gate can roll back a good release | When a bad answer is costly |
+
+## What experienced teams know
+
+1. **A pinned model ID does not pin behavior.** Anthropic's guide says infrastructure changes are the most likely cause when a stable ID acts differently ([Anthropic model IDs](https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions)). So run a fixed set of canary prompts against production every day, and alert when the pass rate moves, even if the ID did not.
+2. **A small share of requests can hurt a large share of users.** The August 2025 routing bug touched 0.8% of requests at first and 16% at the worst hour, yet about 30% of Claude Code users saw at least one bad message. Routing was "sticky", so a user who landed on a bad server tended to land there again ([Anthropic postmortem](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues)). Measure the share of users with a bad answer, not only the share of requests.
+3. **Zero failures is not zero risk.** After n clean requests, the failure rate can still be as high as about 3 / n (the rule of three, derived above: 1 - 0.05^(1/n)). Write "no failures in 300 requests, so under about 1%" in the rollout note, not "it is safe".
+4. **Read the notice period on each row.** OpenAI's headline is 6 months for generally available models, but one row announced on 2026-10-14 has 92 days ([OpenAI deprecations](https://developers.openai.com/api/docs/deprecations)). Anthropic's dates in its table are "Not sooner than", and its notice is at least 60 days ([Anthropic deprecations](https://platform.claude.com/docs/en/about-claude/model-deprecations)). Subscribe to the notices and put each retirement date in the team calendar.
+5. **A behavior regression needs a human veto.** OpenAI's offline evals "generally looked good" while expert testers felt the model was off, and it launched anyway. Its conclusion: "We need to treat model behavior issues as launch-blocking like we do other safety risks" ([OpenAI, quoted by Simon Willison](https://simonwillison.net/2025/May/2/what-we-missed-with-sycophancy/)). Give one named person the right to stop a rollout.
+6. **Shadow runs must not have side effects.** A shadow copy of an agent that calls tools would send the real email or issue the real refund a second time. This follows from how shadow works: the copy runs the same steps. Run shadow with write tools replaced by stubs that record the call and return a canned result, and compare the recorded calls with the live ones.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I treat the model ID, prompt, tools, and settings as one versioned release, pinned to a snapshot. A change goes offline eval, then shadow at 5 to 10%, then a 1% canary with gates on quality, p95 latency, cost, and refusals. I size the canary: about 500 graded requests to see a 4-point drop. Rollback is one config pointer, and I keep the old snapshot until its retirement date." This names the unit, the ladder, the math, and the undo.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we will test it for a few days and then switch". It has no gates, no sample size, and no switch back. Do not call a pinned model "frozen". Do not say a canary with no errors proves the release is safe.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'ai8-roll-dateless-id',
+      q: 'You call claude-sonnet-4-6 and nothing in your code changed. Per Anthropic documentation, when can the weights behind that ID change?',
+      options: [
+        'Whenever a new Sonnet minor version is released by Anthropic',
+        'Each time Anthropic improves the model, since the ID points to the latest',
+        'Never: updates get a new ID, but the serving system can change',
+        'Only on the first day of each month, with email notice to users',
+      ],
+      answer: 2,
+      explain: 'The guide says Anthropic does not update the weights or configuration of an existing ID. The tempting answer is the pointer idea, which applies to older aliases. Behavior can still shift because routers, safety checks, and sampling code are not frozen.',
+    },
+    {
+      id: 'ai8-roll-canary-hours',
+      q: 'Your canary gets 1% of 100,000 requests a day. You need about 490 graded requests to see a 4-point drop. About how long does that take?',
+      options: [
+        'About 1.2 hours',
+        'About 12 hours',
+        'About 5 days',
+        'About 49 days',
+      ],
+      answer: 1,
+      explain: '1% of 100,000 is 1,000 requests a day, so 490 requests take 0.49 days, about 11.8 hours. A smaller drop needs more requests and more time.',
+    },
+    {
+      id: 'ai8-roll-rule-of-three',
+      q: 'A canary served 300 requests with zero failures. What can you say with 95% confidence about the true failure rate?',
+      options: [
+        'It is exactly 0%, since nothing failed in the trial',
+        'It is below 0.01%, since 300 requests is a large sample',
+        'It is below 0.3%, because all 300 requests were clean',
+        'It could still be about 1%',
+      ],
+      answer: 3,
+      explain: 'The rule of three gives an upper bound of about 3 / 300 = 1%. Zero seen failures only shows that the rate is probably low. Reaching 0.1% needs about 3,000 clean requests.',
+    },
+    {
+      id: 'ai8-roll-shadow-tools',
+      q: 'You shadow a new version of a support agent that can issue refunds. What must be true of the shadow copy?',
+      options: [
+        'Its write tools are stubbed so that no refund is issued twice',
+        'It runs with the same live credentials, so the test is realistic',
+        'It must run at 100% of traffic for the result to count',
+        'Its answers are shown to users next to the old ones',
+      ],
+      answer: 0,
+      explain: 'A shadow copy runs the same steps as the live one. With live tools, every refund would happen twice. Stub the writes, record the calls, and compare them with the live calls.',
+    },
+    {
+      id: 'ai8-roll-retirement-days',
+      q: 'Anthropic deprecates claude-sonnet-4-5-20250929 with retirement on November 30, 2026. Today is October 16, 2026. How many days remain?',
+      options: [
+        '61 days',
+        '30 days',
+        '45 days',
+        '75 days',
+      ],
+      answer: 2,
+      explain: 'October 16 to October 31 is 15 days, plus 30 days of November: 45. The 61 days is the whole notice from September 30. The remaining time shrinks daily, so a migration must start on the ladder now.',
+    },
+  ]}
+/>
+
+## Prove it
+
+<Diagnose
+  client:visible
+  id="ai8-roll-alias-drop"
+  title="The overnight drop"
+  scenario="A team calls its model through an alias, a name the provider can repoint to a newer snapshot. Their nightly eval set shows the pass rate fell from 91% to 85% overnight. No deploy happened on the team's side."
+  facts={[
+    'prompt version: v17 (unchanged)',
+    'tool list: unchanged',
+    'response log, yesterday: model = snap-0312',
+    'response log, today:     model = snap-0419',
+    'provider status page: all systems operational',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the best first check?',
+      options: [
+        'Wait for the provider status page to show an incident later today',
+        'Diff the model ID in the logs, then replay on the old one',
+        'Rewrite the prompt for better results',
+        'Raise the pass-rate threshold in the alert',
+      ],
+      answer: 1,
+      explain: 'The logs show the resolved snapshot changed. A replay on the old snapshot confirms it is the cause. A status page shows outages, not quality drift. Rewriting the prompt guesses before you know the cause.',
+    },
+    {
+      prompt: 'What is the lasting fix?',
+      options: [
+        'Pin the snapshot ID, and test new ones on the ladder',
+        'Switch to another provider and call it through its own alias',
+        'Lower the temperature so that the outputs vary less',
+        'Ask users to report bad answers',
+      ],
+      answer: 0,
+      explain: 'Pinning makes the change happen when you choose. The ladder then tests the new snapshot before users see it. Another alias has the same problem. Temperature does not change which weights answer.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: a postmortem of three recent issues](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues)
+- [Anthropic: model IDs and versioning](https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions)
+- [Anthropic: model deprecations](https://platform.claude.com/docs/en/about-claude/model-deprecations)
+- [OpenAI: deprecations](https://developers.openai.com/api/docs/deprecations)
+- [Simon Willison: what OpenAI missed with sycophancy](https://simonwillison.net/2025/May/2/what-we-missed-with-sycophancy/)

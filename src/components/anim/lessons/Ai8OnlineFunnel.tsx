@@ -45,12 +45,12 @@ export default function Ai8OnlineFunnel() {
         const last = s.rows - 1;
         return (
           <SketchSvg width={720} height={330} label="Funnel of signals for two arms: shown, accepted, edited, kept at 24 hours.">
-            <HandText x={BAR_X} y={22} anchor="start" size={TEXT_SIZES.note} color="var(--muted)">
+            <SketchBox cx={BAR_X + 7} cy={20} w={14} h={14} r={3} seed={seedOf('f-lc')} stroke="var(--muted)" fill="var(--muted)" />
+            <HandText x={BAR_X + 20} y={22} anchor="start" size={TEXT_SIZES.note} color="var(--muted)">
               control
             </HandText>
-            <SketchBox cx={BAR_X + 52} cy={20} w={14} h={14} r={3} seed={seedOf('f-lc')} stroke="var(--muted)" fill="var(--muted)" />
-            <SketchBox cx={BAR_X + 112} cy={20} w={14} h={14} r={3} seed={seedOf('f-lt')} stroke="var(--accent)" fill="var(--accent)" />
-            <HandText x={BAR_X + 124} y={22} anchor="start" size={TEXT_SIZES.note} color="var(--muted)">
+            <SketchBox cx={BAR_X + 107} cy={20} w={14} h={14} r={3} seed={seedOf('f-lt')} stroke="var(--accent)" fill="var(--accent)" />
+            <HandText x={BAR_X + 120} y={22} anchor="start" size={TEXT_SIZES.note} color="var(--muted)">
               new variant
             </HandText>
             {ROWS.map((r, i) => {

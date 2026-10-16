@@ -1,5 +1,5 @@
 ---
-summary: 'Use code checks wherever the answer can be checked exactly, and use an LLM judge only for fuzzy quality. A judge is a model that must be tested: it has position, length, and self-preference bias, and raw agreement with humans hides misses. Validate it with recall and precision on labeled examples.'
+summary: 'A code check tests an answer with a rule, exact and free. A judge is a model that grades fuzzy quality, so it must be tested like a classifier: it has favorites (slot, length, its own style), and "95% agreement" can hide a judge that never catches a bad answer. Use recall and precision, and pin the judge version.'
 requires: ['ai/a8-evals/golden-sets', 'ai/a8-evals/error-analysis']
 ---
 
@@ -12,85 +12,137 @@ import Ai8JudgeAgree from '../../../../components/anim/lessons/Ai8JudgeAgree.tsx
 
 ## The problem
 
-You have a golden set ([lesson A8.3](/learn/ai/a8-evals/golden-sets/)) and a list of failure types from error analysis ([lesson A8.2](/learn/ai/a8-evals/error-analysis/)). Now you need a grader. It must run on every prompt change, in minutes, for cents. A human cannot do that. A string match cannot say whether a summary is faithful or a reply is polite.
+You run a support bot. You have a test set of 500 real questions ([lesson A8.3](/learn/ai/a8-evals/golden-sets/)) and a list of the ways the bot fails ([lesson A8.2](/learn/ai/a8-evals/error-analysis/)). Every time you change the prompt, you want to know: did the answers get better or worse?
 
-So teams use two kinds of grader. A **code check** is a program that tests a rule. An **LLM judge** is a model that reads an output and gives a verdict. Code checks are exact and cheap. A judge is flexible, but it is a probabilistic component ([lesson A0.3](/learn/ai/a0-orientation/probabilistic-components/)). It makes mistakes at some rate, and you must measure that rate before you trust it.
+You could read all 500 answers. At 30 seconds each, that is over four hours. You would need to do it after every change, and two people would grade the same answer differently. The check must run in minutes, cost cents, and give the same result twice.
 
-The quality bar for this lesson is a number: the judge agrees with your human labels on the failure you care about. Airbnb's eval post targets agreement "in the high 80s-90s" percent. We will see why raw agreement alone can lie.
+This lesson answers five questions:
 
-## Naive solution: ask for a score from 1 to 10
+1. Can a program check the answer?
+2. When no rule fits, who grades it?
+3. Does the grader have favorites?
+4. How do you know the grader is right?
+5. What happens when the grader changes?
 
-The first attempt is a prompt: "Rate this answer from 1 to 10." It runs, it produces numbers, and the numbers go on a dashboard. Three things break.
+By the end you will know how to build a grader you can trust, and how to catch one you cannot. The quality bar is a number: how often the grader agrees with a person on the failure you care about. Airbnb's engineers say they aim for agreement "in the high 80s-90s" percent.
 
-First, nobody knows what a 6 means. Hamel Husain, who has taught evals to many teams, writes that "people don't know what to do with a 3 or 4". He also says that domain experts' own judgments tend not to correlate with such metrics. Second, a score from a model is not anchored. Change the judge model or one word of the prompt, and every number can shift. Third, nobody checked the judge against a human, so nobody knows if a 7.2 is better than a 7.0.
+## Question 1: can a program check the answer?
 
-## Code checks first
+Start with the cheapest grader. A **code check** is a small program that tests one rule on an output and says pass or fail. It is the same idea as a unit test. You write `assert`, and the machine checks it.
 
-Before you write any judge prompt, ask: can a program check this? Many checks are exact:
+Why does it exist? A rule that a program can test should not cost a human minute or a model call. Examples for a support bot:
 
-- The output is valid JSON and matches the schema.
-- The tool call has the right name and valid arguments.
-- The SQL runs and returns the expected rows.
-- The unit tests pass. The reply contains the order number.
+- The reply is valid JSON and has the fields the app needs.
+- The bot called `lookup_order` with a real order number.
+- The reply contains the refund amount from the database.
+- The SQL the bot wrote runs and returns the expected rows.
 
-Code checks are fast, cheap, and the same every run. Anthropic's agent-eval guide lists their weakness: they are "brittle to valid variations that don't match expected patterns exactly". Its example is a real grading bug. A grader expected "96.124991..." and rejected "96.12". After the bugs were fixed, one model's score on CORE-Bench went from 42% to 95%. The model had not changed. The grader had.
+A code check costs nothing per run and finishes in milliseconds. It gives the same answer every time. You can run 10,000 of them on every commit.
 
-So: code check where you can, with tolerance for valid variation. Use a judge only for the part a program cannot test, such as tone, faithfulness to a source, or whether a plan makes sense.
+It has one weakness. It checks what you wrote, not what is valid. Anthropic's guide on agent evals warns that code checks are "brittle to valid variations that don't match expected patterns exactly". The guide tells a real story. A grader expected the number "96.124991..." and rejected the answer "96.12". After the team fixed such bugs, one model's score on a public benchmark went from 42% to 95%. The model had not changed. The grader had.
 
-## Pointwise or pairwise
+So the rule is: write a code check wherever a program can test the answer, and make it tolerant of valid variation. Compare numbers with a margin. Parse the output. Do not match exact text.
 
-A **pointwise** judge reads one output and gives a verdict or a score. A **pairwise** judge reads two outputs for the same input and picks the better one.
+## Question 2: when no rule fits, who grades it?
 
-Here is practitioner guidance, with the reasoning. I found no study that compares the two head to head on stability, so treat this as a rule of thumb, not a measured result.
+Some quality has no rule. Is the reply polite? Does the summary stay true to the source? Is the plan sensible? A person can tell. A program cannot.
 
-- Use **pointwise with a binary label** (pass or fail, plus a short critique) to gate one version. It costs one call per item. It asks a narrow question. It does not need a scale.
-- Use **pairwise** when you choose between two candidates, such as prompt A against prompt B. People find "which is better" easier than "how good is it". The cost is two calls per pair, because you must run both orders (next section).
+The answer is an **LLM judge**: a language model that reads an output, with a written rubric, and gives a verdict. Picture a teaching assistant grading essays against a marking guide. The assistant is not perfect, but is fast and does not tire.
 
-Neither is stable by default. A 2026 single-author preprint (two OpenAI judges, 29 tasks) found that pairwise verdicts flip on repeated runs of the same input 13.6% of the time on average. It also found that pointwise mean score gaps of 0.19 to 0.36 on a 10-point scale were not significant, even when the judge "chose a winner". This is one small study from one provider. Take the direction, not the numbers.
+Why use one? It scales like code and understands language like a person. Here is the cost. Say a judge reads 2,000 tokens of rubric and answer, and writes 150 tokens of verdict. A token is a small chunk of text, about three-quarters of a word. Prices are from Anthropic's [pricing page](https://platform.claude.com/docs/en/about-claude/pricing), as of 2026-10-16. Sonnet 5.5 costs $2 per million input tokens and $10 per million output tokens. One verdict costs (2,000 x $2 + 150 x $10) / 1,000,000 = $0.0055. Grading all 500 answers costs $2.75. Haiku 5.5, the small model, costs $0.10 and $0.50, so the same job costs about $0.14.
 
-## Three known biases
+But a judge is a model, and a model is a probabilistic component ([lesson A0.3](/learn/ai/a0-orientation/probabilistic-components/)). It will be wrong some of the time. The rest of this lesson is about finding out how often, and in which direction.
 
-The MT-Bench paper (Zheng et al., 2023) is the standard reference. It found that a strong judge, GPT-4, agreed with human preferences over 80% of the time, "the same level of agreement between humans". It also named three biases: **position** (prefers a slot), **verbosity** (prefers longer text), and **self-enhancement** (prefers its own model's style).
+## The naive way: "rate this from 1 to 10"
 
-Each bias has a test you can run on your golden set:
+The first attempt is a prompt that says "Rate this answer from 1 to 10." It runs. It produces numbers. The numbers go on a dashboard. Three things break.
 
-- **Position.** Run each pair in both orders. Count how often the verdict changes.
-- **Verbosity.** Take a good answer. Add filler that adds no facts. If the score rises, the judge rewards length.
-- **Self-enhancement.** Compare the judge's preference for outputs from its own model family with the human preference. Anthropic's eval docs note it is "generally best practice to use a different model to evaluate than the model used to generate".
+First, nobody knows what a 6 means. Hamel Husain, an engineer who writes widely about evals, says that "people don't know what to do with a 3 or 4". He adds that domain experts' own judgments tend not to correlate with such metrics. Second, a model's number has no anchor. Change the judge model, or one word in the prompt, and every number can move. Third, nobody checked the judge against a person. Is 7.2 better than 7.0? You cannot tell.
 
-The position bias has hard numbers. Wang et al. (2023) judged 80 questions in both orders. The animation shows what they measured.
+The fix has four ideas.
+
+## Idea 1: a yes or no verdict, with a written reason
+
+**What it is.** Ask the judge for a **binary verdict**, pass or fail, and a short **critique**: one or two sentences that say why.
+
+**Everyday picture.** A driving test. The examiner does not give you 6.4 out of 10. You pass or you fail, and the examiner writes down what went wrong.
+
+**Why it exists.** A yes or no forces you to decide what "good enough" means. Hamel puts it this way: "a binary decision forces everyone to consider what truly matters". The critique also helps later. A detailed critique next to each human label can go straight into the judge prompt as a **few-shot example**: a sample, placed in the prompt, that shows the model what you want.
+
+**A concrete case.** A bot answers "Can I return a laptop after 45 days?" with "Yes, no problem." The policy allows 30 days. Verdict: fail. Critique: "Says returns are allowed at 45 days. Policy limit is 30 days." One line, and it tells the next reader what to look for.
+
+Start with pass or fail. Add more questions only when a question has its own failure type from error analysis.
+
+## Idea 2: judge one answer, or compare two?
+
+**What it is.** A **pointwise** judge reads one answer and gives a verdict. A **pairwise** judge reads two answers to the same question and picks the better one.
+
+**Everyday picture.** Pointwise is a teacher marking one essay against a rubric. Pairwise is a taste test: "which of these two soups is better?"
+
+**Why both exist.** Pointwise answers "is this version good enough to ship?" Pairwise answers "which of my two prompts is better?" People find the second question easier than "how good is it, from 1 to 10?"
+
+**One number.** Pairwise costs about twice as much, because you must run both orders (Idea 3 shows why). The cost table below shows $5.50 per 1,000 pointwise verdicts on Sonnet 5.5 and $17.00 per 1,000 pairs judged in both orders.
+
+A caution. You may hear that "pairwise is more stable". I found no study that compares the two head to head, so treat that as practitioner advice, not a measured fact. The advice rests on a sound idea: comparing two things needs no absolute scale. But pairwise adds its own problem, shown next. A 2026 preprint by one author, with two judges from one company on 29 tasks, found that pairwise verdicts changed on repeated runs of the same input 13.6% of the time on average. That is one small study. Take the direction, not the number: no judge format is stable by default.
+
+## Idea 3: does the judge have favorites?
+
+Yes. The 2023 paper that introduced the MT-Bench test, from a team that also built the Chatbot Arena, found that a strong judge (GPT-4) agreed with human preferences over 80% of the time. That is "the same level of agreement between humans". It also named three biases.
+
+**Position bias.** *What:* the judge prefers an answer because of where it sits in the prompt. *Picture:* a taster who tends to pick the first cup. *Why it happens:* models are sensitive to the order of text. *Number:* in a 2023 study of 80 questions, researchers judged each pair twice, once in each order. They call the share of questions where swapping the order changed the verdict the **conflict rate**. Watch what they found.
 
 <Ai8JudgeSwap client:visible />
 
-Notice that the bias was largest when the two answers were close. That is the normal case when you compare two prompt versions. A judge that is mostly picking a slot gives you a coin flip.
+The bias was strongest when the two answers were close in quality. That is the usual case when you compare two prompt versions, which is the case you care about. A judge that mostly picks a slot is a coin flip.
 
-## Validate the judge like a classifier
+The fix is cheap. Judge every pair in both orders. Count a win only when both orders agree. When they disagree, count a tie. Log the conflict rate as a health number for your judge.
 
-A judge is a classifier. Treat it like one. Hamel's method: label examples as good or bad yourself, write a critique for each, put the critiques into the judge prompt as examples, and check the judge against your labels. He sends batches of 25 to 50 examples at a time. That is a workflow batch size, not a proven sample size. Airbnb keeps a golden set of 50 to 100 examples.
+**Verbosity bias.** *What:* the judge prefers the longer answer. *Picture:* a teacher who gives higher marks to the thicker essay. *Why:* length looks like effort. *Test:* take a good answer, add a few sentences of filler with no new facts, and judge it again. If the score rises, the judge rewards length.
 
-Then measure on the failure class you care about. Raw agreement is the share of items where judge and human match. Hamel warns it "is generally not recommended and can be misleading when classes are imbalanced". Work an example. Take 1,000 answers where 5% are bad. A judge that always says "pass" agrees with the human on 950 of them: 95%. It catches 0 of 50 bad answers.
+**Self-enhancement bias.** *What:* the judge prefers text in the style of its own model family. *Picture:* a teacher who likes essays that sound like the teacher's own writing. *Why:* the model finds its own habits fluent. *Test and fix:* compare the judge's preference for its own family's outputs with the human preference. A simple defense is to judge with a different model family than the one that wrote the answer. Anthropic's eval documentation calls this "generally best practice".
 
-Use these numbers instead:
+## Idea 4: how do you know the judge is right?
 
-- **Recall** on bad answers: of the 50 bad ones, how many did the judge flag?
-- **Precision**: of everything the judge flagged, how much was truly bad?
-- **Cohen's kappa**: agreement beyond chance. Chance agreement is the agreement you would get if both sides answered at random with their own base rates.
+**What it is.** You test the judge the way you would test any classifier. A person labels a set of answers as good or bad. The judge labels the same set. You compare.
+
+**Everyday picture.** A smoke alarm that never rings. It is "correct" on 364 days a year, because there is no fire on 364 days. A score of 99.7% tells you nothing about the one day that matters.
+
+**Why it exists.** Failures are usually rare. When 5% of answers are bad, a judge that says "pass" every time is right on 95% of answers. Hamel warns that raw agreement "is generally not recommended and can be misleading when classes are imbalanced". So you measure two things on the failure class instead:
+
+- **Recall**: of all the truly bad answers, what share did the judge flag? It tells you what the judge misses.
+- **Precision**: of everything the judge flagged, what share was truly bad? It tells you how many false alarms you must read.
+
+A third number, **Cohen's kappa**, answers "how much better than luck?" Luck here means two graders who guess at their own base rates. The formula uses the observed agreement and the agreement expected by chance:
 
 <Math block tex="\kappa = \frac{p_o - p_e}{1 - p_e}" />
 
-In words: <Math tex="p_o" /> is the observed agreement and <Math tex="p_e" /> is the agreement expected by chance. The "always pass" judge has <Math tex="p_o = 0.95" /> and <Math tex="p_e = 0.95" />, so kappa is 0. Try it.
+Kappa is 0 when the judge is no better than chance, and 1 when it matches the person every time. The always-pass judge has observed agreement 0.95 and chance agreement 0.95, so kappa is 0.
+
+**One number.** Take 1,000 answers with 5% bad. The always-pass judge agrees on 950 and catches 0 of 50 bad answers. Now try a real-looking judge in the widget.
 
 <Ai8JudgeAgree client:visible />
 
-The "Decent judge" preset is worth a look. It catches 80% of bad answers and passes 95% of good ones. Raw agreement is 94.3%. But with only 5% bad answers, precision is 46%: more than half of its flags are false alarms. A number that looks fine hides a judge that wastes your reading time.
+Open the "Decent judge" preset. It catches 80% of bad answers and passes 95% of good ones. Raw agreement is 94.3%, which looks fine. But precision is 46%. More than half of its flags are false alarms. The first number hides a judge that wastes your review time.
 
-Shopify's Sidekick team reports the climb. They improved their judges "from barely-better-than-random (Cohen's Kappa of 0.02)" to 0.61, against a human baseline of 0.69. They treat human agreement as "the theoretical maximum" a judge can reach. Note the baseline: two humans do not agree perfectly either.
+How much labeled data do you need? Hamel sends a colleague batches of 25 to 50 examples at a time. That is a workflow size, not a proof. Airbnb advises a "golden dataset of 50-100 examples". Treat 50 to 100 as a start, and note that with 5% bad answers, 100 examples hold only five bad ones. Add more bad examples on purpose.
 
-On how to improve a judge: Hamel has sometimes fine-tuned a judge but writes "I tend to favor prompt engineering for evaluator model alignment". Improve the criteria and the examples first.
+Shopify's Sidekick team reports the climb. It improved its judges "from barely-better-than-random (Cohen's Kappa of 0.02)" to 0.61, against a human baseline of 0.69. Two people do not agree perfectly either, so human agreement is the ceiling for any judge.
+
+To improve a judge, change the prompt first. Hamel has sometimes fine-tuned a judge, but writes "I tend to favor prompt engineering for evaluator model alignment".
+
+## Idea 5: the judge is part of the metric
+
+**What it is.** Your score is a pair: the answers and the judge that graded them. Change either and the score can move.
+
+**Everyday picture.** A bathroom scale. If you swap in a new scale and the number drops two kilos, you have not lost weight.
+
+**Why it matters.** Model providers retire old models. Anthropic's models overview says every Claude model ID is a pinned snapshot, meaning a frozen version, and it lists retirement dates. A retirement forces a judge swap. If the swap is quiet, a 1-to-5 average can rise 0.4 with no change in quality. The second Diagnose below shows exactly that.
+
+**What to do.** Pin the judge version. Before any switch, run the old and new judge on the same golden set. Compare recall and precision against the human labels. Then start a new score line, with a visible break in the chart.
 
 ## Numbers
 
-Illustrative sizes, priced on [claude.com/pricing](https://platform.claude.com/docs/en/about-claude/pricing) as of 2026-10-16. Sonnet 5.5 costs $2 per million input tokens and $10 per million output tokens. Haiku 5.5 costs $0.10 and $0.50 (for prompts up to 100,000 tokens). The Batch API takes 50% off both.
+Prices as of 2026-10-16 from the [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing). Sonnet 5.5: $2 input and $10 output per million tokens. Haiku 5.5: $0.10 and $0.50, for prompts up to 100,000 tokens. The Batch API (jobs that run later, not live) takes 50% off.
 
 | Judge setup | Tokens per item | Cost per 1,000 items |
 |---|---|---|
@@ -98,30 +150,32 @@ Illustrative sizes, priced on [claude.com/pricing](https://platform.claude.com/d
 | Pointwise, Haiku 5.5 | 2,000 in, 150 out | 1,000 x (2,000 x $0.10 + 150 x $0.50) / 1M = $0.275 |
 | Pairwise, both orders, Sonnet 5.5 | 3,500 in, 150 out, twice | 2 x 1,000 x (3,500 x $2 + 150 x $10) / 1M = $17.00 |
 
-The 150 output tokens are a short critique before the verdict. Batch pricing halves each row, so $2.75, $0.14, and $8.50. Online, you do not judge every request. Airbnb samples 5% of live traffic each day. At 100,000 requests a day that is 5,000 judged items. On Sonnet 5.5 pointwise that is 5 x $5.50 = $27.50 a day. The judge runs after the response, so it adds no user latency.
+The 150 output tokens are a short critique before the verdict. Batch pricing halves each row: $2.75, about $0.14, and $8.50.
+
+Online, you do not judge every request. Airbnb samples 5% of its live traffic each day. At 100,000 requests a day, that is 5,000 judged items. On Sonnet 5.5 pointwise, 5 x $5.50 = $27.50 a day, which is $0.000275 per request served. The judge runs after the reply is sent, so it adds no latency for the user.
 
 ## Trade-offs
 
 | Grader | You gain | You pay | Choose it when |
 |---|---|---|---|
-| Code check | Exact, free, repeatable | Brittle to valid variation | Format, tools, state, anything checkable |
-| Pointwise binary judge | One call, narrow question, easy to validate | Verdict depends on prompt and model | Gating one version in CI or on live samples |
+| Code check | Exact, free, repeatable | Brittle to valid variation | Format, tool calls, state, anything a rule can test |
+| Pointwise binary judge | One call, narrow question, easy to validate | Verdict depends on prompt and model version | Gating one version in CI, or sampling live traffic |
 | Pairwise judge | Natural for "which is better" | Two calls per pair, order bias | Choosing between two candidates |
-| Human label | Ground truth | Slow, costly, not repeatable at scale | Building and checking the golden set |
+| Human label | Ground truth | Slow, costly, not repeatable at scale | Building the golden set and testing judges |
 
 ## What experienced teams know
 
-1. **A binary label with a critique beats a 1-to-5 scale.** Hamel writes that "a binary decision forces everyone to consider what truly matters", and that a detailed critique next to each label can become a few-shot example for the judge. Start with pass or fail. Add dimensions only when a dimension has its own failure mode. Source: [Hamel Husain, "Creating a LLM-as-a-Judge That Drives Business Results"](https://hamel.dev/blog/posts/llm-judge/).
+1. **A binary label with a critique beats a 1-to-5 scale.** Hamel writes that a detailed critique next to each label can become a few-shot example for the judge, and that "being too terse is a common mistake". Start with pass or fail. Add dimensions only when a dimension has its own failure mode. Source: [Hamel Husain on building LLM judges](https://hamel.dev/blog/posts/llm-judge/).
 
-2. **Report recall and precision on the rare class, never only agreement.** Failures are usually rare, and raw agreement then rewards a judge that never flags anything. Shopify reports judge kappa against human labels (0.02 at first, 0.61 later, with a human baseline of 0.69) and treats human agreement as the ceiling. Source: [Shopify Engineering, 2025-08-26](https://shopify.engineering/building-production-ready-agentic-systems).
+2. **Report recall and precision on the rare class, never only agreement.** Failures are rare, and raw agreement then rewards a judge that never flags. Shopify reports judge kappa against human labels (0.02 at first, 0.61 later, human baseline 0.69) and treats human agreement as the ceiling. Source: [Shopify Engineering, 2025-08-26](https://shopify.engineering/building-production-ready-agentic-systems).
 
-3. **Swap the order, always, and log the conflict rate.** With ChatGPT as judge, the verdict changed on 66 of 80 questions (82.5%) for one close pair. With GPT-4 on the same pair it changed on 37 (46.3%). Those are 2023 models, so your current judge is probably better, but you only know by measuring. Count a win only when both orders agree. Source: [Wang et al., arXiv 2305.17926](https://arxiv.org/abs/2305.17926).
+3. **Swap the order, always, and log the conflict rate.** In the 2023 study, with ChatGPT as judge, the verdict changed on 66 of 80 questions (82.5%) for one close pair. With GPT-4 on the same pair it changed on 37 (46.3%). Those are 2023 models, so your judge is probably better, but you only know by measuring. Source: [the position-bias study, "Large Language Models are not Fair Evaluators"](https://arxiv.org/abs/2305.17926).
 
-4. **One judge run is a noisy measurement, and your error bars are too small.** Judge model choice, temperature, and prompt wording add variance that standard confidence intervals leave out. One paper reports that naive standard errors were 40 to 60% smaller than corrected ones. The Coin Flip Judge preprint estimates 11 repeated trials to match a 50-trial majority verdict with 95% probability. So repeat runs on borderline cases before you report a small gain. Sources: [Messing, arXiv 2604.11581](https://arxiv.org/abs/2604.11581) and [Yagubyan, arXiv 2606.13685](https://arxiv.org/abs/2606.13685), both small recent studies.
+4. **One judge run is a noisy measurement, and your error bars are too small.** Judge model choice, temperature, and prompt wording add variance that normal confidence intervals leave out. One 2026 paper reports that naive standard errors were 40 to 60% smaller than corrected ones. A second 2026 preprint estimates 11 repeated trials for a majority vote to match a 50-trial vote with 95% probability. Repeat borderline cases before you report a small gain. Sources: [a paper on hidden measurement error](https://arxiv.org/abs/2604.11581) and [a preprint on judge reliability](https://arxiv.org/abs/2606.13685). Both are recent and small.
 
-5. **The judge is part of the metric. Pin it and re-baseline when it changes.** Anthropic states that every Claude model ID is a pinned snapshot, and lists retirement dates. A retirement forces a judge swap. Do not swap quietly. Run the old and new judge on the same golden set, compare recall and precision against human labels, and start a new score line. Otherwise a rise of 0.4 on a 5-point scale can come from the judge alone (see the second Diagnose). Source: [Anthropic, models overview](https://platform.claude.com/docs/en/models/overview).
+5. **The judge is part of the metric. Pin it and re-baseline when it changes.** Retirement dates force swaps. Run old and new on the same golden set, compare to human labels, and start a new line. Otherwise a 0.4 rise can come from the judge alone. Source: [Anthropic models overview](https://platform.claude.com/docs/en/models/overview).
 
-6. **Several narrow, calibrated judges beat many vague ones, and training on a judge breaks it.** Airbnb reports that "3-5 well-calibrated" judges beat "20-30 noisy ones". Anthropic advises one isolated judge per dimension, and an "Unknown" option so the judge can decline. Shopify later trained against its judges and hit "significant reward hacking". It then updated its validators and judges to recognize the hacking patterns, and judge correlation with humans rose from 0.66 to 0.75 on average. If you optimize against a judge, keep a human-labeled set it never sees. Sources: [Airbnb](https://airbnb.tech/ai-ml/eval-driven-development-lessons-from-evaluating-genai-at-scale/), [Anthropic, agent evals, 2026-01-09](https://anthropic.com/engineering/demystifying-evals-for-ai-agents).
+6. **Several narrow, calibrated judges beat many vague ones, and training against a judge breaks it.** Airbnb reports "3-5 well-calibrated" judges beat "20-30 noisy ones". Anthropic advises one isolated judge per dimension, and an "Unknown" option so the judge can decline. Shopify trained a model against its judges and met "significant reward hacking", meaning the model found ways to please the judge without being better. After it updated its validators and judges, judge correlation with humans rose from 0.66 to 0.75 on average. Keep a human-labeled set that the judge optimization never sees. Sources: [Airbnb](https://airbnb.tech/ai-ml/eval-driven-development-lessons-from-evaluating-genai-at-scale/) and [Anthropic on agent evals, 2026-01-09](https://anthropic.com/engineering/demystifying-evals-for-ai-agents).
 
 ## Interview lens
 

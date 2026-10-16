@@ -1,0 +1,306 @@
+---
+summary: 'A chat agent needs a test partner. A simulated user is a model with a persona, a goal, and facts it reveals only when asked, talking to your agent against a seeded fake world. Grade the end state, vary the personas, and check the simulator against real users, because simulators are too nice.'
+requires: ['ai/a8-evals/trajectory-evals', 'ai/a8-evals/error-analysis']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai8SimWalk from '../../../../components/anim/lessons/Ai8SimWalk.tsx';
+import Ai8SimGap from '../../../../components/anim/lessons/Ai8SimGap.tsx';
+import Ai8SimMix from '../../../../components/anim/lessons/Ai8SimMix.tsx';
+
+## The problem
+
+Your support agent passes every test in your set. Each test is one message and one expected reply. Then real customers arrive. One gives half the facts and expects the agent to guess the rest. One changes their mind in the middle. One is angry and pushes back on the policy. The agent has never been tested against any of this, because a one-message test never pushes back.
+
+A support agent lives in a conversation. To test it, you need someone on the other side of the chat. Hiring 20 people to chat with each release takes days and costs real money. You want a test partner that never sleeps, never gets bored, and can play 300 different customers in ten minutes.
+
+This lesson answers five questions:
+
+1. Who plays the customer?
+2. What does the actor know, and what does it hide?
+3. How do we make the world the agent touches repeatable?
+4. How do we decide the conversation succeeded?
+5. Does the actor behave like real people?
+
+You will see that the last question is where most teams get hurt. The quality bar for this design is a pass rate per type of customer, graded by the final state of the world, and checked against what a sample of real users does.
+
+## Question 1: who plays the customer?
+
+A **simulated user** is a language model that plays the customer. You give it a role, and it chats with your agent turn by turn, the way a person would.
+
+Picture the role-play drills that nurses and pilots train with. A trainer plays the difficult patient so the trainee can practice before a real one arrives. The drill is repeatable, and the trainer can play any patient.
+
+Why does it exist? Because multi-turn behavior cannot be tested with single messages, and people do not scale. Anthropic's guide on agent evals notes that these tests "often require a second LLM to simulate the user". A public benchmark called tau-bench, from Sierra, uses one model to play a customer while the agent works in a simulated shop. Its authors used a 2023 model, gpt-4-0613, as the customer, at temperature 1.0 (more random), and ran the agent at temperature 0.0 (least random). The customer was meant to vary. The agent was meant to be steady.
+
+A number: 300 conversations of 12 turns each cost about $27 to run with a mid-size model as the agent and a small model as the customer. The Ballpark at the end of this lesson works it out.
+
+## Question 2: what does the actor know, and what does it hide?
+
+A real customer does not hand over a full case file. They answer what you ask. So a simulator needs a script that is not a script. It has four parts.
+
+- A **persona**: who the customer is and how they talk. "Vague, short answers." "Angry, cites a rule they half remember."
+- A **goal**: what they want. "Get my money back for the headphones."
+- **Hidden facts**: things only the customer knows, which come out only when asked or pushed. "The order number is A-77." "I was travelling when the window closed."
+- A **stop rule**: when to end the chat. "Stop when I accept the credit, or when the agent refuses twice."
+
+Everyday picture: a patient at the doctor. The patient knows the pain started on Tuesday. The doctor learns it only by asking.
+
+Why hidden facts? They test whether the agent asks the right questions. An agent that is only tested on customers who volunteer everything never learns to ask. The follow-up benchmark, tau2-bench, builds this in. Its simulated user is told to "disclose information progressively" and to wait for the agent to ask. It must never "make up or hallucinate information". It also acts once per turn: one message or one tool action. The tau-bench customer also cannot see the agent's tool calls, just as a real customer cannot read your logs.
+
+Watch one test. The user is vague, holds two hidden facts, and the agent has a 30-day refund policy.
+
+<Ai8SimWalk client:visible />
+
+Notice that the second fact only came out because the agent held the line. A cooperative persona would never have pushed the agent that hard.
+
+## Question 3: how do we make the world repeatable?
+
+The agent calls tools: it looks up orders, issues refunds, creates tickets. If the tools hit a live database, every test run changes the world, and no two runs are comparable.
+
+So you **mock** the tools. A mock is a fake version of a tool that works on test data you control. You **seed** the data: you set the database to a known state before every conversation, such as "order A-77, delivered 45 days ago, $80".
+
+Picture a flight simulator. The weather, the failures, and the airport are programmed. The pilot's skill changes, but the sky does not.
+
+Why? Without it, you cannot tell whether a change in the result came from your agent or from the world. With it, the same seed gives the same starting state, and the customer's behavior is the only moving part. Shopify's engineers describe the same move in their own agent work. They built a merchant simulator that "captures the 'essence' or goals of real conversations", then replays those goals against each new version of their assistant. Real conversations become repeatable tests.
+
+Number: the walk above runs against a database of one order. A real suite has dozens of seeds: one per scenario, such as "order within window", "order past window", "order with a partial refund already issued".
+
+## Question 4: how do we decide the conversation succeeded?
+
+The tempting way is to ask the simulated customer afterward: "Were you satisfied?" Do not do that. A 2026 study that compared simulated users with real people found that simulated feedback is more uniformly positive than human feedback. It also argues that simple rule-based rewards miss the richer feedback real people give. The simulator is a kind customer. Its smile does not tell you the policy was followed.
+
+Grade what is true in the world, as [lesson A8.5](/learn/ai/a8-evals/trajectory-evals/) shows. After the chat, run a **state check**: compare the seeded database with the one correct end state. For our test, the right end state is "no refund on A-77 and $60 store credit". Add safety checks on the transcript: no forbidden tool, no promise outside policy. Tau-bench writes its tasks so that only one end state is correct under the rules.
+
+Use a model judge only for what code cannot see, such as tone, and calibrate it first ([lesson A8.4](/learn/ai/a8-evals/judges/)).
+
+## The naive way: one friendly customer
+
+The simplest design is one simulated customer, written by prompting a model to "act as a customer", with no persona. The model is trained to be helpful and polite, so it plays a polite and helpful customer. It hands over facts quickly, accepts the first answer, and says thanks. The suite shows 85% pass, and you ship.
+
+That number describes a customer who rarely exists. The next section shows how far off it can be.
+
+## The real fix: personas and calibration
+
+### Idea 1: a mix of personas
+
+**What it is.** Run each scenario with several personas: cooperative, vague, hostile. Report the pass rate per persona and a headline rate weighted by your real traffic.
+
+**Everyday picture.** A restaurant tests a new kitchen process with a polite regular, a customer who does not know what they want, and one who sends the food back. Only the third one finds the weak spot.
+
+**Why it exists.** Agents fail where users are hard. The tau2-bench telecom tasks assign a persona (none, easy, or hard) at random, and the paper reports that agents do better with the easy persona than the hard one.
+
+**One number.** In the widget, the same agent passes 90%, 70%, and 45% for the three personas. An 80/15/5 mix reports 84.8%. A 50/30/20 mix, closer to a harder real world, reports 75.0%. The agent did not change. The mix did.
+
+<Ai8SimMix client:visible />
+
+### Idea 2: calibrate the simulator against real users
+
+**What it is.** Treat the simulator as a model of users, and test the model. Compare its conversations with real ones from your logs ([lesson A8.2](/learn/ai/a8-evals/error-analysis/)): how long are the turns, how polite, how often does the user hold back a fact?
+
+**Everyday picture.** A flight simulator is checked against real flights before pilots trust it.
+
+**Why it exists.** Simulators drift toward the friendly average. A 2026 study ran the tau-bench protocol with 451 real people and 31 simulators. The authors say simulators are "excessively cooperative, stylistically uniform" and lack "realistic frustration or ambiguity". That creates an "easy mode" for the agent.
+
+**The numbers.** Look at the gap.
+
+<Ai8SimGap />
+
+Real people succeeded with the agent 63.6% of the time. The top general simulators reached 77.8%, so the agent looked about 14 points better than it was. In human data, 29.0% of turns were three words or fewer. For GPT-4o as the customer, only 1.0% were. 15.3% of human turns were polite, against 49.0% for GPT-4o. Humans are blunt and short. Simulators write paragraphs.
+
+### Idea 3: make the user act, not just talk
+
+**What it is.** In a **dual-control** setup, both the agent and the simulated user have tools and change the same world. The customer has to press buttons on their phone, restart the router, or read a settings screen aloud.
+
+**Everyday picture.** A tech-support call. The agent says "turn Wi-Fi off and on", and the customer actually does it, or does not.
+
+**Why it exists.** Agents tested only with talkers miss the failure where the user acts wrong or does not understand an instruction. In tau2-bench's telecom domain, moving from a setup where the agent works alone to dual control cut the single-run pass rate by 18% for gpt-4.1 and 25% for o4-mini. The paper says "around 20%" overall.
+
+**One number.** gpt-4.1 passed 74% of retail tasks, 56% of airline tasks, and 34% of telecom tasks on a single run in that paper. The dual-control domain is the hardest.
+
+### Idea 4: audit your simulator for bugs
+
+**What it is.** Read a sample of your simulated conversations and mark each one where the simulator, not the agent, was wrong: it invented a fact, it contradicted itself, it ended too early.
+
+**Everyday picture.** A referee who miscalls the game ruins the score, whatever the players did.
+
+**Why it exists.** The tau2-bench authors annotated conversations by hand. They found a simulator error in 47 of 100 airline conversations (13 of them critical to the result), 20 of 50 retail conversations, and 8 of 50 telecom conversations (16%). The telecom sample is small. The telecom error rate is the lowest, which the authors attribute to a domain design that "tightly constrains user behavior".
+
+**One number.** Read 50 of your own simulated conversations before you trust any pass rate from them. It takes about an hour.
+
+## Numbers
+
+Prices as of 2026-10-16 from the [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing): Sonnet 5.5 $2 per million input tokens and $10 per million output tokens. Haiku 5.5 $0.10 and $0.50 (prompts up to 100,000 tokens).
+
+Illustrative token counts per turn: the agent call carries 3,000 input tokens (system prompt, tools, history) and writes 150. The customer call carries 1,200 input and writes 60.
+
+| Piece | Per turn | For 300 dialogs x 12 turns = 3,600 turns |
+|---|---|---|
+| Agent on Sonnet 5.5 | (3,000 x $2 + 150 x $10) / 1M = $0.0075 | $27.00 |
+| Customer on Haiku 5.5 | (1,200 x $0.10 + 60 x $0.50) / 1M = $0.00015 | $0.54 |
+| Customer on Sonnet 5.5 instead | (1,200 x $2 + 60 x $10) / 1M = $0.003 | $10.80 |
+| Model calls in total | 2 per turn | 7,200 |
+
+The total is $27.54 with a small customer model, or $37.80 with a mid-size one. Latency: each turn needs two calls one after the other, since the agent must see the customer's message first. At an illustrative 4 seconds a turn, one dialog takes 48 seconds. Running 30 dialogs in parallel, 300 dialogs finish in 10 waves of 48 seconds: about 8 minutes. The Batch API's half price does not fit well here, because a turn-by-turn chat needs each answer before the next question.
+
+Which model should play the customer? Capability does not equal fidelity. The same 2026 study finds that "higher general model capability does not necessarily yield more faithful user simulation". Test a small model first, and compare it to real traces.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Real human testers | Real behavior | Slow, costly, not repeatable | A small calibration sample; launch checks |
+| One friendly simulator | Cheap, easy | Inflated pass rate | Never as the only suite |
+| Simulator with personas and hidden facts | Covers hard users, repeatable | Prompt work, drift risk, two models per turn | Daily regression runs |
+| Dual-control simulator | Tests user mistakes | Needs tools for the user side | Troubleshooting and setup agents |
+| Same model family for agent and customer | One vendor, one setup | Shared blind spots (my reasoning, not a measured result) | Early prototypes only |
+
+## What experienced teams know
+
+1. **Simulators are easy mode.** With 451 real participants and 31 simulators, most general simulators gave the agent a higher success rate than humans did (63.6%), with top ones reaching 77.8%. A green simulated suite is an upper bound. Source: [the Sim2Real study of user simulation](https://arxiv.org/abs/2603.11245).
+
+2. **Check turn length and politeness first.** Real users send blunt, short turns, and simulators send long, polite ones: 29.0% against 1.0% for short turns, 15.3% against 49.0% for polite turns. Add a length limit and a blunt-style profile to the simulator prompt and recheck against your logs. Source: same study.
+
+3. **Test users who act.** Moving from agent-only to a dual-control setup cut single-run pass rates by 18% and 25% for two models in telecom support. If your agent gives instructions, the simulated user must follow them with real tools. Source: [the tau2-bench paper](https://arxiv.org/abs/2506.07982).
+
+4. **Hand-audit the simulator.** On gpt-4.1 conversations the authors found simulator errors in 47% of airline dialogs, 40% of retail, and 16% of telecom, with 13 critical errors among the 100 airline dialogs. The simulator is a piece of software with bugs. Source: tau2-bench paper.
+
+5. **A profile beats a vague prompt, and a bigger model is not automatically better.** SimulatorArena measured agreement with human ratings. On math tutoring, a simulator given a user profile reached a rank correlation of 0.77, against 0.61 for the baseline prompt. On document creation it reached 0.70 against 0.55. The Sim2Real study finds that "higher general model capability does not necessarily yield more faithful user simulation". Sources: [SimulatorArena](https://arxiv.org/abs/2510.05444) and the Sim2Real study.
+
+6. **Grade by state, not by asking the simulator or a model.** The Sim2Real authors conclude that "LLM evaluators cannot serve as reliable proxies for human quality assessment", and found simulated feedback was more positive than human feedback. Use the state check as the pass or fail, and calibrate any judge on human labels. Source: same study.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "A simulated user is a model with a persona, a goal, and hidden facts it reveals only when asked. It talks to the agent against a seeded fake database, and I grade the final state and the policy checks, not the user's mood. I run cooperative, vague, and hostile personas and weight the headline by real traffic. Then I calibrate the simulator against real traces, because simulators are easier than people: one study measured 77.8% success against 63.6% for humans." That covers design, grading, and the key risk.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the simulated user said it was satisfied, so it passed". Do not ship on a pass rate from one cooperative persona. Do not forget that the simulator is also a model with bugs: read 50 of its conversations before you trust a number.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A suite shows 85% pass with one cooperative simulated user. Real traffic is 50% cooperative, 30% vague, and 20% hostile, and the agent passes 90%, 70%, and 45% for those personas. What is the realistic headline?',
+      options: [
+        'About 85%, since the suite is already measured',
+        'About 69%, since the three rates average to 68.3%',
+        'About 90%, since cooperative users are the easiest',
+        'About 75%, the traffic-weighted average',
+      ],
+      answer: 3,
+      explain: 'Weight each persona rate by its share of real traffic: 45 + 21 + 9 = 75. A plain average of the three rates ignores how often each user type appears. The friendly suite overstates the agent by about 10 points.',
+    },
+    {
+      q: 'Why does the simulated user keep hidden facts and reveal them only when asked?',
+      options: [
+        'To make each chat longer, so the test costs more money',
+        'To check that the agent asks, not guesses',
+        'To stop the agent from reading the user prompt text',
+        'To keep the customer model from running out of context',
+      ],
+      answer: 1,
+      explain: 'Real customers answer what you ask. An agent tested only on users who volunteer everything never practices asking. Hidden facts also let you check that the agent does not invent missing details.',
+    },
+    {
+      q: 'After a simulated chat, which check best decides if the agent did its job?',
+      options: [
+        'Ask the simulated user if it was satisfied',
+        'Count the turns and prefer the shortest chat',
+        'Compare the database with the correct end state',
+        'Ask a second model how polite the agent sounded',
+      ],
+      answer: 2,
+      explain: 'The state of the world is the outcome. The simulated user is kinder than real users, so its satisfaction overstates success, and a short chat can end in the wrong state. Politeness is one trait, not a pass or fail.',
+    },
+    {
+      q: 'In a real study, humans wrote turns of three words or fewer 29.0% of the time, and GPT-4o as the customer did so 1.0% of the time. What should you do in your own simulator?',
+      options: [
+        'Add a short-turn style to the persona, then recheck',
+        'Switch to a larger model, since size always fixes style',
+        'Ignore it, since turn length never changes how the agent acts',
+        'Raise the temperature of the customer model to its maximum',
+      ],
+      answer: 0,
+      explain: 'Style is a measurable gap. You can fix it with the persona, then compare turn lengths again to your real traces. A larger model is not guaranteed to be more faithful, and turn length changes how much the agent must infer.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Cost of 300 simulated dialogs"
+  scenario="You run 300 simulated dialogs of 12 turns each. Each turn makes two model calls: one for the agent and one for the simulated customer. The agent call has 3,000 input tokens and 150 output tokens on Sonnet 5.5 ($2 per million input, $10 per million output). The customer call has 1,200 input tokens and 60 output tokens on Haiku 5.5 ($0.10 per million input, $0.50 per million output). Prices as of 2026-10-16."
+  steps={[
+    {
+      prompt: 'How many model calls does the whole run make?',
+      unit: 'calls',
+      answer: 7200,
+      within: 1.1,
+      explain: '300 dialogs x 12 turns = 3,600 turns. Two calls per turn gives 7,200 calls.',
+    },
+    {
+      prompt: 'What does the agent side cost in dollars?',
+      unit: '$',
+      answer: 27,
+      within: 1.1,
+      explain: 'One agent call: (3,000 x $2 + 150 x $10) / 1M = $0.0075. 3,600 turns x $0.0075 = $27.00.',
+    },
+    {
+      prompt: 'What is the total cost, in dollars, with the Haiku customer included?',
+      unit: '$',
+      answer: 27.54,
+      within: 1.05,
+      explain: 'One customer call: (1,200 x $0.10 + 60 x $0.50) / 1M = $0.00015. 3,600 x $0.00015 = $0.54. Total $27.00 + $0.54 = $27.54.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai8-sim-too-nice"
+  title="Great in the simulator, bad in production"
+  scenario="Illustrative numbers. Your support agent passes 88% of simulated conversations. After launch, the same kind of tasks pass about 65% for real users, and support tickets mention that customers get short, annoyed replies."
+  facts={[
+    'simulated suite: one default persona, written by prompting a model to "act as a customer"',
+    'simulated turns: average 38 words, 49% of turns polite',
+    'real logs: average 9 words, 15% of turns polite, 29% of turns 3 words or fewer',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause of the gap?',
+      options: [
+        'The agent model degraded after launch',
+        'The simulated user is more cooperative, longer, and politer than real users',
+        'The state check in the test suite is too strict',
+        'The seeded database has too few orders',
+      ],
+      answer: 1,
+      explain: 'The logs show a different style: blunt and short in real life, long and polite in the simulator. Simulators are known to give agents an easy mode. A strict state check would lower the simulated score, not raise it.',
+    },
+    {
+      prompt: 'What should you change first?',
+      options: [
+        'Switch the agent to a bigger model',
+        'Stop running the suite',
+        'Add blunt, vague, and hostile personas with real-log style, weight them by traffic, and recheck turn length against logs',
+        'Ask the simulated user to rate the agent from 1 to 10',
+      ],
+      answer: 2,
+      explain: 'Fix the simulator: personas from your error analysis, a style that matches real turns, and a mix that matches real traffic. A bigger agent model does not fix a test that is too easy, and a 1-to-10 rating adds the same kindness bias.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Mind the Sim2Real Gap in User Simulation for Agentic Tasks](https://arxiv.org/abs/2603.11245)
+- [tau2-bench: evaluating conversational agents in a dual-control environment](https://arxiv.org/abs/2506.07982)
+- [tau-bench: a benchmark for tool-agent-user interaction](https://arxiv.org/abs/2406.12045)
+- [SimulatorArena: are user simulators reliable proxies for multi-turn evaluation?](https://arxiv.org/abs/2510.05444)

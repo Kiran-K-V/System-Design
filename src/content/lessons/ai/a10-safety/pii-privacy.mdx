@@ -1,0 +1,299 @@
+---
+summary: 'One chat message is copied into about eight places, and you control only some of them. Learn where personal data lands, how long each provider keeps it, how to redact before you log, and why a deletion request needs a map.'
+requires: ['ai/a10-safety/threat-model', 'ai/a9-llmops/tracing', 'ai/a5-rag/retrieval-permissions']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai10PiiMap from '../../../../components/anim/lessons/Ai10PiiMap.tsx';
+import Ai10PiiRedact from '../../../../components/anim/lessons/Ai10PiiRedact.tsx';
+
+## The problem
+
+A customer types into your support bot: "My email is jane@example.com, please cancel my order." The bot answers. The customer is happy.
+
+Six weeks later, the same customer writes: "Please delete everything you hold about me." Your engineer deletes the customer's rows from the database. Done?
+
+Not even close. That one sentence was copied into your logs, your tracing tool, your search index, your provider's systems, and your backups. The database row was only one of about eight copies. This lesson answers six questions:
+
+1. What counts as personal data, and why does it need special care?
+2. Where does one message actually go?
+3. What do model providers keep, and for how long?
+4. How do you keep personal data out of your own logs?
+5. What about the search index that holds meaning as numbers?
+6. Can the model itself remember a person?
+
+## Question 1: what counts as personal data?
+
+Think of a luggage tag. A tag with only "Suitcase 114" tells a stranger nothing. A tag with your name, phone number, and home address tells a stranger exactly who you are and where to find you.
+
+Data works the same way. **PII** (personally identifiable information) is any data that points at one real person, alone or when combined with other data. A name is PII. An email address is PII. A card number, a phone number, a home address, and a government ID number are PII. Even two harmless facts, such as a job title and an office floor, can point at one person when put together.
+
+Why does this matter for an AI app? Three reasons.
+
+- **Law.** Privacy laws, such as the European Union's GDPR, give people rights over their data. One right is to ask you to erase it. (This lesson is engineering advice, not legal advice. Ask a lawyer about your case.)
+- **Trust.** A leaked support chat is a headline, whether or not a court cares.
+- **Volume.** Users type freely into a chat box. They paste invoices, medical notes, and passwords. You cannot predict what they will send. So you must assume every message may hold PII.
+
+OWASP, the open security community, lists this risk as number two in its 2025 list of risks for LLM apps (LLM stands for large language model, the kind of AI behind chatbots). It is called "Sensitive Information Disclosure". The next lesson, A10.7, walks through the full list.
+
+## Question 2: where does one message go?
+
+Before any fix, you need a map. Start with three words you will see everywhere.
+
+A **log** is a file where your software writes down what it did, one line per event, like a ship's log. A **trace** is a richer record of one request as it moves through your system, step by step, like a parcel's tracking page. (Lesson [A9.1](/learn/ai/a9-llmops/tracing/) shows how to build traces.) **Retention** is how long a store keeps data before it is deleted, like the expiry date on food in a fridge.
+
+Now follow the message. Step through the picture. Each step shows one more copy, and the note beside the box shows how long that copy lives.
+
+<Ai10PiiMap client:visible />
+
+Two lessons from the picture.
+
+First, most of these copies were never a decision. Nobody chose to keep the email in the request log. A log line did it by default. Second, you do not control all eight. The provider log and the prompt cache live on someone else's machines. You can only choose which provider and which contract you use.
+
+OpenTelemetry is the open standard that many tracing tools follow. Its rules for AI calls keep the message text off by default. They add a warning that this text is "likely to contain sensitive information including user/PII data". The standard's authors saw the risk. Many teams switch the setting on anyway, because traces with full text are much easier to debug.
+
+## The naive way: "we do not store chats"
+
+Here are the three beliefs that cause the most trouble.
+
+- **"We do not keep chats in our database, so nothing to delete."** The picture shows why this is wrong. The text is in the logs and the traces even if the database never saw it.
+- **"We turned on zero data retention, so nothing is kept."** Zero data retention (ZDR) is a contract option. It tells the provider not to store your content. It is real, but narrow. The next section shows which endpoints it skips.
+- **"We will remove PII with a regular expression."** A regular expression (regex) is a pattern, like "letters, an @ sign, letters, a dot, letters". It finds emails well. It cannot find a name, or a phone number said in words. Question 4 shows how much slips through.
+
+## Question 3: what do model providers keep?
+
+When your app sends a message to a model provider, the provider's machines read it. The provider may write it down. Three things matter: does it **train** on your data (use it to improve its models), does it keep a **safety log** (a copy kept to find abuse), and how long does each copy live?
+
+Here is what each provider's own pages say. I read all three on 2026-10-16.
+
+| Provider | Trains on API data? | Safety log retention | Other stores to know |
+|---|---|---|---|
+| OpenAI API | No (the data table says "No" for every endpoint) | Up to 30 days by default | Files, batch jobs, fine-tuning jobs, vector stores, conversations, and assistant threads keep data until you delete it. Zero data retention does not cover them. |
+| Anthropic API | Not stated on the retention page | Inputs and outputs are deleted within 30 days | Files API data can live longer. Content flagged as a policy violation: up to 2 years. Safety scores: up to 7 years. Feedback you send: 5 years. |
+| Google Gemini API, paid (billing on) | No | Prompts and replies are logged "for a limited period of time" to find abuse. The length is not stated. | Other usage data, such as token counts, follows Google's general privacy terms |
+| Google Gemini API, free tier | Yes, and human reviewers may read it | Not stated | Google says: do not submit sensitive, confidential, or personal information |
+
+Sources: [OpenAI: data controls](https://developers.openai.com/api/docs/guides/your-data), [Anthropic: how long do you store my organization's data](https://privacy.claude.com/en/articles/7996866-how-long-do-you-store-my-organization-s-data) (page dated 1 July 2026), and [Google: Gemini API terms](https://ai.google.dev/gemini-api/terms). The Gemini terms also say that in the European Economic Area, Switzerland, and the United Kingdom, the paid-service terms apply to every service, including the free tier. Check the page for your region.
+
+Notice the pattern. The headline number is 30 days, but the exceptions hide the real risk. A file you upload, a batch job you run, or a message flagged by the safety system follows different rules. Retention is a property of each endpoint, not of the vendor.
+
+OpenAI also documents that its prompt cache may keep an encrypted copy of your prompt on the GPU machines for up to 24 hours. A prompt cache is a saved shortcut: the provider keeps the processed form of a long prompt so that the next call that starts the same way is cheaper. Lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/) covers it. For privacy, the point is simple: a cache is a store, and a store has a retention time.
+
+## Question 4: how do you keep PII out of your own logs?
+
+The best defence for your logs is **redaction**: find the personal data and replace it before the line is written. It is like a black marker on a printed page. The reader still sees the shape of the document. The secret is gone.
+
+Redaction has two jobs, and tools keep them apart. The first job is **detection**: find each span of text that is PII, and say what kind it is. The second job is **replacement**: swap the span for something safe. Microsoft's open-source tool Presidio is built this way. Its analyzer detects. Its anonymizer replaces, using small modules called operators. The built-in operators include replace, mask, redact, hash, and encrypt, and a deanonymizer can reverse the encrypted kind.
+
+Why split them? Because you will tune them on different schedules. Detection improves as you add rules and models. The choice of replacement depends on how you use the log later. Three common choices:
+
+- **Type label**, such as `[EMAIL_1]`. Safe and readable. You lose the value.
+- **Mask**, such as `*******`. Hides the value and keeps its length.
+- **Stable pseudonym**, such as `EMAIL_4f3682`. The same input always gives the same output. You can count how often one person appears, or follow one person across logs, without seeing who it is. This works by hashing the value with a secret. Presidio documents a salted hash for exactly this "referential integrity".
+
+Try it. The detector below is a toy. It uses patterns, a card-number checksum, and a short list of known names. Real tools add trained models for names, but they miss things too. Presidio's own documentation says there is "no guarantee" that it will find all sensitive information.
+
+<Ai10PiiRedact client:visible />
+
+What did you see? With all detectors on, the support chat still leaks a name and a street address. The HR text leaks a phone number spoken in words. The tracking ticket hides a parcel number because it looks like a phone number. These are the three failures of every detector: **misses** (leaks), **false alarms** (hiding harmless text and hurting debugging), and **drift** (new formats the rules never saw).
+
+How do you measure quality when you cannot see the leaks? Plant fake data. A **canary** is a fake but realistic personal item, such as a made-up email, that you put into test traffic on purpose. After the run, search every store for it. If the canary shows up in a log, the redaction missed it. The share you catch is the **recall** of your redaction. This is your quality bar.
+
+### Two places to redact
+
+There are two different points, and they have different costs.
+
+1. **Before the log or trace.** Redact on the way to storage. This can run off to the side, after the user already has the answer, so it adds no waiting for the user.
+2. **Before the provider.** Redact before the text leaves your system. This is inline: the user waits for it. It protects you from the provider copies in Question 3. But the model may then see `[NAME_1]` and not the real name, which can change the answer. Some apps swap the real value back into the reply with a stored mapping.
+
+A cost example (derived). Suppose you redact with a small model instead of rules. A 1,000-token message goes in, and a 1,000-token cleaned copy comes out. Anthropic lists Claude Haiku 5.5 at $0.10 per million input tokens and $0.50 per million output tokens (as of 2026-10-16, [pricing page](https://platform.claude.com/docs/en/about-claude/pricing)). The cost is 1,000 x $0.10 / 1,000,000 + 1,000 x $0.50 / 1,000,000 = $0.0001 + $0.0005 = $0.0006 per message. At 1 million messages a day, that is $600 a day. It also adds a full model round trip if it runs inline. So use rules first, a model for the hard cases, and run it off the user's path when you can.
+
+## Question 5: what about the search index?
+
+Many AI apps keep a search index of their documents and chats. To search by meaning, the app turns each piece of text into an **embedding**: a list of a few hundred or thousand numbers, like GPS coordinates for meaning. Two texts about the same topic get nearby coordinates. A **vector index** stores those lists and finds the nearest ones. (The lesson on [embedding models](/learn/ai/a5-rag/embedding-models/) builds this.)
+
+A common belief says that numbers are safe, because nobody can read them. That belief is wrong. A 2023 research paper on "text embeddings reveal almost as much as text" showed a method called Vec2Text. Given only an embedding, it recovered 92% of 32-token inputs exactly, and it recovered full names from a set of clinical notes. So treat an embedding as personal data, exactly like the text it came from.
+
+Deleting from an index has a practical trap. If you stored only the numbers, you cannot find "the vectors for this user". So store a user id and a source document id as metadata on every chunk from day one. Then a deletion job can say "remove every chunk where user is 123". Also ask your vector database how deletes work. Some engines mark a record as deleted and clean it up later. The lesson on [retrieval permissions](/learn/ai/a5-rag/retrieval-permissions/) shows the same metadata trick used for access control.
+
+## Question 6: can the model itself remember a person?
+
+A **model** is a large set of numbers (its weights), learned from training text. Sometimes it stores a piece of that text almost word for word. This is **memorization**. A 2020 study of GPT-2 recovered hundreds of verbatim text sequences by asking the model questions. They included names, phone numbers, and email addresses. Each one appeared in just one training document, and larger models leaked more. A 2023 study then extracted gigabytes of training data from open models and from ChatGPT. The authors found that the chatbot's safety tuning did not remove memorization.
+
+What does this mean for you? Two rules.
+
+- **Do not train on raw user data.** When you fine-tune a model (train it further on your own examples), personal data in the examples can end up in the weights. You cannot edit one fact out of a trained model. Lesson A11.5 covers training data. For now, keep personal data out of training sets unless you have clear consent and a plan.
+- **Put personal facts in a store, not in the model.** Keep them in a database or index that the model reads at answer time. A database row can be deleted. A weight cannot.
+
+The European Data Protection Board gave a formal opinion on this in December 2024. It says AI models trained on personal data cannot, in all cases, be called anonymous. Regulators decide case by case, based on how likely it is that data can be extracted. The opinion also lists post-training methods that try to remove or suppress personal data as one possible measure. It does not promise they work.
+
+## The real fix: a data map and a deletion job
+
+Put the answers together. This is a design you can draw on a whiteboard.
+
+1. **Inventory.** List every store: database, logs, traces, caches, index, provider endpoints, files, backups. Write the retention of each. The picture in Question 2 is your starting draft.
+2. **Redact at the edges.** Redact before logs and traces. Redact before the provider when the data class demands it.
+3. **Set a retention timer on every store.** Logs and traces: days, not forever. Short timers do half the work of deletion for free.
+4. **Tag everything with a user id.** Rows, chunks, files, and trace attributes all carry it, so one job can find them.
+5. **One deletion job.** It takes a user id and removes or schedules removal in every store. It writes a record of what it did.
+6. **Honest answer to the user.** Say what is gone now and what expires later. "Your data is deleted from our systems today. Copies held by our model provider expire within 30 days. Backups are overwritten on the next cycle."
+7. **Test with canaries.** Run fake users through the app, then delete them, then search every store.
+
+Quality bar: canary recall for redaction, and "zero canaries left" after a deletion run. Latency: redaction before logs adds none for the user. Redaction before the provider adds its own time, so measure it. Cost: rules cost almost nothing, and a small-model redactor cost $0.0006 per message in the example above.
+
+## Numbers
+
+| Item | Value | Source |
+|---|---|---|
+| Copies of one chat message in a typical design | about 8 | The map above (design count) |
+| OpenAI safety log | up to 30 days | OpenAI data controls page |
+| Anthropic API inputs and outputs | deleted within 30 days | Anthropic privacy centre |
+| Anthropic flagged content | up to 2 years | same page |
+| OpenAI prompt cache copy | up to 24 hours | OpenAI data controls page |
+| Embedding inversion | 92% of 32-token inputs recovered exactly | Vec2Text paper |
+| Small-model redaction | $0.0006 per 1,000-token message | Derived from Haiku 5.5 price |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Redact before logs | Safe debugging data, shorter risk list | Lost detail, some false alarms | Always, for any text you log |
+| Redact before the provider | Less data leaves your system | Extra latency, model sees placeholders | Regulated data, or a provider you do not fully trust |
+| Zero data retention contract | No provider safety log for covered endpoints | Approval needed, some features unavailable | Health, finance, and similar data |
+| Stable pseudonyms | You can still count and join | The secret key becomes a crown jewel | Analytics on logs |
+| Keep no content in traces | Tiny PII surface | Harder debugging | Default for production traces |
+| Self-hosting the model | You own every store | You run the infrastructure | Strict data-location rules |
+
+## What experienced teams know
+
+1. **Retention belongs to the endpoint, not the vendor.** OpenAI's table shows chat calls are eligible for zero data retention, while files, batches, fine-tuning, vector stores, and conversations are not. Build your inventory per endpoint. Re-read the page when you adopt a new feature, because a new feature often means a new store. [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data).
+2. **Your traces are probably your largest PII store.** The OpenTelemetry rules mark message text as opt-in and warn that it is likely to hold personal data. Teams switch it on in a hurry, then forget it. Keep it off by default in production. If you need it for a bug, turn it on for one request, with a short timer. [OpenTelemetry GenAI conventions](https://github.com/open-telemetry/semantic-conventions-genai).
+3. **Embeddings are not anonymous.** Researchers recovered 92% of short texts exactly from their embeddings. So an index needs the same access rules, retention, and delete path as the source text. Never send raw embeddings to a third party and call it safe. [Text Embeddings Reveal (Almost) As Much As Text](https://arxiv.org/abs/2310.06816).
+4. **A free tier may be a training set.** Google's terms say free-tier content is used to improve its products, and human reviewers may read it. A prototype that someone built with a free key can quietly send real customer data there. Use billing-linked keys in production, and check the key type in code review. [Gemini API terms](https://ai.google.dev/gemini-api/terms).
+5. **No redaction tool is complete, so measure it.** Presidio says in its docs that automated detection gives no guarantee. Plant canaries and track recall as a number. A redactor you never measured is only a hope. [Presidio documentation](https://presidio.dataprivacystack.org/).
+6. **A pseudonym with a deletable key makes deletion cheap.** If you encrypt or hash the identity in your logs with one key per user, deleting that key makes the logged values unreadable. This is a design pattern, not a legal guarantee, and your lawyer decides whether it counts as erasure. It is far easier than rewriting backups. The Presidio docs describe the encrypt and decrypt operators it builds on.
+
+## Interview lens
+
+<Callout type="tip">
+When asked about privacy in an AI app, draw the map first: "One message lands in the database, logs, traces, provider log, prompt cache, vector index, uploaded files, and backups. I give each a retention timer and a user id tag. I redact before logs, and before the provider if the data class needs it. I measure redaction recall with canaries. A delete request runs one job across all stores and tells the user honestly what expires later." It shows you think in stores, not in features.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we use zero data retention, so we are compliant". It covers some endpoints only, and it says nothing about your own logs, traces, and index. Do not say "we remove PII with a regex" without a recall number. And do not promise to delete personal data from a trained model.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'pii-which-store-eligible',
+      q: 'A team enables OpenAI zero data retention and uploads customer chats as a file for a fine-tuning job. What does the data controls page say about that file endpoint?',
+      options: [
+        'It is covered, so the provider deletes the file as soon as the job ends',
+        'It is covered only when the uploaded file is less than 30 days old',
+        'It is not covered, so the file stays until you delete it',
+        'It is covered, but only for plain text files and not for images',
+      ],
+      answer: 2,
+      explain: 'The table marks files and fine-tuning jobs as not eligible for zero data retention, with application state kept until deleted. The fix is to delete the file yourself and to include it in your inventory.',
+    },
+    {
+      id: 'pii-embedding-safe-numbers',
+      q: 'A developer says: "We only store embeddings, which are just numbers, so we hold no personal data." What is the best reply?',
+      options: [
+        'Correct, because numbers cannot be turned back into words',
+        'Wrong, since research recovered 92% of short texts from embeddings',
+        'Correct, as long as the numbers are rounded to just two decimals',
+        'Wrong, because embeddings always contain a hidden copy of the file name',
+      ],
+      answer: 1,
+      explain: 'Vec2Text recovered most short inputs from their embeddings, and it recovered full names from clinical notes. Treat the index like the source text. Rounding is not a tested defence, and file names are not part of an embedding.',
+    },
+    {
+      id: 'pii-redaction-recall-canary',
+      q: 'You plant 40 fake emails, names, and phone numbers in test traffic. After the run, 34 are absent from your logs and 6 appear in plain text. What is the redaction recall?',
+      options: [
+        '6 of 40, which is 15%',
+        '34 of 40, which is 85%',
+        '40 of 46, which is 87%',
+        '34 of 6, which is 567%',
+      ],
+      answer: 1,
+      explain: 'Recall is the share of real items caught: 34 / 40 = 85%. The 6 plain-text canaries are the misses. A recall of 85% means that about 1 in 7 personal items still reaches the log.',
+    },
+    {
+      id: 'pii-delete-request-honest-answer',
+      q: 'A user asks for deletion. Your deletion job cleared the database, logs, index, and files. The provider keeps a safety log for up to 30 days. Which reply is honest?',
+      options: [
+        'Everything about you is already gone from every system we use, including the provider',
+        'We cannot delete anything at all, because AI models never forget',
+        'Gone from our systems now; the provider copy expires in 30 days',
+        'Your data stays for 2 years, since that is the usual provider rule here',
+      ],
+      answer: 2,
+      explain: 'Say what is gone and what will expire. The 30 days comes from the provider page you read. The 2-year rule applies only to content the provider flagged as a policy violation. Promising instant total deletion would be false.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai10-pii-deletion-map"
+  title="A deletion request, and what is left"
+  scenario="A user asks you to delete all their data. A developer runs DELETE on the messages table for that user. Your design is below."
+  facts={[
+    'app database: messages table (user_id column)',
+    'request logger: writes the full body of every call, kept 90 days',
+    'tracing: content capture ON, kept 30 days',
+    'provider: chat API, paid tier, safety log up to 30 days',
+    'index: chunks stored with text and vector, no user_id',
+    'backups: nightly snapshot of database and logs, kept 35 days',
+  ]}
+  steps={[
+    {
+      prompt: 'After the DELETE, which store is cleaned right away?',
+      options: [
+        'Only the messages table',
+        'The messages table and the request logs',
+        'The messages table and the vector index',
+        'Every store, since the user id was deleted',
+      ],
+      answer: 0,
+      explain: 'The DELETE touches one table. The logs, traces, index, provider log, and backups are separate stores that nothing cleans.',
+    },
+    {
+      prompt: 'Which store can you not edit at all, so you must plan around its expiry?',
+      options: [
+        'The request logs',
+        'The vector index',
+        'The provider safety log',
+        'The messages table',
+      ],
+      answer: 2,
+      explain: 'The provider log lives on the provider machines. You can only wait for its retention time or use a contract option. You own the other three.',
+    },
+    {
+      prompt: 'The index has no user_id on its chunks. What is the right design fix?',
+      options: [
+        'Delete the whole index each night',
+        'Store a user id and source id on every chunk, and add the index to the deletion job',
+        'Tell users that vectors are numbers, so they hold no personal data',
+        'Move the chunk text into the log, where it is easier to search',
+      ],
+      answer: 1,
+      explain: 'Without an id you cannot find one person chunks. Deleting everything is extreme and breaks search. Embeddings can leak text, so the numbers argument is false.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [OpenAI: data controls in the API platform](https://developers.openai.com/api/docs/guides/your-data) (retention table per endpoint)
+- [Anthropic: how long do you store my organization's data](https://privacy.claude.com/en/articles/7996866-how-long-do-you-store-my-organization-s-data)
+- [Microsoft Presidio documentation](https://presidio.dataprivacystack.org/)
+- [EDPB Opinion 28/2024 on AI models and personal data](https://www.edpb.europa.eu/our-work-tools/our-documents/opinion-board-art-64/opinion-282024-certain-data-protection-aspects_en)

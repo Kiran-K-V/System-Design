@@ -1,10 +1,10 @@
 import { HandText, SketchArrow, SketchBox, SketchSvg, TEXT_SIZES, seedOf } from '../sketch';
 
 const STAGES = [
-  { name: 'Base model', need: ['next-token', 'prediction'], tone: 'var(--muted)' },
-  { name: 'SFT', need: ['demonstrations:', '1 good answer', 'per prompt'], tone: 'var(--accent)' },
+  { name: 'Base model', need: ['a lot of text', '(already done)'], tone: 'var(--muted)' },
+  { name: 'SFT', need: ['examples: one good', 'answer per prompt'], tone: 'var(--accent)' },
   { name: 'Preference tune', need: ['pairs (chosen,', 'rejected) or', 'good/bad labels'], tone: 'var(--accent)' },
-  { name: 'Eval gate', need: ['held-out slices,', 'length-controlled', 'judge, pass^k'], tone: 'var(--ok)' },
+  { name: 'Eval gate', need: ['held-out test set', 'split by topic,', 'judge ignores length'], tone: 'var(--ok)' },
 ];
 const X = [90, 260, 430, 600];
 
@@ -27,7 +27,7 @@ export default function Ai11PrefPipe() {
           </g>
         ))}
         <HandText x={360} y={222} size={TEXT_SIZES.note} color="var(--muted)">
-          Gate fails: fix the data or the beta, never ship on the training loss.
+          If the gate fails, fix the data. Never ship on the training loss alone.
         </HandText>
       </SketchSvg>
     </figure>

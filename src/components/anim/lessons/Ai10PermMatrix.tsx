@@ -5,11 +5,11 @@ import { ACTIONS, ALL_CELLS, ROWS, cellState, grantedCount, type CellState } fro
 /** Illustrative support agent. Steps follow the task-scoped, read-only-by-default, approval-for-writes pattern. */
 const CAPTIONS = [
   'Start: one shared admin token. The agent can read, write, delete, and send in every tool. That is 13 of 13 cells. A single injected instruction can use any of them.',
-  'Step 1: scope to the task. The task is "triage my open tickets", so it needs only Tickets and Email. Billing, Users, and Files are removed from this run. The agent cannot call a tool it was never given.',
-  'Step 2: scope to the action. Inside those two tools the task needs three cells: read tickets, write a comment, and send one email to the user. Delete and read-mail are removed. 3 of 13 remain.',
-  'Step 3: read-only by default. Reading runs freely. The write and the send now wait for a person ("ask"). The agent can still do its job, but every change leaves a record that someone saw.',
-  'Step 4: an injection arrives in a ticket body. It says: delete all tickets and read the billing table. Both cells are outside the grant, so a plain code check refuses them. No model had to notice the attack.',
-  'Step 5: the injection also asks to send mail to an outside address. This cell is in the grant, so it reaches the approval prompt with the exact recipient and body. The person sees an unknown address and denies it.',
+  'Scope to the task. The task is "triage my open tickets", so it needs only Tickets and Email. Billing, Users, and Files are removed from this run. The agent cannot call a tool it was never given.',
+  'Scope to the action. Inside those two tools the task needs three cells: read tickets, write a comment, and send one email to the user. Delete and read-mail are removed. 3 of 13 remain.',
+  'Read-only by default. Reading runs freely. The write and the send now wait for a person ("ask"). The agent can still do its job, but every change leaves a record that someone saw.',
+  'An injection arrives in a ticket body. It says: delete all tickets and read the billing table. Both cells are outside the grant, so a plain code check refuses them. No model had to notice the attack.',
+  'The injection also asks to send mail to an outside address. This cell is in the grant, so it reaches the approval prompt with the exact recipient and body. The person sees an unknown address and denies it.',
 ];
 
 const tone = (s: CellState) => (s === 'granted' ? 'var(--ok)' : s === 'ask' ? 'var(--warn)' : s === 'blocked' || s === 'denied' ? 'var(--bad)' : 'var(--muted)');

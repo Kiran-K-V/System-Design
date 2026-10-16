@@ -1,0 +1,225 @@
+---
+summary: 'Distillation trains a small student model on a large teacher''s answers, so you serve the small one. The data pipeline decides the result: build prompts from real traces, keep only verified answers, deduplicate, hold out the test set first, and score every rare slice. Check the teacher''s terms before you train.'
+requires: ['ai/a11-finetuning/preference-tuning', 'ai/a2-inference-cost/gpu-memory-math', 'ai/a8-evals/golden-sets']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai11DistillFrontier from '../../../../components/anim/lessons/Ai11DistillFrontier.tsx';
+import Ai11DistillWalk from '../../../../components/anim/lessons/Ai11DistillWalk.tsx';
+import Ai11DistillSlice from '../../../../components/anim/lessons/Ai11DistillSlice.tsx';
+
+## The problem
+
+Your support assistant runs on a large model. A typical request has 2,000 input tokens and 400 output tokens. At Opus 5.5 list prices, $4 per million input tokens and $20 per million output tokens (as of 2026-10-16, [pricing page](https://platform.claude.com/docs/en/about-claude/pricing)), one request costs 2,000 x $4 / 1,000,000 + 400 x $20 / 1,000,000 = $0.008 + $0.008 = $0.016. On Haiku 5.5, at $0.10 and $0.50, the same request costs $0.0002 + $0.0002 = $0.0004. That is 40 times cheaper. At 1 million requests a day, the gap is $16,000 against $400.
+
+Cost follows size. Lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/) showed why: a model must read all its weights to produce each token, and weights take 2 bytes per parameter in bf16. An 8-billion-parameter model needs 16 GB. A 70-billion-parameter model needs 140 GB. The smaller one fits on one GPU and reads 8.75 times fewer bytes per token (140 / 16).
+
+But small models are worse at hard tasks. So here is the question this lesson answers: can a small model learn your narrow task from a large model, and reach the large model's quality on that task at the small model's price? The four questions on the way are:
+
+1. Can a small model learn from a big one?
+2. Where do the training examples come from?
+3. What can the small model fail to copy?
+4. How do you know it is good enough?
+
+## Question 1: can a small model learn from a big one?
+
+Yes. This is called **distillation**. The big model is the **teacher** and the small model is the **student**. Think of an apprentice who watches a master craftsperson work and copies the results. The idea is old. Geoffrey Hinton and colleagues wrote in 2015 about compressing the knowledge of a bulky ensemble of models into one model that is easier to deploy.
+
+Why does it work? Because the teacher's answers hold more information than a plain label. A teacher that writes out its steps shows the student how to reason, not only what to answer. For language models, the simplest form is just SFT, which you met in lesson [A11.2](/learn/ai/a11-finetuning/sft-lora/): collect prompts, have the teacher write answers, and train the student on those pairs.
+
+The strongest public evidence comes from DeepSeek. Its R1 model wrote about 800,000 curated samples. DeepSeek then fine-tuned small open models on those samples for 2 to 3 epochs. The numbers below are scores on AIME 2024, a hard high-school math contest. The score is the share of problems solved on one try, so higher is better. The horizontal axis is the memory needed for the model's weights, which is a stand-in for serving cost.
+
+<Ai11DistillFrontier />
+
+Read the chart. The 7-billion-parameter student (14 GB of weights) scores 55.5. The 32-billion student (64 GB) scores 72.6, above the dashed line for o1-mini, a small OpenAI reasoning model, at 63.6. The red square is the control experiment. DeepSeek trained the same 32-billion base model with reinforcement learning alone, as in the previous lesson, and it scored 47.0. For small models, copying the teacher beat searching on their own. DeepSeek's own paper says so.
+
+All scores are from DeepSeek's R1 repository. They measure math. Your task is different, so treat this as proof that the method can work, not as a forecast.
+
+## Question 2: where do the training examples come from?
+
+Two things go into each example: a prompt and a teacher answer.
+
+**Prompts** should look like your real traffic. The best source is your own production traces, the logged requests of lesson [A8.9](/learn/ai/a8-evals/feedback-flywheel/). Real prompts include the typos, odd formats, and rare cases that a made-up set misses. Scrub personal data first (lesson [A10.5](/learn/ai/a10-safety/pii-privacy/)).
+
+**Answers** come from the teacher. But do not keep everything it says. Use **rejection sampling**: generate, then keep only the answers that pass a check, and reject the rest. Picture a quality inspector at the end of a line. The check can be a unit test, an exact match against a known answer, a schema validator, or a judge model ([A8.4](/learn/ai/a8-evals/judges/)). Why does it exist? Because the student copies whatever you give it, including the teacher's mistakes. DeepSeek's pipeline also used rejection sampling when it built R1's training set.
+
+How many examples? It depends on the task. For learning a response format or style, little is needed. The LIMA project fine-tuned a 65-billion-parameter model on only 1,000 carefully chosen examples and humans rated its answers equal or better than GPT-4's in 43% of cases. DeepSeek's reasoning students needed 800,000 because they were learning to reason. Start small, measure, and add data where the failures are.
+
+What does the teacher data cost? Take 50,000 prompts at 700 input and 600 output tokens each. That is 35 million input tokens and 30 million output tokens. At the Opus 5.5 prices above, that is 35 x $4 + 30 x $20 = $140 + $600 = $740. The Batch API takes 50% off both prices, so $370. These are list-price figures to show scale. Whether you may train on a provider's outputs is a separate question, covered below.
+
+## Question 3: what can the student fail to copy?
+
+The student sees only the teacher's text. It does not see the teacher's knowledge. That has three consequences.
+
+**It copies style faster than facts.** A study titled "The False Promise of Imitating Proprietary LLMs" fine-tuned small models on ChatGPT's outputs. Crowd workers rated the small models close to ChatGPT. But on targeted tests, the models closed "little to none of the gap" on tasks the imitation data did not cover. The authors explain that human raters can miss this because the models are good at mimicking style but not factuality. Think of an actor who speaks like a doctor without knowing medicine.
+
+**It copies the teacher's errors.** If the teacher is wrong 4% of the time and you do not filter, the student learns those errors as truth.
+
+**It fails where the data was thin.** A rare category with a few training examples gets a weak copy. The student can sound exactly like the teacher while being wrong.
+
+## The naive way: label with the teacher, train once, check the average
+
+The simple pipeline is: log 50,000 prompts, ask the teacher for answers, train the student, and compare the student's overall score with the teacher's. If the gap is small, ship.
+
+Here is how that fails. The animation shows five support questions. Four are common. One is rare, such as a chargeback dispute.
+
+<Ai11DistillWalk client:visible />
+
+The student matches the teacher on 4 of 5 and looks done. Now do the sum. Say 97% of traffic is common questions, where the teacher scores 97% and the student 96%. The remaining 3% is rare, where the teacher scores 90% and the student 50%. Overall, the teacher scores 0.97 x 0.97 + 0.03 x 0.90 = 96.8%. The student scores 0.97 x 0.96 + 0.03 x 0.50 = 94.6%. The gap is 2.2 points. On the rare slice it is 40 points. A test set that mirrors traffic hides it.
+
+## The real fix: build the data and the test as one system
+
+### Idea 1: order the pipeline so the test stays clean
+
+The order of steps matters more than any single step.
+
+1. **Collect** prompts from traces and scrub personal data.
+2. **Deduplicate** them. A **near-duplicate** is a prompt that differs by a few words, such as a changed order number. Researchers who deduplicated language-model data found one 61-word sentence repeated over 60,000 times in a standard web dataset (C4), and train-test overlap affecting more than 4% of the validation set. After deduplication, models repeated memorized text ten times less often.
+3. **Split before you generate.** Put whole clusters of near-duplicates on one side only, so a test question never has a twin in training. Freeze the test set before the teacher writes a single answer.
+4. **Generate** teacher answers for the training side only.
+5. **Verify** them with rejection sampling.
+6. **Train** the student.
+7. **Test** on the frozen set, by slice.
+
+The common mistake is to split after generation, or to dedupe within the training set only. Both let near-identical items sit on both sides. The student then looks better than it is. The Tulu 3 project calls the cleanup **decontamination**: removing training items that overlap with test sets. They did it across the open datasets they used.
+
+### Idea 2: score every slice, and size the test set for the rare ones
+
+A **slice** is a subset of your traffic with a shared trait: a topic, a language, a customer tier, a risk level. Score each slice on its own. The overall average is a weighted sum, so a slice that is 3% of traffic can fail without moving it.
+
+But a rare slice has few examples in a test set that mirrors traffic. With 500 test questions and a 3% slice, you get 15 rare questions. A score from 15 examples is noisy. The worst-case 95% error bar is about 1.96 x the square root of (0.5 x 0.5 / 15), which is 25 points. With 100 examples it is about 10 points. So **stratify**: collect each important slice on purpose, up to about 100 examples, and keep each as its own test set. Try the numbers.
+
+<Ai11DistillSlice client:visible />
+
+### Idea 3: on-policy distillation, the newer route
+
+Ordinary distillation trains on text the teacher wrote. But at test time the student writes its own text, in situations the teacher's examples never showed, like a driver who learned only on empty roads. One early slip leads somewhere unfamiliar.
+
+**On-policy distillation** fixes this. In October 2025, Thinking Machines Lab described it. The student writes its own answers, and the teacher grades each token the student wrote: how much more does the student favor this token than the teacher does? The training pushes that gap to zero. Think of a coach who stands beside you and comments on every move you make, rather than showing you videos of experts. The gap measure is called a reverse KL divergence, and the post calls it "unhackable", since low KL means the teacher would have chosen the same tokens.
+
+The post reports a math model reaching 70% on AIME 2024 in about 150 training steps. That is about 77,000 prompts with 4 samples each. Ordinary SFT on 400,000 examples reached 60%, and the authors extrapolate that about 2 million examples would reach 70%. They report the cost reduction as 9 times in FLOPs, about 18 times in GPU-hours, and up to about 30 times if you count generating the teacher data. The same figure moves with what you count, so state your accounting. The post also cites the Qwen3 report: reinforcement learning reached 67.6% on AIME using 17,920 GPU-hours, while on-policy distillation reached 74.4% using 1,800, about a tenth.
+
+One limit: the teacher must give you probabilities for each token the student writes. A model you host can. Many chat APIs return few or none, so in practice the teacher is an open-weight model you run. That part is my inference, not the post's claim. The post also notes that the Qwen3 models it used have since been retired from its platform (June 2026), so exact reproduction needs the updated recipes.
+
+### Idea 4: check rights and privacy before you train
+
+Two checks come before any training run.
+
+**Whose outputs?** Some providers forbid using their outputs to train competing models. Anthropic's Commercial Terms, section D.4, say the customer may not use the services "to build a competing product or service, including to train competing AI models" except as expressly approved. Terms differ by provider, so read the terms of your teacher's provider. The R1 repository, by contrast, says the DeepSeek-R1 series allows "distillation for training other LLMs", with the MIT license. Students built on Qwen models keep their Apache 2.0 license, and students built on Llama keep the Llama license.
+
+**Whose data?** Production traces hold customer data. Check that your privacy policy covers training, scrub personal data, and set a retention limit on the training set. Treat a trained model as a copy of its data: a student can repeat rare strings it saw.
+
+## Numbers
+
+Fix three numbers before the run.
+
+- **Quality bar.** A convention for this lesson, not a standard: the student is within 2 points of the teacher overall, and within 5 points on every slice that has at least 100 test examples. Measure with the frozen, stratified test set and the same judge or check for both models.
+- **Latency budget.** Decode speed is limited by reading weights, so weights bytes per token is a rough guide. Moving from a 70-billion model (140 GB) to an 8-billion one (16 GB) cuts bytes per token by 8.75 times. That is an upper bound on the speedup, as other costs do not shrink.
+- **Cost per request.** Compare at the same traffic: the example above gives $0.016 at an Opus-class price against $0.0004 at a Haiku-class price, a 40 times gap. A student you host has its own cost, set by GPU price and utilization, so run the lesson [A2.7](/learn/ai/a2-inference-cost/self-host-vs-api/) comparison before you commit.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Keep prompting the big model | No training, always the best quality | Highest cost and latency | Low volume or a fast-changing task |
+| Prompt a small model | Cheap, no training | Quality gap on hard cases | The small model already passes your tests |
+| Distill (SFT on teacher answers) | Small-model price, near-teacher quality on your task | Data pipeline, copied errors, terms check | High volume on a stable, narrow task |
+| On-policy distillation | Fewer steps, fixes drift | Needs teacher probabilities, more infrastructure | You run an open-weight teacher |
+| RL on the small model | No teacher needed | Many samples, needs a checker | The task is checkable and no strong teacher exists |
+
+## What experienced teams know
+
+1. **For small models, copying a strong teacher beat training with RL.** In the [R1 paper](https://arxiv.org/abs/2501.12948), DeepSeek compared a 32-billion model trained by large-scale reinforcement learning (47.0 on AIME 2024) with the same size distilled from R1 (72.6). The authors say the RL route needs "enormous computational power" and may not reach distillation's score. Try distillation first if a strong teacher exists, and test both on your own eval.
+2. **Style transfers before facts.** The [imitation study](https://arxiv.org/abs/2305.15717) found that models fine-tuned on a proprietary model's outputs looked as good as it to human raters while closing almost none of the gap on tasks the data did not cover. Keep a factual held-out set that the teacher's tone cannot fake.
+3. **Size the test set per slice.** A slice with 15 test examples has a 95% error bar of about plus or minus 25 points (derived above). Collect around 100 per important slice, and add examples by hand where traffic is thin.
+4. **Deduplicate and decontaminate before you split.** The [deduplication study](https://arxiv.org/abs/2107.06499) found test-set overlap with training data on more than 4% of validation examples in common datasets. A student's score on a leaky test is a memory test.
+5. **Count cost the same way each time.** The on-policy distillation [post](https://thinkingmachines.ai/blog/on-policy-distillation/) gives 9x, about 18x, or up to about 30x for the same run, depending on what is counted. Write down whether you include teacher sampling and teacher forward passes.
+6. **Read the terms first.** Anthropic's [commercial terms](https://www.anthropic.com/legal/commercial-terms) bar training competing models on outputs without approval. Open-license teachers such as [DeepSeek-R1](https://github.com/deepseek-ai/DeepSeek-R1) allow distillation but pass on the student base model's license. A model you cannot legally ship wastes the compute.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I'd distill when volume is high and the task is narrow. Prompts come from de-identified traces. A strong teacher answers, I keep only the answers that pass a check, and I dedupe and freeze a stratified test set before generating. I'd report the student against the teacher by slice, not by average. I'd check the teacher's license first." That names data source, filter, test hygiene, and legal risk, plus the cost reason in one breath.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the student matches the teacher on average, so ship". Averages hide rare slices. Do not claim distillation adds knowledge the teacher lacks, and do not forget that copying a strong model's style can make a weak student sound reliable. Do not skip the license check.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A request uses 2,000 input and 400 output tokens. Opus 5.5 charges $4 and $20 per million tokens, and Haiku 5.5 charges $0.10 and $0.50. How many times cheaper is Haiku?',
+      options: ['About 10 times', 'About 20 times', 'About 40 times', 'About 80 times'],
+      answer: 2,
+      explain: 'Opus: $0.008 + $0.008 = $0.016. Haiku: $0.0002 + $0.0002 = $0.0004. The ratio is 40. Both input and output prices differ by the same factor of 40, so the mix does not change it.',
+    },
+    {
+      q: 'A rare slice is 3% of traffic. You test with 500 questions chosen in proportion to traffic. About how precise is the score on that slice?',
+      options: ['Within about 25 points, as only 15 are in it', 'Within about 3 points, since the whole set has 500 questions', 'Within about 10 points, since 500 questions is a large sample', 'Exact, because a slice score is a fixed share of the total'],
+      answer: 0,
+      explain: '3% of 500 is 15 questions. The worst-case 95% error bar is 1.96 x sqrt(0.25 / 15), about 25 points. The 500 count applies to the whole set, not to the slice.',
+    },
+    {
+      q: 'A student trained on teacher answers sounds just like the teacher but gets facts wrong on topics that were rare in the data. What does that show?',
+      options: ['The learning rate was too low for the student to learn', 'The teacher is not strong enough to be a good teacher', 'Fine-tuning always damages facts in small models', 'Imitation copies style more easily than facts'],
+      answer: 3,
+      explain: 'Models can mimic a teacher\'s style and confidence without its factual accuracy, as the imitation study found. Thin coverage makes it worse. This is why rare slices need their own test set.',
+    },
+    {
+      q: 'You deduplicate your prompts and then generate teacher answers. When should the test set be frozen?',
+      options: ['After training, so it reflects the final model well enough', 'Before the teacher answers, keeping near-twins together', 'After the teacher answers, so the best examples are kept in', 'Any time, since the split does not change the results at all'],
+      answer: 1,
+      explain: 'Freezing first, with groups kept together, stops a test question from having a near-twin in training. A leaky test set measures memory, not skill.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai11-distill-missing-slice"
+  title="Matches on average, fails a rare case"
+  scenario="You distilled a support model. On your test set the student scores within 2 points of the teacher. Two weeks after launch, chargeback-dispute tickets show wrong refund rules and a rising escalation rate."
+  facts={[
+    'test set: 500 questions sampled from traffic',
+    'overall: teacher 96.8%, student 94.6%',
+    'chargeback disputes: 3% of traffic, 15 test questions',
+    'student score on those 15: 8 of 15 (53%)',
+  ]}
+  steps={[
+    {
+      prompt: 'Which eval slice was missing?',
+      options: [
+        'A slice of long prompts, since long input breaks small models',
+        'A slice of very short prompts, since those have no context',
+        'A chargeback slice with enough questions to measure',
+        'A slice of prompts in a second language, since tickets vary',
+      ],
+      answer: 2,
+      explain: 'The rare category held only 15 test questions, too few to see a gap. The overall average hid it because the category is 3% of traffic. Nothing in the facts points to length or language.',
+    },
+    {
+      prompt: 'What is the best next step?',
+      options: [
+        'Train the student for more epochs on the very same data as before',
+        'Ship a larger student model and skip the per-slice tests entirely',
+        'Collect about 100 chargeback questions for training and a separate test slice',
+        'Lower the quality bar until the current student passes it',
+      ],
+      answer: 2,
+      explain: 'The rare slice needs more training coverage and its own test set big enough to read. More epochs on the same thin data repeat the gap. A bigger student or a lower bar hides it.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [DeepSeek-R1 repository](https://github.com/deepseek-ai/DeepSeek-R1) (distilled model table and license section)
+- [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](https://arxiv.org/abs/2501.12948)
+- [Thinking Machines Lab: On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [The False Promise of Imitating Proprietary LLMs](https://arxiv.org/abs/2305.15717)

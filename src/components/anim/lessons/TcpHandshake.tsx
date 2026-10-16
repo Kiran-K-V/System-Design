@@ -21,9 +21,9 @@ const steps = [
   { caption: 'The client sends segment 1. A segment is one chunk of the byte stream, at most ~1,460 bytes of payload on Ethernet.' },
   { caption: 'The server acknowledges it. TCP numbers every byte. An ACK says "I have everything up to here", so the sender can free that data.' },
   { caption: 'The client sends segment 2. A router drops it (a full queue, or a bad link). The network gives no error. The packet just vanishes.' },
-  { caption: 'The client waits for an ACK. None comes. A retransmission timer fires. RFC 6298 sets the floor of this timer at 1 second. That is 2,000 times a same-data-center round trip.' },
+  { caption: 'The client waits for an ACK. None comes. A retransmission timer fires. On a new connection, this timer waits about 1 second. That is 2,000 times a same-data-center round trip.' },
   { caption: 'TCP sends the same segment again. The app never saw the loss. It only saw the data arrive late.' },
-  { caption: 'The server acknowledges segment 2. Reliable delivery works, and it cost one extra timer wait. In practice, 3 duplicate ACKs trigger a faster resend (RFC 5681), but the cost is still at least one extra round trip.' },
+  { caption: 'The server acknowledges segment 2. Reliable delivery works, and it cost one extra timer wait. In practice, 3 repeated ACKs trigger a faster resend without the timer, but the cost is still at least one extra round trip.' },
 ];
 
 export default function TcpHandshake() {

@@ -1,0 +1,355 @@
+---
+summary: 'One AI request is many timed steps: model calls, tool calls, retrieval. Record each step as a span with tokens, versions, and outcome, count cached tokens correctly, keep private text out, and turn flagged traces into tests.'
+requires: ['ai/a8-evals/error-analysis', '07-reliability/observability', 'ai/a3-llm-apis/cost-metering']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai9TraceWalk from '../../../../components/anim/lessons/Ai9TraceWalk.tsx';
+import Ai9TraceTokens from '../../../../components/anim/lessons/Ai9TraceTokens.tsx';
+import Ai9TraceToEval from '../../../../components/anim/lessons/Ai9TraceToEval.tsx';
+
+## The problem
+
+A customer writes to your support bot: "Where is my refund for order 8841?" The bot answers in 4.3 seconds. Last week the same question took 1.8 seconds. Yesterday one answer said "30 days" when your policy says 14.
+
+Your logs hold one line per request: the time, the status code, and the total duration. That line cannot tell you which step was slow. It cannot tell you why the answer was wrong. It cannot tell you what the request cost.
+
+This lesson answers five questions:
+
+1. Why is one request many pieces of work?
+2. What goes wrong that one log line hides?
+3. What do you need to see to fix it?
+4. How do you record it so that any tool can read it?
+5. How do you keep the records private, affordable, and useful?
+
+By the end, you can open a recorded request, find the slow or wrong step, and turn it into a test.
+
+## Question 1: why is one request many pieces of work?
+
+An old web request often runs one handler and one database query. An AI request does not. Three terms explain why.
+
+A **language model** is a program that reads text and writes text. A **model call** is one request to it: you send text, it sends text back.
+
+A model cannot look up order 8841 by itself. It can only write text. So it writes a request, such as "look up order 8841". Your code runs a function that does the lookup and sends the result back to the model as more text. That function is a **tool**, and running it is a **tool call**.
+
+An **agent** is a loop around those two. Ask the model. Run the tool it asks for. Ask again. Stop when the model writes a final answer.
+
+Think of a waiter. You give one order. The waiter walks to the kitchen, comes back with a question ("sauce on the side?"), and walks again. To you it is one order. To the restaurant it is several trips.
+
+Our support bot made four trips for one question: a docs search, a model call, an order lookup, and a second model call. That took 4,300 ms. This is the normal shape, not a special case. Anthropic reports that agents "typically use about 4x more tokens than chat interactions", and multi-agent systems about 15x, in its [write-up of its multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system). More steps mean more places to be slow, wrong, or costly.
+
+## Question 2: what goes wrong that one log line hides?
+
+Three things, and each one is worse for an AI system.
+
+**A slow step hides inside the total.** Four steps share 4,300 ms. The log says 4,300. It does not say which step took how much. This also breaks the usual speed numbers. The **p95** is the latency that 95% of requests beat, so 1 request in 20 is slower. When p95 jumps, the log cannot tell you which step grew.
+
+**A wrong answer cannot be replayed.** Run the same request again and you may get a different path. Anthropic says its agents "are non-deterministic between runs, even with identical prompts". The record of the original run is your only evidence. Think of the black box on an aircraft. You read it after the incident, so it must record all the time.
+
+**The system can change under you.** In late summer 2025, Anthropic had a bug that sent some requests to the wrong server setup. Their [postmortem](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues) says it hit about 0.8% of Sonnet 4 requests at the start, and 16% in the worst hour, on August 31. About 30% of Claude Code users had at least one message routed wrong. The first reports "were difficult to distinguish from normal variation in user feedback". Their own tests missed it. You can lose a day or a week to a problem like this if you cannot group bad requests by something other than the user's complaint.
+
+## Question 3: what do you need to see?
+
+Take the support bot. For any one request, you want the answers to these:
+
+- Where did the time go, step by step?
+- What did each step get, and what did it write?
+- Which prompt, model, and tool versions were running?
+- What did the request cost?
+- How did it end?
+
+The tool that answers all five is a **trace**. You will build it in the real fix below. First, see why the simple ways do not work.
+
+<CrossTrackLink id="07-reliability/observability">
+A trace follows one request through many services. Each timed unit of work is a span. Spans nest, so a parent span can be split into its children. Metrics show averages over many requests, and logs show single events, but only a trace shows where the time went for one request. This lesson assumes that base and adds what changes when the steps are model calls and tools.
+</CrossTrackLink>
+
+## The naive way: one log line, or dump the prompt
+
+The first shortcut is the access log line. It gives the total and nothing else.
+
+The second shortcut is to print the final prompt and the answer to a log file. That is better, and it still fails:
+
+- **The middle is missing.** The final prompt does not show the first model call or the tool results that led to it.
+- **Lines from different requests mix.** A busy bot handles hundreds of requests at once. The four steps of one request end up far apart in the file, with no shared label.
+- **There are no timings per step.** You cannot say which step was slow.
+- **You cannot search by structure.** "Show me every run where the order tool failed" needs fields, not text.
+- **It stores private text.** Raw prompts hold names and emails, and a log file is copied to many places.
+
+We need a record that is split per step, tied together per request, and made of fields.
+
+## The real fix: record every step as a span
+
+### Idea 1: a trace is a tree of spans
+
+A **span** is the timed record of one piece of work. It has a name, a start time, an end time, a parent, and **attributes**. An attribute is a labeled fact: a key and a value, such as `tool = get_order`. A **trace** is all the spans of one request. They share one trace ID.
+
+Think of a restaurant receipt with line items. The total is at the top. Under it, each dish has its own price. A span tree works the same way: the parent shows the total time, and the children split it.
+
+The tree exists so that you can ask "which child is big?" instead of staring at a total. Here is our run:
+
+```
+Agent run                        4,300 ms
+├─ Search docs (tool)              390 ms
+├─ Model call 1                  1,200 ms
+├─ Look up order (tool)            600 ms
+└─ Model call 2                  1,950 ms
+```
+
+Add the four children: 390 + 1,200 + 600 + 1,950 = 4,140 ms. The run took 4,300 ms. The missing 160 ms is time in your own code between the calls. A trace shows that gap too.
+
+### Idea 2: put the facts of a model call on its span
+
+What goes on a model call span? The model you asked for, the model that answered, the tokens in and out, why the model stopped, any error, and the time.
+
+A **token** is a chunk of text, about a short word or a piece of a long one. Providers count tokens, bill by tokens, and take longer for more tokens. Think of a taxi meter. The meter decides both the fare and how long the ride feels. Tokens are the meter for a model call.
+
+The stop reason matters more than it looks. Anthropic's API returns a stop reason such as `tool_use` (the model wants a tool), `end_turn` (it finished), or `max_tokens` (it was cut off). A cut-off answer looks like a normal answer. Without the stop reason on the span, you cannot tell them apart.
+
+Step through one run. Watch what each span records, and read the verdict at the end.
+
+<Ai9TraceWalk client:visible />
+
+The numbers give a cost too. The run sent 3,120 + 4,810 = 7,930 tokens in and wrote 210 + 380 = 590 tokens out. At Claude Sonnet 5.5 prices ($2 per million tokens in, $10 per million out, as of 2026-10-16, from the [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing)), that is $0.0159 + $0.0059 = $0.0218 for one run, with no caching.
+
+### Idea 3: use shared names
+
+Every team that invents its own attribute names builds its own tools. A better path is a shared standard.
+
+**OpenTelemetry** (OTel) is an open standard for traces, metrics, and logs. It works in any language and sends data to any backend. The backend lesson linked above covers it. For AI work, an OpenTelemetry group wrote the **GenAI conventions**: agreed names for the attributes of model calls, tool calls, and agents.
+
+Think of shipping containers. Every crane, ship, and truck handles the same box size. Agreed names do that for traces: the small libraries that add tracing to your code emit the names, and any backend reads them. You can change your backend without rewriting your code.
+
+Here is what a model call span looks like with the standard's names. Everything after `#` is a note, not part of the data:
+
+```
+span name: chat claude-sonnet-5-5               # kind: client
+gen_ai.operation.name        = chat             # required
+gen_ai.provider.name         = anthropic        # required
+gen_ai.request.model         = claude-sonnet-5-5
+gen_ai.response.model        = <what answered>
+gen_ai.response.finish_reasons = ["stop"]       # why the model stopped
+gen_ai.usage.input_tokens    = 3120
+gen_ai.usage.output_tokens   = 210
+error.type                   = <only on error>
+server.address               = <which endpoint>
+```
+
+Tool and agent spans have names too. A tool span is called `execute_tool get_order`. An agent span is `invoke_agent support-bot`. The standard also has `plan` and `invoke_workflow` spans.
+
+Two warnings. First, the standard marks these names with the status **Development**. That means they can still change. The group has also moved its pages out of the main OpenTelemetry repository into its own, `semantic-conventions-genai`. Check that repository before you hard-code a name. Second, the names above are only the shared part. For the rest, use your own prefix, such as `app.prompt.version`, so you never collide with a future standard name.
+
+### Idea 4: count cached tokens, or your dashboard lies
+
+A **prompt cache** is a provider feature. The provider remembers the start of a prompt it has seen. When a new request starts with the same text, it reads that start from the cache and charges a small share of the normal price. For Claude Sonnet 5.5, a cache read costs $0.10 per million tokens, against $2 for normal input (as of 2026-10-16). Think of a bookmark: you skip the first 200 pages and start where the bookmark is.
+
+Why does tracing care? Anthropic reports the counts apart. The `input_tokens` field holds only the fresh tokens after the last cached part. Cached tokens come in two other fields. Anthropic's [rate limit page](https://platform.claude.com/docs/en/api/rate-limits) gives an example: a 200,000-token cached document and a 50-token question give `input_tokens: 50`, though the real input is 200,050 tokens.
+
+Imagine a dashboard that reads only that field. The day you turn on caching, it shows prompt size falling by 99.97%. Nothing really fell. The standard avoids the trap by defining the input total as the sum of three fields. The Anthropic page of the OTel conventions says:
+
+```
+gen_ai.usage.input_tokens             = input_tokens
+                                      + cache_read_input_tokens
+                                      + cache_creation_input_tokens
+gen_ai.usage.cache_read.input_tokens  = cache_read_input_tokens
+gen_ai.usage.cache_write.input_tokens = cache_creation_input_tokens
+```
+
+Note the two names for the same thing. Anthropic's API says "cache creation". The standard says "cache write". Map one to the other once, at the point where the data enters your trace store. Try the widget.
+
+<Ai9TraceTokens client:visible />
+
+### Idea 5: tag every trace with versions
+
+When quality drops, the first question is "what changed?" A trace that records only the model name cannot answer it. A change in the prompt, the tool descriptions, or the retrieval settings (how you look up documents to put in the prompt) looks the same from outside.
+
+So put the versions on the trace: the prompt version, the tool definitions, the retrieval settings, and the model ID that actually answered. Think of a lab notebook. A result with no recipe version is not worth much.
+
+Agents need one more tag. An agent holds state: the messages so far and any plan. Save that state at each step as a **checkpoint**, and write its ID on the span. Then you can restart a failed step from exactly the state it saw, instead of guessing.
+
+With version tags, "error rate by prompt version" is one group-by. Without them, you compare timestamps and hope. Lesson A9.3 treats these items as one release.
+
+### Idea 6: keep private text out
+
+The standard treats message content as **opt-in**. The input and output messages are off unless you switch them on. That default is deliberate.
+
+Think of a hospital. Headcounts and wait times are fine to share widely. Patient charts go in a locked cabinet. In a trace, tokens, timings, and versions are the headcounts. Prompt text is the chart. It holds names, emails, and anything a customer typed.
+
+Three habits keep you safe:
+
+- **Metadata by default.** Store the counts, timings, and versions for every run.
+- **Redact before storage.** Replace private data with placeholders, such as `<NAME>` and `<EMAIL>`, before the trace leaves your service. A pattern finds an email address reliably. Names are harder, and some slip through. Treat redaction as risk reduction, not a guarantee.
+- **Capture content narrowly.** Switch it on for flagged runs or a short window, and log who reads it.
+
+Metadata is more useful than it sounds. Anthropic says its privacy controls "limit how and when engineers can access user interactions". That is right, and it also meant engineers could not simply read the bad ones during the 2025 incident. Counts, versions, and server names let you group bad requests without reading anyone's text.
+
+### Idea 7: keep what matters, and make it searchable
+
+Storing every trace costs money. **Sampling** means storing only a share. Think of a security camera that keeps all footage near an alarm and only a few minutes of the quiet hours.
+
+Suppose 2% of runs fail or run slow. Keep all of them. Keep 5% of the rest. You store 0.02 + 0.98 × 0.05 = 6.9% of runs, which is 93% less storage. This only works if you decide after the run ends, because you only know a run failed at the end.
+
+Stored traces must be easy to search. Hamel Husain, who has helped many teams build AI products, [writes](https://hamel.dev/blog/posts/evals/): "Searching, filtering, and reading traces are essential features for whatever solution you pick." Filter by prompt version, by tool, by error, and by user feedback.
+
+### Idea 8: turn a trace into a test
+
+A trace is the best source of real failures you will get. An **eval set** is a list of test cases, each with an input and the expected outcome. It works like unit tests for model behavior. The lessons [A8.1](/learn/ai/a8-evals/eval-driven-design/) and [A8.2](/learn/ai/a8-evals/error-analysis/) cover how to build and read one.
+
+Think of a bug report that becomes a regression test. The path has five stops: find the flagged trace, redact it, write a one-line label of what went wrong, add it to the set, and run the set on every change.
+
+<Ai9TraceToEval client:visible />
+
+The set grows by one case, from 120 to 121. The new case fails until someone fixes the bug, and after that it guards against the bug coming back. Hamel's advice for how long to keep reading traces is a good rule: keep going until you stop learning anything new.
+
+## Numbers
+
+| Item | Value | Source |
+|---|---|---|
+| Support bot run | 5 spans, 4,300 ms | Illustrative |
+| Time inside model calls | 3,150 ms of 4,300 ms, 73% | Derived from the trace above |
+| Cost of that run | $0.0218 | Derived at Sonnet 5.5 prices, no caching |
+| Input seen by a cache-blind dashboard | 50 tokens instead of 200,050 | Anthropic rate limit page |
+| Requests misrouted in the 2025 incident | 0.8% at the start, 16% in the worst hour | Anthropic postmortem |
+| Storage kept with the sampling rule above | 6.9% of runs | Derived |
+| Stability of the GenAI attribute names | Development | OpenTelemetry GenAI repository |
+
+A design needs three more numbers. The **quality bar** for tracing itself is the share of failed runs that have a complete trace. The target is 100%, and you measure it by counting failed runs with no trace. The **latency budget** is close to zero for the user, if you send spans in the background in batches instead of inside the request. The **cost** is storage: the sampling rule above stores about 7% of runs.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Metadata only | Safe by default, small, cheap to keep | You cannot read what the model saw | Always the default |
+| Capture content | You can read the exact failing prompt | Privacy risk, redaction work, more storage | Flagged runs, short windows, access logged |
+| Keep every trace | Nothing is lost | Storage grows with traffic | Low traffic, or early in a project |
+| Sample, keep failures | About 93% less storage in the example | You decide after the run, and you lose most good runs | Production traffic |
+| Standard names | You can switch backends | The names can still change | Almost always, with one mapping layer |
+
+## What experienced teams know
+
+1. **A cache-blind dashboard shows a fake drop.** The provider reports fresh and cached tokens in separate fields, and the standard defines the input total as their sum. Add them when the data enters your store, and keep all three. Otherwise the day you turn on caching looks like a collapse in prompt size. See the [Anthropic page of the OpenTelemetry conventions](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/anthropic.md).
+
+2. **Treat the attribute names as a moving target.** The standard is still labeled Development, and its pages moved to a new repository. Langfuse, a trace tool, [says](https://langfuse.com/integrations/native/opentelemetry) the GenAI names "are still evolving". Map names in one place where data enters your store, so a rename means one change, not fifty.
+
+3. **Log the model that answered, with a date.** Anthropic says each model ID is pinned, but "Occasionally, infrastructure updates produce minor differences in observable behavior even when the model ID and weights have not changed" ([model IDs page](https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions)). If behavior shifts with no deploy of yours, compare traces from before and after that date.
+
+4. **Record where each request ran.** In the 2025 incident, Anthropic says its routing is "sticky", so some users were hit much harder than others. One bad server can look like one unlucky user. Store the server address and the conversation ID so you can group by them.
+
+5. **Tests can miss what users feel.** Anthropic said its evaluations "didn't capture the degradation users were reporting", partly because Claude "often recovers well from isolated mistakes". Traces of real traffic are the second net. Read them, and add what you find to the eval set.
+
+6. **Remove friction from reading traces.** Hamel Husain [says](https://hamel.dev/blog/posts/evals/): "You must remove all friction from the process of looking at data." He also warns that some tools "do not implement these basic functions correctly". Before you pick a tool, test search, filter, and a one-click open of a full trace.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I model an agent run as a trace: a root span for the run, a child per model call and tool call. Each model span carries model, tokens in and out including cached tokens, stop reason, and version tags. I redact before storage, keep content opt-in, sample successes but keep every failure, and send flagged traces to the eval set." That covers structure, cost, privacy, and the loop back to tests.
+</Callout>
+
+<Callout type="mistake">
+Do not answer a slow-p95 question with "check the GPUs (the chips that run models)" or "use a faster model". You have not found the slow part yet. Say you would pull a trace of a p95 request and find the widest span first. Also do not say "log every prompt". That is a privacy risk, and it still lacks timings per step.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'ai9-trace-fake-token-drop',
+      q: 'A dashboard shows prompt tokens per request falling from 8,000 to 2,000 on the day you turned on prompt caching. Traffic and answers are unchanged. What is the most likely cause?',
+      options: [
+        'The model began ignoring the end of every prompt it receives',
+        'Users began sending much shorter questions on that same day',
+        'The provider shrinks cached prompts to a quarter of their size',
+        'The dashboard counts only fresh input, not cached tokens',
+      ],
+      answer: 3,
+      explain: 'The provider reports fresh input apart from cache reads and cache writes. A dashboard that reads one field sees a fake drop. The true total is the sum of the three. Shorter questions would not change the shared prompt start, and the provider does not shrink cached text.',
+    },
+    {
+      id: 'ai9-trace-uncovered-gap',
+      q: 'A run lasted 4,300 ms. Its child spans took 390, 1,200, 600, and 1,950 ms. What explains the missing 160 ms?',
+      options: [
+        'Time in your own code between the calls, which no child span covers',
+        'A fifth span that the tracer silently dropped',
+        'Clock drift, which makes span times add up to less than the run',
+        'Time the model spent thinking before it answered, which is hidden from the trace',
+      ],
+      answer: 0,
+      explain: '390 + 1,200 + 600 + 1,950 = 4,140 ms, so 160 ms lies between spans. That is your own code: building prompts, parsing replies, waiting for a thread. Model time is already inside the model call spans.',
+    },
+    {
+      id: 'ai9-trace-private-content',
+      q: 'A team wants to save the full prompt and answer on every span to debug faster. Which starting design is safest?',
+      options: [
+        'Save everything for every run and protect the store with a shared password',
+        'Save only the failed runs, with the text left exactly as it came in',
+        'Save nothing at all, not even token counts, timings, or version tags',
+        'Keep metadata, redact text, and capture content only for flagged runs',
+      ],
+      answer: 3,
+      explain: 'Counts, timings, and versions carry little private data and answer most questions. Content is opt-in and redacted before storage. Saving raw text for failed runs still stores private data. Saving nothing leaves you blind.',
+    },
+    {
+      id: 'ai9-trace-sampling-share',
+      q: 'About 2% of runs fail or run slow. You keep all of those and 5% of the other runs. What share of all runs do you store?',
+      options: [
+        'About 5%',
+        'About 7%',
+        'About 2%',
+        'About 52%',
+      ],
+      answer: 1,
+      explain: 'You keep 2% plus 5% of the remaining 98%: 0.02 + 0.98 x 0.05 = 0.069, about 7%. The 5% figure forgets the failures you keep. The 2% figure forgets the sample of good runs.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai9-slow-p95-order-tool"
+  title="The slow p95"
+  scenario="The support bot has a median latency of 3.1 s and a p95 of 9.8 s. You pull the trace of one p95 request."
+  facts={[
+    'trace 7c1e   total 9,840 ms   prompt v14   model claude-sonnet-5-5',
+    'Model call 1      30 -  1,310 ms   in 3,090  out 205  stop tool_use',
+    'Order tool #1  1,330 -  3,830 ms   error timeout',
+    'Order tool #2  3,880 -  6,380 ms   error timeout',
+    'Order tool #3  6,430 -  8,430 ms   ok',
+    'Model call 2  8,460 -  9,810 ms   in 3,540  out 190  stop end_turn',
+  ]}
+  steps={[
+    {
+      prompt: 'Which part of the trace explains most of the extra time?',
+      options: [
+        'The order tool, which failed twice before it worked',
+        'Model call 2, because it has the most input tokens',
+        'Model call 1, because it started the run',
+        'The time before the first span, which is network delay',
+      ],
+      answer: 0,
+      explain: 'The three order tool spans take 2,500 + 2,500 + 2,000 = 7,000 ms, which is 71% of 9,840 ms. The two model calls take 1,280 + 1,350 = 2,630 ms, a normal amount for two calls. Token counts alone do not make a span slow.',
+    },
+    {
+      prompt: 'What is the best fix?',
+      options: [
+        'Move to a faster model, which lowers the time of both model calls',
+        'Raise the tool timeout to 5 s so that the first attempt succeeds more often',
+        'Set a short tool timeout, cap the retries, and answer with a fallback message if they run out',
+        'Add more GPUs, which gives each model call more compute',
+      ],
+      answer: 2,
+      explain: 'The slow part is a tool that times out and is retried, not the model. A short timeout with a retry cap bounds the worst case, and a fallback answers the user in time. A faster model saves little of the 7,000 ms. GPUs are not in your path when you call an API. A longer timeout makes the worst case worse.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [OpenTelemetry GenAI semantic conventions (repository)](https://github.com/open-telemetry/semantic-conventions-genai): the current home of the attribute names. Check status and names here.
+- [OpenTelemetry GenAI conventions for Anthropic](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/anthropic.md): how Anthropic usage fields map to the standard's names.
+- [Anthropic: a postmortem of three recent issues](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues): a real incident where traffic share, routing, and privacy limits shaped the debugging.
+- [Hamel Husain: your AI product needs evals](https://hamel.dev/blog/posts/evals/): why reading traces comes first.

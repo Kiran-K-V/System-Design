@@ -32,7 +32,7 @@ export default function PacketLayers() {
 
         <SketchBox cx={510} cy={150} w={420} h={270} stroke={layers[3].color} seed={seedOf('frame')} r={14} />
         <HandText x={312} y={34} size={14} anchor="start" color={layers[3].color}>
-          Ethernet frame (carries at most 1,500 B: the MTU)
+          Link frame (at most 1,500 B on Ethernet or Wi-Fi)
         </HandText>
         <SketchBox cx={510} cy={168} w={396} h={215} stroke={layers[2].color} seed={seedOf('ip')} r={12} />
         <HandText x={326} y={78} size={14} anchor="start" color={layers[2].color}>
@@ -47,7 +47,7 @@ export default function PacketLayers() {
           your data
         </HandText>
         <HandText x={510} y={221} size={14} color="var(--muted)">
-          up to 1,460 B (MSS = 1,500 - 20 - 20)
+          up to 1,460 B (1,500 - 20 - 20)
         </HandText>
         <HandText x={510} y={299} size={14} color="var(--muted)">
           With UDP the header is 8 B, so up to 1,472 B of data

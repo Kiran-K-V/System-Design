@@ -2,7 +2,7 @@
 
 export type Method = 'full' | 'lora' | 'qlora';
 
-/** Mixed-precision Adam, bytes per parameter (ZeRO paper, arXiv 1910.02054): 2 weights + 2 gradients + 12 optimizer states. */
+/** Mixed-precision Adam, bytes per parameter (Microsoft ZeRO paper, 2019): 2 weights + 2 gradients + 12 optimizer states. */
 export const BYTES = { weights: 2, grads: 2, master: 4, adamM: 4, adamV: 4 } as const;
 export const BYTES_PER_TRAINED_PARAM = BYTES.weights + BYTES.grads + BYTES.master + BYTES.adamM + BYTES.adamV; // 16
 
@@ -55,14 +55,14 @@ export function budget(paramsNominal: number, c: Config, method: Method, rank: n
   const segs: Budget['segs'] = [];
   let trainable = n;
   if (method === 'full') {
-    segs.push({ id: 'w', label: 'weights (BF16)', gb: (n * BYTES.weights) / GB });
+    segs.push({ id: 'w', label: 'weights (16-bit)', gb: (n * BYTES.weights) / GB });
     segs.push({ id: 'g', label: 'gradients', gb: (n * BYTES.grads) / GB });
-    segs.push({ id: 'm', label: 'FP32 master copy', gb: (n * BYTES.master) / GB });
-    segs.push({ id: 'a', label: 'Adam moments', gb: (n * (BYTES.adamM + BYTES.adamV)) / GB });
+    segs.push({ id: 'm', label: 'master copy', gb: (n * BYTES.master) / GB });
+    segs.push({ id: 'a', label: 'optimizer notes', gb: (n * (BYTES.adamM + BYTES.adamV)) / GB });
   } else {
     trainable = loraParams(c, rank);
     const base = method === 'lora' ? BYTES.weights : NF4_BYTES;
-    segs.push({ id: 'w', label: method === 'lora' ? 'frozen base (BF16)' : 'frozen base (NF4)', gb: (n * base) / GB });
+    segs.push({ id: 'w', label: method === 'lora' ? 'frozen base (16-bit)' : 'frozen base (4-bit)', gb: (n * base) / GB });
     segs.push({ id: 't', label: 'adapter states', gb: (trainable * BYTES_PER_TRAINED_PARAM) / GB });
   }
   segs.push({ id: 'act', label: 'activations (assumed)', gb: activationGB });

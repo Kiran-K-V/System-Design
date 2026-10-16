@@ -1,0 +1,329 @@
+---
+summary: 'A golden set is a labeled, versioned set of test cases drawn from real traces, filled out with synthetic cases for rare scenarios, and split so you never tune on the half you grade with. Public benchmarks leak into training data, so choose models with your own private set.'
+requires: ['ai/a8-evals/error-analysis']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai8GoldGrow from '../../../../components/anim/lessons/Ai8GoldGrow.tsx';
+import Ai8GoldOverlap from '../../../../components/anim/lessons/Ai8GoldOverlap.tsx';
+
+## The problem
+
+A team must pick a model for its SQL assistant. Model X scores 95% on a well-known public benchmark of SQL questions. Model Y scores 91%. The team also built its own test, using 87 questions taken from real customer chats. On that test, X scores 60% and Y scores 78%.
+
+Which numbers should the team trust?
+
+The answer decides money and customer experience, and the two tests disagree about which model is better. This lesson shows how to build the team's own test so you can trust it, and why a public score can mislead. It answers six questions:
+
+1. What is a golden set, and where do its cases come from?
+2. How do you cover the rare cases?
+3. How do you avoid fooling yourself while you tune?
+4. How do you know the labels are right?
+5. How many cases do you need?
+6. Why can a public benchmark be wrong for you?
+
+## Question 1: what is a golden set, and where do its cases come from?
+
+In lesson [A8.1](/learn/ai/a8-evals/eval-driven-design/), an eval was a fixed set of test cases plus a grader. A **golden set** is the best version of that set. Each case has an input, a verified label (pass or fail, or the right answer), and a tag for the scenario it covers. "Golden" means you trust it more than anything else you have.
+
+An everyday picture: the master copy of a map. Every other map is checked against it, so errors in the master spread everywhere.
+
+Where do the cases come from? From your own users, first. Lesson [A8.2](/learn/ai/a8-evals/error-analysis/) showed how to read real traces and find failure types. Those traces are the raw material. Real traces have your real wording, your real mess, and your real mix of problems. Nobody on your team would invent them.
+
+Shopify's engineers describe the same move in their [2025 post on building their Sidekick assistant](https://shopify.engineering/building-production-ready-agentic-systems). They moved away from hand-made "golden" datasets to what they call Ground Truth Sets that "reflect actual production distributions". They sample real conversations and write the grading rules from what they see. They advise having at least three product experts label each set of conversations.
+
+## Question 2: what do real traces miss?
+
+Real traces over-represent what is common. A refund question may appear 200 times and a warranty claim in a messy format may appear twice. Rare scenarios still matter. A rare one may be the one that costs you a customer, or breaks a law.
+
+So you need a way to add cases for the rare scenarios. A **synthetic** case is one you write or generate on purpose, not one that came from a real user. Think of a fire drill. You do not wait for a real fire to test the exits.
+
+## Question 3: how do you avoid fooling yourself?
+
+You will change your prompt many times to raise the score. After enough changes, the prompt fits the test cases the way a student fits last year's exam. The score stops measuring skill and starts measuring memory. This is called **overfitting to the test**.
+
+The fix is old and simple: keep some cases back and do not look at them while you tune.
+
+## Question 4: how do you know the labels are right?
+
+A golden set is only as good as its labels. People disagree. Two experts may label the same answer differently. You need a way to measure that, and a way to decide what "good enough" means.
+
+## The naive way: write 30 questions and trust a leaderboard
+
+The first plan is to have one engineer write 30 questions from memory, label them alone, and test on them. The second plan is to trust a public score. Both fail.
+
+The 30 questions come from one head. They cover what that engineer thought of, not what users ask. One person's labels cannot be checked. And 30 cases give only a wide range of what the true pass rate might be.
+
+The public score has its own flaws, covered in Idea 6. In short: the questions may have been seen during training, and the leaderboard may favor those who tuned for it.
+
+## The real fix: six ideas
+
+### Idea 1: start from real traces and tag the scenarios
+
+**What it is.** Take cases from the failures and the typical traces you read in A8.2. Tag each one with a scenario (what the user wanted) and a variant (typical, messy, edge case). Write the expected result or the rule it must follow. Include failures. Hamel Husain's guidance on judge sets suggests about 30 to 50 passing and 30 to 50 failing examples in each of the dev and test sets, so the set is not mostly easy passes. A set of easy passes hides regressions.
+
+**Picture.** A coverage map of a city. Each cell is a district. You want at least a few test visits to every district.
+
+**Why it exists.** Tags let you see where the set is thin, and report results per scenario, not as one blended number.
+
+**Number.** Airbnb's engineering post on eval-driven development gives a guide, not a measurement: "Create a golden dataset of 50–100 examples", and it "MUST include bad examples". That is a good size for a first version.
+
+### Idea 2: fill gaps with synthetic cases, built from dimensions
+
+**What it is.** Look at the coverage map and add cases to the thin cells. Do not ask a model for "20 test questions". Hamel's FAQ warns that this gives generic, repetitive output. Use his structured method:
+
+1. Pick **dimensions**, which are the ways user requests vary. For a support bot: issue type, how upset the customer is, and whether there is earlier conversation.
+2. Write about 20 combinations by hand. Each one is a tuple, one value per dimension, such as (warranty claim, angry, no history).
+3. Ask a model to generate more tuples, and then, in a separate step, turn each tuple into a realistic message. Two steps give less repetitive wording than one.
+4. Run the messages through the real system and read the traces.
+
+Fix known problems first. If the prompt already ignores a rule, fix the prompt before you write test cases for it.
+
+**Picture.** A casting call. You do not ask for "some actors". You write what each part needs, and then audition for each part.
+
+**Why it exists.** You can start before you have users, and you can reach scenarios that real data rarely shows.
+
+**Number.** In the animation, 68 real cases leave 7 thin or empty cells. Adding 19 synthetic cases brings every cell to at least 3, for 87 in total.
+
+<Ai8GoldGrow client:visible />
+
+One warning. Once you add rare cases, the set no longer mirrors your traffic. The pass rate over all 87 is not the production pass rate. Report the result per scenario, or weight each scenario by its real share of traffic.
+
+### Idea 3: split the set, and version it
+
+**What it is.** Split the labeled cases into two parts: a **dev** part you look at and tune against, and a **test** part you keep for honest scores. For the labels you use to check an LLM judge (lesson A8.4), Hamel's guide suggests 10 to 20% for a small training part and 40 to 45% each for dev and test, with 30 to 50 of each label in dev and test. Then **version** the set: give it a name such as golden-v1, never edit it in place, and make golden-v2 for any change.
+
+**Picture.** A teacher keeps back an exam the class has never seen. Practice questions are for study. The final is for the grade.
+
+**Why it exists.** Tuning on every case turns the score into a memory test. Versions make scores comparable. A score on v1 and a score on v2 are not the same measurement.
+
+**Number.** The 87 cases split into 44 dev and 43 test. Each half has about 43 to 44 cases. We will see next why even that is a small sample.
+
+### Idea 4: measure the labels, not just the answers
+
+**What it is.** Have two people label a sample of the cases and compare. The simple measure is raw agreement: the share of cases where both gave the same label. But raw agreement misleads when most cases have one answer. The better measure is **Cohen's kappa**, a number that corrects for the agreement you would get by guessing. Kappa is 0 when the labelers agree no more than chance, and 1 when they agree perfectly.
+
+**Picture.** Two people guess at heads or tails with a mostly-heads coin. They will agree most of the time with no skill at all. Kappa subtracts that free agreement.
+
+**Why it exists.** If the people cannot agree, the label is not a fact. A judge or a model cannot be held to a standard that people do not share.
+
+**Number.** Say two labelers each mark 90% of 100 cases as pass, and they agree on 90% of cases. Raw agreement is 0.90, which sounds great. Chance agreement is 0.9 x 0.9 + 0.1 x 0.1 = 0.82, because two people who pass nine in ten would often match by luck. Kappa = (0.90 - 0.82) / (1 - 0.82) = 0.08 / 0.18 = 0.44. A quarter of the apparent quality was chance. Shopify reported a human baseline of 0.69 on its Sidekick labels, and Airbnb's guide notes: "Perfect agreement isn't achievable — even humans disagree."
+
+### Idea 5: count how many cases you need
+
+**What it is.** The number of cases decides how finely you can tell two versions apart. For a pass rate near 50%, the 95% range around your measured rate is about plus or minus 1.96 x square root of (p x (1 - p) / n). Turn that around to get cases for a wanted margin e: n = 1.96 squared x p x (1 - p) / e squared.
+
+**Picture.** A poll. Asking 10 people tells you almost nothing about a city. Asking 1,000 tells you quite a lot.
+
+**Why it exists.** Teams read a 3-point gain on 100 cases as real. It is not.
+
+**Number.** At p = 0.5 and 95% confidence: for plus or minus 10 points you need 97 cases, and for plus or minus 5 you need 385. Two versions each tested on 100 different cases need a gap of about 14 points to stand out from noise (1.96 x square root of 2 x 0.25 / 100 = 0.139). Testing both on the same cases and counting flips, as in lesson A8.1, does much better. It is why a 100-case set can still guide you.
+
+### Idea 6: assume public benchmarks leak, and measure how much
+
+**What it is.** A public benchmark is a published test set that many people use to compare models. **Contamination** means some of its test items appeared in a model's training data. A model that has seen the answer is not being tested on skill. The first piece of evidence is old. A 2021 study documenting the C4 training corpus by Dodge and colleagues found "evaluation examples from other benchmark NLP datasets" inside it. A 2023 position paper by Sainz and colleagues states that contamination "causes an overestimation of the performance of a contaminated model", and also that its extent "is unknown, as it is not straightforward to measure".
+
+**Picture.** A student who found last year's exam paper in the library. A high mark may be skill, or it may be memory. You cannot tell from the mark.
+
+**Why it exists as a risk.** Models train on huge copies of the web. Benchmarks sit on the web. And with a closed model you cannot inspect the training data.
+
+**Number.** In 2024, researchers wrote a fresh set of grade-school math problems, GSM1k, built to match the well-known GSM8k in style and difficulty. Several models scored lower on the new set, with accuracy drops of up to 8%. A model's tendency to produce GSM8k examples tracked the size of its drop (a Spearman r-squared of 0.36). That is a controlled test of memorization.
+
+How do you look for overlap when you can see the training text? The GPT-3 paper (2020) did it with **n-grams**: runs of n words in a row. It flagged any test item that shared a 13-word run with the training data, removed those, and re-scored the "clean" part. Try the idea below.
+
+<Ai8GoldOverlap client:visible />
+
+The checker shows both limits. Short runs flag innocent items, and long runs miss a rewrite of the same problem. An overlap scan finds copies. It does not find paraphrases.
+
+What can you do when you cannot see a closed model's training data? Four defenses:
+
+- **Keep your own set private.** Never paste it into a public repo or a public prompt.
+- **Build a fresh matched set.** As GSM1k did, write new cases in the style of the public ones, and see whether the score falls.
+- **Use held-out splits.** The SWE-Bench Pro coding benchmark (2025) has 1,865 problems from 41 repositories. Its public part uses 11 of those repositories, a held-out part uses 12, and a commercial part uses 18 private ones. The held-out and commercial problems are not public. The authors call it a "contamination-resistant testbed".
+- **Rotate.** Retire items from a set after they have been seen, and add new ones.
+
+## Numbers
+
+Quality bar for the set: every scenario has at least 3 cases, at least two people labeled a sample, and kappa on that sample is at least about 0.6 (Shopify's judge reached 0.61 against a human baseline of 0.69). Latency budget: a full run of 87 cases times 3 trials finishes in a few minutes. Cost: with the A8.1 token sizes (illustrative), Sonnet 5.5 for the model and Haiku 5.5 for the judge, 87 x 3 = 261 calls cost 261 x $0.009 = $2.35 for the model and 261 x $0.0003 = $0.08 for the judge. That is about $2.43 a run. Prices as of 2026-10-16, from the [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing).
+
+Labeling is the bigger bill. At an illustrative 2 minutes per case, 87 cases take 174 minutes, which is 2.9 hours. A second person on a 30-case sample takes 60 minutes more. Compare that with $2.43 for the run. People are the cost. Keep the set small enough to maintain and large enough to see the changes you care about.
+
+| Quantity | Value | Derivation |
+|---|---|---|
+| Cases for plus or minus 10 points | 97 | 1.96 squared x 0.25 / 0.1 squared |
+| Cases for plus or minus 5 points | 385 | 1.96 squared x 0.25 / 0.05 squared |
+| Gap to see between two separate 100-case runs | about 14 points | 1.96 x square root of (2 x 0.25 / 100) |
+| Kappa of two labelers, 90% pass, 90% agreement | 0.44 | (0.90 - 0.82) / 0.18 |
+| Cost of one 87-case, 3-trial run | about $2.43 | 261 x ($0.009 + $0.0003) |
+
+## Trade-offs
+
+| Source of cases | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Real traces | True wording and mix, finds surprises | Slow to collect, privacy work, rare cases are rare | Always the first source |
+| Synthetic cases | Fast, targets rare scenarios, no users needed | May not sound real, cannot show how common a failure is | Filling thin cells, and starting before launch |
+| Public benchmark | Comparable across teams and models | May be in training data, may not match your task | Shortlisting models, never the final choice |
+| Private held-out set | Trusted score for your task | Not comparable across teams, costs labeling time | Choosing a model and gating a release |
+
+## What experienced teams know
+
+1. **Contamination often matters less than feared, so measure it before you panic.** The GPT-3 paper (Brown et al., 2020) removed any test item that shared a 13-gram with its training data, then compared scores. It reported that potential contamination was often high, with a quarter of benchmarks over 50% flagged, yet "in most cases performance changes only negligibly". It found real evidence for only a few tasks, such as PIQA and Winograd. Do the clean-subset comparison. If the score does not change, the leak did not help.
+
+2. **A fresh matched set is the best detector you can run on a closed model.** You cannot read the training data of a model behind an API. You can write 40 new questions in the style of a public set and see whether the score drops. The [GSM1k study](https://arxiv.org/abs/2405.00332) found drops of up to 8%. Keep a small stash of unpublished cases for this check.
+
+3. **An n-gram scan finds copies and misses rewrites.** Use the widget above: at 13 words, item B (the same problem in new words) is clean. A translated or paraphrased leak passes the scan. So treat a clean scan as "no copies", not "no contamination".
+
+4. **A leaderboard is a target people tune against.** The [Leaderboard Illusion paper](https://arxiv.org/abs/2504.20879) (April 2025) studied the Chatbot Arena rankings. It found that some providers test many private variants and publish the best. Meta tested 27 private variants before the Llama 4 release. A ranking built that way is biased toward the winner of the private contest. Use rankings to build a shortlist. Use your own private set to choose.
+
+5. **Raw agreement flatters. Kappa tells the truth.** Two labelers who pass 9 of 10 cases and agree 90% of the time score a kappa of 0.44, as computed above. If you report agreement, report kappa next to it. Set the target from the human ceiling: Shopify's judges were held to a human baseline of 0.69, not to 1.0.
+
+6. **A model retirement notice is an eval deadline.** Anthropic's [deprecations page](https://platform.claude.com/docs/en/about-claude/model-deprecations) promises at least 60 days' notice before retirement of a publicly released model, and advises testing replacements "well before the retirement date". On 2026-09-30 it announced that Claude Sonnet 4.5 retires on 2026-11-30, with claude-sonnet-5-5 as the recommended replacement. As of 2026-10-16 that leaves 45 days. If your golden set is versioned and runs in minutes, the migration is an afternoon. If not, it is a scramble.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I build the golden set from real traces, tagged by scenario, then fill thin scenarios with synthetic cases built from dimensions. I split it into dev and test and version it. Two people label a sample and I report kappa. I size the set for the effect I need to see, and I compare versions case by case. For model choice I use a private set, because public benchmarks can leak into training data." This covers sources, split, labels, size, and contamination.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we picked the model with the best benchmark score". Do not tune on every case and then report the same cases as the result. Do not claim a clean n-gram scan proves a benchmark is clean. And do not report one blended pass rate over a set where you added rare cases on purpose.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Two people each label 100 cases and pass 90% of them. They agree on 90 of the 100 cases. What is Cohen\'s kappa?',
+      options: [
+        'About 0.90, the same as raw agreement',
+        'About 0.82, the chance agreement',
+        'About 0.44, with chance removed',
+        'About 0.08, the gap above chance',
+      ],
+      answer: 2,
+      explain: 'Chance agreement is 0.9 x 0.9 + 0.1 x 0.1 = 0.82. Kappa = (0.90 - 0.82) / (1 - 0.82) = 0.44. The 0.08 answer is the top of the fraction and forgets to divide. 0.82 is the chance part, not kappa.',
+    },
+    {
+      q: 'Model A scores 80% and model B scores 86% on the same 100 cases. A 95% range for each rate is roughly plus or minus 7 or 8 points. What is the fair reading?',
+      options: [
+        'B is clearly better, because 86 is above 80 and both used the same cases',
+        'The ranges overlap, so check which cases flipped first',
+        'A is better, because its range is wider and so it covers more cases',
+        'Neither can be read, because 100 cases is too few for any comparison',
+      ],
+      answer: 1,
+      explain: 'A runs from about 71% to 87% and B from about 78% to 91%. They overlap a lot, so the 6-point gap is weak evidence on its own. A per-case look at flips uses the pairing and is more sensitive. 100 cases still shows large gaps.',
+    },
+    {
+      q: 'A test question appears in the training text translated into French. The team scans for English 13-word overlaps. What does the scan report for that question?',
+      options: [
+        'Clean, because no 13-word English run matches',
+        'Flagged, because the meaning is the same',
+        'Flagged, because the numbers in the problem match',
+        'It reports a partial match at the French words',
+      ],
+      answer: 0,
+      explain: 'An n-gram scan compares exact word runs, so a translation shares none. This is the limit of overlap checks: they find copies, not paraphrases or translations. A fresh matched set can catch what the scan misses.',
+    },
+    {
+      q: 'A team tuned its prompt on all 87 cases and the pass rate rose from 70% to 90%. What does the 90% mainly show?',
+      options: [
+        'The prompt now handles all future users at about 90% accuracy',
+        'The labels in the set were wrong before the tuning began',
+        'The model itself got better at the task during the tuning',
+        'It shows fit to those cases, so you need a held-out test half',
+      ],
+      answer: 3,
+      explain: 'Tuning against the same cases you grade with measures fit, not skill on new traffic. Holding back a test half and looking at it rarely is how you get an honest score. The model itself did not change.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="How many cases do you need?"
+  scenario="Use n = 1.96 squared x p x (1 - p) / e squared, where p is the pass rate you expect and e is the margin you want (as a fraction). Use p = 0.5 unless told otherwise."
+  steps={[
+    {
+      prompt: 'How many cases for a margin of plus or minus 10 points (e = 0.10)?',
+      unit: 'cases',
+      answer: 97,
+      within: 1.1,
+      explain: '1.96 squared is 3.84. 3.84 x 0.25 = 0.96. Divide by 0.1 squared = 0.01. That gives about 96 to 97 cases.',
+    },
+    {
+      prompt: 'How many cases for plus or minus 5 points (e = 0.05)?',
+      unit: 'cases',
+      answer: 385,
+      within: 1.1,
+      explain: 'Halving the margin multiplies the cases by 4: 0.96 / 0.0025 = 384 to 385. Precision is expensive: twice as sharp costs four times the labels.',
+    },
+    {
+      prompt: 'The failure you track is about 5% of traffic (p = 0.05). How many cases for plus or minus 2 points (e = 0.02)?',
+      unit: 'cases',
+      answer: 457,
+      within: 1.1,
+      explain: '3.84 x 0.05 x 0.95 = 0.1825. Divide by 0.02 squared = 0.0004. About 456 to 457 cases. A rare event needs fewer cases than p = 0.5 for the same margin, but a tight margin on a rare event is still large.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai8-public-vs-private"
+  title="95% on the public set, 60% on ours"
+  scenario="A team chooses a model for its SQL assistant. Model X scores 95% on a public SQL benchmark. Model Y scores 91%. On the team's private golden set of 87 real cases, X scores 60% and Y scores 78%."
+  facts={[
+    'public benchmark: published 2023, open on the web',
+    'private set: 87 cases from real chats, never published',
+    'private set: X 52/87 (60%), Y 68/87 (78%)',
+    'training data of both models: not visible',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely reason for the big gap on X?',
+      options: [
+        'The public set, or text close to it, was probably in X\'s training data',
+        'X is much better, and the team\'s labels are all wrong',
+        'The private set is too small to mean anything at all',
+        'Random noise, since 95% and 60% are both possible for one model',
+      ],
+      answer: 0,
+      explain: 'A public set on the open web can end up in training data, and the private set cannot. The labels would have to be wrong for X alone. 87 cases give a wide range, but not wide enough to explain 35 points. Noise does not make an 18-point gap in the same direction.',
+    },
+    {
+      prompt: 'Which check can the team run when it cannot see the training data?',
+      options: [
+        'Ask each model whether it has seen the benchmark',
+        'Scan the model weights for the benchmark words',
+        'Write 40 fresh questions in the same style and see whether X drops more than Y',
+        'Pick the model with the larger parameter count',
+      ],
+      answer: 2,
+      explain: 'A fresh matched set is the standard way to test for memorization without access to training data. A model\'s answer about what it has seen is not reliable evidence. Weights do not hold readable word lists. Size does not say whether a leak happened.',
+    },
+    {
+      prompt: 'What is the sound decision now?',
+      options: [
+        'Pick X, since public benchmarks are the industry standard',
+        'Pick Y at once, since 78 is above 60 and nothing more is needed',
+        'Average the public and private scores and pick the higher average',
+        'Lean to Y, then confirm with a flip-by-flip comparison and more private cases',
+      ],
+      answer: 3,
+      explain: 'The private set matches the real task and is not leaked. Its 87 cases still give wide ranges (roughly 49 to 69% for X and 68 to 86% for Y), which barely touch. Comparing which cases flipped, and adding cases, firms up the choice. Averaging mixes a leaked score with a clean one.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Hamel Husain: evals FAQ (synthetic data, judge labels)](https://hamel.dev/blog/posts/evals-faq/)
+- [Airbnb: eval-driven development](https://airbnb.tech/ai-ml/eval-driven-development-lessons-from-evaluating-genai-at-scale/)
+- [Brown and others: Language Models are Few-Shot Learners, GPT-3 (arXiv 2005.14165)](https://arxiv.org/abs/2005.14165)
+- [Deng and others: SWE-Bench Pro (arXiv 2509.16941)](https://arxiv.org/abs/2509.16941)

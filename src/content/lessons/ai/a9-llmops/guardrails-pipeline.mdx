@@ -1,0 +1,320 @@
+---
+summary: 'Guardrails are checks around a model call. Run cheap rule checks first and costly model checks last. Run independent checks in parallel, gate side-effect actions, and set the block line with the base rate in mind. A guardrail lowers risk but is not a security boundary.'
+requires: ['ai/a3-llm-apis/structured-output', 'ai/a9-llmops/cost-engineering']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai9GuardPipe from '../../../../components/anim/lessons/Ai9GuardPipe.tsx';
+import Ai9GuardLat from '../../../../components/anim/lessons/Ai9GuardLat.tsx';
+import Ai9GuardThresh from '../../../../components/anim/lessons/Ai9GuardThresh.tsx';
+
+## The problem
+
+A team ships a support bot. In the first week, someone gets it to quote a refund policy that does not exist. In the second week, it repeats a customer's card number back in a reply. The team does what most teams do. They add checks.
+
+First comes a check on the input. Then a check on the output. Then a second, smarter check for the cases the first one missed. Each check is a model call. Each call takes time and costs money. A month later, every reply takes a second longer than before. Support also reports that real customers get blocked with "I can't help with that".
+
+Checks help, but they are not free, and they are not magic. This lesson answers five questions:
+
+1. What can you check, and what does each kind of check cost?
+2. Where in the request path do checks belong?
+3. How do the times of several checks add up?
+4. Where do you set the line between "block" and "allow"?
+5. Can a check stop an attacker?
+
+## Question 1: what can you check, and what does each check cost?
+
+Think of airport security. First, a scanner looks at your bag. It is fast and dumb: it only sees shapes. Then a dog sniffs the line. It is slower and sees what a scanner cannot. A few people get pulled aside for a hand search by an officer. That is the slowest step, so it is used the least.
+
+A **guardrail** is a check that sits around a model call. It can block a request, fix a reply, or just log a warning. Guardrails come in three kinds, and they match the airport:
+
+- **Rule checks** are plain code. They test the shape of the text: a length limit, a pattern for card numbers (a **regex**, a short pattern that matches text), a list of allowed values (an **allow list**), or a check that the reply is valid JSON. They cost about a millisecond. They never get tired. They only catch what you wrote a rule for.
+- **Classifier checks** use a small model that returns a label or a score, such as "injection: 0.93". A **classifier** is a model that sorts input into categories. It sees meaning, not only shape. It costs tens of milliseconds when it is small, and more when it is a large hosted model.
+- **Judge checks** ask a large language model to grade the text against a written rule. They handle fuzzy rules, such as "is the tone polite?". They are the slowest and the most expensive.
+
+Why this ladder? Each step buys more understanding and costs more time and money. Use the lowest step that can catch the problem.
+
+Two sourced numbers anchor the ladder. Cloudflare's guardrails run Llama Guard 3 8B, a safety classifier, as a hosted service. Cloudflare's documentation says such checks "typically ... add approximately 500 milliseconds per request". For judges, Anthropic's guide to building agents says a model that grades another model's output is "generally not a very robust method, and can have heavy latency tradeoffs".
+
+Dollars are small but not zero. Take a judge on Claude Haiku 5.5, priced at $0.10 per million input tokens and $0.50 per million output tokens (Anthropic pricing page, as of 2026-10-16, for prompts up to 100,000 tokens). Say the judge reads 1,500 tokens and writes 20. The cost is 1,500 x $0.10 / 1,000,000 = $0.00015, plus 20 x $0.50 / 1,000,000 = $0.00001. That is $0.00016 per check. At 5 million requests a month, one judge on every request costs $800. [Lesson A9.2](/learn/ai/a9-llmops/cost-engineering/) shows how to put that line in the cost budget.
+
+You can often skip a check by shaping the output first. [Lesson A3.3](/learn/ai/a3-llm-apis/structured-output/) shows how to force a reply to match a schema. Eugene Yan's guardrails notes list this first: "Apply guidance whenever possible. It provides direct control over outputs". A reply that cannot be malformed needs no format check.
+
+## Question 2: where do checks belong?
+
+Think of a building with four doors in a row: the front door, the mail room, the exit, and the vault. A guard at the front door cannot stop a clerk who walks out of the vault with cash. Each door needs its own guard, set up for what passes through it.
+
+A model-based feature has four such doors.
+
+1. **Input filters** check what the user sends, before the main model sees it.
+2. **Retrieval filters** check the documents that a search step pulls in, before they enter the prompt. A bot may read a web page or a file that the user did not write. That text can carry instructions an attacker wrote.
+3. **Output filters** check the reply, before the user sees it.
+4. **Action gates** check a tool call that changes the outside world, such as a refund, an email, or a database write, right before it runs.
+
+Why four? Each door sees something the others cannot. The input filter cannot see what the model will write. The output filter cannot stop a refund that already went out. Only the action gate sits in front of a side effect. In an agent that calls several tools, placement matters. The OpenAI Agents SDK documentation says input guardrails run only for the first agent in a chain, and output guardrails only for the agent that produces the final output. Separate "tool guardrails" run on every guarded tool call. So a check on the final reply does not see what the agent did in the middle.
+
+Step through the animation. It follows one request through two input stages, the main model, and two output stages. The timings are made up, except the output guard, which uses Cloudflare's typical figure.
+
+<Ai9GuardPipe client:visible />
+
+Look at the numbers on the right. The two rule stages together cost 3 ms. The classifier cost 40 ms. The hosted guard cost 500 ms. One stage out of four cost more than all the others together. That is typical: the cost sits in the model-based checks.
+
+## Question 3: how do the times of several checks add up?
+
+Think of a kitchen with three cooks and one table of guests. If the cooks work one after another, the guests wait for the sum of three jobs. If the cooks work side by side, the guests wait only for the slowest cook.
+
+Checks work the same way.
+
+- **Serial** means one after another. The added time is the sum of all checks.
+- **Parallel** means all at once. The added time is the time of the slowest check, plus a little overhead to start them and gather the results.
+
+Say you have four checks that each take 50 ms. Serial adds 4 x 50 = 200 ms. Parallel adds about 50 ms. That is a 150 ms saving. Real numbers show the same shape. NVIDIA measured a NeMo Guardrails test with 215 interactions. With no guardrails, the average reply took 0.91 s. With content moderation added, it took 1.29 s. With a jailbreak detector also added, 1.36 s. With topic control too, 1.44 s. The first guard added the most (0.38 s). The next two added 0.07 s and 0.08 s. NVIDIA wrote that "the first guardrail incurs the most latency, but subsequent additions have minimal impact".
+
+A caution about averages. Latency has a long tail. The **p95** is the time that 95% of requests beat. It is the number that users with a bad day feel. The p95 of a sum is not the sum of the p95s. The sum of the p95s is an upper bound. In NVIDIA's table, the p95 grew from 0.97 s to 1.38 s, 1.45 s, then 1.66 s, which is 0.69 s in total for three layers. Always measure the real distribution.
+
+Try it. Pick checks and see both totals. The latencies are made up, except the median of the hosted guard.
+
+<Ai9GuardLat client:visible />
+
+Notice two things. First, parallel is not free. The slowest of several checks is slower than a single check, because any one of them may land in its own tail. With four checks of 50 ms each, the median of the slowest is about 56 ms, not 50. Second, when one check dominates, parallel saves less. If the hosted guard takes 500 ms, nothing around it can hide that.
+
+There are two traps in parallel.
+
+**The first trap is state.** NVIDIA's NeMo documentation says parallel rails are best for rails that call external models, and that "input rail mutations can lead to erroneous results during parallel execution because of race conditions". A **race condition** is a bug where the result depends on which task finishes first. The advice is: run independent, read-only checks in parallel, and keep checks that change the text in series.
+
+**The second trap is side effects.** You can run an input guard at the same time as the main model, so the user does not wait. The OpenAI Agents SDK does this by default. Its documentation warns what that costs: "if the guardrail's tripwire is triggered, the agent may have already consumed tokens and executed tools before being cancelled." If the agent can send an email, a parallel input guard may be too late. Use "blocking" mode when tools have side effects. Use parallel mode for read-only work.
+
+## Question 4: where do you set the line between block and allow?
+
+Think of a smoke detector. Make it sensitive, and it screams at burnt toast. Make it calm, and it may miss a real fire. No setting is right for both.
+
+A guard returns a score. You pick a **threshold**: block everything at or above it. Two mistakes are possible.
+
+- A **false positive** blocks a harmless request. A real customer is turned away.
+- A **false negative** lets a harmful request through.
+
+Raise the threshold and false positives fall, but false negatives rise. Lower it and the reverse happens.
+
+Now the part that surprises people. It is the **base rate**, the share of requests that are truly harmful. If harm is rare, even a good guard blocks mostly harmless traffic. Work an example. Say 0.5% of 5 million requests a month are harmful. That is 25,000 harmful requests and 4,975,000 harmless ones. Say the guard catches 84% of the harmful ones and wrongly blocks 2.3% of the harmless ones. It catches about 21,000 real threats. It also blocks about 113,000 harmless requests. Of every 100 blocks, about 84 are mistakes. The guard works as designed, and the base rate does the damage.
+
+Move the sliders and watch it. All numbers are made up.
+
+<Ai9GuardThresh client:visible />
+
+So how do you pick the line? Pick it by cost. What does one false block cost, in lost customers and support tickets? What does one miss cost? Then watch the block rate, which is the share of requests the guard blocks each day. A jump in the block rate right after a release often means your own change broke something. That is why [lesson A9.3](/learn/ai/a9-llmops/versioning/) puts a release id on every trace: you can split the block rate by release.
+
+## Question 5: can a check stop an attacker?
+
+Think of a bouncer who checks that everyone wears a collared shirt. The bouncer keeps out most rowdy people. But a determined person buys a collared shirt. A **security boundary** is a wall that holds even when the attacker tries as hard as they can, such as a locked vault door. A guardrail is the bouncer. It lowers risk. It is not the vault door.
+
+Why? A guard model is a probabilistic classifier. It was tested on attacks someone already knew about. An attacker who can try again and again, and who reads your block message, adapts. Two sources say this directly.
+
+Simon Willison, who coined the term "prompt injection", writes that vendors of guardrail products "almost always carry confident claims that they capture '95% of attacks' or similar... but in web application security 95% is very much a failing grade".
+
+A group of researchers from several labs, in "The Attacker Moves Second" (October 2025), tried adaptive attacks on 12 recently published defenses. They report attack success above 90% for most. And "the majority of defenses originally reported near-zero attack success rates".
+
+So use guardrails to cut noise, abuse, and accidents. For security, limit what the system can do if a check fails. Give tools the least permission they need, and require approval for risky actions (lesson A10.4). Treat the guardrail as a speed bump in front of that wall. Lesson A10.2 covers prompt injection in full.
+
+## The naive way: one judge on every input and output
+
+The first design most teams build is simple. Send every input to a large model with the question "is this safe?". Run the main model. Send every reply to the same large model again. Run the checks one after another. Stream the reply while it is written.
+
+It fails in five ways. It is slow: two judge calls in series can add a second or more. It is costly: every request pays two extra model calls. It is fragile: Anthropic calls judges "not a very robust method". It leaks: a streamed reply may reach the user before the check finishes. And it is blind to actions: a refund tool called in the middle is never checked.
+
+## The real fix
+
+### Idea 1: cheap first, costly last, stop at the first block
+
+**What it is.** Order the checks from the cheapest to the most costly. Stop when one blocks.
+
+**Picture.** The airport again: the scanner first, the hand search last.
+
+**Why.** Most bad requests are caught by the cheap stages, so the costly stages run for fewer requests. A block at stage one also saves the main model call.
+
+**Number.** Say rules and a small classifier stop 80% of the bad requests that a hosted guard would also stop. Then only the other 20% of those need the 500 ms call. In the animation, a blocked request costs 42 ms and no model tokens.
+
+### Idea 2: parallel for independent checks, series for the rest
+
+**What it is.** Group the checks that do not depend on each other and run each group at once.
+
+**Picture.** Three cooks side by side.
+
+**Why.** It cuts the sum to the slowest.
+
+**Number.** Four 50 ms checks: 200 ms in series, about 56 ms in parallel (median in our model).
+
+### Idea 3: gate the action, not just the words
+
+**What it is.** Put a plain-code check right before each tool call that changes something: an amount limit, a recipient allow list, a rate limit, a human approval above a threshold.
+
+**Picture.** A cash drawer that opens only with a key.
+
+**Why.** A model check can be fooled. Code that compares an amount to a limit cannot be talked out of it. This is the check that comes closest to a security boundary.
+
+**Number.** A rule "refunds above $100 need approval" costs about a millisecond and never misses a $500 refund.
+
+### Idea 4: decide in advance what happens when a guard is down
+
+**What it is.** For each check, choose **fail open** (let the request through if the check cannot run) or **fail closed** (block it).
+
+**Picture.** A door that unlocks when the power fails, or one that locks.
+
+**Why.** Guard models are services, and services fail. Cloudflare lets you pick per hazard category: if a category is set to block and the guard model cannot answer, the request is blocked. If it is set to flag, the request proceeds without evaluation.
+
+**Number.** A hosted guard with 99.9% availability is down about 43 minutes in a 30-day month (30 x 24 x 60 x 0.001 = 43.2). Know what your users see in those 43 minutes. See the [circuit breaker lesson](/learn/backend/07-reliability/circuit-breaker/) for the general pattern.
+
+### Idea 5: measure every stage
+
+**What it is.** Log the result and the time of every check, tagged with the release id. Track block rate per stage per day. Read a small random sample of blocks and of allowed requests each week.
+
+**Picture.** A smoke detector with a monthly test.
+
+**Why.** A guard decays. Users change, attackers change, and your own prompts change. The block rate is the early warning.
+
+**Number.** If the daily block rate of one stage doubles in the hour after a release, treat the release as the first suspect.
+
+## Numbers
+
+| Item | Value | Source |
+|---|---|---|
+| Rule check | about 1 ms | typical for plain code |
+| Hosted Llama Guard 3 8B check | about 500 ms per request | Cloudflare guardrails documentation |
+| Added latency, first guard layer | 0.38 s average (0.91 s to 1.29 s) | NVIDIA NeMo Guardrails test, 215 interactions |
+| Added p95 latency, three layers | 0.69 s (0.97 s to 1.66 s) | same test |
+| Haiku 5.5 price | $0.10 in and $0.50 out per million tokens, as of 2026-10-16 | [pricing page](https://platform.claude.com/docs/en/about-claude/pricing) |
+| One judge check, 1,500 tokens in and 20 out | $0.00016 | derived above |
+| One judge on 5M requests a month | $800 | derived above |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Rule checks | Fast, exact, cheap | Only catch what you wrote | Always, first |
+| Classifier | Sees meaning, tens of ms | Needs a threshold and drift checks | Input and output on user-facing paths |
+| LLM judge | Handles fuzzy rules | Slow, costly, not robust | Sampled review or a high-stakes reply |
+| Parallel checks | Time of the slowest only | Race risk, early side effects | Independent, read-only checks |
+| Blocking before the model | No tokens or tools used on bad input | The user waits for the guard | Tools have side effects |
+| Strict threshold | Fewer misses | More false blocks | Harm is costly |
+| Loose threshold | Fewer false blocks | More misses | Harm is cheap, false blocks cost customers |
+| Fail closed | No unchecked traffic | An outage blocks users | Safety-critical paths |
+| Fail open | The product stays up | Unchecked traffic during an outage | Low-risk paths |
+
+## What experienced teams know
+
+1. **A guardrail is not a security boundary.** Adaptive attackers beat published defenses. In [The Attacker Moves Second](https://arxiv.org/abs/2510.09023), 12 defenses fell to attacks with above 90% success for most, and most had reported near-zero. Willison makes the same point about [95% filters](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). So limit what a successful attack can do. Do not rely on catching it (lesson A10.4).
+
+2. **A parallel guard may lose the race, and the agent may already have acted.** The OpenAI Agents SDK [guardrails documentation](https://openai.github.io/openai-agents-python/guardrails/) says the agent "may have already consumed tokens and executed tools" before a parallel guard cancels it. For agents with write tools, run the input guard in blocking mode or gate each action.
+
+3. **Streaming and output checks conflict.** Cloudflare's [usage notes](https://developers.cloudflare.com/ai-gateway/guardrails/usage-considerations) say its guardrails do not support streaming. On its REST API, a streamed response is evaluated and logged but not enforced. On its gateway, the response is buffered and returned as one payload, so it no longer streams. Choose between a fast first token and an enforced check. Or check in chunks and accept a gap.
+
+4. **Decide fail open or fail closed per check, in advance.** Cloudflare's block category fails closed and its flag category fails open when the guard model cannot answer. A guard outage is a design input, not a surprise.
+
+5. **Rare harm makes false blocks the main cost.** With 0.5% harmful traffic and a 2.3% false-positive rate, most blocks hit harmless users (worked above). So measure the false-positive rate on real traffic. Review a sample of blocks each week.
+
+6. **Put the LLM judge last and sample it.** Anthropic says an LLM judge is ["generally not a very robust method, and can have heavy latency tradeoffs"](https://claude.com/blog/building-agents-with-the-claude-agent-sdk). Run rules and classifiers on every request. Run the judge on a sample, or only on the replies the cheaper stages marked as unsure.
+
+## Interview lens
+
+<Callout type="tip">
+Say it as a pipeline: "Four doors: input, retrieved text, output, and an action gate. Rules first, a small classifier next, a judge last and sampled. Independent checks run in parallel, so latency is the slowest check, not the sum. Side-effect tools sit behind a plain-code gate. I pick fail open or fail closed per check, track block rate by release, and I never call a guardrail a security boundary. Permissions are the boundary." That covers cost, latency, and limits.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we added a guardrail, so we are safe from prompt injection". It lowers the odds and does not close the hole. Do not add three serial model checks without a latency budget. Do not quote a block-rate number you did not measure. And do not run a parallel input guard next to an agent that can send email.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'guardrails-serial-vs-parallel-four-checks',
+      q: 'A pipeline has four independent checks that take 50 ms each. You change them from running one after another to running all at once. Ignoring overhead, how much added latency do you save?',
+      options: [
+        '150 ms, since 200 ms becomes 50 ms',
+        '50 ms, since one check is removed',
+        '100 ms, since half the checks overlap',
+        '200 ms, since all the delay disappears',
+      ],
+      answer: 0,
+      explain: 'Serial adds 4 x 50 = 200 ms. Parallel adds only the slowest check, 50 ms. The saving is 150 ms. The delay does not vanish, because the slowest check still runs.',
+    },
+    {
+      id: 'guardrails-parallel-input-guard-risk',
+      q: 'An agent that can send email runs its input guard in parallel with the main model, the default in the OpenAI Agents SDK. What is the risk?',
+      options: [
+        'The guard cannot read the user input at all',
+        'The agent may act before the guard cancels it',
+        'The guard result is always wrong in parallel mode',
+        'The agent cannot stream a reply in parallel mode',
+      ],
+      answer: 1,
+      explain: 'The documentation says that with a parallel guard, the agent may already have consumed tokens and run tools before a tripwire cancels it. Blocking mode runs the guard first, so the agent never starts. The guard still reads the input in both modes.',
+    },
+    {
+      id: 'guardrails-base-rate-false-blocks',
+      q: 'Out of 1,000,000 requests, 0.5% are harmful. A guard catches 84% of harmful requests and wrongly blocks 2.3% of harmless ones. About what share of all blocks are mistakes?',
+      options: [
+        'About 2%, since the false-positive rate is 2.3%',
+        'About 16%, since the guard misses 16% of harmful requests',
+        'About 50%, since the guard is right half the time',
+        'About 84%, since harmless traffic is so much larger'
+      ],
+      answer: 3,
+      explain: 'Harmful: 5,000, caught 4,200. Harmless: 995,000, blocked 22,885. Mistakes are 22,885 of 27,085 blocks, about 84%. The false-positive rate says little until you apply it to the large harmless group.',
+    },
+    {
+      id: 'guardrails-not-a-security-boundary',
+      q: 'A vendor says its guardrail catches 95% of prompt injection attacks. What is the best reading of that claim for a system that can move money?',
+      options: [
+        'Safe to rely on, since 95% is a high catch rate for a filter',
+        'Safe once the vendor raises the catch rate to 99% or more',
+        'Not enough: attackers adapt, so limit what the system can do',
+        'Useless, since classifiers never catch any real attack at all',
+      ],
+      answer: 2,
+      explain: 'Willison calls 95% "very much a failing grade" in application security, and adaptive attacks beat many published defenses. A guardrail lowers risk. Permissions and action gates limit the damage when it fails. It is not useless, and 99% would still not be a boundary.',
+    },
+  ]}
+/>
+
+## Prove it
+
+<Ballpark
+  client:visible
+  title="Cost of checks on 5 million requests"
+  scenario="A bot checks every request with four serial 50 ms checks. A small-model judge also reads 1,500 input tokens and writes 20 output tokens for every request. The judge runs on Claude Haiku 5.5 at $0.10 per million input tokens and $0.50 per million output tokens (as of 2026-10-16). Traffic is 5,000,000 requests a month."
+  steps={[
+    {
+      prompt: 'How much latency do the four serial checks add, in ms?',
+      unit: 'ms',
+      answer: 200,
+      within: 1.1,
+      explain: 'Serial checks add up: 4 x 50 = 200 ms.',
+    },
+    {
+      prompt: 'If the four checks are independent and run in parallel, about how much do they add, in ms (ignore overhead)?',
+      unit: 'ms',
+      answer: 50,
+      within: 1.1,
+      explain: 'Parallel adds the slowest check: 50 ms. A real run adds a little overhead, and the median of the slowest of four is a bit above 50.',
+    },
+    {
+      prompt: 'What does the judge cost for the month, in dollars?',
+      unit: '$',
+      answer: 800,
+      within: 1.1,
+      explain: 'Per request: 1,500 x $0.10 / 1M = $0.00015, plus 20 x $0.50 / 1M = $0.00001, which is $0.00016. Times 5,000,000 requests is $800 a month. Sampling 10% of requests would cut it to $80.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [NVIDIA NeMo Guardrails: running input and output rails in parallel](https://archive.docs.nvidia.com/nemo/microservices/latest/guardrails/tutorials/parallel-rails.html) (when parallel helps, and the race risk)
+- [Cloudflare AI Gateway guardrails: usage considerations](https://developers.cloudflare.com/ai-gateway/guardrails/usage-considerations) (about 500 ms per check, streaming, fail open or closed)
+- [OpenAI Agents SDK: guardrails](https://openai.github.io/openai-agents-python/guardrails/) (parallel and blocking modes, tripwires, tool guardrails)
+- [The Attacker Moves Second](https://arxiv.org/abs/2510.09023) (why defenses that look strong fail against adaptive attackers)

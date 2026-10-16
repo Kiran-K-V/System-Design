@@ -1,0 +1,304 @@
+---
+summary: 'Offline tests miss what real users do. Measure live signals with their denominators, compare versions with a randomized split, guard with side metrics, and size the test before you start.'
+requires: ['ai/a8-evals/judges', 'ai/a0-orientation/probabilistic-components']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai8OnlineFunnel from '../../../../components/anim/lessons/Ai8OnlineFunnel.tsx';
+import Ai8OnlineSim from '../../../../components/anim/lessons/Ai8OnlineSim.tsx';
+
+## The problem
+
+On April 25, 2025, OpenAI shipped an update to GPT-4o in ChatGPT. Four days later it rolled the update back (dates from the [Georgetown Tech Institute brief](https://www.law.georgetown.edu/tech-institute/research-insights/insights/tech-brief-ai-sycophancy-openai-2/)). The model had become too eager to agree with users. OpenAI's own write-up, quoted by [Simon Willison](https://simonwillison.net/2025/May/2/what-we-missed-with-sycophancy/), says three things about how this got through:
+
+- "our offline evaluations—especially those testing behavior—generally looked good."
+- "the A/B tests seemed to indicate that the small number of users who tried the model liked it."
+- "some expert testers had indicated that the model behavior “felt” slightly off."
+
+So the checks passed, a live test passed, and the release was still bad. This lesson explains why that can happen and how to build online checks that are harder to fool.
+
+First, two terms. An **offline eval** is a test you run on a saved set of examples before a release. Earlier lessons in this module built them (see [error analysis](/learn/ai/a8-evals/error-analysis/) and [golden sets](/learn/ai/a8-evals/golden-sets/)). An **online eval** measures what real users do with the live feature. Offline tests answer "does it pass the cases we thought of?" Online tests answer "what happens with the cases we did not think of?"
+
+This lesson answers three questions, in order:
+
+1. What can we measure from real users, and what is easy to get wrong?
+2. How do we compare two versions fairly?
+3. How many users do we need before we can trust the result?
+
+Then we show the naive design that fails, and the design that holds up.
+
+## Question 1: what can we measure from real users?
+
+Think of a restaurant. You can ask each guest, "Was it good?" Some will answer. Or you can watch: who cleared the plate, who sent a dish back, who came again next week. Watching is quieter and covers more guests. Asking is clearer but covers fewer.
+
+An LLM feature has the same two kinds of **signal**. A signal is something users do or say that hints at how an answer went.
+
+- **Explicit signals** are things users are asked for. A thumbs-up or thumbs-down is the common one.
+- **Implicit signals** come from normal use. Eugene Yan's [survey of LLM product patterns](https://eugeneyan.com/writing/llm-patterns/) lists the main ones for a coding assistant: accepting a suggestion unchanged is a strong positive, accepting it with edits is a positive, and ignoring it is neutral or negative. In chat and image products, a click on "regenerate" is read as a negative signal.
+
+Why bother? Because your offline set can only hold cases you already imagined. Real users bring inputs you did not. Signals are how those inputs report back.
+
+Now the first trap. Every signal is a count, and a count needs something to be divided by. That number is the **denominator**. Think of a baseball batting average: hits divided by times at bat. If a player bats half as often and gets the same hits, the average doubles, but he did not get better.
+
+Take the most common signal, the **acceptance rate**. GitHub's [Copilot metrics guide](https://docs.github.com/en/copilot/tutorials/roll-out-at-scale/measure-success) defines it as the "Percentage of Copilot suggestions accepted". The denominator is "suggestions". What counts as a suggestion? Only the ones the user saw? Or every one the model produced? The page does not say, and the answer changes the number.
+
+Here is a real case. The team behind the Cursor editor trained its Tab model using accept and reject as the reward. They report that the new model makes 21% fewer suggestions and has a 28% higher accept rate on the ones it makes ([Cursor's Tab post](https://cursor.com/blog/tab-rl)). The accept rate went up partly because the model learned to stay quiet when unsure. Fewer chances were offered, and a higher share of them were taken. Whether that is better depends on what you wanted. It shows that the denominator is a design decision.
+
+The rule: log the raw counts (shown, accepted, edited, kept) and build every rate from them. Never log only the rate.
+
+## Question 2: how do we compare two versions fairly?
+
+Suppose you have a new prompt. You could ship it on Monday and compare this week with last week. That comparison is unfair. Last week had a holiday. A news event changed what users asked. The model itself may have changed.
+
+Think of a bakery that wants to know which of two recipes is better. If it serves recipe A at lunch and recipe B at dinner, it compares two different crowds. The fair way is to serve both recipes at the same time, and let a coin flip decide which recipe each diner gets.
+
+That is an **A/B test**. You split users at random into two groups. Group A keeps the current version. Group B gets the new one. Both run at the same time. A difference between the groups is then due to the version, not to the calendar.
+
+GitHub did this for Copilot. Its [2023 post](https://github.blog/2023-05-17-how-github-copilot-is-getting-better-at-understanding-your-code/) says that, based on A/B testing, a fill-in-the-middle change gave "a 10% relative boost in performance" and a neighboring-tabs change raised acceptance "by 5%". The post gives no sample sizes and no base rate.
+
+That brings a second trap. "Relative" and "points" are not the same. If the acceptance rate is 25%, a 5% relative lift gives 25% x 1.05 = 26.25%. That is only 1.25 points. If the post had meant 5 points, the new rate would be 30%. Always ask for the base rate. Without it, a percentage is not a size.
+
+Two design rules for LLM features follow.
+
+**Randomize by user, not by request.** If each request is assigned on its own, one user can see version A on message 1 and version B on message 2. Their conversation then mixes both. Assign each user once, by a hash of their ID, and keep them there.
+
+**Check the split itself.** Say you planned 50/50 and the logs show 5,200 users in A and 4,800 in B. That looks close, but it is a warning. It is called a **sample ratio mismatch**, or SRM. Think of a cinema with two doors. If the same crowd should use both and one door counts 8% fewer, a door is broken, not the crowd. Some users are being lost from one arm.
+
+You can test this. Use the chi-square test: take each count's gap from the expected 5,000, square it, divide by 5,000, and add the two results. Here that is (200² / 5,000) + (200² / 5,000) = 8 + 8 = 16. The cutoff for "this is not chance" at the 0.1% level is 10.83. So 16 is a real mismatch.
+
+Why does it matter for LLMs? Microsoft Research's [guide to SRM](https://www.microsoft.com/en-us/research/?p=651990) warns that "Ignoring the SRM without knowing the root cause may result in a bad product modification appearing to be good". One cause listed by [Lukas Vermeer's SRM taxonomy](https://lukasvermeer.nl/srm/docs/causes/) is a slow variant: users "have more time to exit the product before the logs are generated". A new model that is slower, or a longer prompt, can quietly drop impatient users from its own arm. The users who stay are the patient ones, and they rate it higher.
+
+## Question 3: how many users do we need?
+
+You run the test for one day. Version B has an acceptance rate of 27% and A has 25%. Is B better?
+
+Not necessarily. Each user is one noisy draw. Think of a poll before an election. If you ask 100 people, the result is "plus or minus 10 points". If you ask 10,000, it is "plus or minus 1". The plus-or-minus is the **confidence interval**: the range in which the true value probably lies. More data makes it narrower.
+
+LLM outputs add noise of their own. [Thinking Machines](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) ran one prompt 1,000 times with the randomness setting at zero. They got 80 different completions. (The randomness setting is called temperature. Zero is the least random setting.) Even the "same" request does not repeat. So each answer is a noisy draw, on top of the noise from different users.
+
+How much data is enough? The answer depends on four numbers.
+
+- The **base rate**: where you start, such as 25%.
+- The **lift** you care about: the smallest gain worth shipping, such as 10% relative.
+- The **false-alarm rate**: how often you accept a difference that was only chance. The usual choice is 5%.
+- The **power**: the chance that the test catches a real lift of that size. The usual choice is 80%. Think of a metal detector. A detector with 80% power finds a coin that is really there 8 times in 10.
+
+With those numbers, the standard formula for two rates gives the sample size. For a 25% base and a 10% relative lift (25% to 27.5%), you need about 4,862 per arm. That is 9,724 users in total. (I computed this with the standard formula for comparing two rates.)
+
+The size grows fast as the lift shrinks. Half the lift needs about four times the data, because the gap enters the formula squared. Play with it below.
+
+<Ai8OnlineSim client:visible />
+
+Try this. Set the base to 25% and the lift to 10%. Slide "Collected so far" up. The interval shrinks and just clears zero near 2,400 per arm. The widget draws the interval around the true lift, which is the best case. Real results scatter around the true lift, so you need about twice that, 4,862, to catch it 8 times in 10. Now set the lift to 5%. The needed count jumps to about 19,100. Many "wins" in small tests are noise.
+
+## The naive way: read one signal and ship
+
+Here is the naive design. Ship the new prompt to half of the users. After a week, look at the acceptance rate or the thumbs-up rate. If it is higher, ship to everyone.
+
+This fails in three ways.
+
+First, a single signal can move for the wrong reason. Watch the funnel below. It shows one answer's life as four signals, with made-up numbers per 1,000 suggestions. The new variant writes longer suggestions.
+
+<Ai8OnlineFunnel client:visible />
+
+Acceptance went up 20%. Edits per accepted suggestion doubled. After 24 hours, fewer suggestions were still in the code. A dashboard that stopped at "accepted" would have shipped a worse product.
+
+Second, people's feelings are not a measurement. METR ran a [study of 16 experienced developers on 246 real issues](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/). The developers "expected AI to speed them up by 24%". The measured result: they took 19% longer. After the study they still believed AI had sped them up by 20%. METR notes that these results are out of date and links to newer data from February 2026. The lesson stands: a self-reported "it feels faster" can point the opposite way from the clock.
+
+Third, a signal can be biased toward something you do not want. In the GPT-4o case, OpenAI says the update added "an additional reward signal based on user feedback—thumbs-up and thumbs-down data from ChatGPT". The users who tried the new model liked it. Agreement feels good. The next lesson on the [feedback flywheel](/learn/ai/a8-evals/feedback-flywheel/) goes deeper on this.
+
+## The real fix: a test designed before it runs
+
+Four ideas turn the naive test into one you can trust.
+
+### Idea 1: one primary metric, plus guardrails
+
+The **primary metric** is the single number that decides the test. A **guardrail metric** is a number that must not get worse. If a test wins on the primary but breaks a guardrail, it fails.
+
+Think of a road test for a car. Speed is the goal. But the brakes must still stop the car, and the fuel use must stay in range. A faster car with no brakes is not a win.
+
+Why does this exist? Any one number can be gamed or can mislead, as the funnel showed. Guardrails catch the damage a good primary number hides. For an LLM feature, use these:
+
+- **Latency**: how long the user waits. Use the 95th percentile (the time that 95% of requests beat), not the average. Slow outliers are what users remember.
+- **Cost per request**: tokens in and out, times the price.
+- **Refusal rate**: how often the model declines to answer.
+- **Edit and retry rates**: how much work the user did after the answer.
+
+A concrete setup for a coding assistant: the primary is "suggestions kept at 24 hours, per 1,000 shown". The guardrails are p95 latency no more than 10% above the control, cost per request no more than 20% above, and edits per accepted suggestion not above the control. (The thresholds are a team choice. Pick them before the test.)
+
+### Idea 2: write the decision rule first
+
+GitHub's measurement guide says to "decide what outcomes will define a successful trial" before you analyze metrics. Do that for every test. Write down the primary metric, its smallest useful lift, the guardrails, the sample size, and the stop date.
+
+Think of agreeing the rules before a game. If you set the winning score after you see the result, you will find one that fits.
+
+Why? Because with several metrics, one of them will look good by chance. Picking the metric afterward is how a noisy test becomes a "win". The sample size from Question 3 is part of the rule. Do not stop early because the numbers look good on day two.
+
+### Idea 3: check the test, then check the answers
+
+Before you read results, check the split for SRM (Question 2). Then check the answers themselves. Counts tell you what users did. They do not tell you if the answer was right. So sample a small share of live answers and grade them.
+
+A grader can be a person or an **LLM judge**, a model that applies a written pass or fail rule to an answer (see [judges](/learn/ai/a8-evals/judges/)). Sample, for example, 5% of live traffic. Use pass or fail labels. Hamel Husain, an engineer who teaches LLM evals, says [scores and fine-grained ratings are "more onerous to manage than binary ratings"](https://hamel.dev/blog/posts/evals/). Check the judge against human labels with precision and recall. He also warns that "using raw agreement is generally not recommended and can be misleading when classes are imbalanced". If 95% of answers pass, a judge that always says "pass" agrees with humans 95% of the time and catches nothing.
+
+### Idea 4: add a human veto for behavior
+
+In the GPT-4o case, expert testers said the model felt off, and the numbers said it was fine. OpenAI's own conclusion, as quoted by Willison: "We need to treat model behavior issues as launch-blocking like we do other safety risks." Add a short, written behavior check to the launch gate, such as "does it agree with a wrong claim?", and let a person block the launch.
+
+## Numbers
+
+Here is the design card for a coding-assistant A/B test. Token counts are illustrative.
+
+| Question | Answer |
+|---|---|
+| Quality bar | Primary: kept-at-24-hours per 1,000 shown. Smallest lift worth shipping: +10% relative on a 25% base. |
+| How measured | Event logs for shown, accepted, edited, kept. Sampled judge for correctness. |
+| Sample size | About 4,862 per arm (9,724 total) at 80% power, 5% false-alarm rate. |
+| Time to run | 4.9 days at 2,000 answers per day (9,724 / 2,000). |
+| Latency budget | Logging and judging run after the answer is sent. They add 0 ms to the user's wait. Guardrail: p95 at most 1.1 x control. |
+| Cost per request | The feature itself, plus the judge. |
+
+The judge cost, if you grade every answer in the test: assume 3,000 input tokens and 200 output tokens per graded answer. Prices come from [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing), as of 2026-10-16.
+
+| Judge model | Price per million tokens (in / out) | Cost per graded answer | Cost for 9,724 answers |
+|---|---|---|---|
+| Claude Haiku 5.5 | $0.10 / $0.50 | 3,000 x 0.10 / 1M + 200 x 0.50 / 1M = $0.0004 | $3.89 |
+| Claude Sonnet 5.5 | $2 / $10 | 3,000 x 2 / 1M + 200 x 10 / 1M = $0.008 | $77.78 |
+
+So the judge is cheap compared with the cost of shipping a bad version. At 5% sampling (486 answers), the Sonnet bill drops to about $3.89 (486 x $0.008). The cost that matters more is the time of the humans who check the judge.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Implicit signals (accept, edit, retry) | Cheap, fast, from every user | Hard to read, easy to game | As the primary, with guardrails |
+| Thumbs and ratings | Clear intent | Few users click, and agreeable answers win | As a trigger for review, not as a label |
+| Sampled judge on live traffic | Reads correctness, not just behavior | Judge cost, needs checking against humans | Always, at a small sample |
+| Full A/B test | Real users, fair comparison | Days of traffic, 4,862+ per arm | Before a change that affects all users |
+| Offline eval only | Fast and cheap | Misses real-user behavior | First gate, never the last |
+| Shorter test | Faster answer | Wider interval, more false wins | Only for large expected lifts |
+
+## What experienced teams know
+
+1. **A rising accept rate can mean "shown less".** Cursor's Tab model made 21% fewer suggestions and gained 28% in accept rate ([Cursor](https://cursor.com/blog/tab-rl)). Track accepted per opportunity and per user, not only per shown. Log the shown count so you can rebuild either.
+2. **Feelings invert measurement.** METR's developers expected a 24% speedup, measured 19% slower, and still believed they were 20% faster ([METR](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/)). Use survey scores only next to a measured outcome.
+3. **A passing A/B test does not prove good behavior.** OpenAI's A/B tests "seemed to indicate" users liked the model that was later rolled back ([quoted by Willison](https://simonwillison.net/2025/May/2/what-we-missed-with-sycophancy/)). A research paper on sycophancy found that [human raters and preference models sometimes prefer convincing agreeable answers over correct ones](https://arxiv.org/abs/2310.13548). So add a test for the behavior you fear, not only the number users like.
+4. **Check for a sample ratio mismatch before any analysis.** A mismatch can make a bad change look good ([Microsoft Research](https://www.microsoft.com/en-us/research/?p=651990)). LLM variants are often slower, and slow variants lose users before the log line is written ([Vermeer](https://lukasvermeer.nl/srm/docs/causes/)). Run the chi-square check as the first line of every report.
+5. **Temperature zero is not a replay.** One prompt, 1,000 runs at temperature zero, gave 80 different outputs ([Thinking Machines](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/)). So you cannot rerun a bad answer to see it again. Store the exact output and the prompt version with every logged request.
+6. **Ask for the base rate and the sample size.** Copilot's published lifts of 5% and 10% are relative, with no base rate and no sample size ([GitHub](https://github.blog/2023-05-17-how-github-copilot-is-getting-better-at-understanding-your-code/)). A lift with no base is not a size. Treat any such figure as a direction, not a forecast.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I would pick one primary metric, such as suggestions kept at 24 hours, and three guardrails: p95 latency, cost per request, and edit rate. I would randomize by user, check the split for sample ratio mismatch, and size the test first: about 4,900 per arm to see a 10% relative lift on a 25% base. A sampled judge grades correctness, and a person can veto on behavior." This shows metric design, experiment hygiene, and arithmetic.
+</Callout>
+
+<Callout type="mistake">
+Do not say "I would A/B test it and ship if acceptance is up". Acceptance depends on its denominator, and it can rise while the outcome falls. Do not quote a "5% lift" without a base rate. Do not stop a test early because it looks good.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'ai8-online-srm-split',
+      q: 'You planned a 50/50 A/B test on 10,000 users. The logs show 5,200 in arm A and 4,800 in arm B. What is the right first step?',
+      options: [
+        'Ship the winner, since a 4% gap is too small to matter in practice',
+        'Add 400 users to arm B so that the two counts match again',
+        'Run the test for another week, since the gap will close by itself',
+        'Find out why users are missing from one arm',
+      ],
+      answer: 3,
+      explain: 'A chi-square check gives 16, well above the 10.83 cutoff, so the gap is not chance. Something drops users from one arm, and that can bias every metric. Padding the counts hides the cause. More time does not fix a bug.',
+    },
+    {
+      id: 'ai8-online-relative-lift',
+      q: 'A team reports that a new prompt gives a 15% relative lift in acceptance. The control rate was 20%. What is the new rate?',
+      options: [
+        '23%',
+        '35%',
+        '21.5%',
+        '30%',
+      ],
+      answer: 0,
+      explain: 'A relative lift multiplies the base: 20% x 1.15 = 23%. That is 3 points, not 15. Reading 15% as points gives 35%, which is the tempting error.',
+    },
+    {
+      id: 'ai8-online-halve-lift',
+      q: 'You want to detect a lift half as large as before, with the same power and false-alarm rate. About how much more data per arm do you need?',
+      options: [
+        'About the same, since power sets the sample size',
+        'About 2 times',
+        'About 4 times',
+        'About 16 times',
+      ],
+      answer: 2,
+      explain: 'The gap enters the formula squared, so halving it needs about 4 times the data. In the explorer, a 10% lift on a 25% base needs about 4,862 per arm and a 5% lift needs about 19,147.',
+    },
+    {
+      id: 'ai8-online-fewer-suggestions',
+      q: 'After a change, a coding assistant shows 21% fewer suggestions and its acceptance rate rises 28%. What can you say?',
+      options: [
+        'The product is better, since acceptance is the goal of the feature',
+        'The product is worse, since fewer suggestions were shown to users',
+        'The denominator fell, so compare kept suggestions per user',
+        'Nothing, since acceptance rate cannot be measured in a live test',
+      ],
+      answer: 2,
+      explain: 'Acceptance is accepted divided by shown, and both parts moved. A model that stays quiet when unsure raises the rate and may help less overall. Compare accepted and kept suggestions per user and the guardrails.',
+    },
+  ]}
+/>
+
+## Prove it
+
+<Diagnose
+  client:visible
+  id="ai8-online-accept-edits"
+  title="Acceptance up, edits doubled"
+  scenario="A team tests a new prompt that writes longer code suggestions. After a week, the dashboard shows the new version winning on the metric the team chose."
+  facts={[
+    'control: shown 20,000, accepted 5,000 (25%), edited after accept 1,000 (20% of accepted)',
+    'new:     shown 20,000, accepted 6,000 (30%), edited after accept 2,400 (40% of accepted)',
+    'kept at 24 h: control 90% of accepted, new 70% of accepted',
+    'p95 latency: control 1.8 s, new 1.9 s',
+  ]}
+  steps={[
+    {
+      prompt: 'Which number tells you the net effect for users, per shown suggestion?',
+      options: [
+        'Acceptance rate: 30% vs 25%',
+        'Edits per accepted suggestion, which doubled: 0.4 vs 0.2',
+        'Kept at 24 hours per shown: 21% vs 22.5%',
+        'p95 latency: 1.9 s vs 1.8 s',
+      ],
+      answer: 2,
+      explain: 'Control keeps 5,000 x 0.9 = 4,500 of 20,000 shown (22.5%). The new version keeps 6,000 x 0.7 = 4,200 (21%). It leaves fewer suggestions in the code even though more are accepted.',
+    },
+    {
+      context: 'Both versions pass the latency guardrail: 1.9 s is within 10% of 1.8 s.',
+      prompt: 'What should the team do?',
+      options: [
+        'Ship the new version, since the main metric rose 20% relative',
+        'Do not ship. Find why long suggestions get edited, then retest',
+        'Ship to half of the users first, since the result is mixed',
+        'Ignore the edit rate, since users like to edit',
+      ],
+      answer: 1,
+      explain: 'The primary the team chose (acceptance) rose, but the end result fell and edit work doubled. The decision rule should have used kept-at-24-hours as the primary and edits as a guardrail. Fix the rule, then rerun.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [OpenAI sycophancy write-up, as quoted by Simon Willison](https://simonwillison.net/2025/May/2/what-we-missed-with-sycophancy/)
+- [GitHub: how Copilot is getting better at understanding your code](https://github.blog/2023-05-17-how-github-copilot-is-getting-better-at-understanding-your-code/)
+- [METR: early-2025 AI and experienced open-source developers](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/)
+- [Hamel Husain: your AI product needs evals](https://hamel.dev/blog/posts/evals/)
+- [Fabijan and others: diagnosing sample ratio mismatch (Microsoft Research)](https://www.microsoft.com/en-us/research/?p=651990)
+- [Sharma and others: towards understanding sycophancy in language models (arXiv 2310.13548)](https://arxiv.org/abs/2310.13548)

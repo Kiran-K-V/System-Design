@@ -1,0 +1,302 @@
+---
+summary: 'Model cost is tokens times price, so cut it with levers: a smaller model, prompt caching, shorter output, batching, and routing. Gate each lever with an eval, and judge cost per successful task, not per call.'
+requires: ['ai/a3-llm-apis/cost-metering', 'ai/a2-inference-cost/prompt-caching', 'ai/a3-llm-apis/multi-provider-gateway']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai9CostWalk from '../../../../components/anim/lessons/Ai9CostWalk.tsx';
+import Ai9CostPareto from '../../../../components/anim/lessons/Ai9CostPareto.tsx';
+
+## The problem
+
+A product makes 5 million model requests a month. Each request sends 3,000 tokens in and gets 500 tokens back. Finance asks one question: "Can this cost less, without getting worse?"
+
+Prices below are USD per million tokens, as of 2026-10-16, from the [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing). A token is a chunk of text, roughly a short word. Here is what the same traffic costs on four models. The arithmetic is shown later in this lesson.
+
+| Model | Input | Output | Monthly cost for this traffic |
+|---|---|---|---|
+| Claude Haiku 5.5 | $0.10 | $0.50 | $2,750 |
+| Claude Sonnet 5.5 | $2 | $10 | $55,000 |
+| Claude Opus 5.5 | $4 | $20 | $110,000 |
+| Claude Fable 5.1 | $10 | $50 | $275,000 |
+
+The same traffic costs 100 times more on the top row than on the bottom row. The right choice is almost never the biggest model, and almost never the smallest. This lesson answers five questions:
+
+1. What do you pay for?
+2. What is the right unit of cost?
+3. Which levers lower it?
+4. How do you know a cheaper choice is still good enough?
+5. How do you stop a surprise bill?
+
+[Lesson A3.9](/learn/ai/a3-llm-apis/cost-metering/) showed how to measure cost per request and per customer. This lesson is about lowering it.
+
+## Question 1: what do you pay for?
+
+You pay per token, and the price differs by direction. Think of a print shop that charges 2 cents for each page it reads and 10 cents for each page it writes. Reading is cheap, writing is dear.
+
+The reason is how a model works. It reads your whole prompt in one fast pass. It then writes its answer one token at a time, and each new token needs a pass of its own. Lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) shows this. Output tokens use the machine longer, so they cost more.
+
+The cost of one request is:
+
+<Math block tex="c = \frac{n_{\text{in}} \, p_{\text{in}} + n_{\text{out}} \, p_{\text{out}}}{10^{6}}" />
+
+In words: input tokens times the input price, plus output tokens times the output price, divided by a million because prices are per million tokens. Take Claude Sonnet 5.5 and our request:
+
+- Input: 3,000 × $2 ÷ 1,000,000 = $0.006
+- Output: 500 × $10 ÷ 1,000,000 = $0.005
+- Total: $0.011 per request
+
+Multiply by 5 million requests and you get $55,000 a month. Now look at the split. Output is 500 of 3,500 tokens, which is 14%. Yet it is $0.005 of $0.011, which is 45% of the bill. One output token costs as much as five input tokens here. Keep that ratio in mind. It decides which levers pay most.
+
+## Question 2: what is the right unit of cost?
+
+The cost per request hides waste. Suppose a cheap model answers wrongly 3 times in 10, and each wrong answer is thrown away and asked again. The bill counts all 10 attempts. Your users only got 7 good answers.
+
+The better unit is **cost per successful task**: total spend divided by the number of tasks that passed your quality check. A **pass rate** is the share of tasks that pass that check on a set of test cases. A set of test cases plus a way to score them is called an **eval**. Lesson A8.1 shows how to build one.
+
+If failed attempts are retried until one passes, the expected cost per success is the cost of one attempt divided by the pass rate. Sonnet 5.5 at $0.011 per attempt and an 86% pass rate costs $0.011 ÷ 0.86 = $0.0128 per success. The pass rate here is a made-up example. You must measure your own.
+
+Model calls are also not the only cost. A request may add a document search, a tool that charges per use, a second model that judges the answer, and retries after errors. Add those to the numerator. A cost model that counts only the main model call is a lower bound.
+
+## Question 3: which levers lower it?
+
+Every lever attacks one term in the cost formula:
+
+- **Smaller model:** a lower price per token.
+- **Prompt cache:** a lower price on repeated input tokens.
+- **Shorter output:** fewer output tokens, the dear ones.
+- **Batching:** a lower price for work that can wait.
+- **Routing:** a cheaper model for easy requests.
+- **Fewer wasted attempts:** a higher pass rate and fewer retries.
+
+Each lever can also lower quality. So there is one rule for all of them: no lever ships until the eval says the pass rate holds.
+
+## The naive way: the biggest model and a month-end bill
+
+The first habit is to pick the strongest model "to be safe" and ship. On our traffic, that is Opus 5.5 at $110,000 a month, or Fable 5.1 at $275,000. You learn the cost when the invoice arrives.
+
+The second habit is to cut cost by trimming words from the prompt at random. This saves little, because the prompt is only part of the bill, and it breaks things quietly. With no pass rate to watch, nobody sees quality fall.
+
+Both habits skip the same step: measuring what "good enough" is. The levers below all start from that measurement.
+
+## The real fix: pull the levers in order, each behind an eval
+
+### Idea 1: use the smallest model that passes the bar
+
+The **quality bar** is the minimum pass rate you accept, such as 80% on your test cases. Pick the cheapest model that clears it. You do not hire a surgeon to take a temperature.
+
+The price spread makes this the biggest lever. Haiku 5.5 costs $0.10 per million input tokens and Sonnet 5.5 costs $2. That is 20 times less, and output is also 20 times less ($0.50 against $10). On our traffic:
+
+- Haiku 5.5: 15,000 million input tokens × $0.10 + 2,500 million output tokens × $0.50 = $1,500 + $1,250 = $2,750
+- Sonnet 5.5: 15,000 × $2 + 2,500 × $10 = $30,000 + $25,000 = $55,000
+- Opus 5.5: 15,000 × $4 + 2,500 × $20 = $60,000 + $50,000 = $110,000
+
+Where do 15,000 and 2,500 come from? 5,000,000 requests × 3,000 tokens is 15 billion input tokens, which is 15,000 million. And 5,000,000 × 500 is 2.5 billion output tokens, or 2,500 million.
+
+If you host a model yourself, a different set of tools applies: [quantization](/learn/ai/a2-inference-cost/quantization-small-models/) shrinks the memory a model needs, and [self-host versus API](/learn/ai/a2-inference-cost/self-host-vs-api/) shows when it pays.
+
+### Idea 2: cache the repeated start of the prompt
+
+Look at what every request begins with. The same system instructions. The same tool descriptions. Often the same documents. Each request pays to read this shared start again.
+
+A **prompt cache** fixes that. The provider keeps its work on the start of a prompt (the **prefix**), and a later request with the same start reads it back at a low price. Think of a form with the fixed part pre-printed. You only fill in the blanks.
+
+Anthropic prices this with multipliers on the normal input price. Writing to the 5-minute cache costs 1.25 times the input price. Writing to the 1-hour cache costs 2 times. Reading costs 0.1 times, and 0.05 times on Opus 5.5 and Sonnet 5.5. For Sonnet 5.5, that is $2.50 for a 5-minute write, $4 for a 1-hour write, and $0.10 for a read. The pricing page says caching "pays off after one cache read for the 5-minute duration (1.25x write), or after two cache reads for the 1-hour duration (2x write)".
+
+Check the break-even. Without a cache, a prefix used twice costs 2 units. With a 5-minute cache on Sonnet 5.5, it costs 1.25 + 0.05 = 1.30 units. One read already wins.
+
+Now our traffic. Say 2,400 of the 3,000 input tokens are the shared prefix, so 80% of input is a cache read. The cost on Sonnet 5.5:
+
+- Reads: 12,000 million tokens × $0.10 = $1,200
+- Fresh input: 3,000 million tokens × $2 = $6,000
+- Output: $25,000
+- Total: $32,200, which is 41% less than $55,000
+
+Writes are small. If the prefix were rewritten every 5 minutes all month, that is 8,640 writes × 2,400 tokens × $2.50 per million = about $52.
+
+### Idea 3: write fewer output tokens
+
+Output is the dear direction, so shorter answers save the most per token. It is like paying per word for a telegram. Say what you need and stop.
+
+On our traffic, cutting output from 500 to 300 tokens saves 5,000,000 × 200 = 1,000 million tokens, which is 1,000 × $10 = $10,000 a month on Sonnet 5.5. The prompt does not change.
+
+How to get there: ask for a concise format, return structured fields instead of prose (lesson [A3.3](/learn/ai/a3-llm-apis/structured-output/)), and drop pleasantries. Use a maximum-length setting as a safety stop, not as the tuning knob, because a cut-off answer is a broken answer. Models that think before answering write extra tokens first, and those are billed as output. Lesson [A4.7](/learn/ai/a4-context/reasoning-budgets/) shows how to cap them.
+
+### Idea 4: batch the work nobody waits for
+
+Some work has no user waiting: nightly summaries, test runs, and backfills of old data. The **Batch API** takes many requests at once and returns the results later. Anthropic charges half price on both input and output. The cache multipliers stack on top of that discount.
+
+Think of bulk mail. You give up speed and pay less. Anthropic says most batches finish within 1 hour, and a batch expires if it is not done in 24 hours. For Sonnet 5.5, batch prices are $1 in and $5 out per million tokens. Because batches can outlast the 5-minute cache, Anthropic suggests the 1-hour cache for shared prefixes.
+
+Say 30% of our requests are offline jobs. After caching and shorter output, the bill is $22,200. Half price on 30% of it saves $22,200 × 0.30 × 0.5 = $3,330. The 30% share is an assumption for this example.
+
+### Idea 5: route easy requests to a cheaper model
+
+A **router** decides which model handles each request. Think of a triage nurse. A simple case goes to a nurse, and a hard one goes to the specialist. Because the price gap is 20 times, even a rough router pays.
+
+How well does it work? The RouteLLM team (UC Berkeley, Anyscale, and Canva) tested routers between GPT-4 and a smaller model, Mixtral 8x7B. Their abstract says routing can cut cost by "over 2 times without sacrificing response quality". The details are narrower. To recover 80% of the quality gap between the weak and strong model, savings were 2.49 times on MT-Bench (a chat-quality test), but only 1.14 times on MMLU (a multiple-choice knowledge exam) and 1.27 times on GSM8K (grade-school math). Routing savings depend on the task. Measure them on yours. The router itself was cheap: the paper puts its most expensive one at no more than 0.4% of the strong model's cost.
+
+Say half of our requests pass the same eval on Haiku 5.5. After the other levers, the bill falls to about $9,900. The next step shows it all in one picture. The gateway in lesson [A3.8](/learn/ai/a3-llm-apis/multi-provider-gateway/) is the natural place to put the router.
+
+<Ai9CostWalk client:visible />
+
+### Idea 6: divide by successes, not by calls
+
+A model that is cheap per call can be dear per success. Drag the pass rates below. The chart plots each model's pass rate against its cost per successful task. A model whose point is below the red quality bar is out. Of the models that meet the bar, the cheapest per success wins. A model is **beaten** when another one is both cheaper and better.
+
+<Ai9CostPareto client:visible />
+
+With the defaults, Haiku 5.5 is the cheapest per success, but its 72% misses the 80% bar. Sonnet 5.5 is the cheapest model that clears it. Opus 5.5 costs about twice as much and is only a little better. Move the bar to 88% and Opus becomes the only choice. The numbers are your own eval results, so the chart is only as good as your test set.
+
+### Idea 7: put a ceiling on spend
+
+A bug or a loop can burn a month of budget in an hour. Set a ceiling before it happens. Think of a fuse in a fuse box. It cuts the power before the wires melt.
+
+Anthropic puts a monthly spend cap on each tier: $500 on Start, $1,000 on Build, and $200,000 on Scale. You can also set your own limit lower, in the billing page. The two caps behave differently. At the tier cap, requests return an HTTP 429 error (the web's "too many requests" code) with no `retry-after` header, which is the field that tells a client how long to wait. The client library's automatic retries fail until the first of the next month. At a limit you set yourself, requests return an HTTP 400 error. So your code should treat both as "stop and alert", not "retry". Lesson [A3.9](/learn/ai/a3-llm-apis/cost-metering/) covers alerts, and the [circuit breaker lesson](/learn/backend/07-reliability/circuit-breaker/) covers how to stop retrying.
+
+## Numbers
+
+All prices are USD per million tokens, as of 2026-10-16, from the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing). Traffic: 5 million requests a month, 3,000 tokens in and 500 out.
+
+| Step | Monthly cost | Change |
+|---|---|---|
+| Opus 5.5, no levers | $110,000 | start |
+| Sonnet 5.5 | $55,000 | -$55,000 |
+| Cache 80% of input | $32,200 | -$22,800 |
+| Output 500 to 300 tokens | $22,200 | -$10,000 |
+| Batch 30% of requests (assumed) | $18,870 | -$3,330 |
+| Route half to Haiku 5.5 (assumed) | $9,932 | -$8,938 |
+
+That is 91% less than the start, or about $0.002 per request. Each row after the first needs an eval to show the pass rate held.
+
+A design must name three numbers. The **quality bar** is the pass rate you hold, measured on a test set of your own cases. The **latency budget** is how long a user will wait: batching moves work out of the user's wait, and caching also shortens the wait before the answer starts. The **cost per request** here ends near $0.002, or about $0.0023 per successful task at an assumed 86% pass rate.
+
+## Trade-offs
+
+| Lever | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Smaller model | Up to 20 times lower price per token | Lower pass rate on hard tasks | The eval says it clears the bar |
+| Prompt cache | Reads cost 5% to 10% of normal | A miss costs 1.25 times or 2 times; needs a stable prefix | Many requests share a long start |
+| Shorter output | Saves the dear tokens | Less detail, risk of cut-off answers | Output is a large share of the bill |
+| Batch | Half price | Results arrive later; not for waiting users | Offline jobs and evals |
+| Router | Cheap model for easy cases | A router to build, test, and watch | Traffic mixes easy and hard requests |
+| Fast mode (Opus 5.5) | Faster output | Twice the price ($8 in, $40 out); not allowed with Batch | A user waits and speed beats cost |
+
+## What experienced teams know
+
+1. **A cache miss costs more than no cache, and a burst of parallel requests all miss.** A cache entry only becomes available after the first response begins, so 50 parallel requests on a cold prefix cannot read it, and each pays the write price. Priced in units of the normal input price, that is 50 × 1.25 = 62.5, against 1.25 + 49 × 0.1 = 6.15 if you send one first and wait, at the standard 0.1 read price. That is about 10 times more. Send one request, wait for it to start answering, then send the rest. See [Anthropic's prompt caching guide](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+
+2. **Changing the early part of a prompt breaks everything after it.** The cache follows the order tools, then system prompt, then messages. Anthropic says changes at one level "invalidate that level and all subsequent levels", and editing a tool description invalidates the whole cache. A timestamp near the top of the prompt means every request misses. Put fixed text first and changing text last. Check the cache read count on each response to be sure.
+
+3. **Caching also buys rate-limit room.** A provider limits input tokens per minute (ITPM). For most Claude models, cache reads do not count toward ITPM. Anthropic's example: a 2,000,000 ITPM limit with an 80% hit rate lets you process 10,000,000 input tokens per minute. If you hit limits, check your hit rate before you ask for more. See the [rate limits page](https://platform.claude.com/docs/en/api/rate-limits).
+
+4. **Copy no cost model between models without reading the footnotes.** Cache reads are 0.05 times the input price on Sonnet 5.5 and Opus 5.5, 0.025 times on Fable 5.1, and 0.1 times on the others. Haiku 5.5 charges 5 times more per token ($0.50 in, $2.50 out) when a prompt is over 100,000 tokens. The prompt length counts cache reads, so a cache hit does not keep you under that line. See the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing).
+
+5. **A spend cap is an outage.** When an organization reaches its tier cap, every request fails until 00:00 UTC on the first of next month, and retries fail too. Set your own limit below the cap, alert at a fraction of it, and make the retry code stop on that error. Batches add one more catch: Anthropic notes they "may go slightly over" a workspace spend limit. See the [rate limits](https://platform.claude.com/docs/en/api/rate-limits) and [batch](https://platform.claude.com/docs/en/build-with-claude/batch-processing) pages.
+
+6. **Agents multiply the bill.** Anthropic found that agents use about 4 times more tokens than chat, and multi-agent systems about 15 times. On one benchmark, token use alone explained 80% of the variance in performance. That is why they work, and why they are costly. Anthropic says they pay off only when the task is worth enough. Set a budget per task, not per call. See [how Anthropic built its multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system).
+
+## Interview lens
+
+<Callout type="tip">
+Say: "Cost is tokens times price, and output costs about five times input here. I judge cost per successful task. I start with the smallest model that clears the eval bar, add prompt caching with a stable prefix, cap output, batch the offline work, and route easy requests. Every lever ships behind an eval, and I set a spend limit under the provider's cap." Then do the arithmetic aloud for 5 million requests.
+</Callout>
+
+<Callout type="mistake">
+Do not say "caching gives 90% off" or "routing halves the cost" as flat facts. A cache gives that discount only on reads, writes cost extra, and the hit rate decides the result. Routing savings were over 2 times on one test and 1.14 times on another. Also do not forget output: a quote of "$25,000" for our 5 million requests counts only the output side.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'ai9-cost-two-million-requests',
+      q: 'A feature makes 2 million requests a month on Sonnet 5.5 ($2 in, $10 out per million tokens). Each has 2,000 tokens in and 400 out. What is the monthly cost?',
+      options: [
+        '$8,000',
+        '$12,000',
+        '$16,000',
+        '$32,000',
+      ],
+      answer: 2,
+      explain: 'Input: 2,000,000 x 2,000 = 4,000 million tokens x $2 = $8,000. Output: 2,000,000 x 400 = 800 million tokens x $10 = $8,000. Total $16,000. The $8,000 figure counts only one side.',
+    },
+    {
+      id: 'ai9-cost-cache-break-even',
+      q: 'A 5-minute cache write costs 1.25 times the input price and a read costs 0.1 times. A prefix is used twice within 5 minutes. How does the cached cost compare with no cache?',
+      options: [
+        '1.35 units against 2.0 units, so the cache already wins',
+        '1.25 units against 1.0 unit, so the cache loses',
+        '2.5 units against 2.0 units, since both uses pay the write price',
+        '0.2 units against 2.0 units, since both uses are reads',
+      ],
+      answer: 0,
+      explain: 'The first use writes (1.25) and the second reads (0.1): 1.35 units. With no cache, two uses cost 2.0. The first use is always a write, so the second is the only read. One read is enough to break even.',
+    },
+    {
+      id: 'ai9-cost-router-two-times',
+      q: 'A vendor says a router "cuts costs over 2 times", citing the RouteLLM abstract. What is the best reaction?',
+      options: [
+        'Accept it, since a published paper backs the claim as stated',
+        'Reject it, since routers cannot save money on any real task',
+        'Expect 2 times on every task, but only with the largest model',
+        'Test it on your own evals, since savings vary a lot by task',
+      ],
+      answer: 3,
+      explain: 'The paper measured 2.49 times on MT-Bench but 1.14 times on MMLU and 1.27 times on GSM8K at the same quality target. Savings depend on how many of your requests are easy. Your own eval tells you.',
+    },
+    {
+      id: 'ai9-cost-spend-cap-retries',
+      q: 'Your organization hits its monthly spend cap. The client retries every 429 error with backoff. What happens?',
+      options: [
+        'Retries work after a short wait, since 429 only means slow down',
+        'Retries keep failing until the reset, so stop on this error',
+        'The retries work, but each is billed at double the price',
+        'The provider raises the cap on the first retry that it sees',
+      ],
+      answer: 1,
+      explain: 'At the tier cap the API returns 429 with no retry-after header, and access returns only at the next month. Backoff cannot help. Look at the error details to tell this case from a normal rate limit.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Levers on a 5-million-request month"
+  scenario="5,000,000 requests a month, 3,000 tokens in and 500 out. Prices per million tokens as of 2026-10-16: Opus 5.5 $4 in and $20 out. Sonnet 5.5 $2 in, $10 out, and $0.10 for a cache read."
+  steps={[
+    {
+      prompt: 'What is the monthly cost on Opus 5.5, with no levers?',
+      unit: 'dollars',
+      answer: 110000,
+      within: 1.1,
+      explain: 'Input: 15,000 million tokens x $4 = $60,000. Output: 2,500 million tokens x $20 = $50,000. Total $110,000.',
+    },
+    {
+      prompt: 'Now use Sonnet 5.5, read 80% of input from cache, and cut output to 300 tokens. What is the monthly cost?',
+      unit: 'dollars',
+      answer: 22200,
+      within: 1.1,
+      explain: 'Cache reads: 12,000 million x $0.10 = $1,200. Fresh input: 3,000 million x $2 = $6,000. Output: 5,000,000 x 300 = 1,500 million x $10 = $15,000. Total $22,200.',
+    },
+    {
+      prompt: 'The eval says 86% of tasks pass, and failures are retried until one passes. What is the cost of 1,000 successful tasks?',
+      unit: 'dollars',
+      answer: 5.16,
+      within: 1.1,
+      explain: 'Cost per attempt is $22,200 / 5,000,000 = $0.00444. Divide by 0.86 for the cost per success: $0.00516. For 1,000 successes that is $5.16.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing): token prices, cache multipliers, batch and fast mode. Re-check before you quote a price.
+- [Anthropic prompt caching guide](https://platform.claude.com/docs/en/build-with-claude/prompt-caching): prefix order, minimum lengths, and what invalidates the cache.
+- [Anthropic rate limits](https://platform.claude.com/docs/en/api/rate-limits): cache-aware input limits and spend caps.
+- [RouteLLM: Learning to Route LLMs with Preference Data (arXiv 2406.18665)](https://arxiv.org/abs/2406.18665): the routing paper, with the per-benchmark savings table.

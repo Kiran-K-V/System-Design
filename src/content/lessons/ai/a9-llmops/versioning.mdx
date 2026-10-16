@@ -1,0 +1,340 @@
+---
+summary: 'A release of an AI feature is a manifest: prompt, model ID, tools, search index, and settings, all versioned together and stamped on every trace. A fixed model ID pins the weights, not the servers around them, and a model has a retirement date, so rollback has a deadline.'
+requires: ['ai/a8-evals/rollout', 'ai/a4-context/prompts-as-code']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai9VerManifest from '../../../../components/anim/lessons/Ai9VerManifest.tsx';
+import Ai9VerTraces from '../../../../components/anim/lessons/Ai9VerTraces.tsx';
+import Ai9VerNotice from '../../../../components/anim/lessons/Ai9VerNotice.tsx';
+
+## The problem
+
+A team ships a support bot. It answers questions about customer orders. Each night, a script runs 200 test questions against it, and counts how many answers are right. On Monday the score is 91%.
+
+On Tuesday the team ships "a small cleanup". A teammate rewords one line of the prompt. Another rewrites the text that describes the order-search tool. A third rebuilds the search index with a new chunk size. A fourth lowers the maximum reply length. That night, the score reads 78%.
+
+The model did not change. Nobody touched the model. So what broke?
+
+You can only answer if you can say exactly what changed between Monday and Tuesday. Most teams cannot. They have the code in git. They have the prompt somewhere. They have no single record of everything that shapes the bot's behavior. This lesson answers five questions:
+
+1. What exactly do you ship when you ship an AI feature?
+2. How do you know which version served a given request?
+3. Is a model with a fixed name really a fixed thing?
+4. What breaks when you switch to a new model?
+5. How long can you go back to the old one?
+
+[Lesson A4.1](/learn/ai/a4-context/prompts-as-code/) showed how to version a prompt like code. This lesson widens that rule to everything else that changes the answer.
+
+## Question 1: what exactly do you ship?
+
+Think of a restaurant recipe. The recipe card says "tomato soup". But the soup also depends on which tomatoes, which oven, and how long it cooks. If the card lists only the dish name, nobody can cook it the same way twice.
+
+An AI feature is the same. Its answers depend on five things:
+
+- The **prompt**: the written instructions you send to the model on every call.
+- The **model ID**: the name of the model you call, such as `claude-sonnet-5-5`.
+- The **tools**: the functions the model may call, plus the short text that describes each one. The model reads that text to decide which tool to use. So the description is part of the behavior, not just a comment.
+- The **search index**: the store of document pieces the bot looks up before it answers. Its contents, how the text was cut into pieces, and the model that turned each piece into numbers all change what the bot finds.
+- The **settings**: values such as the maximum reply length.
+
+Change any one of the five and the answers change. Put all five in one file. That file is a **manifest**: a list of every part of a release, each with its exact version. A **release** is one manifest that you deploy as a unit.
+
+Why bother? Because without a manifest, "what changed?" has no answer. With one, the answer is a diff, the same kind of diff you read in a code review.
+
+A manifest holds a short **hash** of each long piece of text. A hash is a fingerprint: a fixed-size code computed from the text. Change one character and the fingerprint changes completely. So two prompts that look the same but differ by a space get different fingerprints, and a diff catches it.
+
+One number to keep in mind. The manifest above lists five rows. The Tuesday release changed four of them. A prompt-only change history would have shown one.
+
+## Question 2: which version served this request?
+
+Look at the phone number on a food package. If the store recalls a bad batch, the batch number tells you which packages to pull. Without it, you pull everything.
+
+Your requests need a batch number. Every request to an AI feature should leave a **trace**: a saved record of what happened, such as the input, each model call, each tool call, the output, the time, and the cost. [Lesson A9.1](/learn/ai/a9-llmops/tracing/) builds traces in full. Here you need one rule: put the release id on every trace.
+
+The **release id** is a hash of the whole manifest. If one row changes, the id changes. So the id names the release in one short code, and it can never drift out of date, because it is computed from the contents.
+
+Also log the model that actually answered. Every provider returns the model name in the reply. The OpenTelemetry conventions for AI calls define two separate fields, one for the model you asked for (`gen_ai.request.model`) and one for the model that answered (`gen_ai.response.model`). Those conventions have moved to their own repository, so check the current names before you build on them. The two values can differ when you call a moving name, which Question 3 explains.
+
+Step through the animation. It shows two releases, the diff between them, and the stamp on a trace.
+
+<Ai9VerManifest client:visible />
+
+With that stamp, a question like "did the failure rate rise after Tuesday?" becomes a filter: count failed traces for each release id. Try it below on four releases. Each release changed only one thing. The data is made up.
+
+<Ai9VerTraces client:visible />
+
+Look at release r4. The failure rate doubled from 11% to 22%. With 300 traces per release, the 95% range is about plus or minus 3.5 points for r3 and about plus or minus 4.7 for r4. The two ranges do not overlap. So the rise is not noise. And the failure reasons say where to look: almost all the growth is "wrong tool chosen". That points at the tool text.
+
+## Question 3: is a fixed model name a fixed model?
+
+Think of a car model. A 2024 sedan is the same car in every showroom. But the roads change, the fuel changes, and the garage that services it changes its tools. The car did not change. Your trip did.
+
+Model names work the same way. Here is what the main providers say.
+
+Anthropic's documentation on model IDs says that for the Claude 4.6 generation and later, a dateless ID such as `claude-sonnet-4-6` is a pinned snapshot. In its words: "Anthropic does not update the weights or configuration of an existing model ID. When an updated version is available, it ships under a new model ID." A **snapshot** is a frozen copy of the model's weights, which are the learned numbers that make up the model.
+
+The same page then adds a second fact. The weights are fixed, but "the serving infrastructure around the model can change over time". It names the request router, the safety classifiers, and the sampling logic. A **serving stack** is all the code that sits between your request and the weights. Its changes can cause "minor differences in observable behavior even when the model ID and weights have not changed".
+
+Older models behave differently. Before the 4.6 generation, a short name like `claude-sonnet-4-5` is an **alias**: a name that points at the most recent dated snapshot, so it can move. OpenAI gives the same advice for its models: pin production to a dated snapshot such as `gpt-4.1-2025-04-14`, because "even different snapshots of models within the same family could produce different results".
+
+Is this a real risk? Yes, and the clearest proof is Anthropic's own postmortem. In late summer 2025, three bugs in the serving stack, not in the weights, made Claude answers worse for a while. One bug sent short requests to servers built for very long ones. At the worst hour, 16% of Sonnet 4 requests were affected. The routing was "sticky": once a request landed on a wrong server, its follow-ups tended to land there too. So about 30% of Claude Code users who made requests in that period had at least one message routed wrong. An average of 16% hid the fact that some users saw it again and again.
+
+Anthropic then explained why it took so long to find. Its checks are "benchmarks alongside safety evaluations and performance metrics", and engineers "perform spot checks and deploy to small 'canary' groups first". A **canary** is a small slice of traffic that gets a new version first, so a bug hurts few people. Anthropic said the process still failed: "The evaluations we ran simply didn't capture the degradation users were reporting". It also wrote that "we relied too heavily on noisy evaluations". Its fix was to "run them continuously on true production systems".
+
+Take two lessons from this. A fixed model ID is necessary, not sufficient. And a check that runs only before a release cannot see a change that arrives after it.
+
+## Question 4: what breaks when you switch models?
+
+Think of moving to a new house. Your furniture is the same, but the doors are different sizes. A sofa that fit in the old hall may not fit in the new one.
+
+A new model is a new house. Three things change under your prompts.
+
+**The tokenizer.** A **token** is the unit a model reads and bills by: a piece of a word. A **tokenizer** is the code that cuts text into tokens. Anthropic's pricing page says that Claude 4.7 and later models use a newer tokenizer that "produces approximately 30% more tokens for the same text", and the exact figure depends on your content. So an 8,000-token prompt on the old tokenizer is about 8,000 x 1.3 = 10,400 tokens on the new one. At the Sonnet 5.5 input price of $2 per million tokens (pricing page, as of 2026-10-16), that prompt moves from $0.016 to $0.0208 per call, if the per-token price stays the same. Context limits, length caps, and cost forecasts all move with it.
+
+**The accepted settings.** Anthropic's deprecations page says that `temperature`, `top_p`, and `top_k` return a 400 error on Claude 4.7 and later models when set to a non-default value. A settings file that worked last month can crash the new release on its first call. So settings belong in the manifest, per model.
+
+**The prompt itself.** A prompt is tuned to one model. Researchers tested a set of open models on meaning-preserving format changes in a few-shot prompt, such as separators and spacing. Scores moved by up to 76 accuracy points on one model (LLaMA-2-13B). The same study found that a format's score "only weakly correlates between models". So a prompt that is best on the old model may be mediocre on the new one. Treat a model swap as a prompt rewrite.
+
+The fix for all three is the same: a model swap is a release. Run the golden set (a fixed list of test questions with known-good answers; see [lesson A8.3](/learn/ai/a8-evals/golden-sets/)) before you ship it.
+
+## Question 5: how long can you go back?
+
+Think of a lease. It has an end date. You can stay until then, and no later.
+
+Models have end dates too. Anthropic calls the last day a model works its **retirement date**, and says it gives "at least 60 days' notice before model retirement for publicly released models". Retired models fail: "Requests to retired models will fail". The same page warns that deprecated models "are likely to be less reliable than active models".
+
+Here are three retirements from that page, with the days between notice and end, counted from the dates:
+
+<Ai9VerNotice />
+
+Sonnet 4.5 (`claude-sonnet-4-5-20250929`) was announced on September 30, 2026 and retires on November 30, 2026. Today is October 16, so 45 days remain. Amazon Bedrock and Google Cloud keep their own schedules, so the date for the same model can differ there.
+
+What does this mean for rollback? **Rollback** means going back to the last good release. It works only while the old model still runs. If your new release breaks things two weeks before the old model retires, you have two weeks to fix forward. After that, going back is impossible.
+
+## The naive way: version the prompt, call the newest model
+
+The common first design looks like this. The prompt sits in git, which is good. The model is named by an alias or by "whatever is newest". The tool text, the search index, and the settings live in three other places, each with its own history, or none.
+
+It fails in four ways. A moving name changes the model with no deploy at all, so nothing in git explains the new behavior. A bundle of edits ships as one change, and nobody can tell which edit hurt. A trace has no release id, so a bad answer cannot be tied to a version. And when the old model retires, the team learns it from a failing production call.
+
+## The real fix
+
+Five ideas fix the five questions. Each one is cheap.
+
+### Idea 1: one manifest per release
+
+**What it is.** A file that lists the prompt hash, the exact model ID, the tool text hash, the index version, and the settings, with one release id computed from all of them.
+
+**Picture.** A recipe card that names every ingredient and brand, plus an oven setting.
+
+**Why.** Without it, "what changed?" cannot be answered. With it, the answer is a diff you read in under a minute. The prompt registry from lesson A4.1 can hold the prompt. The manifest points to it by version.
+
+**Number.** The Tuesday release changed 4 of 5 rows. The diff shows exactly which four.
+
+### Idea 2: stamp every trace
+
+**What it is.** The release id and the response model go on every trace.
+
+**Picture.** A batch number on every package.
+
+**Why.** It lets you filter any metric by release. It also lets you compare two releases on live traffic, as in the widget above.
+
+**Number.** With 300 traces per release, a jump from 11% to 22% failures is clear. The 95% range is about plus or minus 4 points at these rates. The range gets wider when the sample is smaller.
+
+### Idea 3: run a fixed test against live traffic, on a schedule
+
+**What it is.** Run the golden set every few hours against the production model with the production settings. Alert when the score drops below a line. Also compare the response model field with the one in the manifest.
+
+**Picture.** A smoke detector with a test button. You press it on a schedule, not only after you move house.
+
+**Why.** Anthropic's postmortem shows that infrastructure can change quality with no release on your side. A scheduled run is the only check that fires then.
+
+**Number.** How big a drop is real? With 200 cases and a score near 90%, one run has a standard error of about 2.1 points, because the square root of (0.9 x 0.1 / 200) is 0.021. A 1-point change is inside the noise. Set the alert line at about two standard errors, which is 4 points, or use more cases.
+
+### Idea 4: ship one change at a time
+
+**What it is.** Each release changes one row of the manifest. If you must bundle, test each change alone before you merge them.
+
+**Picture.** Changing one setting at a time on a lab experiment.
+
+**Why.** It turns a debugging hunt into a lookup. Four bundled changes need up to 4 extra test runs to separate. Four separate releases need none, because each release id already points at one change.
+
+**Number.** In the widget above, four releases cost four deploys. The cause shows up on its own line.
+
+### Idea 5: keep the old model warm until the new one is proven
+
+**What it is.** Keep the previous model in the eval rotation until its retirement date, and keep a tested path to switch back.
+
+**Picture.** Keep the old key until you are sure the new lock works.
+
+**Why.** Rollback is only real while the old model runs. Also track the retirement date of every model in your manifests. Put it on a calendar, 60 days out.
+
+**Number.** The three retirements above each gave 61 to 62 days. Start the migration the day the notice arrives.
+
+For the full rollout steps, such as shadow runs and canaries, see [lesson A8.8](/learn/ai/a8-evals/rollout/).
+
+## Numbers
+
+| Item | Value | Source |
+|---|---|---|
+| Notice before retirement | at least 60 days | Anthropic deprecations page |
+| Sonnet 4.5: notice to retirement | Sep 30 to Nov 30, 2026 = 61 days | same page, counted |
+| Sonnet 4 and Opus 4 | Apr 14 to Jun 15, 2026 = 62 days | same page, counted |
+| Tokens for the same text, new tokenizer | about 1.3 times | Anthropic pricing page |
+| Sonnet 5.5 input price | $2 per million tokens, as of 2026-10-16 | [pricing page](https://platform.claude.com/docs/en/about-claude/pricing) |
+| Worst-hour misrouting, Sonnet 4, Aug 31 2025 | 16% of requests | Anthropic postmortem |
+| Standard error of one run, 200 cases at 90% | about 2.1 points | derived above |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Alias or "latest" | Free upgrades, no migration work | Silent behavior change, nothing in git to explain it | A prototype, never production |
+| Pinned dated model | Stable weights, a clear change log | Forced migration at retirement, no free upgrades | Production |
+| One manifest for all five parts | Clear diffs, one id per release | A little process and tooling | Any feature with more than one prompt or tool |
+| One change per release | The cause is obvious | More deploys and more test runs | Anything user-facing |
+| Scheduled live golden set | Catches changes you did not make | Cost per run, plus a flaky alert if noise is ignored | Always for paid traffic |
+| Keep old model warm | Real rollback | Eval time and cost on two models | Until the old model retires |
+
+## What experienced teams know
+
+1. **A pinned model ID does not pin behavior.** Weights and configuration are frozen. The router, the safety classifiers, and the sampling code are not. Anthropic's [model IDs page](https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions) says an infrastructure update is "the most likely cause" of unexpected change on a stable ID. So log the response model and run a scheduled test. Do not rely on the name.
+
+2. **Averages hide sticky failures.** In Anthropic's [postmortem](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues), 16% of requests were misrouted at the worst hour, but routing was sticky. About 30% of Claude Code users saw at least one bad message. So report per-user or per-session failure, not only per-request rates.
+
+3. **Unannounced drift is not new, and it can be large.** A [2023 study of GPT-4 and GPT-3.5](https://arxiv.org/abs/2307.09009) compared the March and June 2023 versions of GPT-4 behind the same service. On prime-versus-composite questions, accuracy fell from 84% to 51%. The authors tied part of the drop to weaker chain-of-thought following. Pinning to a dated snapshot, as OpenAI [advises](https://platform.openai.com/docs/guides/prompt-engineering), is the defense.
+
+4. **A whitespace edit is a release.** In the [prompt-format study](https://arxiv.org/abs/2310.11324), format changes that keep the meaning moved scores by up to 76 points on one model. Put every prompt change through the golden set, even a "typo fix". Do not carry a prompt to a new model without a re-test.
+
+5. **Settings are per model.** On Claude 4.7 and later, a non-default `temperature`, `top_p`, or `top_k` returns a 400 error ([deprecations page](https://platform.claude.com/docs/en/about-claude/model-deprecations)). Keep settings inside the manifest, keyed by model, and test the first call of every new model in CI.
+
+6. **Rollback has a deadline.** The old model retires on a date you can read today. Sonnet 4.5 has 45 days left as of 2026-10-16. Keep it in the eval rotation until then, and start the next migration on day one of the notice.
+
+## Interview lens
+
+<Callout type="tip">
+Say it as a chain: "A release is a manifest: prompt, pinned model ID, tool text, index version, and settings, hashed to one release id. Every trace carries that id and the response model. I ship one change at a time, run the golden set on each, and run it on a schedule against live traffic, because pinned weights do not pin the serving stack. I track retirement dates, so rollback never depends on a retired model." That shows scope, traceability, and the deadline.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we pinned the model, so nothing changes". The weights are fixed. The servers are not. Do not say "roll back by switching the model ID" without asking whether the old model still runs. And do not claim a 1-point change on 200 test cases is a real regression: that is inside the noise.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'versioning-pinned-id-what-can-change',
+      q: 'A team calls claude-sonnet-4-6, a dateless ID from the 4.6 generation. Which part can still change under a fixed ID, according to Anthropic?',
+      options: [
+        'The weights, which Anthropic updates every quarter',
+        'The ID itself, which moves to point at the newest model',
+        'The router, safety classifiers, and sampling code',
+        'The tokenizer, which changes from one request to the next',
+      ],
+      answer: 2,
+      explain: 'Anthropic says it does not update the weights or configuration of an existing ID. It also says the serving stack (router, safety classifiers, sampling logic) can change, and that can shift behavior slightly. The weights and the ID stay fixed.',
+    },
+    {
+      id: 'versioning-tokenizer-swap-prompt-size',
+      q: 'A prompt counts 8,000 tokens on an older Claude model. The new model uses a tokenizer that makes about 30% more tokens for the same text. About how many tokens will the same prompt count on the new model?',
+      options: [
+        'About 10,400 tokens',
+        'About 8,030 tokens',
+        'About 5,700 tokens',
+        'About 24,000 tokens',
+      ],
+      answer: 0,
+      explain: '8,000 x 1.3 = 10,400. A rise of 30% means multiply by 1.3. Adding 30 tokens, or dividing by 1.4, gives wrong results. The change also moves cost and context fit.',
+    },
+    {
+      id: 'versioning-postmortem-why-evals-missed',
+      q: 'Anthropic\'s 2025 postmortem explains why its checks missed the quality drop. Which reason did it give?',
+      options: [
+        'It ran no evaluations at all before it shipped the change',
+        'It ignored user reports, since they were only anecdotes',
+        'Its canary slice was too large for any problem to show',
+        'Its evaluations missed the drop and were noisy',
+      ],
+      answer: 3,
+      explain: 'The postmortem says "the evaluations we ran simply didn\'t capture the degradation users were reporting" and "we relied too heavily on noisy evaluations". It did run evaluations and it did collect reports. Its fix was to run evaluations continuously on production.',
+    },
+    {
+      id: 'versioning-retirement-days-left',
+      q: 'Claude Sonnet 4.5 retires on November 30, 2026. Today is October 16, 2026. How many days remain to move off it?',
+      options: [
+        '30 days',
+        '45 days',
+        '61 days',
+        '75 days',
+      ],
+      answer: 1,
+      explain: 'October 16 to October 31 is 15 days, plus 30 days of November to the 30th, so 45 days. The 61 days is the gap between the notice (September 30) and the retirement, not the time left today.',
+    },
+  ]}
+/>
+
+## Prove it
+
+<Diagnose
+  client:visible
+  id="ai9-four-files-one-regression"
+  title="Which of the four changes hurt?"
+  scenario="Release r13 bundled four edits. The golden set (200 cases) passed 91.0% on r12 and 78.0% on r13. The model ID is the same in both. To find the cause, the team re-ran r13 four times, each time with exactly one edit reverted."
+  facts={[
+    'r12 (before):           91.0%',
+    'r13 (all four edits):   78.0%',
+    'r13, prompt reverted:   79.0%',
+    'r13, tools reverted:    89.0%',
+    'r13, index reverted:    79.0%',
+    'r13, settings reverted: 78.0%',
+    'noise: about 2.1 points per run (200 cases near 90%)',
+  ]}
+  steps={[
+    {
+      prompt: 'Which edit caused most of the drop?',
+      options: [
+        'The settings change, since it was the last file listed in the diff',
+        'The tool text rewrite: reverting it recovers 11 points',
+        'The prompt edit, because the prompt is always the biggest lever',
+        'The search index rebuild, because it changed the most files at once',
+      ],
+      answer: 1,
+      explain: 'Reverting the tool text brings the score from 78.0% to 89.0%, an 11-point gain. Every other revert moves the score by 1 point or less. The order of files in a diff says nothing about cause.',
+    },
+    {
+      prompt: 'Reverting the prompt gave +1.0 point. What should the team conclude?',
+      options: [
+        'The prompt edit is the second biggest cause, so revert it too',
+        'One point is inside the 2-point noise, so harm is not proven',
+        'The prompt is safe, because any change under 5 points is harmless',
+        'The golden set is broken, because a clean test gives the same score each run',
+      ],
+      answer: 1,
+      explain: 'One run on 200 cases has a standard error near 2.1 points, so a 1-point gap is not distinguishable from chance. It does not prove harm and it does not prove safety. More cases or repeated runs would narrow it. A test on a probabilistic system does not repeat exactly.',
+    },
+    {
+      prompt: 'What process change would have found this without four extra test runs?',
+      options: [
+        'A larger prompt, so that the model has more context to use',
+        'A lower temperature, which would make every run identical',
+        'Shipping each edit as its own release with its own id',
+        'Removing the golden set, since it only ever reports noise',
+      ],
+      answer: 2,
+      explain: 'With one change per release, the score line shows which release moved. The release id on each trace points straight at the change. Lowering temperature is not available on Claude 4.7 and later, and would not tell you which edit hurt.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: a postmortem of three recent issues](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues) (the serving stack changed, and the checks missed it)
+- [Claude docs: model IDs and versioning](https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions)
+- [Claude docs: model deprecations](https://platform.claude.com/docs/en/about-claude/model-deprecations) (notice period, retirement dates, parameter changes)
+- [How is ChatGPT's behavior changing over time?](https://arxiv.org/abs/2307.09009) (the same service, two versions, different answers)
