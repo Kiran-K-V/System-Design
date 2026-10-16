@@ -37,7 +37,7 @@ export default function Ai10RedLoop() {
                 { x: 610, t: 'Judge model' },
               ].map((b, k) => (
                 <g key={b.t}>
-                  <SketchBox cx={b.x} cy={50} w={170} h={44} r={8} seed={seedOf(`red-${k}`)} stroke={k === 1 && i >= 5 ? 'var(--ok)' : 'var(--fg)'} />
+                  <SketchBox cx={b.x} cy={50} w={170} h={44} r={8} seed={seedOf(`red-${k}`)} stroke={k === 1 && i === 5 ? 'var(--ok)' : k === 1 && i === 6 ? 'var(--bad)' : 'var(--fg)'} />
                   <HandText x={b.x} y={50} size={TEXT_SIZES.label}>{b.t}</HandText>
                 </g>
               ))}

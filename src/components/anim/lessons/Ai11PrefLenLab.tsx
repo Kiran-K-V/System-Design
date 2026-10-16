@@ -30,7 +30,7 @@ export default function Ai11PrefLenLab() {
             </div>
           ))}
         </div>
-        <p className="mt-2 text-xs text-muted">Each pair: left bar is the chosen answer (green), right bar is the rejected one (red). Faded pairs are dropped.</p>
+        <p className="mt-2 text-xs text-muted">Each pair: left bar is the chosen answer (green), right bar is the rejected one (orange). Faded pairs are dropped.</p>
       </div>
       <div className="mt-3 grid gap-3 text-sm sm:grid-cols-3" aria-live="polite">
         <div className="rounded-lg border border-line p-3">

@@ -2,13 +2,13 @@ import { HandText, SketchBox, SketchSvg, TEXT_SIZES, seedOf } from '../sketch';
 
 /** Real figures from a 2026 study with 451 human participants and 31 simulators (agent success; short turns; polite turns). */
 const ROWS = [
-  { label: 'Agent success rate', human: 63.6, sim: 77.8, simName: 'best simulators' },
+  { label: 'Agent success rate', human: 63.6, sim: 77.8, simName: 'top simulators' },
   { label: 'Turns of 3 words or fewer', human: 29.0, sim: 1.0, simName: 'GPT-4o' },
   { label: 'Polite turns', human: 15.3, sim: 49.0, simName: 'GPT-4o' },
 ];
 
 const X0 = 250;
-const W = 380;
+const W = 320;
 
 /** Static infographic: humans against simulators on three measures. */
 export default function Ai8SimGap() {

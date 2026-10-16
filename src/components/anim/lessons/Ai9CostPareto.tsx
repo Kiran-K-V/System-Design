@@ -6,7 +6,7 @@ import { PRICES, candidates } from './Ai9CostMath';
 const W = 720;
 const H = 300;
 const PX0 = 80;
-const PX1 = 690;
+const PX1 = 660;
 const PY0 = 30;
 const PY1 = 250;
 const LO = -4;

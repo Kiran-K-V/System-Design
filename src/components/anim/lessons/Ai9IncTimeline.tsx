@@ -86,7 +86,7 @@ const LANE_Y = (i: number) => 112 + i * 58;
 
 export default function Ai9IncTimeline() {
   return (
-    <AnimFrame title="Three bugs, five weeks: Anthropic, August to September 2025" steps={steps} interval={6500}>
+    <AnimFrame title="Three bugs in five weeks (Anthropic, 2025)" steps={steps} interval={6500}>
       {(_, s) => (
         <SketchSvg width={720} height={300} label={`Timeline of three bugs, cursor at ${s.label}`}>
           <HandText x={X0} y={22} anchor="start" size={TEXT_SIZES.heading} color="var(--muted)">
@@ -128,8 +128,13 @@ export default function Ai9IncTimeline() {
             );
           })}
           <SketchArrow points={[[x(s.day), 46], [x(s.day), 250]]} head="none" dashed stroke="var(--accent)" strokeWidth={2.2} seed={seedOf(`cur${s.day}`)} />
-          <HandText x={X0 + 540} y={22} anchor="end" size={TEXT_SIZES.note} color="var(--muted)">
-            red: wrong answers reach users. orange: fix rolling out.
+          <SketchBox cx={330} cy={22} w={22} h={14} r={6} seed={seedOf('lg-bad')} stroke="var(--bad)" fill="var(--bad)" />
+          <HandText x={346} y={22} anchor="start" size={TEXT_SIZES.note} color="var(--muted)">
+            wrong answers reach users
+          </HandText>
+          <SketchBox cx={572} cy={22} w={22} h={14} r={6} seed={seedOf('lg-warn')} stroke="var(--warn)" fill="var(--warn)" />
+          <HandText x={588} y={22} anchor="start" size={TEXT_SIZES.note} color="var(--muted)">
+            fix rolling out
           </HandText>
         </SketchSvg>
       )}

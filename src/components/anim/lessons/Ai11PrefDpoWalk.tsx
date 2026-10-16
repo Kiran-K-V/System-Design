@@ -44,8 +44,8 @@ const steps: Step[] = [
   },
 ];
 
-const CX = 400;
-const SCALE = 34;
+const CX = 440;
+const SCALE = 30;
 const clampX = (v: number) => CX + Math.max(-9.6, Math.min(3.4, v)) * SCALE;
 
 function Bar({ y, v, label, tone, active, seed }: { y: number; v: number; label: string; tone: string; active: boolean; seed: string }) {

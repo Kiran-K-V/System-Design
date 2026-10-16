@@ -7,12 +7,12 @@ interface Msg {
 }
 
 const MSGS: Msg[] = [
-  { who: 'user', text: 'I want a refund for my headphones.' },
+  { who: 'user', text: 'I want my headphones refunded.' },
   { who: 'agent', text: 'What is your order number?' },
   { who: 'user', text: 'A-77. That is all I know.' },
-  { who: 'agent', text: 'It arrived 45 days ago. Refunds end\nat 30 days. I can give $60 credit.' },
+  { who: 'agent', text: 'Arrived 45 days ago. Refunds\nend at 30 days. $60 credit?' },
   { who: 'user', text: 'That is unfair. I was travelling!' },
-  { who: 'agent', text: 'I understand. The 30-day rule\nstands. The $60 credit is ready.' },
+  { who: 'agent', text: 'I understand. The 30-day rule\nstands. Your $60 credit is set.' },
 ];
 
 /** Private notes of the simulated user. `at` is the message index (0-based) where the fact comes out. */
@@ -41,10 +41,10 @@ const steps: Step[] = [
   { shown: 6, check: true, caption: 'Now grade the end state, not the chat. Refunds issued: none (expected none). Store credit: $60 (expected $60). The state matches, so the run passes. Run this test again with a hostile persona and a cooperative one, and compare.' },
 ];
 
-const CX = 150;
-const LX = 262;
-const RX = 462;
-const BW = 240;
+const CX = 135;
+const LX = 268;
+const RX = 472;
+const BW = 230;
 
 export default function Ai8SimWalk() {
   return (
@@ -52,7 +52,7 @@ export default function Ai8SimWalk() {
       {(_, s) => (
         <SketchSvg width={720} height={400} label="A six-turn chat between a simulated user and a support agent, graded by the end state.">
           <HandText x={CX} y={22} size={TEXT_SIZES.heading} color="var(--muted)">simulated user: private notes</HandText>
-          <SketchBox cx={CX} cy={140} w={250} h={176} r={8} seed={seedOf('swcard')} stroke="var(--muted)" dashed />
+          <SketchBox cx={CX} cy={140} w={230} h={176} r={8} seed={seedOf('swcard')} stroke="var(--muted)" dashed />
           {NOTES.map((n, k) => {
             const revealed = n.at >= 0 && s.shown > n.at;
             const done = n.at < 0 || revealed;
@@ -65,10 +65,10 @@ export default function Ai8SimWalk() {
           <HandText x={CX} y={250} size={TEXT_SIZES.note} color="var(--muted)">accent = already said aloud</HandText>
           {s.check && (
             <g>
-              <SketchBox cx={CX} cy={326} w={250} h={92} r={8} seed={seedOf('swchk')} stroke="var(--ok)" fill="var(--ok)" strokeWidth={2.2} />
+              <SketchBox cx={CX} cy={326} w={230} h={92} r={8} seed={seedOf('swchk')} stroke="var(--ok)" fill="var(--ok)" strokeWidth={2.2} />
               <HandText x={CX} y={300} size={TEXT_SIZES.label}>state check: pass</HandText>
-              <HandText x={CX} y={324} size={TEXT_SIZES.note} mono>refunds: none (want none)</HandText>
-              <HandText x={CX} y={346} size={TEXT_SIZES.note} mono>credit: $60 (want $60)</HandText>
+              <HandText x={CX} y={324} size={TEXT_SIZES.note} mono>refunds: none (ok)</HandText>
+              <HandText x={CX} y={346} size={TEXT_SIZES.note} mono>credit: $60 (ok)</HandText>
             </g>
           )}
           {MSGS.map((m, k) => {

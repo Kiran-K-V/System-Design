@@ -94,7 +94,7 @@ export default function Ai8ErrCards() {
             {!showCards && (
               <>
                 <HandText x={360} y={36} size={TEXT_SIZES.heading} color="var(--muted)">Failures by group, all 40 failed traces</HandText>
-                {ORDER.map((g, n) => {
+                {[...ORDER].sort((a, b) => COUNTS[b] - COUNTS[a]).map((g, n) => {
                   const y = 90 + n * 56;
                   const w = (COUNTS[g] / max) * 360;
                   const top = g === 'doc';

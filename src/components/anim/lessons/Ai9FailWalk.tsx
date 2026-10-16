@@ -88,8 +88,8 @@ export default function Ai9FailWalk() {
         const off = new Set(s.offEdges ?? []);
         const edges: FlowEdge[] = [
           { from: 'client', to: 'router' },
-          { from: 'router', to: 'primary', dashed: off.has('router>primary') },
-          { from: 'router', to: 'fallback', dashed: off.has('router>fallback') },
+          { from: 'router', to: 'primary', dashed: off.has('router>primary'), tone: off.has('router>primary') ? 'muted' : 'default' },
+          { from: 'router', to: 'fallback', dashed: off.has('router>fallback'), tone: off.has('router>fallback') ? 'muted' : 'default' },
         ];
         return (
           <FlowDiagram
