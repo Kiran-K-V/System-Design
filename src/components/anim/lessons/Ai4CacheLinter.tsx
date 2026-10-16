@@ -82,7 +82,7 @@ export default function Ai4CacheLinter() {
         </div>
       </div>
       <p className="mt-3 text-xs leading-relaxed text-muted">
-        Model: the cached prefix is every block before the first block that differs between requests, and it must reach {MIN_CACHEABLE} tokens. A hit costs $0.10 per million tokens, anything else $2. Cache writes and the 5-minute expiry are left out, so this is the cost once traffic is steady. Orange rows differ between requests.
+        Model: the cached prefix is every block before the first block that differs between requests, and it must reach {MIN_CACHEABLE} tokens. A hit costs $0.10 per million tokens, anything else $2. Cache writes and the 5-minute expiry are left out, so this is the cost once traffic is steady. Amber rows differ between requests.
       </p>
     </CacheWidgetFrame>
   );

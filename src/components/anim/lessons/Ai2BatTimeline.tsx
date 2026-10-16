@@ -119,8 +119,8 @@ export default function Ai2BatTimeline() {
         <SketchSvg width={720} height={420} label="Two timelines of four GPU slots: static batching leaves slots idle, continuous batching refills them">
           <Lane runs={SR} idle={SI} lane={0} t={s.t} focus={s.focus?.lane === 0 ? s.focus.req : undefined} title="Static batching" seedKey="sb" />
           <Lane runs={CR} idle={CI} lane={1} t={s.t} focus={s.focus?.lane === 1 ? s.focus.req : undefined} title="Continuous batching" seedKey="cb" />
-          <line x1={x(s.t)} x2={x(s.t)} y1={LANE_Y[0] - 22} y2={LANE_Y[1] + 3 * (ROW + 6) + 22} stroke="var(--accent)" strokeWidth={1.4} strokeDasharray="4 4" />
-          <HandText x={x(s.t)} y={LANE_Y[1] + 3 * (ROW + 6) + 36} size={TEXT_SIZES.note} mono color="var(--accent)">
+          <line x1={x(s.t)} x2={x(s.t)} y1={LANE_Y[0] - 46} y2={LANE_Y[1] + 3 * (ROW + 6) + 22} stroke="var(--accent)" strokeWidth={1.4} strokeDasharray="4 4" />
+          <HandText x={x(s.t) + (s.t > 12 ? -6 : 6)} y={LANE_Y[0] - 40} anchor={s.t > 12 ? 'end' : 'start'} size={TEXT_SIZES.note} mono color="var(--accent)">
             {`step ${s.t}`}
           </HandText>
           <HandText x={24} y={406} anchor="start" size={TEXT_SIZES.note} color="var(--muted)">

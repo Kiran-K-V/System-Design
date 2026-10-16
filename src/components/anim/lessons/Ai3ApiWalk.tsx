@@ -71,7 +71,7 @@ const steps: S[] = [
     turn: 1, res: true, hiReq: {}, hiRes: { usage: W }, meter: false,
   },
   {
-    caption: 'Turn 2. The server kept nothing from turn 1. Your code sends the system prompt, the first user turn, the reply, and the new question again. The old part is outlined in green and the new part in blue.',
+    caption: 'Turn 2. The server kept nothing from turn 1. Your code sends the system prompt, the first user turn, the reply, and the new question again. The old part is outlined in green and the new part in the accent color.',
     turn: 2, res: false, hiReq: { old: O, new: A }, hiRes: {}, meter: true,
   },
   {
@@ -86,7 +86,7 @@ export default function Ai3ApiWalk() {
       {(i, s) => {
         const px = 360 / 23;
         return (
-          <SketchSvg width={720} height={420} label={`Step ${i + 1} of the API call walk`}>
+          <SketchSvg width={720} height={450} label={`Step ${i + 1} of the API call walk`}>
             <Ai3Code x={16} y={18} w={340} title={s.turn === 1 ? 'Request, turn 1' : 'Request, turn 2'} lines={s.turn === 1 ? REQ1 : REQ2} hi={s.hiReq} />
             {s.res && <Ai3Code x={372} y={18} w={332} title="Response" lines={RES} hi={s.hiRes} />}
             {!s.res && s.turn === 1 && (
@@ -96,16 +96,16 @@ export default function Ai3ApiWalk() {
             )}
             {s.meter && (
               <g>
-                <HandText x={16} y={316} anchor="start" size={TEXT_SIZES.heading} color="var(--muted)">
+                <HandText x={16} y={340} anchor="start" size={TEXT_SIZES.heading} color="var(--muted)">
                   input_tokens per call
                 </HandText>
-                <HandText x={16} y={352} anchor="start" size={TEXT_SIZES.note} mono>turn 1</HandText>
-                <SketchBox cx={90 + (12 * px) / 2} cy={352} w={12 * px} h={22} r={6} seed={seedOf('m1')} fill={A} stroke={A} />
-                <HandText x={100 + 12 * px} y={352} anchor="start" size={TEXT_SIZES.note} mono>12</HandText>
-                <HandText x={16} y={386} anchor="start" size={TEXT_SIZES.note} mono>turn 2</HandText>
-                <SketchBox cx={90 + (17 * px) / 2} cy={386} w={17 * px} h={22} r={6} seed={seedOf('m2a')} fill={O} stroke={O} />
-                <SketchBox cx={90 + 17 * px + (6 * px) / 2} cy={386} w={6 * px} h={22} r={6} seed={seedOf('m2b')} fill={A} stroke={A} />
-                <HandText x={100 + 23 * px} y={386} anchor="start" size={TEXT_SIZES.note} mono>
+                <HandText x={16} y={376} anchor="start" size={TEXT_SIZES.note} mono>turn 1</HandText>
+                <SketchBox cx={90 + (12 * px) / 2} cy={376} w={12 * px} h={22} r={6} seed={seedOf('m1')} fill={A} stroke={A} />
+                <HandText x={100 + 12 * px} y={376} anchor="start" size={TEXT_SIZES.note} mono>12</HandText>
+                <HandText x={16} y={410} anchor="start" size={TEXT_SIZES.note} mono>turn 2</HandText>
+                <SketchBox cx={90 + (17 * px) / 2} cy={410} w={17 * px} h={22} r={6} seed={seedOf('m2a')} fill={O} stroke={O} />
+                <SketchBox cx={90 + 17 * px + (6 * px) / 2} cy={410} w={6 * px} h={22} r={6} seed={seedOf('m2b')} fill={A} stroke={A} />
+                <HandText x={100 + 23 * px} y={410} anchor="start" size={TEXT_SIZES.note} mono>
                   {'23 = 12 + 5 resent, 6 new'}
                 </HandText>
               </g>

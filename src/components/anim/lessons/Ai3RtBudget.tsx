@@ -14,7 +14,7 @@ function Slider({ id, label, value, max, onChange }: { id: string; label: string
   );
 }
 
-const COLORS = ['var(--accent)', 'var(--warn)', 'var(--ok)', 'var(--purple)', 'var(--muted)'];
+const COLORS = ['var(--accent)', 'var(--warn)', 'var(--ok)', 'var(--fg)', 'var(--muted)'];
 
 function Bars({ title, stages, ms, scale, id }: { title: string; stages: Stage[]; ms: number[]; scale: number; id: string }) {
   let start = 0;
@@ -30,13 +30,13 @@ function Bars({ title, stages, ms, scale, id }: { title: string; stages: Stage[]
           const left = (start / scale) * 100;
           const w = (ms[k] / scale) * 100;
           start += ms[k];
-          return <div key={s.id} className="absolute h-full" style={{ left: `${left}%`, width: `${w}%`, background: COLORS[k % COLORS.length], opacity: 0.85 }} title={`${s.label}: ${ms[k]} ms`} />;
+          return <div key={s.id} className="absolute h-full" style={{ left: `${left}%`, width: `${w}%`, background: COLORS[k % COLORS.length], opacity: k === 3 ? 0.55 : 0.85 }} title={`${s.label}: ${ms[k]} ms`} />;
         })}
       </div>
-      <ul className="mt-2 grid gap-x-4 gap-y-1 text-xs text-muted sm:grid-cols-2">
+      <ul className="mt-2 space-y-1 text-xs text-muted">
         {stages.map((s, k) => (
           <li key={s.id} className="flex items-center gap-1.5">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ background: COLORS[k % COLORS.length] }} />
+            <span className="inline-block h-2.5 w-2.5 shrink-0 rounded-sm" style={{ background: COLORS[k % COLORS.length], opacity: k === 3 ? 0.55 : 1 }} />
             {s.label}: <span className="tabular-nums text-fg">{ms[k]} ms</span>
           </li>
         ))}

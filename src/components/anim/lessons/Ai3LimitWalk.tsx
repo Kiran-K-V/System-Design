@@ -16,7 +16,7 @@ interface Step {
 const steps: Step[] = [
   {
     caption: 'Three buckets, all full. These are the Start tier limits for Opus 5.5 on the rate limits page: 1,000 requests, 2,000,000 input tokens, and 400,000 output tokens per minute. Each bucket refills continuously, not at the minute mark.',
-    rem: [1, 1, 1], labels: ['1,000', '2.0M', '400K'], outcome: 'idle', tone: 'idle',
+    rem: [1, 1, 1], labels: ['1,000', '2.0M', '400K'], outcome: 'no requests yet', tone: 'idle',
   },
   {
     caption: '300 requests arrive at the same moment. Each has 4,000 uncached input tokens and returns 500 output tokens. They use 300 requests, 1.2M input tokens, and 150K output tokens. All pass. A burst is fine while the buckets hold tokens.',
@@ -35,8 +35,8 @@ const steps: Step[] = [
     rem: [0.2, 0.68, 0], labels: ['200', '1.36M', '0'], bind: 2, outcome: '800 requests, then 429', tone: 'warn',
   },
   {
-    caption: 'A different 429. The organization reached its monthly spend cap. The error code is enforced_spend_limit_reached and there is no retry-after header. Every request fails until the first of the month. Stop retrying, alert a person, and fail fast or switch provider.',
-    rem: [1, 1, 1], labels: ['full', 'full', 'full'], outcome: '429, no retry-after, do not retry', tone: 'bad',
+    caption: 'A different 429. The buckets have room, but the organization reached its monthly spend cap. The error code is enforced_spend_limit_reached and there is no retry-after header. Every request fails until the first of the month. Stop retrying, alert a person, and fail fast or switch provider.',
+    rem: [1, 1, 1], labels: ['room', 'room', 'room'], outcome: '429, no retry-after, do not retry', tone: 'bad',
   },
 ];
 
@@ -56,7 +56,7 @@ export default function Ai3LimitWalk() {
               const cy = 50 + k * 62;
               const f = spend ? 1 : s.rem[k];
               const bound = s.bind === k;
-              const tone = spend ? 'var(--muted)' : bound ? 'var(--bad)' : 'var(--accent)';
+              const tone = spend ? 'var(--ok)' : bound ? 'var(--bad)' : 'var(--accent)';
               const w = Math.max(f * TRACK, 4);
               return (
                 <g key={n}>

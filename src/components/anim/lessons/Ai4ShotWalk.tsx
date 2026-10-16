@@ -17,6 +17,7 @@ interface Step {
   unit: string;
   bars: Bar[];
   tag: string;
+  notes?: string[];
 }
 const col = (t: Bar['tone']) => `var(--${t})`;
 
@@ -24,10 +25,11 @@ const steps: Step[] = [
   {
     caption: 'The task is sentiment labelling. The prompt holds four labelled examples, then the new review. The examples are the only thing the model sees about the task. P means Positive, N means Negative.',
     shots: ['P', 'P', 'P', 'N'],
-    heading: 'No prediction yet',
+    heading: 'Task',
     unit: '',
     bars: [],
     tag: '',
+    notes: ['Label a review as', 'P (Positive) or N (Negative)', 'Which label will it pick?'],
   },
   {
     caption: 'Zhao et al. (2021) tested GPT-3 with the order P P P N. They report that this order leads to "nearly 90%" Negative predictions. The last label in the prompt wins, even though three of four examples were Positive. This is recency bias.',
@@ -65,10 +67,11 @@ const steps: Step[] = [
   {
     caption: 'The fix is a process. Balance the labels. Shuffle the order and run several orders. Report the spread, not one score. Then test on held-out cases that are not in the prompt. The paper also finds that variance stays high with more examples.',
     shots: ['P', 'N', 'N', 'P'],
-    heading: 'Report a range, not one number',
+    heading: 'A test plan',
     unit: '',
     bars: [],
     tag: '',
+    notes: ['Balanced labels: 2 P, 2 N', 'Run 3 or more orders per K', 'Report mean and spread', 'Score on held-out cases'],
   },
 ];
 
@@ -112,6 +115,11 @@ export default function Ai4ShotWalk() {
               </g>
             );
           })}
+          {(s.notes ?? []).map((n, k) => (
+            <HandText key={n} x={400} y={80 + k * 36} anchor="start" size={TEXT_SIZES.label}>
+              {n}
+            </HandText>
+          ))}
           {s.tag && (
             <HandText x={400} y={250} anchor="start" size={TEXT_SIZES.note} color="var(--muted)">
               {s.tag}

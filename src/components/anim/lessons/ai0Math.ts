@@ -61,7 +61,7 @@ export function simulate(p: number, n: number, runs: number, seed: number): numb
   return counts;
 }
 
-export const GPU = { name: 'H100 SXM, per GPU-hour (Lambda on-demand)', perHour: 3.99, tokensPerSec: 8399 };
+export const GPU = { name: 'H100 SXM, per GPU-hour (Lambda on-demand)', perHour: 3.99, tokensPerSec: 4485 };
 export const HOURS_PER_MONTH = 730;
 
 export interface Crossover {

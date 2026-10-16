@@ -1,0 +1,242 @@
+---
+summary: 'A call has two phases. Prefill reads the whole prompt at once and is limited by compute. Decode makes one token per pass and is limited by memory bandwidth. Derive the decode floor for a 70B model and measure with MBU, not GPU utilization.'
+requires: ['ai/a2-inference-cost/gpu-memory-math', 'ai/a1-model-function/attention-cost']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai2PdRoof from '../../../../components/anim/lessons/Ai2PdRoof.tsx';
+import Ai2PdTimeline from '../../../../components/anim/lessons/Ai2PdTimeline.tsx';
+
+## The problem
+
+You test one model two ways. A 20,000-token document with a one-line answer takes a second before anything appears, then it is done. A one-line question with a 1,000-word answer starts at once, then streams for half a minute. Same model, same GPUs. Why do the two feel so different?
+
+Because a call is two jobs with different limits. If you tune one and measure the other, you waste money. This lesson separates them and gives you a number for each.
+
+## Naive solution: "latency is cost per token times tokens"
+
+[Lesson A1.3](/learn/ai/a1-model-function/forward-pass/) gave one cost per token: about 2N FLOPs. A single number per token predicts that a 20,000-token prompt and a 20,000-token answer cost the same. They do not. The prompt tokens go through the model **together**. The answer tokens go through **one at a time**, because each one depends on the one before it ([sampling and decoding](/learn/ai/a1-model-function/sampling-decoding/)).
+
+## The mechanism: two phases, two ceilings
+
+- **Prefill** [junior]: the model reads the whole prompt in one pass and produces the first output token. The time until you see that token is **TTFT** [junior] (time to first token).
+- **Decode** [junior]: the model makes the rest of the tokens, one per pass. The average gap between tokens is **TPOT** [junior] (time per output token).
+
+Databricks states the total: latency = TTFT + TPOT x number of output tokens. A TPOT of 100 ms is 10 tokens per second for that user. For a backend engineer, TTFT is time to first byte, and TPOT is the pace of a streamed response.
+
+A GPU kernel can hit one of two ceilings. The **compute ceiling** is peak FLOP/s. The **memory ceiling** is how fast bytes arrive from HBM. Which one binds depends on **arithmetic intensity** [mid]: FLOPs of work per byte moved. The **ridge point** [mid] is the intensity where the two ceilings meet: peak FLOP/s divided by bandwidth.
+
+For an H100 SXM in BF16, dense: 989 TFLOPS / 3.35 TB/s = **295 FLOPs per byte**. (A2.1 explained why 989 and not 1,979.)
+
+Now the intensity of a transformer pass. Each weight is a 2-byte value. It is read from HBM once per pass. It does 2 FLOPs (a multiply and an add) for every token in that pass.
+
+<Math block tex="\text{intensity} = \frac{2 \text{ FLOPs} \times T \text{ tokens}}{2 \text{ bytes}} = T" />
+
+So intensity is about the number of tokens T that share one read of the weights. In **decode** T is the batch size b: one token from each request. At batch 1, intensity is 1, far below 295. In **prefill** T is the prompt length. A 2,000-token prompt has intensity 2,000, above the ridge. Watch the dot move.
+
+<Ai2PdRoof client:visible />
+
+The consequence: decode is **memory-bound**, prefill is **compute-bound**. A prompt shorter than about 295 tokens is still on the slope. The attention term and the KV cache reads move the real ridge, so treat 295 as a first estimate (the roofline here is our model, in the style Databricks describes).
+
+### The decode floor: derive it
+
+Every decode step reads all the weights once. Let W be the weight bytes, n the GPUs sharing them (tensor parallel, A2.1), and BW the bandwidth of one GPU. Each GPU holds W/n and reads it in parallel, so:
+
+<Math block tex="t_{\text{step}} \;\ge\; \frac{W / n}{BW} \;=\; \frac{W}{n \cdot BW}" />
+
+This is a floor: the real step also reads the KV cache and talks over NVLink. Work the 70B BF16 case (W = 140 GB), on hardware that holds it.
+
+- **2 x H100:** 140 / (2 x 3,350 GB/s) = **20.9 ms**, so at most 48 tokens/s for one user.
+- **1 x H200:** 140 / 4,800 GB/s = **29.2 ms**, at most 34 tokens/s.
+- **4 x H100:** 140 / (4 x 3,350) = **10.4 ms**, at most 96 tokens/s, before link costs.
+
+You may see "140 GB / 3.35 TB/s = 42 ms" quoted. That uses one H100 and 140 GB of weights, which is impossible: the model does not fit. Use the number of GPUs that actually holds it.
+
+### The TTFT floor
+
+Prefill does about 2 x N x p FLOPs for p prompt tokens, plus the attention score work from [lesson A1.4](/learn/ai/a1-model-function/attention-cost/), 4 x p² x d x L. For Llama 3 70B (N = 70e9, d = 8,192, L = 80) and p = 2,000:
+
+- Weights: 2 x 70e9 x 2,000 = 2.8e14 FLOPs.
+- Attention: 4 x 2,000² x 8,192 x 80 = 1.05e13 FLOPs.
+- Total 2.9e14, over 2 x 989 TFLOPS = **147 ms**.
+
+Real servers reach a fraction of peak, so TTFT is longer. Move the sliders to see both floors for a whole request.
+
+<Ai2PdTimeline client:visible />
+
+Try 2,048 tokens in and 512 out on 2 x H100: TTFT about 0.15 s, TPOT about 21 ms, total about 10.9 s. Decode is 99% of the time. This is why output length drives latency: the Databricks guide says so too. To speed up a slow answer, first ask for fewer output tokens.
+
+## Measuring: MFU and MBU, not "utilization"
+
+NVIDIA's own docs define the GPU percentage in nvidia-smi as the percent of time over the sample period during which one or more kernels was executing. It does not say how much of the math units or the memory bandwidth the kernel used. A decode loop keeps a kernel running all the time, so it reads near 100% while it wastes most of the chip.
+
+Two better numbers:
+
+- **MFU** [mid] (model FLOPs utilization): achieved FLOP/s over peak FLOP/s. Good for prefill and training. Llama 3 405B pre-training reached 38 to 43 percent on H100s (41% at 16K GPUs). That is training, not serving.
+- **MBU** [mid] (model bandwidth utilization): achieved bytes/s over peak bytes/s, where bytes are weights plus KV cache per step divided by TPOT. Databricks' example: a 7B BF16 model at 14 ms TPOT moves 14 GB in 14 ms, which is 1 TB/s, so 50% of a 2 TB/s GPU. Good for decode.
+
+At batch 1, decode MFU is tiny by design. Judge decode by MBU.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| H100 ridge point, BF16 dense | 295 FLOPs/byte | Derived: 989 TFLOPS / 3.35 TB/s |
+| Decode floor, 70B BF16, 2 x H100 | 20.9 ms per token | Derived: 140 GB / (2 x 3.35 TB/s) |
+| Decode floor, 70B BF16, 1 x H200 | 29.2 ms per token | Derived: 140 GB / 4.8 TB/s |
+| TTFT floor, 70B, 2,000 tokens, 2 x H100 | 147 ms | Derived, with attention |
+| TPOT of 100 ms | 10 tokens/s per user | Databricks |
+| Llama 3 405B training MFU | 38 to 43% | Llama 3 paper |
+
+## Trade-offs
+
+| Lever | You gain | You pay | Choose when |
+|---|---|---|---|
+| Shorter prompt | Lower TTFT, cheaper prefill | Less context for the model | Long inputs dominate TTFT |
+| Fewer output tokens | Lower total latency | Shorter answers | Answers are long (decode dominates) |
+| More GPUs per replica | Lower TPOT floor, more KV room | Cost, link traffic | One user needs speed |
+| Higher batch | More tokens/s per GPU | Higher TPOT per user (A2.4) | You serve many users |
+| Lower precision | Fewer bytes per step, so lower TPOT | Quality risk (A2.6) | Decode is the limit |
+
+## Interview lens
+
+<Callout type="tip">
+Split every latency answer into the two phases: "TTFT is prefill, compute-bound, grows with prompt length. TPOT is decode, memory-bound, set by weight bytes over bandwidth. For 70B on two H100s that is about 21 ms per token, so a 500-token answer takes at least 10 seconds." Then say which phase you would shorten first.
+</Callout>
+
+<Callout type="mistake">
+Do not quote GPU utilization as evidence that a deployment is efficient. Do not say "the GPU is the bottleneck" without naming compute or memory bandwidth. Do not divide the weight size by one GPU's bandwidth when the weights are split over several.
+</Callout>
+
+<Callout type="deep" title="Why a bigger batch does not slow the step much">
+At batch 1, a step takes about W / (n x BW) whatever the batch is, as long as compute stays below the roof. Going from 1 to 16 tokens per step adds a little KV reading and some math, but not 16 times the time. That is why batching raises throughput nearly for free, until the ridge or the KV cache stops it. Lesson A2.4 builds on this.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="The decode floor"
+  scenario="Llama 3 70B in BF16 has 140 GB of weights. It runs on 2 x H100 with tensor parallelism. Each H100 reads at 3.35 TB/s. Ignore the KV cache and link traffic."
+  steps={[
+    {
+      prompt: 'Minimum time per decode step, in milliseconds?',
+      unit: 'ms',
+      answer: 20.9,
+      within: 1.1,
+      explain: 'Each GPU reads 70 GB. 70 / 3,350 GB/s = 0.0209 s = 20.9 ms. Both GPUs read in parallel.',
+    },
+    {
+      prompt: 'Maximum tokens per second for one user at batch 1?',
+      unit: 'tokens/s',
+      answer: 48,
+      within: 1.1,
+      explain: '1 / 0.0209 s = 47.8, so about 48 tokens per second. Real systems are slower.',
+    },
+    {
+      prompt: 'Ridge point of one H100 in BF16 dense, in FLOPs per byte? (989 TFLOPS and 3.35 TB/s)',
+      unit: 'FLOPs/byte',
+      answer: 295,
+      within: 1.1,
+      explain: '989e12 / 3.35e12 = 295. Below it a kernel is memory-bound.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai2-util-100-slow"
+  title="Busy GPU, slow tokens"
+  scenario="A team serves Llama 3 70B (BF16) on 2 x H100, one request at a time. nvidia-smi shows the GPUs always busy. Users say it streams slowly. The numbers below are illustrative but consistent with the lesson."
+  facts={[
+    'nvidia-smi GPU utilization: 100%',
+    'batch size: 1',
+    'time per output token: 33 ms (30 tokens/s)',
+    'bytes read per step: 70 GB per GPU',
+  ]}
+  steps={[
+    {
+      prompt: '70 GB in 33 ms is 2.1 TB/s per GPU, 63% of 3.35 TB/s. Achieved math is 30 x 140 GFLOPs = 4.2 TFLOPS, about 0.2% of the 1,978 TFLOPS the two GPUs offer. What does the 100% mean?',
+      options: [
+        'The compute units are saturated, so the GPU is maxed out',
+        'A kernel was running; math and bandwidth use are unknown',
+        'The memory bus is saturated, so MBU is also 100%',
+        'The model is too large and is being swapped to disk',
+      ],
+      answer: 1,
+      explain: 'NVIDIA defines that percentage as the time share during which a kernel was executing. Here MFU is 0.2% and MBU is 63%. The compute units are nearly idle and the memory bus is partly used.',
+    },
+    {
+      prompt: 'Which change raises tokens per second per GPU the most?',
+      options: [
+        'Buy GPUs with more compute and keep batch at 1',
+        'Serve many requests at once to share each read',
+        'Raise the temperature so tokens come out faster',
+        'Pin the process to one CPU core',
+      ],
+      answer: 1,
+      explain: 'At batch 1 each weight read feeds one token. A larger batch reuses the same read for more tokens and moves the dot up the roofline. More compute does not help a memory-bound step. Temperature and CPU pinning do not change the GPU step.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A user sends a 12-token question and gets a 600-token answer. Which phase takes most of the time?',
+      options: [
+        'Prefill, because every request starts with it and reads the prompt',
+        'Decode: 600 passes, each reading all weights',
+        'Neither, since network time dominates the total latency',
+        'They take equal time, as both phases read the weights',
+      ],
+      answer: 1,
+      explain: 'Prefill handles 12 tokens in one pass. Decode runs about 600 passes, each reading all the weights, at about 21 ms each on 2 x H100: roughly 12.6 s. Both read the weights, but decode does so 600 times.',
+    },
+    {
+      q: 'At batch 1 on an H100, what is the arithmetic intensity of a BF16 decode step, and which ceiling binds?',
+      options: [
+        'About 295 FLOPs/byte, compute-bound',
+        'About 1 FLOP/byte, compute-bound',
+        'About 295 FLOPs/byte, memory-bound',
+        'About 1 FLOP/byte, memory-bound',
+      ],
+      answer: 3,
+      explain: 'Each 2-byte weight does 2 FLOPs for one token: 1 FLOP per byte. That is far below the ridge at 295, so memory bandwidth binds. 295 is the ridge point, not the intensity of decode.',
+    },
+    {
+      q: 'A 70B BF16 model is split over 4 H100s with tensor parallelism. What is the decode floor per token, ignoring KV reads and links?',
+      options: [
+        'About 42 ms, since 140 GB / 3.35 TB/s',
+        'About 10.4 ms, since each GPU reads 35 GB',
+        'About 5.2 ms, since 4 GPUs read in series',
+        'About 20.9 ms, since the link sets the pace',
+      ],
+      answer: 1,
+      explain: 'Each GPU holds and reads 140 / 4 = 35 GB: 35 / 3,350 = 10.4 ms. 42 ms treats all weights as sitting on one GPU. The GPUs read in parallel, not in series. In practice the link adds time.',
+    },
+    {
+      q: 'Which metric tells you best how well a decode loop uses the hardware?',
+      options: [
+        'The GPU utilization percentage from nvidia-smi',
+        'MFU, since FLOPs measure work',
+        'MBU, since decode is memory-bound',
+        'Peak TFLOPS, since the roof is fixed',
+      ],
+      answer: 2,
+      explain: 'MBU divides the bytes moved per second (weights plus KV cache over TPOT) by peak bandwidth, which is the binding ceiling in decode. MFU will read near zero by design. The nvidia-smi figure only counts time with a kernel running.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Databricks, LLM Inference Performance Engineering: Best Practices](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices): TTFT, TPOT, MBU, and the batch-size data.
+- [nvidia-smi documentation](https://docs.nvidia.com/deploy/nvidia-smi/index.html): the definition of the utilization counters.
+- [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783): training MFU in section 3.3.2.
+- [NVIDIA H100 Tensor Core GPU](https://www.nvidia.com/en-us/data-center/h100/): bandwidth and the "with sparsity" labels.

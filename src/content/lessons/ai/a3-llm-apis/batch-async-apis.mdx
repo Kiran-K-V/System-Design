@@ -1,0 +1,268 @@
+---
+summary: 'A batch API takes many requests and returns results within 24 hours at half price. Use it for evals, backfills, and enrichment, never for a user who is waiting. Join results by custom_id, expect partial failures, and keep batch traffic out of your live rate limits.'
+requires: ['ai/a3-llm-apis/limits-retries-idempotency', '06-async/queues']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai3BatchWalk from '../../../../components/anim/lessons/Ai3BatchWalk.tsx';
+import Ai3BatchCalc from '../../../../components/anim/lessons/Ai3BatchCalc.tsx';
+
+## The problem
+
+A team must tag 2 million product descriptions with categories. The job is a one-time backfill. Nobody is waiting for any single answer. They write a loop that calls the model once per item.
+
+The loop has three costs. It pays the full price. It competes with the live product for the same rate limits, so a long backfill can push real users into 429 errors. And it needs retry, pacing, and resume code that the team must write and run for days.
+
+Many LLM jobs do not need an answer now. For those, providers offer a batch API: submit a file of requests, come back later, and pay about half. Facts about Anthropic come from its batch, rate limits, and prompt caching pages, fetched on 2026-10-16. Prices are USD per 1M tokens.
+
+## Naive solution: loop over sync calls
+
+```
+for item in items: save(call_model(item))
+```
+
+It works for 100 items. At scale it breaks. A crash at item 1,400,000 means a restart from a checkpoint you must have built. Rate-limit retries ([lesson A3.6](/learn/ai/a3-llm-apis/limits-retries-idempotency/)) slow it down and make it fragile. A big `max_tokens` and a long call can hit network timeouts. Anthropic's errors page suggests the Batches API for long requests, because you poll for results instead of holding a connection.
+
+## The mechanism: submit, poll, collect, retry
+
+<CrossTrackLink id="06-async/queues">
+A queue decouples the producer from the consumer. The producer adds work and moves on. Workers take work at their own pace. A batch API is a managed queue: you are the producer, and the provider runs the workers and holds the results.
+</CrossTrackLink>
+
+<Ai3BatchWalk client:visible />
+
+### The lifecycle on Anthropic
+
+1. **Build the list.** Each request has a `custom_id` and a `params` object, which is a normal Messages request. The `custom_id` is 1 to 64 characters: letters, digits, hyphen, underscore.
+2. **Submit.** One call creates the batch. A batch is limited to 100,000 requests or 256 MB, whichever comes first. `processing_status` starts as `in_progress`.
+3. **Poll.** Check the status until it is `ended`. The page describes polling. It does not describe a webhook, so check before you design around one. A scheduled job that polls every few minutes is enough.
+4. **Collect.** Stream the results file from `results_url`. It is `.jsonl`, one result per request. Results may come back in any order, so you must join on `custom_id`.
+5. **Handle failures.** Each result is `succeeded`, `errored`, `canceled`, or `expired`. Resubmit the rest.
+
+Time and retention, from the page: most batches finish in under 1 hour. Results are readable when every request has finished or after 24 hours, whichever comes first. A batch expires if it is not complete in 24 hours. Results stay downloadable for 29 days after creation, so copy them into your own store.
+
+Rules that cause surprises:
+
+- Params are validated asynchronously. A bad request is reported only when the batch ends. Run one request through the normal API first.
+- `max_tokens: 0` is not allowed in a batch. `stream: true` and fast mode (`speed`) are not supported.
+- Errored, canceled, and expired requests are not billed.
+- A batch can go slightly over your workspace spend limit, because of concurrent processing.
+- Processing can slow down with demand. The page warns that more requests may expire after 24 hours in that case.
+
+### Separate limits
+
+The Message Batches API has its own limits, shared across models: a requests-per-minute limit, a cap on batch requests waiting in the queue (200,000 on the Start tier, 300,000 on Build, 500,000 on Scale), and the 100,000 per batch. These are separate from the RPM, ITPM, and OTPM that your live traffic uses. A backfill in a batch does not drain the live bucket. This is a larger reason to use batch than the discount, when you share an organization with a product that has users.
+
+### Price
+
+Anthropic charges 50% of the standard price on all usage in a batch. Prices as of 2026-10-16, from the [batch page](https://platform.claude.com/docs/en/build-with-claude/batch-processing) and [claude.com/pricing](https://claude.com/pricing):
+
+| Model | Sync in / out | Batch in / out |
+|---|---|---|
+| Opus 5.5 | $4 / $20 | $2 / $10 |
+| Sonnet 5.5 | $2 / $10 | $1 / $5 |
+| Haiku 5.5 (prompt up to 100K tokens) | $0.10 / $0.50 | $0.05 / $0.25 |
+
+The discount stacks with prompt caching. Cache reads cost 0.05 times the base input price on Opus 5.5 and Sonnet 5.5, and 0.1 on Haiku 5.5, so a cached batch input token on Sonnet 5.5 costs $0.05 per 1M, down from $2. A batch runs requests concurrently, so cache hits are best effort. The page says hit rates typically run from 30% to 98%. To raise them, put identical `cache_control` blocks in every request, keep a steady stream, share as much content as you can, and consider the 1-hour cache duration, since a batch can take longer than the 5-minute default lifetime. Lesson A2.5 covers caching.
+
+### Try it
+
+The calculator compares the same job run sync and as a batch. Start with the defaults: 31,623 requests on Sonnet 5.5 at 1,000 input and 200 output tokens. Then raise the cache share and watch both costs fall. Then pick a smaller model.
+
+<Ai3BatchCalc client:visible />
+
+What to notice. At the Start tier a 10,000-request job of this size finishes in about 10 minutes on sync calls if you spend the whole budget, so batch is not about speed here. It is about cost, and about leaving the live budget alone. For very large jobs sync time grows into hours and days, and you must pace it.
+
+### Other providers
+
+The idea is the same. The numbers differ, so keep them in config, not in code. As of 2026-10-16:
+
+| Provider | Discount | Window | Limits | Results kept |
+|---|---|---|---|---|
+| Anthropic ([page](https://platform.claude.com/docs/en/build-with-claude/batch-processing)) | 50% | 24 h, then expire | 100,000 requests or 256 MB per batch | 29 days |
+| OpenAI ([page](https://developers.openai.com/api/docs/guides/batch)) | 50% | 24 h (the only option now) | 50,000 requests, 200 MB file, 2,000 batches per hour | Output file deleted 30 days after completion |
+| Google Gemini ([page](https://ai.google.dev/gemini-api/docs/batch-api)) | 50% | Target 24 h, expires after 48 h pending or running | Inline total under 20 MB, file up to 2 GB | 6 weeks |
+
+OpenAI says you are charged for tokens consumed by the completed requests of an expired batch. Failed requests go to an error file, and expired ones carry the code `batch_expired`. Output order may not match input order there either. Use `custom_id`.
+
+### Run it safely
+
+A batch job is a distributed job, so give it the properties from [lesson A3.6](/learn/ai/a3-llm-apis/limits-retries-idempotency/).
+
+- **Make submit idempotent.** Creating a batch twice costs twice. Save your own job row with a unique `job_id` before you submit, then store the returned batch id on that row. After a crash, look up the row. Do not submit again if it holds a batch id.
+- **Design the `custom_id`.** Use a stable key such as `job_id:item_id`, within 64 characters. A retry batch then reuses the same ids, and a write to your store keyed by `custom_id` overwrites instead of duplicating.
+- **Chunk by limits.** 250,000 requests need at least 3 batches. Respect the queue cap, and submit in waves.
+- **Validate first.** Send a handful of requests to the sync API with the same params.
+- **Check completeness.** After download, compare the set of `custom_id` values with your input set. Anything missing or not `succeeded` goes to the retry list.
+
+### When batch fits
+
+| Fits | Does not fit |
+|---|---|
+| Evals and regression runs over a golden set | A chat or a form where a user waits |
+| Backfills, re-tagging, re-embedding a corpus | A step in an agent loop that needs the last result |
+| Nightly summaries and enrichment | Anything with a latency target under a few minutes |
+| Bulk classification and extraction | Work that must finish by a fixed time without slack |
+
+An agent run is a chain: each step needs the previous answer. Running one step per batch adds up to a day per step. You can batch many independent runs, one step at a time, but the wait per step stays.
+
+<Callout type="deep" title="Batch is a spot-like tier">
+Cheaper capacity that can be late is a common cloud pattern. Spot instances work this way. You get a lower price in return for giving up a promise about when. Treat the 24-hour window as a ceiling, not an estimate, and give your pipeline slack for it.
+</Callout>
+
+## Numbers
+
+| Quantity | Value | Source |
+|---|---|---|
+| Batch discount, all three providers | 50% | provider pages, 2026-10-16 |
+| Anthropic typical finish | under 1 hour for most batches | Anthropic batch page |
+| Anthropic max per batch | 100,000 requests or 256 MB | same page |
+| Anthropic results retention | 29 days from creation | same page |
+| 10M input + 2M output on Sonnet 5.5, sync | 10 x $2 + 2 x $10 = $40 | derived |
+| Same, as a batch | $20 | derived |
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| Sync loop | Instant results, simple | Full price, shares live limits, resume code | Small jobs, user waiting |
+| Batch | Half price, own limits, managed queue | Up to 24 h wait, late validation, partial failures | Evals, backfills, enrichment |
+| Batch with caching | Stacked savings | Prompt layout work, best-effort hits | Many requests share a big prefix |
+| Own queue and paced sync | Control over timing | You build and run it | Jobs with a deadline shorter than the window |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "This job has no user waiting, so I would run it as a batch. It costs 50% less and uses separate limits, so it does not hurt live traffic. I would key each request with a stable custom_id, poll for the status, join results by id, and resubmit failures. I would keep a job row so a restart does not submit twice." Then give one number: 10M input and 2M output tokens is $40 sync and $20 batch on Sonnet 5.5.
+</Callout>
+
+<Callout type="mistake">
+Do not use batch for anything a user is waiting on. Do not assume the results are in input order. Do not skip a sync test of the params, because errors come late. And do not forget to copy results out before the retention period ends.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="A 10M-token backfill"
+  scenario="You must run 10,000 documents through Sonnet 5.5. Each has 1,000 input tokens and 200 output tokens. Sonnet 5.5 costs $2 per 1M input tokens and $10 per 1M output tokens. Batch is 50% of that (as of 2026-10-16). Ignore caching."
+  steps={[
+    {
+      prompt: 'What is the sync cost in dollars?',
+      unit: 'dollars',
+      answer: 40,
+      within: 1.1,
+      explain: 'Input: 10,000 x 1,000 = 10M tokens x $2 = $20. Output: 10,000 x 200 = 2M tokens x $10 = $20. Total $40.',
+    },
+    {
+      prompt: 'What is the batch cost in dollars?',
+      unit: 'dollars',
+      answer: 20,
+      within: 1.1,
+      explain: 'The discount is 50% on all usage in the batch. $40 x 0.5 = $20. The batch prices are $1 per 1M input and $5 per 1M output, which gives $10 + $10.',
+    },
+    {
+      prompt: 'The backfill grows to 250,000 requests. At least how many batches do you need?',
+      unit: 'batches',
+      answer: 3,
+      within: 1.1,
+      explain: 'One batch holds up to 100,000 requests. 250,000 / 100,000 = 2.5, which rounds up to 3. Check the 256 MB limit and the queue cap too.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="a3-7-order"
+  title="The summaries are on the wrong documents"
+  scenario="A nightly job sends 5,000 documents as one batch. It downloads the results and zips them with the input list by position. A reader notices that many summaries describe a different document. The batch status was ended and every line was succeeded."
+  steps={[
+    {
+      prompt: 'What is the bug?',
+      options: [
+        'Results may arrive in any order, and the job paired them by position',
+        'The model summarized the wrong document because the batch ran in parallel',
+        'The 29-day retention shuffled the results file after the batch ended',
+        'Succeeded results are sorted by output length when the batch ends',
+      ],
+      answer: 0,
+      explain: 'Anthropic says batch results can be returned in any order and may not match the order of creation. Each request ran on its own with the right input. Only the pairing is wrong. Retention does not change order.',
+    },
+    {
+      prompt: 'What is the fix?',
+      options: [
+        'Sort both lists by length before zipping them',
+        'Submit the documents in smaller batches of 100 to keep the order',
+        'Wait 24 hours before download so the file is complete and sorted',
+        'Give each request a stable custom_id and join the results on it',
+      ],
+      answer: 3,
+      explain: 'The custom_id is the only field that ties a result to its request. Join on it and check that every input id appears. Smaller batches and waiting do not promise any order.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'a3-7-q-fit',
+      q: 'Which job is the best fit for a batch API?',
+      options: [
+        'Answering a support chat message while the customer is waiting',
+        'A step in an agent loop that needs the result of the last step to go on',
+        'Re-tagging 2 million product descriptions with no deadline',
+        'Autocomplete suggestions as a user types text in an editor window',
+      ],
+      answer: 2,
+      explain: 'The re-tagging job has no user waiting and tolerates a delay, so it can take the 50% discount and use separate limits. The other three each have a person or a next step waiting, and a batch can take up to 24 hours.',
+    },
+    {
+      id: 'a3-7-q-billing',
+      q: 'A batch ends with 4 succeeded, 1 errored, and 1 expired request. On Anthropic, which requests do you pay for?',
+      options: [
+        'The 4 succeeded requests only',
+        'All 6, because the batch was submitted as one unit',
+        'The 4 succeeded and the 1 expired, because it was queued',
+        'The 4 succeeded and the 1 errored, because it was processed',
+      ],
+      answer: 0,
+      explain: 'The page says errored, canceled, and expired requests are not billed. OpenAI differs in wording but also charges only for tokens used by completed requests when a batch expires.',
+    },
+    {
+      id: 'a3-7-q-validation',
+      q: 'You submit 5,000 requests. The params of request 3,412 are invalid. When do you find out?',
+      options: [
+        'At submit time, because the whole call is rejected with a 400',
+        'After the first poll, because validation runs on the first status check',
+        'Only when you download results, because the file is checked then',
+        'When the batch ends, because validation runs after submit',
+      ],
+      answer: 3,
+      explain: 'The batch page says params are validated asynchronously, and the errors come back when processing of the whole batch has ended. Test a sample on the sync API first so a typo does not cost you hours of waiting.',
+    },
+    {
+      id: 'a3-7-q-cache',
+      q: 'Your batch requests share a 30,000-token prefix. Which setup gives the best chance of cache hits?',
+      options: [
+        'Different cache_control blocks per request, so each one gets its own cache entry',
+        'Identical cache_control blocks, a steady stream, and the 1-hour option',
+        'No cache_control at all, because the batch price replaces caching',
+        'A single request first, then a wait of 24 hours so the cache is warm',
+      ],
+      answer: 1,
+      explain: 'Hits in a batch are best effort because requests run concurrently. Identical blocks, steady flow, and the 1-hour lifetime raise the odds. The discounts stack, so caching is not replaced. A 24-hour wait outlasts any cache lifetime.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic, Batch processing](https://platform.claude.com/docs/en/build-with-claude/batch-processing): limits, results, prices, and the caching section.
+- [Anthropic, Rate limits](https://platform.claude.com/docs/en/api/rate-limits): the batch queue and RPM limits by tier.
+- [OpenAI, Batch API](https://developers.openai.com/api/docs/guides/batch): status values, error file, and expiry.
+- [Google, Gemini Batch API](https://ai.google.dev/gemini-api/docs/batch-api): job states, size limits, and retention.

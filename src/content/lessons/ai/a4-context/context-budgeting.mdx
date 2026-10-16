@@ -1,0 +1,201 @@
+---
+summary: 'The context window is a budget that system text, tools, examples, documents, history, and the reply all spend from. Plan each part, leave room for the output, and decide what to drop before the window fills.'
+requires: ['ai/a4-context/prompts-as-code', 'ai/a1-model-function/hallucination-context']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Math from '../../../../components/lesson/Math.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai4BudgetFill from '../../../../components/anim/lessons/Ai4BudgetFill.tsx';
+import Ai4BudgetBar from '../../../../components/anim/lessons/Ai4BudgetBar.tsx';
+
+## The problem
+
+An agent helps with a code repository. In the first turns it is sharp. By turn 25 it forgets a rule from the system prompt, re-reads a file it already read, and its answers get slower and more costly. At turn 34 the request fails with an error: the prompt is too long.
+
+Nothing leaked and nothing broke. The **context window** [junior] filled up. This is the maximum number of tokens the model reads in one request, and lesson A1.6 introduced it. A chat looks like a stream, but each call is a fresh request that carries the whole history again. So a conversation is a list that only grows, inside a box that does not.
+
+This lesson treats the window as a **budget**: a fixed amount of tokens that several parts spend from. You plan the spend, as you plan memory on a server.
+
+## What spends the budget
+
+Anthropic's context window docs list what counts: "the system prompt, every message in `messages` (including tool results, images, and documents), and your tool definitions". The reply counts too, including thinking tokens. Even a cached prompt prefix still occupies the window. Caching changes the price, not the size.
+
+So a request has six spenders:
+
+| Spender | Typical behavior | Who controls it |
+|---|---|---|
+| System prompt | Fixed per route | You |
+| Tool definitions | Fixed per agent; grows with each tool | You |
+| Examples | Fixed or chosen per query (lesson A4.2) | You |
+| Retrieved documents | Per call, can be large | Your retriever |
+| Chat history | Grows each turn | The user, and the tools |
+| Output reservation | Space kept free for the reply | You, through `max_tokens` |
+
+Windows are large now. As of 2026-10-16, Anthropic's docs list a 1M-token window for Claude Sonnet 5.5 and other current models, with up to 128K output tokens per request, and 200K for some older models ([context windows](https://platform.claude.com/docs/en/build-with-claude/context-windows)). Size is not the limit. Quality and cost are.
+
+## Why a big window is not a free one
+
+Anthropic's guide describes context as "a finite resource with diminishing marginal returns". It says that as the token count grows, the model's ability to recall details falls, and that this is "a performance gradient rather than a hard cliff". Chroma's study of 18 models (July 2025) reached the same view from tests: performance "grows increasingly unreliable as input length grows". The text gives no accuracy figures; they are only in charts, so treat the effect as real and size it on your own task. Anthropic's docs call this **context rot** [mid]: accuracy and recall degrade as the token count grows, even if the task stays the same.
+
+Position matters too. Lesson A1.6 showed the lost-in-the-middle curve: facts at the start or end of a long prompt are found more often than facts in the middle. So do not just fill the window. Order it. Put the instructions and the most important facts near the edges.
+
+There is also the cost. Every call re-sends the history, so a 100K-token history costs 100K input tokens on each turn, unless a cache serves it. And attention work grows with length (lesson A1.4).
+
+## The failing design: append forever
+
+The naive design appends every message and every tool result and sends all of it. Watch what that does to a 200K window at 6K tokens per turn. The numbers are round figures for a ballpark.
+
+<Ai4BudgetFill client:visible />
+
+The arithmetic is short. The turns that fit are:
+
+<Math block tex="\text{turns} = \left\lfloor \frac{W}{t} \right\rfloor = \left\lfloor \frac{200{,}000}{6{,}000} \right\rfloor = 33" />
+
+In words: the window size W divided by the tokens added per turn t, rounded down. This is the best case. System text, tool definitions, and the reply reserve all come out of W first, so the real number is lower. A single big tool result, such as a file dump or a verbose command log, can use thousands of tokens in one turn (the Claude Agent SDK docs say so), and 40K tokens at once costs about 7 turns.
+
+## The mechanism: plan the budget
+
+Plan it like capacity. Give each spender a share, a policy for when it is over, and a place on the page.
+
+**Reserve the output first.** The reply must fit. Thinking tokens count against `max_tokens` and the window. If the input alone exceeds the window, the API returns a 400 error. On Claude 4.5 and newer models, if input plus `max_tokens` exceeds the window the API still accepts the request, but generation may stop early with `stop_reason: "model_context_window_exceeded"`. A cut-off JSON reply is a bug that looks random. So subtract the reserve before you count the room.
+
+**Set a priority order.** When the budget is tight, something must go. Decide in advance:
+
+1. Never drop: the system prompt, the tool definitions in use, the current user turn.
+2. Keep as long as you can: the latest few turns, and facts the task needs.
+3. Trim first: stale tool output, low-ranked retrieved passages, old chat turns.
+
+**Pick a truncation policy per spender.** A policy is a rule for how to cut:
+
+| Spender | Policy | Risk |
+|---|---|---|
+| Retrieved documents | Keep the top-ranked passages until a token cap | A needed passage ranks low |
+| Tool output | Keep the head and the tail, drop the middle | The key line is in the middle |
+| Chat history | Sliding window of the last N turns | Early decisions vanish |
+| Chat history | Summarize old turns (lesson A4.4) | The summary loses a detail |
+| Tool definitions | Load only the tools the task needs | The model lacks a tool it needs |
+
+Anthropic names a common failure: "bloated tool sets that cover too much functionality". More tools also mean more definition tokens on every call. Aim for the smallest set that covers the task.
+
+**Offload work to sub-agents.** A sub-agent runs in its own window, reads a lot, and returns a short result. Anthropic reports that such a summary is often 1,000 to 2,000 tokens. The main window pays for the summary only, not for the 30K tokens the sub-agent read.
+
+**Keep notes outside the window.** An agent can write decisions and open items to a file and read them back when needed. The file does not spend budget until it is read.
+
+Try the budget. Drag a section and watch the headroom. Raise the retrieved documents until the output reservation turns red.
+
+<Ai4BudgetBar client:visible />
+
+## Numbers
+
+Start from the defaults and work one case. A 200K window holds a 3K system prompt, 9K of tool definitions, 4K of examples, 40K of retrieved documents, 30K of history, and a 16K reply reserve. The input is 3 + 9 + 4 + 40 + 30 = 86K. The headroom is 200 - 86 - 16 = 98K. At 6K per turn, 98 / 6 = 16 more turns fit. Raise the documents to 100K and the input is 146K. The headroom is 38K and only 6 turns fit. One retriever setting cut the conversation length by 10 turns.
+
+A window is also a cost line. A 150K-token history at $2 per million input tokens (Claude Sonnet 5.5, as of 2026-10-16, [pricing](https://platform.claude.com/docs/en/about-claude/pricing)) costs 150,000 / 1,000,000 × $2 = $0.30 of input per turn if nothing is cached. Over 20 such turns that is $6.00, for one user.
+
+<Ballpark
+  client:visible
+  title="When does the window fill?"
+  scenario="An agent runs in a 200K-token window. Each turn adds about 6,000 tokens (user message, reply, and tool results)."
+  steps={[
+    {
+      prompt: 'Turns until 200,000 tokens fill, with nothing else in the window?',
+      unit: 'turns',
+      answer: 33,
+      within: 1.1,
+      explain: '200,000 / 6,000 = 33.3, so 33 whole turns fit. The 34th would need 204,000 tokens.',
+    },
+    {
+      prompt: 'Now 12,000 tokens go to the system prompt and tools, and 16,000 are reserved for the reply. How many turns fit?',
+      unit: 'turns',
+      answer: 28,
+      within: 1.1,
+      explain: '200,000 - 12,000 - 16,000 = 172,000. Then 172,000 / 6,000 = 28.7, so 28 whole turns. The fixed costs removed 5 turns.',
+    },
+    {
+      prompt: 'One tool call returns a 40,000-token log. About how many turns does that cost?',
+      unit: 'turns',
+      answer: 7,
+      within: 1.2,
+      explain: '40,000 / 6,000 = 6.7, so about 7 turns. This is why you truncate or clear tool output instead of keeping it raw.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Policy | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Append everything | Simple code, full detail | Rot, cost, and a hard stop | Short chats |
+| Sliding window | Predictable size | Early facts are gone | Chats where old turns do not matter |
+| Summarize old turns | Long runs without a hard stop | A summary call, and lost detail | Long agent runs (lesson A4.4) |
+| Sub-agents and notes | Small main window | More moving parts | Tasks with heavy reading |
+
+## Interview lens
+
+<Callout type="tip">
+Give the budget in numbers: "A 200K window, 12K for system and tools, a 16K reply reserve, and 6K per turn gives 28 turns. At 70% full, I clear old tool results. At 75%, I compact." Then say what you protect: system prompt, tool definitions, and the current turn.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we have a 1M window, so we do not need to manage context". Quality falls as the input grows, you pay for every token on each call, and the reply needs reserved space. Also do not count only the input. The output, including thinking, spends the same window.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A 200K window holds 3K of system prompt, 9K of tools, 4K of examples, 40K of documents, and 30K of history. The reply reserve is 16K. How many 6K turns still fit?',
+      options: [
+        '12 turns, since the documents take the largest share of the window',
+        '16 turns, since 98K of headroom divided by 6K is about 16',
+        '19 turns, since the reply reserve is not part of the budget',
+        '33 turns, since 200K divided by 6K is about 33 in any case',
+      ],
+      answer: 1,
+      explain: 'Input is 86K and the reserve is 16K, so headroom is 200 - 86 - 16 = 98K. Then 98 / 6 = 16.3, so 16 turns. Ignoring the reserve gives 114K / 6 = 19, which risks a cut-off reply. 33 ignores every fixed cost.',
+    },
+    {
+      q: 'A team sends 900K tokens into a 1M window because it fits. What does the Anthropic and Chroma evidence lead you to expect?',
+      options: [
+        'A hard failure once input passes about half of the window size',
+        'No change in quality, since the model reads all tokens in the window equally',
+        'The same quality as a short prompt but a slower first token only',
+        'A gradual loss of recall and reliability that you must measure on your task',
+      ],
+      answer: 3,
+      explain: 'Anthropic describes a performance gradient, not a hard cliff, and Chroma finds reliability falls as input grows across 18 models. Neither source gives one cutoff, so you measure. Equal reading and a latency-only cost both contradict the findings.',
+    },
+    {
+      q: 'On a Claude 4.5-or-newer model, input is 150K tokens, the window is 200K, and max_tokens is 64K. What happens, per Anthropic docs?',
+      options: [
+        'The API returns a 400 error at once because 150K plus 64K exceeds 200K',
+        'The API silently lowers max_tokens to 50K and finishes the reply as normal',
+        'It accepts it; the reply may stop with model_context_window_exceeded',
+        'The API drops the oldest 14K tokens of history to make room for the reply',
+      ],
+      answer: 2,
+      explain: 'The docs say the API accepts the request and stops with that stop reason if generation reaches the window limit. A 400 happens only when the input alone exceeds the window. The API does not trim history or change max_tokens for you.',
+    },
+    {
+      q: 'The window is 90% full. Which spenders should you trim first?',
+      options: [
+        'Stale tool output and low-ranked retrieved passages',
+        'The system prompt, since it is the same on every call',
+        'The tool definitions of every tool, so the model must guess',
+        'The current user turn, since the history already has the context',
+      ],
+      answer: 0,
+      explain: 'Stale tool output and low-ranked passages have the lowest value per token. The system prompt, the tools in use, and the current turn define the task, so they sit at the top of the priority list. Cutting them breaks the request.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic, "Effective context engineering for AI agents"](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+- [Anthropic, context windows](https://platform.claude.com/docs/en/build-with-claude/context-windows)
+- [Chroma, "Context Rot"](https://www.trychroma.com/research/context-rot)
+- [Claude Agent SDK, how the agent loop works](https://code.claude.com/docs/en/agent-sdk/agent-loop)

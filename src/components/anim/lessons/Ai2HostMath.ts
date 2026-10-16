@@ -1,11 +1,12 @@
 /** Capacity and cost arithmetic for lesson A2.7. Output tokens only, as in lesson A0.4. Pure functions. */
 
 export const HOURS_PER_MONTH = 730;
-/** Measured: Llama 3.1 8B, one H100, vLLM, 128 in / 128 out, request rate 64 (E2E Networks benchmark, as cited in lesson A0.4). */
-export const MEASURED_TOK_PER_SEC = 8399;
-/** Same benchmark row: completed requests per second. Times 128 output tokens gives a stricter output-only figure. */
+/** Listed throughput in the E2E Networks row. It counts prompt plus output tokens (35.04 x 256 = 8,970, about 8,399). */
+export const LISTED_TOK_PER_SEC = 8399;
+/** Same row: completed requests per second. Times 128 output tokens gives the output rate. */
 export const MEASURED_REQ_PER_SEC = 35.04;
 export const OUTPUT_ONLY_TOK_PER_SEC = Math.round(MEASURED_REQ_PER_SEC * 128);
+export const MEASURED_TOK_PER_SEC = OUTPUT_ONLY_TOK_PER_SEC;
 
 export interface PlanIn {
   peakQps: number;

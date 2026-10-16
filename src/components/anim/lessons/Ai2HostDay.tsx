@@ -7,7 +7,7 @@ const PRICE = 3.99;
 const PCT = (v: number) => `${Math.round(v * 100)}%`;
 const USD = (v: number) => `$${Math.round(v).toLocaleString('en-US')}`;
 
-type Mode = 'load' | 'static' | 'lag';
+type Mode = 'load' | 'work' | 'static' | 'lag';
 interface Step {
   caption: string;
   mode: Mode;
@@ -27,7 +27,7 @@ const steps: Step[] = [
   },
   {
     caption: `An API prices only the work. The same ${D.used.toFixed(1)} GPU-hours of work, billed at the cost of ${D.used.toFixed(1)} busy GPUs, would be ${USD(D.used * PRICE)} at the same hourly rate. The gap between the two numbers is the price of idle time. This is why utilization, not the hourly rate, decides the crossover (lesson A0.4).`,
-    mode: 'static',
+    mode: 'work',
     stat: `work only: ${USD(D.used * PRICE)} a day`,
   },
   {
@@ -36,7 +36,7 @@ const steps: Step[] = [
     stat: `autoscaled: ${PCT(D.lagUtil)} used, ${USD(D.lagHours * PRICE)} a day`,
   },
   {
-    caption: `The lag has a price. In the ${D.shortHours} hours where traffic climbs, the fleet is smaller than the load (red tops): requests queue and latency rises. You can add headroom, which costs idle GPUs again, or accept slow mornings. An API absorbs this for you. A self-host design must pick one.`,
+    caption: `The lag has a price. In the ${D.shortHours} hours where traffic climbs, the fleet is smaller than the load (red bars): requests queue and latency rises. You can add headroom, which costs idle GPUs again, or accept slow mornings. An API absorbs this for you. A self-host design must pick one.`,
     mode: 'lag',
     stat: `${D.shortHours} hours short of capacity`,
   },
@@ -52,7 +52,7 @@ export default function Ai2HostDay() {
   return (
     <AnimFrame title="One day of traffic against a rented fleet" steps={steps} interval={5200}>
       {(i, s) => (
-        <SketchSvg width={720} height={290} label={`Step ${i + 1}: traffic and GPU capacity over 24 hours`}>
+        <SketchSvg width={720} height={300} label={`Step ${i + 1}: traffic and GPU capacity over 24 hours`}>
           {DAY_LOAD.map((load, h) => {
             const cx = X0 + h * (BW + GAP) + BW / 2;
             const cap = s.mode === 'static' ? D.peakGpus : s.mode === 'lag' ? D.lagged[h] : 0;
@@ -72,7 +72,7 @@ export default function Ai2HostDay() {
             <HandText key={h} x={X0 + h * (BW + GAP) + BW / 2} y={BASE + 24} size={TEXT_SIZES.note} color="var(--muted)">{`${String(h).padStart(2, '0')}:00`}</HandText>
           ))}
           <HandText x={X0} y={18} size={TEXT_SIZES.note} color="var(--muted)" anchor="start">GPUs of work per hour (bar), GPUs rented (dashed)</HandText>
-          <HandText x={360} y={278} size={TEXT_SIZES.label} mono color="var(--fg)">{s.stat}</HandText>
+          <HandText x={360} y={288} size={TEXT_SIZES.label} mono color="var(--fg)">{s.stat}</HandText>
         </SketchSvg>
       )}
     </AnimFrame>

@@ -73,7 +73,7 @@ const steps: Step[] = [
       'The gateway writes one log record: tenant, alias, the model that really answered, token counts, latency, and a "fell back" flag. Without that flag, a quality dip after an outage has no visible cause. Token counts here feed cost metering (lesson A3.9).',
     active: 'log',
     tones: { gw: 'ok', cache: 'warn', a: 'bad', b: 'ok', log: 'ok' },
-    subs: { gw: 'answered by B', cache: 'miss', a: '529', b: '200 OK', log: 'fell_back: true' },
+    subs: { gw: 'answered by B', cache: 'miss', a: '529', b: '200 OK', log: 'fell_back' },
     packets: [{ from: 'gw', to: 'log' }],
   },
 ];
@@ -88,7 +88,7 @@ export default function Ai3GwWalk() {
           { id: 'app', x: 66, y: 150, w: 96, h: 56, label: 'App', sub: i === 0 ? 'model: chat-main' : undefined, tone: t.app ?? 'default' },
           { id: 'gw', x: 270, y: 150, w: 140, h: 64, label: 'Gateway', sub: sub.gw ?? 'one internal API', tone: t.gw ?? 'default' },
           { id: 'cache', x: 270, y: 44, w: 120, h: 56, label: 'Cache', shape: 'db', sub: sub.cache, tone: t.cache ?? 'default' },
-          { id: 'log', x: 270, y: 256, w: 120, h: 56, label: 'Log', shape: 'db', sub: sub.log, tone: t.log ?? 'default' },
+          { id: 'log', x: 270, y: 256, w: 130, h: 68, label: 'Log', shape: 'db', sub: sub.log, tone: t.log ?? 'default' },
           { id: 'a', x: 600, y: 80, w: 130, h: 60, label: 'Provider A', sub: sub.a ?? 'primary', tone: t.a ?? 'default' },
           { id: 'b', x: 600, y: 220, w: 130, h: 60, label: 'Provider B', sub: sub.b ?? 'fallback', tone: t.b ?? 'default' },
         ];

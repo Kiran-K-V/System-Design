@@ -96,10 +96,10 @@ export default function Ai2PdRoof() {
           ))}
           <SketchArrow points={[[px(1), py(BW)], [px(RIDGE), py(PEAK)]]} head="none" seed={seedOf('rf-slope')} stroke="var(--accent)" strokeWidth={2.2} />
           <SketchArrow points={[[px(RIDGE), py(PEAK)], [px(10000), py(PEAK)]]} head="none" seed={seedOf('rf-roof')} stroke="var(--ok)" strokeWidth={2.2} />
-          <HandText x={px(1.6)} y={py(BW) - 34} anchor="start" size={TEXT_SIZES.note} color="var(--accent)">
+          <HandText x={px(14)} y={py(3)} anchor="start" size={TEXT_SIZES.note} color="var(--accent)">
             memory-bound
           </HandText>
-          <HandText x={px(1500)} y={py(PEAK) - 14} size={TEXT_SIZES.note} color="var(--ok)">
+          <HandText x={px(5500)} y={py(PEAK) - 14} size={TEXT_SIZES.note} color="var(--ok)">
             compute-bound
           </HandText>
           {s.showRidge && (

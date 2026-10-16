@@ -1,0 +1,268 @@
+---
+summary: 'Asking a model for JSON works most of the time, and the failures break parsers. Structured output compiles your schema into a grammar and masks every token that would break it, so the shape is guaranteed. It cannot guarantee the content is true, and truncation or a refusal can still break it.'
+requires: ['ai/a3-llm-apis/api-anatomy', 'ai/a1-model-function/sampling-decoding']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai3StructMask from '../../../../components/anim/lessons/Ai3StructMask.tsx';
+import Ai3StructRepair from '../../../../components/anim/lessons/Ai3StructRepair.tsx';
+
+## The problem
+
+Your code needs a label, a date, or a list of line items, not a paragraph. So you write "Reply with JSON only" in the prompt. In testing it works. In production, one reply in a few hundred starts with "Sure! Here is the JSON:", wraps the JSON in a code fence, calls the field `Label` instead of `label`, or stops in the middle of an object. `JSON.parse` throws and the pipeline stops.
+
+The cause is the one from [lesson A1.5](/learn/ai/a1-model-function/sampling-decoding/). The model draws each token from a probability list. A prompt makes the right token likely. It does not make a wrong token impossible. At 100,000 calls per day, a failure rate of 0.5% is 500 broken replies every day. This is a **probabilistic component** ([lesson A0.3](/learn/ai/a0-orientation/probabilistic-components/)) sitting inside a strict pipeline.
+
+## Naive solution: ask nicely and parse
+
+The simple pattern is: write the format in the prompt, call the model, `JSON.parse` the text, and handle errors. Three habits make it a little better. Show an example of the format. Put a `json` fence in the answer and strip it. Retry on a parse error.
+
+Retry helps, but every retry is a full extra call. It also repeats the same failure when the cause is systematic, such as a field name the model keeps changing. And a parse error is only the loudest failure. A reply with valid JSON, a missing field, and a wrong type passes `JSON.parse` and breaks your code three layers down.
+
+## The mechanism: mask the invalid tokens
+
+If the problem is that wrong tokens have probability, remove the probability. This is **constrained decoding**. It uses a **grammar**, a set of rules that says which text is valid, and at each step it sets the probability of every token that would break the rules to zero. Then it rescales and samples as usual.
+
+The Anthropic docs describe it this way: structured outputs compile your JSON schema into a grammar that constrains the output. You send the schema in `output_config.format`:
+
+```json title="anthropic-request.json"
+{
+  "model": "claude-opus-5-5",
+  "max_tokens": 1024,
+  "messages": [{ "role": "user", "content": "Ticket: ..." }],
+  "output_config": {
+    "format": {
+      "type": "json_schema",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "label": { "type": "string", "enum": ["negative", "neutral", "mixed"] },
+          "urgent": { "type": "boolean" }
+        },
+        "required": ["label", "urgent"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+The reply is JSON that matches the schema, in the text block of the response. OpenAI's Responses API uses `text.format` with `type: "json_schema"`, a `name`, the `schema`, and `strict: true`:
+
+```json title="openai-request.json"
+{
+  "model": "gpt-5.5",
+  "input": [{ "role": "user", "content": "Ticket: ..." }],
+  "text": {
+    "format": {
+      "type": "json_schema",
+      "name": "ticket_label",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": { "label": { "type": "string" }, "urgent": { "type": "boolean" } },
+        "required": ["label", "urgent"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+Watch what the mask does at each token. The probabilities here are illustrative, but the rule is the real one.
+
+<Ai3StructMask client:visible />
+
+Look at how this connects to sampling. Temperature, top-k, and top-p still work on the tokens that remain. The mask only removes options. In the walk, "negative" went from 45% to 69.2%, because the 35% that belonged to invalid tokens was shared among the valid ones. That means the model still picks the label itself. You only took away the ways to be malformed.
+
+A backend engineer can think of this as a compiler front end. The schema is the grammar, the model is a very fast typist who keeps hitting wrong keys, and the grammar is a keyboard that locks the wrong keys.
+
+The mask also lets the server skip work. SGLang's compressed finite state machine (FSM, a machine with a fixed set of states and allowed moves) finds stretches where only one token is possible, such as the `{` and `}` in the walk, and fills them in as a block without sampling. Its authors report up to 2 times lower latency and up to 2.5 times higher throughput than two other constrained-decoding stacks, measured on llama-7B on one A10 GPU (LMSYS blog, 2024). Hosted providers do not publish how they do it. Treat the SGLang numbers as one open implementation's result.
+
+## What it costs
+
+- **Compile time.** The first request with a new schema pays to compile the grammar. The Anthropic docs say compiled grammars are cached for 24 hours from last use, and there is a compile timeout of 180 seconds. OpenAI's guide says the first request with a schema has added latency and later ones do not. A schema that changes on every call (for example, one built from user input) pays the compile cost every time and never gets the cache. Changing only a `name` or `description` does not invalidate the cache, but changing the structure does.
+- **Limits on schemas.** The Anthropic page lists what is not supported: recursive schemas, numeric constraints such as `minimum`, `maximum`, and `multipleOf`, string constraints `minLength` and `maxLength`, array constraints beyond a `minItems` of 0 or 1, and any `additionalProperties` other than `false`. Using an unsupported feature returns a 400 error. Across all strict schemas in one request, the limits are 20 strict tools, 24 optional parameters, and 16 parameters with union types. Past them, you get "Schema is too complex for compilation". Some SDK helpers move unsupported constraints into field descriptions and still validate them after the reply, so a limit you cannot enforce in the grammar can still be enforced in your code.
+- **OpenAI strict rules.** `additionalProperties: false` on every object, every property listed in `required`, and optional fields written as a type that includes `null`.
+- **Providers differ.** Gemini also takes a JSON Schema for structured output. Its page warns that very large or deeply nested schemas may be rejected and says to validate values in your app. Always check the current limits for the provider and model you use.
+
+## Failure modes that remain
+
+Constrained decoding fixes the **syntax**. Four failures stay.
+
+1. **Truncation.** If the reply hits `max_tokens`, the JSON stops mid-object. The Anthropic docs say the output "may be incomplete and not match your schema", and tell you to retry with a higher `max_tokens`. The grammar cannot add the closing brace the token cap cut off. Set the cap from the largest valid reply, not the average one, and treat `stop_reason: "max_tokens"` as a failure before you parse.
+2. **Refusal.** On a refusal the HTTP status is 200 and the stop reason is `refusal`. The docs say the refusal message takes precedence over the schema, and you are billed for the tokens generated. OpenAI adds a `refusal` content part for the same case. Check for it before you parse.
+3. **Enum capitalization.** The docs say the capitalization of `enum` and `const` strings is not guaranteed. A value may differ from your schema in capitalization, typically in the first letter of a word after a space. The reply completes with no error. Compare enum values case-insensitively and avoid values that differ only in capitalization.
+4. **Valid shape, wrong content.** This is the big one. A schema says `label` is one of three words. It cannot say it is the right word. A hacked-account ticket labeled "neutral, not urgent" passes every check. Only an eval (module A8) or a second check can catch it.
+
+One more trap: do not put a field that asks the model to show its step-by-step reasoning in the schema. The tool-definition docs warn that such a parameter may lead to a `reasoning_extraction` refusal. Ask for a short explanation or supporting evidence instead.
+
+## Validate and repair
+
+Even with a guarantee, you still validate. Models and providers change, constraints fall outside the grammar, and failures 1 to 4 above get through. The pattern is a small loop:
+
+1. Check `stop_reason` first. `refusal` and `max_tokens` skip the parse.
+2. Parse and validate against the same schema, with your own validator for rules the grammar does not cover.
+3. On a validation failure, send the error back to the model: "Your last reply failed validation: ... Reply with only the corrected JSON." Allow a small number of repairs, such as 2.
+4. If the budget runs out, return a typed failure to the caller. Do not guess.
+
+Each repair is an extra call, so count it in your cost model. Try each failure, and notice which ones a repair loop cannot help with.
+
+<Ai3StructRepair client:visible />
+
+The loop has a built-in limit. It fixes shape problems. It does not fix a refusal, and it does not fix a confidently wrong label. Those need a fallback route and an eval. This is also why you should log the failure rate for each class (truncation, refusal, validation error, repaired) as a metric.
+
+<Callout type="deep" title="Does the mask slow generation?">
+It adds work at every token, because the grammar state must be checked and the vocabulary filtered. Hosted providers do not publish the overhead, so measure it on your own calls. The arithmetic is simple. If the mask added 10 ms per token (an assumption, not a measured figure), a 200-token reply would take 10 ms x 200 = 2 s longer. The SGLang result above points the other way for long fixed stretches: skipping forced tokens can make constrained output faster, not slower.
+</Callout>
+
+## Numbers
+
+| Quantity | Value | Source |
+|---|---|---|
+| Grammar cache lifetime (Anthropic) | 24 hours from last use | Anthropic structured outputs page |
+| Grammar compile timeout (Anthropic) | 180 seconds | same |
+| Strict tools per request | 20 | same |
+| Optional parameters, union-type parameters | 24 and 16 | same |
+| Failures a broken-JSON prompt gives at 0.5% and 100,000 calls/day | 500 per day | derived, 0.5% assumed |
+| Added time if the mask cost 10 ms per token on a 200-token reply | 2 s | derived, 10 ms assumed |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Prompt only ("reply with JSON") | No schema limits, any provider | A few percent broken replies, retries | Prototypes, free-form text |
+| Structured output (grammar) | Shape guaranteed, no parse retries | Compile on first use, schema limits | Any pipeline that parses the reply |
+| Strict tool use | Valid tool inputs | 20 strict tools, same schema limits | A model that calls your functions |
+| Validate and repair | Catches what the grammar does not | Extra calls, more latency | Always, with a small cap |
+| Semantic check or eval | Catches wrong content | Cost of the second check | When a wrong answer is costly |
+
+## Interview lens
+
+<Callout type="tip">
+Name the layers: "I use structured output so the shape is guaranteed, I check stop_reason before parsing so truncation and refusal are caught, I validate with my own rules, and I allow up to two repairs. Correctness of the content is a separate problem, so I sample outputs against a golden set." Say what each layer catches.
+</Callout>
+
+<Callout type="mistake">
+Do not say "structured output means the answer is correct". It means the answer parses. A confidently wrong label in a perfect schema is the common production failure. Also do not forget that max_tokens can cut a guaranteed schema in half.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Before the mask, the next-token probabilities are 0.50 for an invalid token, 0.30 for allowed token A, and 0.20 for allowed token B. What does token A get after masking and rescaling?',
+      options: [
+        '0.30, because the mask does not change the allowed tokens',
+        '0.50, because A takes all the mass the invalid token lost',
+        '0.60, because 0.30 / (0.30 + 0.20) after the mask',
+        '0.80, because 0.30 plus the 0.50 that was masked off',
+      ],
+      answer: 2,
+      explain: 'Masked tokens go to zero, and the rest is rescaled to sum to 1. The kept mass is 0.30 + 0.20 = 0.50, so A is 0.30 / 0.50 = 0.60 and B is 0.40. Adding the whole 0.50 to A would ignore B.',
+    },
+    {
+      q: 'A call with a strict JSON schema returns stop_reason "max_tokens". The text is {"items": [{"name": "pen", "qty". What should the code do?',
+      options: [
+        'Parse it, since the schema guarantees the JSON is valid at every length',
+        'Close the open brackets by hand and accept the repaired object',
+        'Treat it as a failure, then retry with a higher max_tokens',
+        'Ask the model to explain why it stopped and use that reply',
+      ],
+      answer: 2,
+      explain: 'The cap cut the output, so it may not match the schema. The docs advise retrying with a higher max_tokens. Closing brackets by hand invents a quantity that the model never wrote.',
+    },
+    {
+      q: 'A strict schema makes a ticket classifier return {"label": "neutral", "urgent": false} for a message about a hacked account. Which statement is correct?',
+      options: [
+        'The schema was ignored, so the grammar must have failed to compile',
+        'The output is invalid, since the right label is "negative"',
+        'The model refused, so the stop reason should have been "refusal"',
+        'The shape is valid, and only an eval or a second check finds it',
+      ],
+      answer: 3,
+      explain: 'The grammar guarantees keys, types, and enum membership. It cannot know which label fits the ticket. A wrong but allowed label passes. A refusal would show as a stop reason, not as a normal reply.',
+    },
+    {
+      q: 'Your app builds a new schema for every request from a user-supplied field list. What is the likely cost?',
+      options: [
+        'Nothing, because the grammar is compiled on the client side',
+        'A compile delay on most calls, as the 24-hour cache rarely hits',
+        'A guaranteed 400 error, since dynamic schemas are never allowed',
+        'Lower output quality, since the grammar removes valid tokens',
+      ],
+      answer: 1,
+      explain: 'The grammar is compiled from the schema on the provider side and cached for 24 hours from last use. A new structure each time means a cache miss and a compile each time. Dynamic schemas are allowed within the limits, and the mask removes only invalid tokens.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Failures you ship"
+  scenario="A prompt-only JSON pipeline makes 100,000 calls a day. Assume 0.5% of replies fail to parse. Each failure is retried once, and each retry is a full call that costs $0.004."
+  steps={[
+    {
+      prompt: 'How many broken replies per day?',
+      unit: 'replies',
+      answer: 500,
+      within: 1.1,
+      explain: '100,000 x 0.005 = 500 broken replies per day.',
+    },
+    {
+      prompt: 'What do the retries cost per 30-day month, in dollars?',
+      unit: 'dollars',
+      answer: 60,
+      within: 1.2,
+      explain: '500 retries x $0.004 = $2 per day. Over 30 days that is $60. Small in dollars, but each retry also adds a full call of latency to 0.5% of your users.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai3-struct-valid-wrong"
+  title="Valid JSON, wrong content"
+  scenario="A triage service uses a strict schema for { priority: low | medium | high }. Parse errors are zero. Support leads say urgent tickets are landing in 'low'."
+  facts={[
+    'parse errors in the last 7 days: 0',
+    'stop_reason = max_tokens: 0, refusal: 0',
+    'sample of 200 tickets reviewed by hand: 31 labeled low that should be high',
+  ]}
+  steps={[
+    {
+      prompt: 'What does this tell you?',
+      options: [
+        'The grammar is broken, since a correct grammar would block wrong labels',
+        'Syntax is fixed, but priority is wrong 15.5% of the time here',
+        'The API is mixing up tickets between customers and returning random labels',
+        'The schema is too strict, so the model has no good option to pick',
+      ],
+      answer: 1,
+      explain: 'The grammar guarantees valid shape. 31 of 200 is 15.5% wrong in this sample. That is a quality problem in the model or the prompt, so it needs an eval, not a parser fix.',
+    },
+    {
+      prompt: 'What is the best next step?',
+      options: [
+        'Add more required fields to the schema so the model must try harder',
+        'Switch to a repair loop that asks the model to try again on every ticket',
+        'Build a labeled test set and measure accuracy first',
+        'Turn off structured output so the model can explain its choice in prose',
+      ],
+      answer: 2,
+      explain: 'You need a measured quality bar first. A repair loop retries only validation failures, and there are none. Extra fields or prose do not measure or fix accuracy.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)
+- [OpenAI: structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
+- [Gemini API: structured output](https://ai.google.dev/gemini-api/docs/structured-output)
+- [LMSYS: fast JSON decoding with a compressed finite state machine](https://www.lmsys.org/blog/2024-02-05-compressed-fsm/)

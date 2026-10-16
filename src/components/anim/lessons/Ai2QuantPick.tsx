@@ -68,7 +68,7 @@ export default function Ai2QuantPick() {
               <g key={x.id}>
                 <text x={L - 10} y={y + 22} textAnchor="end" fontSize={14} fill={sel ? 'var(--fg)' : 'var(--muted)'}>{x.label}</text>
                 <rect x={L} y={y} width={Math.max(2, px(v) - L)} height={30} rx={6} fill={over ? 'var(--bad)' : 'var(--ok)'} fillOpacity={0.25} stroke={over ? 'var(--bad)' : 'var(--ok)'} strokeWidth={sel ? 2.2 : 1.4} />
-                <text x={px(v) + 8 > W - R - 80 ? L + 10 : px(v) + 8} y={y + 20} fontSize={14} fill="var(--fg)" style={{ fontFamily: 'var(--font-mono)' }}>{Math.round(v * 10) / 10} GB</text>
+                <text x={px(v) + 8 > W - R - 80 ? L + 10 : px(v) + 8} y={y + 20} fontSize={14} fill="var(--fg)" stroke="var(--bg)" strokeWidth={4} paintOrder="stroke" style={{ fontFamily: 'var(--font-mono)' }}>{Math.round(v * 10) / 10} GB</text>
               </g>
             );
           })}

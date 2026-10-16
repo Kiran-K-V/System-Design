@@ -1,0 +1,201 @@
+---
+summary: 'The KV cache turns quadratic recompute into linear work, at the price of memory per user. Size it per token, see why one long sequence can fill half a GPU, and see how paging stops contiguous reservations from wasting most of the pool.'
+requires: ['ai/a2-inference-cost/prefill-decode', '05-caching/why-cache']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai2KvWalk from '../../../../components/anim/lessons/Ai2KvWalk.tsx';
+import Ai2KvPaged from '../../../../components/anim/lessons/Ai2KvPaged.tsx';
+
+## The problem
+
+[Lesson A1.4](/learn/ai/a1-model-function/attention-cost/) introduced the KV cache and its size formula. This lesson asks the operations question. You have 4 H100s, the weights are loaded, and 148 GB of memory is left (lesson A2.1). Users start sessions with different lengths and different answer lengths, and you do not know in advance how long any of them will run. How do you hand out that memory without wasting most of it or running out?
+
+## Naive solution: recompute, then reserve
+
+Two naive moves, and both fail.
+
+**Recompute.** Skip the cache. Each new token recomputes Keys and Values for the whole text so far. Work per token grows with length, and the whole answer costs about n²/2 K/V computations. For 1,000 tokens that is 500,500 against 1,000 with a cache.
+
+**Reserve the maximum.** Keep the cache, but give each request one contiguous slab sized for its longest possible length, because GPU kernels usually want one contiguous tensor. The slab is booked for the request's whole life. Most requests stop earlier, so most of the slab is never used.
+
+Step through the first failure and what the cache costs in memory.
+
+<Ai2KvWalk client:visible />
+
+## The mechanism: the cache is a per-session cache
+
+For a backend engineer the KV cache is a per-session cache. It holds work already done (Keys and Values for a session's tokens), it is keyed by session, and it grows with the session.
+
+<CrossTrackLink id="05-caching/eviction">
+A cache has limited space, so you need a rule for what to drop. For the KV cache the rule is harsh: dropping part of a running request's cache means redoing that work. Servers instead make new requests wait, or throw away or swap out the cache of a whole sequence and rebuild it later.
+</CrossTrackLink>
+
+The vLLM paper uses an all-or-nothing rule: evict every block of a sequence or none, because a sequence needs all its blocks at each step.
+
+### Size per token
+
+<Math block tex="\text{KV bytes per token} = 2 \times L \times H_{kv} \times d_{head} \times \text{bytes}" />
+
+The 2 is for K and V. L is layers, H_kv the number of KV heads, d_head the head width. For Llama 3 70B (80 layers, 8 KV heads, head width 128, BF16): 2 x 80 x 8 x 128 x 2 = 327,680 bytes, **320 KiB per token**. The layer and head counts come from the Llama 3.1 70B `config.json` (the same architecture; Meta's own file needs a login, so we read a public mirror).
+
+| Model | Layers | KV heads | KV per token (BF16) | One 8K sequence |
+|---|---|---|---|---|
+| Llama 3 8B | 32 | 8 | 128 KiB | 1.0 GiB |
+| Llama 3 70B | 80 | 8 | 320 KiB | 2.5 GiB |
+| Llama 3 405B | 126 | 8 | 504 KiB | 3.9 GiB |
+| Mixtral 8x7B | 32 | 8 | 128 KiB | 1.0 GiB |
+
+Sources: Llama 3 paper Table 3, Mixtral paper Table 1. All use 8 KV heads and head width 128. Derived with the formula above.
+
+The 8 KV heads matter. Llama 3 70B has 64 query heads. With **grouped-query attention** [mid] (GQA), several query heads share one K/V head. Without it the cache would be 64 / 8 = 8 times bigger: 2.5 MiB per token, 20 GiB for an 8K sequence. The GQA paper reports that converting a model costs about 5% of its original pre-training compute and keeps quality close to full multi-head attention. Cache size drove that design.
+
+Now scale it by users:
+
+- One 128,000-token sequence on Llama 3 70B: 40 GiB. Half an 80 GB card.
+- 32 sequences of 8K tokens: 32 x 2.5 = 80 GiB. On 4 x H100 (137.8 GiB of room, with the 10% reserve from lesson A2.1) that fits. On 2 x H100, with 4 GB, it does not.
+
+## Allocation: paging fixes waste
+
+The vLLM paper profiled existing serving systems and found that only **20.4% to 38.2%** of KV memory held real token data. The rest was reservation that was never used, plus gaps. The vLLM launch post says such systems waste 60% to 80% of memory. Three kinds of waste appear:
+
+- **Reserved:** space booked for tokens that have not been generated yet.
+- **Internal fragmentation** [mid]: space reserved that the request never uses.
+- **External fragmentation** [mid]: free space split into holes too small for any new request.
+
+The fix comes from operating systems. **PagedAttention** splits each sequence's cache into small fixed-size blocks and keeps a **block table** per sequence that maps its logical blocks to physical ones. The blocks need not touch. The paper's own analogy: blocks are pages, tokens are bytes, and requests are processes. Blocks are taken on demand, one at a time as the sequence grows. All blocks are the same size, so there is no external fragmentation. Waste only happens in the last block of each sequence. vLLM reports under 4% waste. (The mechanics of the kernel are elective E3.2.)
+
+The demo below is a toy: six requests share a 16,384-token pool, with illustrative sizes. Move the slider and watch the two allocators. Then tick the box to let B and D finish.
+
+<Ai2KvPaged client:visible />
+
+At 50% progress the contiguous pool holds 5,050 real tokens in 14,336 reserved: 65% wasted. The paged pool holds 5,072 tokens for the same data: 0.4% wasted. The newcomer G reserves 4,096 tokens. The contiguous pool says no, even though about 11,300 tokens of the pool hold no data. The paged pool says yes, since G only needs 19 blocks to start. Tick the box and the contiguous pool has 4,096 free tokens in three separate holes, and still says no.
+
+Paging has a second gift: blocks can be shared. Many requests with the same prompt prefix can point to the same blocks. That is the idea behind prompt caching (lesson A2.5).
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| KV per token, Llama 3 70B BF16 | 320 KiB | Derived: 2 x 80 x 8 x 128 x 2 |
+| 8K sequence, Llama 3 70B | 2.5 GiB | Derived |
+| 128K sequence, Llama 3 70B | 40 GiB | Derived |
+| Memory saved by GQA, 64 to 8 heads | 8x | Derived |
+| KV memory holding real tokens, older systems | 20.4% to 38.2% | vLLM paper |
+| Waste with paging | under 4% | vLLM launch post |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Contiguous reservation | Simple kernels | 60% to 80% waste, fewer users | Almost never today |
+| Paged blocks | Near-zero waste, sharing | Block-table lookup, a more complex kernel | A shared server |
+| Shorter max context | More sessions per GPU | Less context per request | Most sessions are short |
+| GQA model | 8x smaller cache | A small quality risk | Always choose when serving many users |
+| Queue or preempt new requests | No out-of-memory crash | Waiting, or recompute work | The pool is full |
+
+## Interview lens
+
+<Callout type="tip">
+Say the cache as a budget: "KV is 2 x layers x KV heads x head width x bytes. For 70B that is 320 KiB per token. After weights, I divide the leftover memory by tokens per session to get concurrent sessions." Then mention paging as the way to not waste that memory.
+</Callout>
+
+<Callout type="mistake">
+Do not claim the KV cache is small because 320 KiB sounds small. Multiply by tokens and by users. Do not say "more GPUs fix it" without saying that weights and cache are both split over them. Do not size by prompt length only: the cache grows with the output too.
+</Callout>
+
+<Callout type="deep" title="Why the cache is read on every step">
+The cache is not only stored, it is read. Each decode step reads the weights and every cached K and V of that request. At long contexts the cache read can rival the weight read. That is one reason the floor from lesson A2.2 rises with context length, and why bigger batches stop being free.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="KV cache sizes"
+  scenario="Llama 3 70B in BF16: 80 layers, 8 KV heads, head width 128, so 320 KiB (327,680 bytes) of KV cache per token. Llama 3 8B has 32 layers and the same heads."
+  steps={[
+    {
+      prompt: 'KV cache for one 128K-token (131,072) sequence of Llama 3 70B, in GiB?',
+      unit: 'GiB',
+      answer: 40,
+      within: 1.1,
+      explain: '131,072 x 327,680 bytes = 42.9e9 bytes. Divide by 2^30 (1.07e9): 40 GiB. That is half of an 80 GB card, before weights.',
+    },
+    {
+      prompt: 'KV bytes per token for Llama 3 8B in BF16, in KiB?',
+      unit: 'KiB',
+      answer: 128,
+      within: 1.1,
+      explain: '2 x 32 layers x 8 KV heads x 128 x 2 bytes = 131,072 bytes = 128 KiB.',
+    },
+    {
+      prompt: 'On 4 x H100 with 148 GB of KV room, how many 4,096-token sequences of Llama 3 70B fit?',
+      unit: 'sequences',
+      answer: 110,
+      within: 1.1,
+      explain: 'One sequence is 4,096 x 327,680 = 1.342e9 bytes. 148e9 / 1.342e9 = 110.3, so 110 sequences.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'What does the KV cache save during decode?',
+      options: [
+        'The weight reads, since the weights are kept in the cache',
+        'Recomputing K and V of earlier tokens',
+        'The sampling step, since sampled tokens are cached',
+        'The network transfer of the prompt to the GPU at each step',
+      ],
+      answer: 1,
+      explain: 'Without it, every new token recomputes K and V for the whole text so far. The cache keeps them, so only the new token is computed. Weights still stream from HBM on every step, so the cache does not remove that.',
+    },
+    {
+      q: 'Llama 3 70B has 64 query heads and 8 KV heads. Without GQA (64 KV heads), how big would the cache per token be?',
+      options: [
+        '320 KiB, since GQA does not change it',
+        '640 KiB, double',
+        '2.5 MiB, eight times larger',
+        '40 KiB, eight times smaller',
+      ],
+      answer: 2,
+      explain: 'The cache is proportional to the KV head count. 64 / 8 = 8, so 320 KiB x 8 = 2,560 KiB = 2.5 MiB. GQA shrinks the cache, it does not grow it.',
+    },
+    {
+      q: 'A server reserves the maximum length of each request in one contiguous block. Real requests use a fraction of it. What is the main waste?',
+      options: [
+        'Reserved space never used, plus holes',
+        'Time spent copying the cache between GPUs at each step',
+        'Extra copies of the weights stored for each request',
+        'Wasted FLOPs in the attention math for padded tokens',
+      ],
+      answer: 0,
+      explain: 'Internal fragmentation (booked but unused) and external fragmentation (holes between slabs) waste memory. The vLLM paper found only 20.4% to 38.2% held real tokens. The cache does not duplicate weights, and the loss is memory, not FLOPs.',
+    },
+    {
+      q: 'Why does paging remove external fragmentation?',
+      options: [
+        'It compacts memory between every decode step',
+        'It never allocates memory to a sequence until the sequence is finished',
+        'It forces every request to use the same length',
+        'All blocks are the same size, so any free block fits any request',
+      ],
+      answer: 3,
+      explain: 'Fixed-size blocks mean a free block is never "too small", so holes cannot strand space. Compaction would be too slow for a large cache, and requests keep their varying lengths.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Efficient Memory Management for LLM Serving with PagedAttention](https://arxiv.org/abs/2309.06180): the 20.4% to 38.2% profile and the block-table design.
+- [vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention](https://vllm.ai/blog/2023-06-20-vllm): the 60% to 80% waste and under-4% claims.
+- [GQA: Training Generalized Multi-Query Transformer Models](https://arxiv.org/abs/2305.13245): why 8 KV heads.
+- [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783): Table 3 for the layer and head counts.

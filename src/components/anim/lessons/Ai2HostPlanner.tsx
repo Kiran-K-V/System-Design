@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import CacheWidgetFrame from './CacheWidgetFrame';
 import { API_MODELS } from './ai0Math';
-import { MEASURED_TOK_PER_SEC, OUTPUT_ONLY_TOK_PER_SEC, plan } from './Ai2HostMath';
+import { LISTED_TOK_PER_SEC, MEASURED_TOK_PER_SEC, plan } from './Ai2HostMath';
 
 const money = (v: number) => (v >= 1000 ? `$${Math.round(v).toLocaleString('en-US')}` : `$${v.toFixed(2)}`);
 const GPU_PRICES = [
@@ -35,8 +35,8 @@ export default function Ai2HostPlanner() {
           <Slider id="a27-tok" label="Output tokens per request" value={tokReq} min={50} max={2000} step={50} on={setTokReq} show={String(tokReq)} />
           <Slider id="a27-rate" label="Tokens per second per GPU (measure yours)" value={rate} min={500} max={12000} step={100} on={setRate} show={rate.toLocaleString('en-US')} />
           <div className="flex flex-wrap gap-2 text-xs">
-            <button type="button" onClick={() => setRate(MEASURED_TOK_PER_SEC)} className="rounded-md border border-line px-2 py-1 text-muted hover:bg-surface">Benchmark as cited in A0.4: {MEASURED_TOK_PER_SEC.toLocaleString('en-US')}</button>
-            <button type="button" onClick={() => setRate(OUTPUT_ONLY_TOK_PER_SEC)} className="rounded-md border border-line px-2 py-1 text-muted hover:bg-surface">Output only, 35.04 req/s x 128: {OUTPUT_ONLY_TOK_PER_SEC.toLocaleString('en-US')}</button>
+            <button type="button" onClick={() => setRate(MEASURED_TOK_PER_SEC)} className="rounded-md border border-line px-2 py-1 text-muted hover:bg-surface">Output rate, 35.04 req/s x 128: {MEASURED_TOK_PER_SEC.toLocaleString('en-US')}</button>
+            <button type="button" onClick={() => setRate(LISTED_TOK_PER_SEC)} className="rounded-md border border-line px-2 py-1 text-muted hover:bg-surface">Listed figure (input + output): {LISTED_TOK_PER_SEC.toLocaleString('en-US')}</button>
           </div>
           <Slider id="a27-util" label="Target utilization at peak" value={util} min={30} max={100} step={5} on={setUtil} show={`${util}%`} />
           <div>

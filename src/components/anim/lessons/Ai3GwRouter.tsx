@@ -51,10 +51,11 @@ export default function Ai3GwRouter() {
               value={diff}
               onChange={setDiff}
               options={[
-                { id: 'simple', label: 'Simple (any model)' },
-                { id: 'hard', label: 'Hard (Sonnet or Opus)' },
+                { id: 'simple', label: 'Simple' },
+                { id: 'hard', label: 'Hard' },
               ]}
             />
+            <div className="mt-1 text-xs text-muted">Simple: any model will do. Hard: needs Sonnet or Opus (illustrative).</div>
           </div>
           <div>
             <div className="mb-1 text-xs text-muted">Provider health</div>

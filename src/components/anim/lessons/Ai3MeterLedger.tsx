@@ -55,9 +55,8 @@ const steps: Step[] = [
   },
 ];
 
-const MAX = 0.027;
 const BAR_X = 410;
-const BAR_W = 200;
+const BAR_W = 220;
 const usd = (v: number) => `$${v.toFixed(4)}`;
 const n = (v: number) => v.toLocaleString('en-US');
 
@@ -66,6 +65,7 @@ export default function Ai3MeterLedger() {
     <AnimFrame title="Cost ledger for one Sonnet 5.5 request" steps={steps} interval={5200}>
       {(i, s) => {
         const c = lineCosts(s.usage, P);
+        const MAX = Math.max(c.input, c.cacheRead, c.cacheWrite, c.output);
         const u = s.usage;
         const rows = [
           { label: 'Input', tok: u.input_tokens, rate: P.input, amt: c.input, color: 'var(--accent)' },
@@ -81,14 +81,14 @@ export default function Ai3MeterLedger() {
         ];
         return (
           <SketchSvg width={720} height={430} label="A ledger turns the four usage counters of one response into dollars">
-            <SketchBox cx={250} cy={74} w={440} h={116} r={8} seed={seedOf('usage')} stroke="var(--muted)" />
+            <SketchBox cx={250} cy={79} w={440} h={126} r={8} seed={seedOf('usage')} stroke="var(--muted)" />
             <HandText x={40} y={34} size={14} anchor="start" color="var(--muted)">usage</HandText>
             {json.map((line, k) => (
               <HandText key={k} x={40} y={58 + k * 22} size={14} anchor="start" mono color={s.rows === 0 ? 'var(--accent)' : 'var(--fg)'}>
                 {line}
               </HandText>
             ))}
-            <HandText x={500} y={74} size={14} anchor="start" color="var(--muted)">{i === 5 ? 'cold call' : 'warm call'}</HandText>
+            <HandText x={500} y={79} size={14} anchor="start" color="var(--muted)">{i === 5 ? 'cold call' : 'warm call'}</HandText>
             {s.rows > 0 && <HandText x={150} y={162} size={14} anchor="start" color="var(--muted)">tokens x dollars per 1M tokens</HandText>}
             {rows.map((r, k) => {
               const shown = s.rows > k;

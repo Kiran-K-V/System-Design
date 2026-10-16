@@ -89,7 +89,7 @@ const steps: Step[] = [
 
 const KV_X = [110, 200, 290, 380, 470, 560];
 const kvTone = { none: 'var(--muted)', stored: 'var(--ok)', redo: 'var(--warn)', new: 'var(--accent)' } as const;
-const kvText = { none: '', stored: 'K V', redo: 'K V again', new: 'K V new' } as const;
+const kvText = { none: '', stored: 'K V', redo: 'K V redo', new: 'K V new' } as const;
 
 export default function Ai2KvWalk() {
   return (

@@ -27,7 +27,7 @@ export default function Ai3Code({ x, y, w, title, lines, hi }: { x: number; y: n
       })}
       {lines.map((l, i) => (
         <HandText key={i} x={x + 12} y={top + i * LH + 8} anchor="start" size={TEXT_SIZES.note} mono color={l.g && hi[l.g] ? 'var(--fg)' : 'var(--muted)'}>
-          {l.t}
+          {l.t.replace(/^ +/, (m) => '\u00a0'.repeat(m.length))}
         </HandText>
       ))}
     </g>

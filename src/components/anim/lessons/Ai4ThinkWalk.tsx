@@ -40,7 +40,7 @@ const steps: Step[] = [
 ];
 
 const X0 = 130;
-const SCALE = 560 / 170;
+const SCALE = 400 / 170;
 const tone = (t: string) => `var(--${t})`;
 
 export default function Ai4ThinkWalk() {
@@ -65,7 +65,7 @@ export default function Ai4ThinkWalk() {
           })}
           <SketchArrow points={[[X0, 214], [X0 + 170 * SCALE, 214]]} head="end" seed={seedOf('tw-ax')} stroke="var(--muted)" />
           <HandText x={X0} y={234} anchor="start" size={TEXT_SIZES.note} color="var(--muted)">0 s</HandText>
-          <HandText x={X0 + 170 * SCALE} y={234} anchor="end" size={TEXT_SIZES.note} color="var(--muted)">decode time, 20 ms per token (assumed). Orange: thinking. Blue: answer.</HandText>
+          <HandText x={706} y={234} anchor="end" size={TEXT_SIZES.note} color="var(--muted)">decode time, 20 ms per token (assumed). Amber: thinking. Purple: answer.</HandText>
         </SketchSvg>
       )}
     </AnimFrame>

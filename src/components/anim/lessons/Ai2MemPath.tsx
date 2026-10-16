@@ -4,7 +4,7 @@ import { HandText, SketchArrow, SketchBox, SketchSvg, TEXT_SIZES, seedOf } from 
 const NODES = [
   { label: 'Disk', note: 'weight files' },
   { label: 'HBM', note: '80 GB' },
-  { label: 'SRAM', note: 'small, on-chip' },
+  { label: 'SRAM', note: 'tiny' },
   { label: 'Tensor Core', note: '989 TFLOPS' },
 ];
 const X = [80, 260, 440, 620];
@@ -64,7 +64,7 @@ export default function Ai2MemPath() {
   return (
     <AnimFrame title="From disk to Tensor Core" steps={steps} interval={5600}>
       {(_, s) => (
-        <SketchSvg width={720} height={330} label="Data path from disk through HBM and SRAM to the Tensor Core, with bandwidth labels">
+        <SketchSvg width={720} height={300} label="Data path from disk through HBM and SRAM to the Tensor Core, with bandwidth labels">
           {NODES.map((n, k) => {
             const on = s.active === k;
             const done = k < s.active;
@@ -104,8 +104,8 @@ export default function Ai2MemPath() {
               </HandText>
             </>
           )}
-          <SketchBox cx={360} cy={288} w={560} h={44} r={8} seed={seedOf('mp-read')} fill="var(--accent-soft)" />
-          <HandText x={360} y={289} size={TEXT_SIZES.label} mono color="var(--accent)">
+          <SketchBox cx={360} cy={268} w={560} h={44} r={8} seed={seedOf('mp-read')} fill="var(--accent-soft)" />
+          <HandText x={360} y={269} size={TEXT_SIZES.label} mono color="var(--accent)">
             {s.readout}
           </HandText>
         </SketchSvg>

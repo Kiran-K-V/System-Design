@@ -86,7 +86,7 @@ export default function Ai4CompactSim() {
             {String(t)}
           </HandText>
         ))}
-        <HandText x={X1} y={14} anchor="end" size={TEXT_SIZES.note} color="var(--bad)">
+        <HandText x={X0 + 6} y={14} anchor="start" size={TEXT_SIZES.note} color="var(--bad)">
           window 200K
         </HandText>
         {basePts.length > 1 && (
@@ -103,7 +103,7 @@ export default function Ai4CompactSim() {
           turn
         </HandText>
       </SketchSvg>
-      <p className="mt-1 text-xs text-muted">Dashed grey: no compaction, no clearing. Solid: your settings.</p>
+      <p className="mt-1 text-xs text-muted">Thin grey: no compaction, no clearing. Solid: your settings.</p>
       <div className="mt-3 grid gap-4 text-sm md:grid-cols-2">
         <div className="space-y-3">
           {slider('a44-per', 'Tokens added per turn', kk(perTurn), 2000, 12000, 1000, perTurn, setPerTurn)}

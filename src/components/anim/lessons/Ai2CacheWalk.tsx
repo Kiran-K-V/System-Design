@@ -47,7 +47,7 @@ const steps: Step[] = [
 
 const ROW_Y = [62, 124, 186, 248];
 const BAR_X = 392;
-const PX = 200; // pixels for one uncached prefix
+const PX = 160; // pixels for one uncached prefix
 
 export default function Ai2CacheWalk() {
   return (
@@ -77,7 +77,7 @@ export default function Ai2CacheWalk() {
                   <HandText x={327} y={y} size={TEXT_SIZES.note} color="var(--muted)">new</HandText>
                   <SketchBox cx={BAR_X + PX / 2} cy={y} w={PX} h={26} r={6} seed={seedOf(`cw-d${r}`)} stroke="var(--muted)" dashed />
                   {active && <SketchBox cx={BAR_X + w / 2} cy={y} w={w} h={26} r={6} seed={seedOf(`cw-c${r}-${k}`)} fill={c} stroke={c} strokeWidth={2.2} />}
-                  <HandText x={BAR_X + PX + 70} y={y} size={TEXT_SIZES.note} mono color={active ? c : 'var(--muted)'}>{active ? money(mult(k) * UNIT) : '-'}</HandText>
+                  <HandText x={BAR_X + PX + 108} y={y} size={TEXT_SIZES.note} mono color={active ? c : 'var(--muted)'}>{active ? money(mult(k) * UNIT) : '-'}</HandText>
                 </g>
               );
             })}

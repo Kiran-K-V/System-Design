@@ -1,0 +1,186 @@
+---
+summary: 'A reasoning model writes hidden thinking tokens before its answer. They bill as output tokens and delay the first visible token. Cap them with effort levels or a thinking budget, and use them only where multi-step work pays for the wait.'
+requires: ['ai/a1-model-function/sampling-decoding', 'ai/a4-context/context-budgeting']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai4ThinkWalk from '../../../../components/anim/lessons/Ai4ThinkWalk.tsx';
+import Ai4ThinkBudget from '../../../../components/anim/lessons/Ai4ThinkBudget.tsx';
+
+## The problem
+
+A support tool has two kinds of request. Most are lookups: "What is the return window?" A few are multi-step: "Order 4471 shipped in two parcels, one was damaged, the coupon was applied to the wrong parcel. What do we refund?" The team switches the model to thinking mode to fix the hard cases. The easy cases now take 40 seconds and cost ten times more.
+
+A **reasoning model** spends tokens working on a problem before it answers. Those **thinking tokens** (also called reasoning tokens) are generated like any other output, one token at a time. The idea is **test-time compute**: instead of only making the model bigger or training it longer ([lesson A1.7](/learn/ai/a1-model-function/scaling-laws/)), you let it spend more compute on each hard question, at the moment of the question. The cost is paid per request, so it has a latency price and a money price. This lesson shows both, and how to cap them.
+
+## How thinking changes a request
+
+Lesson A1.5 ([sampling and decoding](/learn/ai/a1-model-function/sampling-decoding/)) showed that a model produces one token at a time, each costing about the same time. Thinking does not change that. It adds tokens before the answer. Two things follow.
+
+**Latency.** The answer cannot start until the thinking ends. If decoding takes 20 ms per token (our assumption; real speed varies by model and load, so measure yours), then 8,000 thinking tokens take 8,000 x 0.020 = 160 seconds before the first answer token. Streaming does not help, because the wait is before the stream. This is a time-to-first-token (TTFT) cost. Processing the prompt adds its own wait before any token appears. This lesson counts only the thinking part.
+
+**Cost.** Thinking tokens bill as output tokens. Anthropic's docs say you pay for the full thinking, even when the API returns only a short summary of it. OpenAI says reasoning tokens are not visible through the API, "still occupy space in the model's context window and are billed as" output tokens. At the Sonnet 5.5 output price of $10 per million tokens (as of 2026-10-16, [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)):
+
+<Math block tex="8{,}000 \times \frac{\$10}{10^{6}} = \$0.08" />
+
+That is the thinking alone, per call, before the answer. At 1,000 calls a day it is $80 a day. Watch the timeline.
+
+<Ai4ThinkWalk client:visible />
+
+## Controlling thinking today
+
+Providers have changed how you control thinking. The rules below are what the docs say as of 2026-10-16. They change often. Check the page for your model before you ship, and keep the idea, not the parameter name.
+
+**Anthropic.** Two modes exist.
+
+- *Manual budget:* `thinking: {type: "enabled", budget_tokens: N}`. The budget must be at least 1,024 and less than `max_tokens`. It is "a target rather than a strict cap": the model may stop sooner, and `max_tokens` is the hard ceiling. The docs suggest starting near 1,024 for simple tasks and at 16,000 or more for complex ones, and using batch processing above 32,000 tokens. This mode is deprecated on the Claude 4.6 models, which still accept it. Claude 4.7 and later models reject it with a 400 error. The docs name Opus 5.5, Sonnet 5, Sonnet 5.5, Fable 5.1, and Haiku 5.5 among them. On Claude 4.5 and earlier thinking models, it is the only mode.
+- *Adaptive thinking with effort:* `thinking: {type: "adaptive"}` plus `output_config: {effort: ...}`. The model decides per request whether to think and how much. The levels are `low`, `medium`, `high`, `xhigh`, and `max`. `high` is the default on most models. `medium` is the default on Opus 5.5 and Haiku 5.5. Effort is "soft guidance", not a token count, and which levels exist varies by model. On Sonnet 5.5 and Haiku 5.5, lowering the effort works better than asking in the prompt for less thinking.
+
+In both modes thinking counts toward `max_tokens`. If `stop_reason` is `max_tokens`, raise the cap or lower the effort. The response field `usage.output_tokens_details.thinking_tokens` reports how many billed output tokens were thinking. A change to the effort or the budget between requests invalidates the cached message blocks (lesson A4.5), so pick one setting per conversation.
+
+**OpenAI.** The `reasoning` effort takes values from `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, and which are valid depends on the model. The guide says GPT-6 Astra rejects `none` with an HTTP 400, and GPT-6.1 Sol rejects `none` and `minimal` and defaults to `medium`. Reasoning may range "from a few hundred to tens of thousands" of tokens. OpenAI recommends reserving at least 25,000 tokens for reasoning and output when you start, because the output limit includes the reasoning. You can request a reasoning summary with the `summary` parameter. With function calling, it recommends passing back the reasoning items returned with the last call.
+
+The common shape: a soft control (effort) and a hard cap (`max_tokens`). Set the cap high enough for thinking plus the answer.
+
+## Where reasoning comes from
+
+DeepSeek-R1 (DeepSeek-AI, 2025) shows that this behavior can be trained with reinforcement learning (RL) on checkable rewards. The reward is rule-based. It has an accuracy part (a math answer in a set format can be checked by a program, and code can be tested) and a format part (put the reasoning between think tags). The R1-Zero version, trained with RL alone, raised its average pass@1 score on the AIME 2024 math contest from 15.6% to 77.9% during training, and its thinking time grew steadily. The final DeepSeek-R1 scores 79.8% on AIME 2024 and 97.3% on MATH-500. Those are single-benchmark numbers from the paper's own evaluation, and on tasks with checkable answers, which is why RL works there. They do not predict gains on open-ended tasks.
+
+We omit OpenAI's published o1 chart numbers because we could not load the primary page to confirm them.
+
+## Pick a budget
+
+How much thinking is enough? It depends on the task, and the gain flattens: Anthropic says returns diminish "depend on the task". The explorer shows latency and cost as arithmetic. Its accuracy curve is **made up**, to show a knee where extra tokens stop paying. No paper we read measures accuracy against thinking tokens for a current model. Run this test on your own set: score 50 or more real tasks at 3 or 4 settings, then pick the cheapest setting that reaches your quality bar.
+
+<Ai4ThinkBudget client:visible />
+
+What to notice:
+
+1. **Check by hand.** At 8,000 thinking tokens on Sonnet 5.5, the first answer token waits 160 s. Total decode time with a 300-token answer is 166 s. Output cost is 8,300 x $10 / 10^6 = $0.083 per call, and $83 a day at 1,000 calls.
+2. **Model price matters.** Switch to Haiku 5.5 ($0.50 per million output tokens): the same call costs about $0.0042. Switch to Opus 5.5 ($20): $0.166.
+3. **Latency is linear.** Every 1,000 thinking tokens add 20 s at our assumed speed. A UI with a 10-second limit allows about 500 thinking tokens in total.
+4. **The knee is a property of your task.** On the made-up curve it sits near 9,200 tokens. Yours may be at 500 or at 30,000.
+
+## When to use reasoning
+
+| Task | Use thinking? | Reason |
+|---|---|---|
+| Extract fields from an invoice | No | One pass reads the answer. Thinking adds latency and cost for no gain. |
+| Classify a short message | No, or `low` effort | The label is a direct pattern. |
+| Multi-step math, planning, hard code | Yes | Intermediate steps are the work. |
+| Multi-step tool use (agents) | Yes, on planning steps | Models can think between tool calls. Most reasoning happens on the first request after new input. |
+| A chat with a 3-second latency budget | Usually no | No thinking budget fits. |
+| A background job or batch | Yes, with a high cap | Nobody waits. |
+
+State the latency budget first. If the budget is 5 seconds, at 20 ms per token no more than 250 tokens fit for thinking and answer together. Then choose the model and effort that fit it. A common design routes: a cheap model or low effort for easy requests, thinking for the requests a classifier flags as multi-step. Reasoning also reduces some errors, but it does not remove hallucination (lesson A1.6, [hallucination and context](/learn/ai/a1-model-function/hallucination-context/)). A model can reason its way to a confident wrong answer, so check outputs where it matters.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| No thinking | Lowest latency and cost | Weak on multi-step problems | Lookups, extraction, short answers |
+| Low effort | Some reasoning at small cost | Smaller gains on hard tasks | Mixed traffic with tight latency |
+| High effort or large budget | Better on hard tasks | Latency in tens of seconds, higher bill | Hard problems, offline work |
+| Fixed per-conversation setting | The prompt cache keeps working | Cannot tune per turn | Long conversations with a cached prefix |
+| Routing by difficulty | Pay for thinking only when needed | A classifier that can be wrong | Mixed traffic at volume |
+
+## Interview lens
+
+<Callout type="tip">
+Put numbers on it: "8,000 thinking tokens at 20 ms is 160 seconds and about 8 cents on a $10 per million output price. So I route: simple requests skip thinking, hard ones get a capped budget, and I run an eval to find the knee." Mention that thinking tokens bill even when the thinking is hidden.
+</Callout>
+
+<Callout type="mistake">
+Do not turn thinking on for every request "for quality". Do not treat `budget_tokens` as a hard cap: it is a target, and `max_tokens` is the limit. Do not hard-code one provider's parameter, since the rules differ by model and change. Say "a soft effort control and a hard token cap".
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A model decodes at 25 ms per token and thinks for 6,000 tokens before a 200-token answer. How long until the first answer token?',
+      options: [
+        'About 0.5 s, because streaming starts at once',
+        'About 5 s, because thinking runs in parallel with the answer',
+        'About 150 s, because 6,000 x 25 ms comes before the answer',
+        'About 155 s, because the answer is included in the first token',
+      ],
+      answer: 2,
+      explain: 'The answer starts after the thinking ends. 6,000 x 0.025 s = 150 s. The 200 answer tokens come after that wait, so the full time is 155 s, but the first answer token appears at 150 s. Streaming starts at the first answer token, not before.',
+    },
+    {
+      q: 'A call on Sonnet 5.5 uses 5,000 thinking tokens and 500 answer tokens. Output costs $10 per million tokens. What is the output cost?',
+      options: [
+        '$0.0050, because only the answer tokens are billed',
+        '$0.0550, because thinking and answer tokens both bill as output',
+        '$0.0500, because only the visible thinking summary is billed',
+        '$0.5500, because thinking tokens cost ten times the output price',
+      ],
+      answer: 1,
+      explain: '(5,000 + 500) x $10 / 10^6 = $0.055. Thinking tokens bill as output tokens, and Anthropic bills the full thinking even if the response shows only a summary. Nothing in the docs says thinking costs more per token than other output.',
+    },
+    {
+      q: 'You send thinking: {type: "enabled", budget_tokens: 8000} to Sonnet 5.5 today. What do the Anthropic docs say happens?',
+      options: [
+        'It works, with a budget of exactly 8,000 tokens enforced as a hard cap by the API',
+        'It works, but it is billed at a lower rate than adaptive thinking is',
+        'It is silently ignored, and the model chooses its own effort level instead',
+        'It fails with a 400 error: 4.7 and later models do not support that mode',
+      ],
+      answer: 3,
+      explain: 'The extended thinking page says 4.7 and later models reject type enabled with a 400 error, and names Sonnet 5.5 in its list. Use adaptive thinking with an effort level. Even where the mode works, the budget is a target, not a strict cap.',
+    },
+    {
+      q: 'Which task benefits least from a large thinking budget?',
+      options: [
+        'Extracting an invoice number and a total from a clean invoice',
+        'Planning a multi-step database migration, with steps that depend on each other',
+        'Solving a competition-style math problem that has several steps',
+        'Debugging a failing test whose cause spans four different files',
+      ],
+      answer: 0,
+      explain: 'Extraction from a clean source is a one-pass read, so thinking adds latency and cost with little gain. The other three need intermediate steps, which is where thinking helps. Measure on your own set before you decide.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Cost of 8K thinking tokens"
+  scenario="A call uses 8,000 thinking tokens at a decode speed of 20 ms per token (assumed). Sonnet 5.5 output price as of 2026-10-16: $10 per million tokens. Ignore the answer tokens."
+  steps={[
+    {
+      prompt: 'How many seconds does the thinking take?',
+      unit: 's',
+      answer: 160,
+      within: 1.1,
+      explain: '8,000 x 0.020 s = 160 s.',
+    },
+    {
+      prompt: 'What does the thinking cost per call, in dollars?',
+      unit: '$',
+      answer: 0.08,
+      within: 1.1,
+      explain: '8,000 x $10 / 10^6 = $0.08.',
+    },
+    {
+      prompt: 'At 1,000 calls per day, what does the thinking cost per day, in dollars?',
+      unit: '$',
+      answer: 80,
+      within: 1.1,
+      explain: '1,000 x $0.08 = $80 per day, about $2,400 per month, for thinking alone.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic, extended thinking (manual budgets)](https://platform.claude.com/docs/en/build-with-claude/extended-thinking)
+- [Anthropic, steering thinking and cost](https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost)
+- [OpenAI, reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
+- [DeepSeek-AI, DeepSeek-R1](https://arxiv.org/abs/2501.12948)
