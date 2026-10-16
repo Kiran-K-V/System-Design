@@ -1,0 +1,179 @@
+---
+summary: 'A plan is a list of steps that the model writes before it acts and that the system keeps as state. A plan stops long tasks from drifting, lets cheap models do the steps, and gives you a check before the agent says done. A plan must also be easy to revise when a step fails.'
+requires: ['ai/a6-agents/agent-loop', 'ai/a6-agents/workflows-vs-agents']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai6PlanWalk from '../../../../components/anim/lessons/Ai6PlanWalk.tsx';
+import Ai6PlanSim from '../../../../components/anim/lessons/Ai6PlanSim.tsx';
+
+## The problem
+
+You ask an agent to add a coupon field to a checkout page. That job touches the API, the UI, the tests, and a pull request. The agent works for 40 turns. Somewhere in the middle it forgets that tests were part of the job. It opens the pull request without them, and says "done".
+
+Nothing crashed. The agent had no durable idea of what "finished" meant. Each turn it saw a long history and chose the next action by feel. On long tasks, feel drifts. A plan fixes that by writing "finished" down before the work starts.
+
+## Two ways to run a long task
+
+There are two styles. In the **interleaved** style, the agent has no written plan. It looks at the history, picks one action, sees the result, and picks the next. This is the loop from lesson [A6.1](/learn/ai/a6-agents/agent-loop/) and the ReAct pattern from lesson [A6.4](/learn/ai/a6-agents/loop-patterns/). Anthropic's guide says what makes it work: "it's crucial for the agents to gain 'ground truth' from the environment at each step". Each new observation can change the next move.
+
+In the **plan-then-act** style, a planner writes the steps first. Executors then run the steps. LangChain's write-up of plan-and-execute agents describes three parts: a planner that "prompts an LLM to generate a multi-step plan", executors that "accept the user query and a step in the plan and invoke 1 or more tools", and a re-planning step. After the steps run, "the agent is called again with a re-planning prompt", and it decides "whether to finish with a response or whether to generate a follow-up plan."
+
+Neither style wins everywhere. Interleaving adapts at every step but pays for it in tokens and can wander. Planning gives structure and cheaper steps, but a rigid plan breaks when the world surprises it. Most real agents mix them: a short plan, an interleaved loop inside each step, and a replan on failure. In lesson [A6.2](/learn/ai/a6-agents/workflows-vs-agents/) terms, plan-then-act moves the agent toward a workflow: the path is written down before it runs.
+
+## The plan lives in state
+
+A plan that exists only in the model's output scrolls away as the history grows. Keep it in **state**, a typed object your code owns (lesson [A6.3](/learn/ai/a6-agents/agents-as-graphs/)). The plan is a list of steps, each with a status: pending, running, verified, or failed. Your code shows the current plan to the model on every turn, and the model reads it instead of remembering it.
+
+You have seen this in products. The context engineering guide gives "Claude Code creating a to-do list" as an example of an agent that writes notes outside the context window. The list is the plan, kept as external state. Because your code holds it, you can also read it: show it in the UI, log it, and test against it.
+
+Now step through one scripted run. A step fails, and the agent replans.
+
+<Ai6PlanWalk client:visible />
+
+Notice three details. The replanner kept the verified steps 1 and 2 and did not redo them. The new plan added a step the first plan did not know about. And "verified" is a status the system sets after a check, not a word the model writes.
+
+## Replan on failure
+
+When a step fails, you have three options. Retry the same step. Replan the rest. Or stop and ask a human. A retry is right for a flaky tool. A replan is right when the failure shows that the plan was wrong, as with the missing import above. A stop is right when the agent has no safe next move.
+
+Replanning has a cost. It needs a strong model call with the plan and the results so far. Set a cap on replans, as you cap loop steps (lesson [A6.1](/learn/ai/a6-agents/agent-loop/)). An agent that replans forever is the same endless loop in a new place. A good rule: replan on a tool failure or a failed check, and after the cap, hand the task to a human.
+
+## Plan verification: check before "done"
+
+The plan is also your test for "finished". Anthropic's work on long-running agents shows the failure and the fix.
+
+The failure first. They list two behaviors: "Claude declares victory on the entire project too early", and the agent marks "features as done prematurely". An agent judges its own work, and a model is eager to report success.
+
+The fix: keep a feature list as a file, and give the agent a narrow right to change it. In their setup, the initializer wrote the requirements, and coding agents could "edit this file only by changing the status of a passes field." Removing or editing the tests was not allowed. The list in their claude.ai clone example grew to "over 200 features". The team chose JSON for the file because models are less likely to overwrite it than Markdown. They also found agents were more reliable once prompted to verify features end to end, using browser automation, as a human user would.
+
+Turn this into a rule for your own agent. Before the system accepts "done", code checks the plan: is every step verified by a passed check? If not, the loop continues and the model sees the open steps. The check is code, not another opinion from the model. The same idea appears in the memory tool docs: mark a feature complete "only after end-to-end verification confirms it works, not when the code is written."
+
+## Plans and cost
+
+A plan can lower the cost of a run, and the LangChain post says so. It claims plan-and-execute agents are faster, cheaper than ReAct agents, and can perform better. Their reasons are specific. The main agent is not called after each action, and sub-tasks can use smaller models, with the large model reserved for planning and the final response. These are the post's claims, not measured results, so test them on your own tasks.
+
+The post also names two limits. Execution is "restricted by serial tool calling". And the design "doesn't support variable assignment", so each task still needs an LLM call, and later steps cannot reuse earlier outputs directly. There is a quiet risk too: an executor that sees only its step has less context, so it may fail more. A cheap executor needs a clear step and the facts it needs.
+
+Try a toy model. It compares one interleaved loop with a plan-and-execute run. Every size in it is an assumption, and it counts input tokens only. The arithmetic is under the results.
+
+<Ai6PlanSim client:visible />
+
+With the defaults (10 steps, 3,000 base tokens, 800 tokens added per step, a 300-token plan, 1 failure), the no-plan loop makes 11 calls. Its input is 11 x 3,000 + 800 x 11 x 10 / 2 = 33,000 + 44,000 = 77,000 tokens. The plan run uses 55,400 tokens. At $2 per million tokens (Sonnet 5.5, claude.com/pricing, 2026-10-16), that is $0.154 against $0.111. If the executors run on Haiku 5.5 at $0.10, the plan run falls to about $0.025. Most of that saving is the cheaper model, and only part is the plan. Change the sliders to see where the plan stops helping: with few steps, the planner call is overhead.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| No plan, interleaved | Adapts at every step, simple | Drift on long tasks, history grows each call | Short or exploratory tasks |
+| Plan, then execute | Structure, progress you can see, cheaper executors | Planner call, brittle if the world changes | Long tasks with known parts |
+| Replan on failure | Recovers from surprises | Extra strong-model calls, risk of loops | Tools fail, or plans can be wrong |
+| Static plan, no replan | Predictable cost | Breaks on the first surprise | Stable tools, simple jobs |
+| Plan-state check before done | Stops early victory | Extra checks and tests to write | Any task with several parts |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "For a long task I have the model write a short plan and keep it in state with a status per step. Each turn the model sees the plan. A failed step triggers a capped replan. A strong model plans and replans, cheaper models execute. Before the agent can say done, code checks that every step passed its own test, because models declare victory early." That covers structure, cost, and control.
+</Callout>
+
+<Callout type="mistake">
+Do not treat the plan as a promise. A plan the model wrote is a guess, and tools fail. Do not let the model mark its own steps verified: a check outside the model sets that status. And do not claim a plan always saves money. It can, with small steps and cheap executors, but the planner call and the lost context also cost something.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Step 3 of a 6-step plan fails with an error the plan did not foresee. What does a plan-and-execute design do next?',
+      options: [
+        'It deletes the plan and starts the task from zero',
+        'It retries step 3 until the loop cap stops it',
+        'It calls a replanner with plan and results',
+        'It marks step 3 done so the rest of the plan can run',
+      ],
+      answer: 2,
+      explain: 'The replan step sees the plan and the results, and decides to finish or to write a follow-up plan. Starting over wastes verified work. Blind retries repeat a plan error, and marking a failed step done hides the problem.',
+    },
+    {
+      q: 'The agent writes "done" after 2 of 6 steps. Where should the check against the plan run?',
+      options: [
+        'In code, before done is accepted, using step status',
+        'In the prompt, by asking the model to be more careful',
+        'In the model, by asking it to grade its own work again',
+        'In the user interface, after the final answer is shown',
+      ],
+      answer: 0,
+      explain: 'The status of each step is state that your code owns. Code can refuse "done" while any step is open. Asking the model to be careful, or to re-grade itself, relies on the same judgment that failed.',
+    },
+    {
+      q: 'In the Anthropic long-running agent setup, which edit to the feature list file is allowed for a coding agent?',
+      options: [
+        'Removing a test that keeps failing in the end-to-end run',
+        'Rewording a feature so the test is easier to pass',
+        'Adding new features to match what the agent built',
+        'Changing the status of the passes field after testing',
+      ],
+      answer: 3,
+      explain: 'Agents could edit the file only by changing the passes status. Removing or editing tests was not allowed, which stops an agent from passing by moving the goal. Adding or rewording features changes the target.',
+    },
+    {
+      q: 'A loop makes 4 calls. Each call carries 1,000 base tokens, and each call adds 500 tokens of history. How many input tokens does it use in all?',
+      options: [
+        'About 4,000, since only the base repeats',
+        'About 7,000, from 1,000 + 1,500 + 2,000 + 2,500',
+        'About 5,000, since history is counted only once',
+        'About 8,000, since each call carries all 2,000 added',
+      ],
+      answer: 1,
+      explain: 'Call 1 sees 1,000. Call 2 sees 1,000 + 500. Call 3 sees 2,000. Call 4 sees 2,500. The sum is 7,000. Equivalent formula: 4 x 1,000 + 500 x 4 x 3 / 2 = 7,000.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai6-plan-early-done"
+  title="Done after step 2"
+  scenario="Your agent wrote a 6-step plan. It finished steps 1 and 2, then replied: 'All done, the feature is complete.' The pull request has no tests and a broken build."
+  facts={[
+    'plan state: steps 1-2 verified, steps 3-6 pending',
+    'final model message: "All done."',
+    'loop exit rule: stop when the model sends no tool call',
+    'plan state check before exit: none',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the root cause?',
+      options: [
+        'The plan was too long for the model to follow',
+        'Nothing checks plan state against done',
+        'The executor model was too small for these steps',
+        'The planner wrote steps in the wrong order',
+      ],
+      answer: 1,
+      explain: 'The loop ends when the model stops calling tools, so the model alone decides when the job is over. The state shows 4 steps open, but no code looks at it. The plan length, order, and executor size are not shown to be at fault.',
+    },
+    {
+      prompt: 'What is the best fix?',
+      options: [
+        'Code blocks exit until every step is verified',
+        'Tell the model in the prompt to count the steps first',
+        'Shorten the plan to 3 steps so that it is easier to finish',
+        'Let the model mark each step verified when it feels sure',
+      ],
+      answer: 0,
+      explain: 'Make exit depend on state: any open step sends the loop back with the list of open steps, with a cap on rounds. A prompt note is advice the model can ignore. A shorter plan hides work, and self-marked status repeats the failure.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [LangChain: Plan-and-execute agents](https://www.langchain.com/blog/planning-agents)
+- [Anthropic: Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
+- [Anthropic: Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)

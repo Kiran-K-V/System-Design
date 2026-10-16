@@ -1,0 +1,216 @@
+---
+summary: 'A person should approve the few actions that are costly or cannot be undone. Asking about everything teaches people to click through, so tier actions by risk, show the exact call, and use a durable pause that resumes without a waiting worker.'
+requires: ['ai/a7-agents-prod/loop-control', 'ai/a6-agents/mcp', 'ai/a7-agents-prod/durable-graph-runtime']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai7HitlFlow from '../../../../components/anim/lessons/Ai7HitlFlow.tsx';
+import Ai7HitlSim from '../../../../components/anim/lessons/Ai7HitlSim.tsx';
+
+## The problem
+
+An agent can send money, delete data, and write to a customer. The model decides what to call, and the model is wrong some of the time (lesson [A0.3](/learn/ai/a0-orientation/probabilistic-components/) says how often to plan for). Loop caps (lesson [A7.2](/learn/ai/a7-agents-prod/loop-control/)) limit how long a wrong run lasts. They do not make a single wrong action safe.
+
+The usual answer is to put a person in the loop: the agent asks, the person approves. The protocol for tools says so. The MCP tools spec says there "SHOULD always be a human in the loop with the ability to deny tool invocations". Note the word: it is a SHOULD, not a MUST. Whether and where to ask is your design.
+
+## The naive design: ask about everything
+
+The first version asks before every tool call. It feels safe. It fails in a known way.
+
+Anthropic reports that Claude Code users "approve 97% of permission prompts", and that the rejection rate is "only 3%". Anthropic reads this as evidence that "many users are clicking through reflexively rather than reviewing each command". Think about what that means. A prompt that is approved 97 times in 100 is, in practice, a delay. It is not a control. People who see the same prompt all day stop reading it.
+
+Here is simple arithmetic (derived). An agent that makes 120 tool calls an hour, with a prompt on each, interrupts a person every 3,600 / 120 = 30 seconds. No one reads carefully at that rate. The dangerous call looks like the 119 safe ones around it.
+
+Anthropic also reports a signal in the other direction. When Claude presents a plan for approval, "users reject 39% of them". The same people who wave through commands push back on a plan. An approval step that is rare and meaningful gets real attention.
+
+## The mechanism: tiers, then a durable pause
+
+The fix has two parts. First decide which actions need a person. Then build a pause that does not hold a worker.
+
+### Where approvals go
+
+Ask a person in three cases:
+
+- **Before an irreversible action.** Sending an email, charging a card, deleting a record, deploying.
+- **Above a spend or scale limit.** A refund over $100, a query that touches 10,000 rows.
+- **On low confidence.** The model, a classifier, or a rule says the call is unusual. Use this one with care: model confidence is often not calibrated (lesson [A0.3](/learn/ai/a0-orientation/probabilistic-components/)).
+
+Sort every tool into a tier. The tiers below are an example design, not a standard:
+
+| Tier | What the action is | Gate | Example |
+|---|---|---|---|
+| 0 | Read, no side effect | None | `read_file`, `search_docs` |
+| 1 | Write that can be undone | Run, log, review once at the end | Edit in the working directory under a checkpoint |
+| 2 | Irreversible, or above a limit | Stop and ask | `refund`, `send_email`, `deploy` |
+
+The Claude Agent SDK offers the same shape as modes. In `default` mode, a call that needs approval goes to your `canUseTool` callback, and with no callback it is denied. `acceptEdits` auto-approves file edits and common filesystem commands. `plan` lets Claude explore without editing source files. `dontAsk` never prompts and denies anything that would. `bypassPermissions` runs all allowed tools, and the SDK page says to use it only in isolated environments. Pick the mode, then add rules for your own tools.
+
+<Ai7HitlFlow client:visible />
+
+### Show the exact action
+
+The prompt must show what will happen: tool name, arguments, and for a write, the diff. "Allow the agent to update the order?" is a summary. "refund(order 8841, $480.00) to card ending 4417" is the action. The MCP spec asks clients to "show tool inputs to the user before calling the server, to avoid malicious or accidental data exfiltration". A summary hides the one field that matters, and a model can write a harmless summary of a harmful call.
+
+### A pause that waits for free
+
+An approval may take hours. A person is at lunch. You do not want a worker, a connection, or a thread blocked that long. This is where durable state (lesson [A7.1](/learn/ai/a7-agents-prod/durable-graph-runtime/)) pays off.
+
+In LangGraph a node calls `interrupt()`. The docs say this pauses execution, saves state through the checkpointer, and waits until you resume. A checkpointer is required. The caller resumes with `Command(resume=...)` on the same thread id, and that value becomes the return value of `interrupt()`:
+
+```python title="approve.py"
+from langgraph.types import Command, interrupt
+
+def approve_refund(state):
+    ok = interrupt({"action": "refund", "order": state["order"], "amount_usd": state["amount"]})
+    return Command(goto="issue_refund" if ok else "cancel")
+
+# later, from the approval endpoint
+graph.invoke(Command(resume=True), {"configurable": {"thread_id": "run-8841"}})
+```
+
+The payload given to `interrupt()` must be JSON-serializable, because the checkpointer stores it.
+
+## The rules that cause bugs
+
+The LangGraph interrupts page lists several traps. All of them follow from one fact: on resume, "the runtime restarts the entire node from the beginning".
+
+1. **Code before `interrupt()` runs again.** If a node creates a record, then calls `interrupt()`, it creates a second record on resume. The docs say side effects before an interrupt "should (ideally) be idempotent". Put the side effect after the interrupt or in its own node.
+2. **Do not wrap `interrupt()` in a broad `try/except`.** The pause works by raising a special exception. The page says a broad handler would catch it and "the interrupt will not be passed back to the graph".
+3. **Do not loop on `interrupt()` inside one node.** The page warns against `while True` plus `interrupt()`. A resume re-runs earlier iterations. Call it once and loop back with a conditional edge.
+4. **Resume values match by position.** With several interrupts in a node, "matching is strictly index-based". Do not skip one conditionally.
+
+Temporal has the same need and a different mechanism: a durable workflow that waits for a message from outside (lesson [Temporal](/learn/backend/08-technologies/temporal/)). The rule is the same too. The paused work must live in storage, not in a process.
+
+## Approval fatigue, as a model
+
+Use the model below to see the effect. It is illustrative: the inputs are assumptions you can move, and real people do not behave this neatly. It says a person can review only so many prompts an hour. Prompts above that are approved unseen.
+
+<Ai7HitlSim client:visible />
+
+At 120 actions an hour and a capacity of 30 careful reviews, "ask on everything" shows 120 prompts and reviews 30 / 120 = 25% of them. If 2% of actions are risky (2.4 an hour), 2.4 x 25% = 0.6 are caught and 1.8 slip through. "Ask on tier 2 only" shows 12 prompts an hour, all within capacity, and catches all 2.4. The second policy has fewer prompts and catches more. That is the point of tiers.
+
+## Make the approval useful
+
+- **Log each decision**: who, which action, the exact payload, the time. This is your audit trail, and your data on whether the gate works.
+- **Let the person edit**, not only accept or reject. A refund of $480 may become $48.
+- **Return a rejection as a tool result**, so the model can pick another plan.
+- **Set a timeout policy.** A request that nobody answers for 24 hours should expire and notify, not wait forever. Decide what the agent does on expiry.
+- **Ask where a person has context.** Do not route a refund approval to someone who cannot judge a refund.
+
+## Trade-offs
+
+| Policy | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Ask on every call | Feels safe, simple | Fatigue, little real review | A short pilot with few calls |
+| Tiered gates | Attention goes to risky calls | You must classify every tool | Most production agents |
+| Plan approval | One review covers many steps | Plans drift from execution | Long, multi-step work |
+| Auto mode (a classifier decides) | Fewer interrupts | Classifier errors, needs monitoring | Trusted, well-scoped tasks |
+| Sandbox plus few prompts | Safe default, fewer prompts | A box to build (lesson [A7.4](/learn/ai/a7-agents-prod/sandboxes-code-execution/)) | Code and shell agents |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I tier tools by risk. Reads run. Reversible writes run under a checkpoint and get one review at the end. Irreversible or high-spend actions stop at an interrupt that shows the exact call. The pause is durable, so no worker waits. I watch the approval rate: 97% means the prompt is not a control." That covers design, mechanism, and a metric.
+</Callout>
+
+<Callout type="mistake">
+Do not answer "add a human approval" and stop. Say where, for which tier, what the screen shows, and how it pauses. Also do not put a side effect before `interrupt()`. It runs again on every resume.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A LangGraph node runs create_ticket(), then calls interrupt() for approval. The person approves. How many tickets exist after the node finishes?',
+      options: [
+        'One, because the runtime resumes after the interrupt line',
+        'Two, as the node restarts on resume',
+        'Zero, since the ticket waits for the approval to commit',
+        'One, since the checkpointer saves the ticket call result',
+      ],
+      answer: 1,
+      explain: 'On resume the runtime restarts the whole node from the beginning, so code before interrupt() runs again. The ticket is made once before the pause and once after. Make the call idempotent or move it after the interrupt.',
+    },
+    {
+      q: 'Users approve 97% of Claude Code permission prompts. What does this say about a design that asks before every tool call?',
+      options: [
+        'It is the safest design, since users almost never see a bad call',
+        'It shows that the model is right 97% of the time',
+        'It needs a longer timeout, so that users can read each prompt',
+        'Prompts are weak as a control, so ask rarely and only on risk',
+      ],
+      answer: 3,
+      explain: 'Anthropic reads the figure as people clicking through reflexively. A prompt that is almost always approved works as a delay, not a control. It does not measure model accuracy, and a longer timeout does not fix attention.',
+    },
+    {
+      q: 'Which action most belongs in the tier that stops and asks a person?',
+      options: [
+        'Refunding $480, which cannot be undone',
+        'Reading a file in the working directory',
+        'Editing a file that a checkpoint can restore',
+        'Listing the names of the available tools',
+      ],
+      answer: 0,
+      explain: 'The refund is irreversible and above a spend limit. A read has no side effect. An edit under a checkpoint can be undone and can be reviewed once at the end. Listing tool names changes nothing.',
+    },
+    {
+      q: 'In the Claude Agent SDK default permission mode, a tool call needs approval and you set no canUseTool callback. What happens?',
+      options: [
+        'The call runs, since no callback means no objection',
+        'The SDK asks the model to confirm its own call',
+        'The call is denied',
+        'The run pauses forever until a callback is added',
+      ],
+      answer: 2,
+      explain: 'The SDK page says that in default mode a call that needs approval triggers canUseTool, and with no callback the call is denied. It fails closed. It does not run the call and it does not wait.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai7-hitl-click-through"
+  title="Everyone clicks approve"
+  scenario="Illustrative case. An ops agent asks for approval before every tool call, about 90 prompts an hour. A review of the log shows reviewers approved 98% of prompts, usually within 2 seconds. Last week an approved prompt deleted a customer record."
+  facts={[
+    'prompts per hour: 90',
+    'approval rate: 98%',
+    'median time to approve: 2 s',
+    'prompt text: "Agent wants to update data. Allow?"',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the main design fault?',
+      options: [
+        'The reviewers are careless and need training on every prompt',
+        'The model makes too many calls and should be a smaller model',
+        'The gate asks too often and hides the action, so it is not a control',
+        'The approval endpoint is too slow for reviewers to use',
+      ],
+      answer: 2,
+      explain: 'A prompt every 40 seconds that is approved in 2 seconds is not reviewed. The text also hides the call, so a delete looks like any update. Blaming people or the model leaves the design as it is.',
+    },
+    {
+      prompt: 'Which redesign is best?',
+      options: [
+        'Ask only on tier 2, show the exact call, and log each decision',
+        'Ask on every call, but add a sound to make people look up',
+        'Remove the gate, since people approve everything anyway',
+        'Ask twice for each call so that a mistake gets a second look',
+      ],
+      answer: 0,
+      explain: 'Fewer, specific prompts for irreversible actions give each one real attention, and the log lets you check the gate. Removing the gate leaves the delete unguarded. Asking twice doubles the fatigue.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [LangGraph: interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts)
+- [Anthropic: auto mode as the default in Claude Code](https://claude.com/blog/auto-mode-default-in-claude-code)
+- [Claude Agent SDK: how the agent loop works (permission modes)](https://code.claude.com/docs/en/agent-sdk/agent-loop)
+- [MCP specification: tools (human in the loop)](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)

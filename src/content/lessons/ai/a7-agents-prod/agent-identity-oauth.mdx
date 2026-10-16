@@ -1,0 +1,221 @@
+---
+summary: 'An agent has no rights of its own, so every tool call must borrow someone else''s. Give it the calling user''s narrow, short-lived, audience-bound token, never a shared admin key. Know the MCP authorization rules, token exchange, the confused deputy, and what to log.'
+requires: ['ai/a3-llm-apis/tool-calling-protocol', 'ai/a6-agents/mcp', '03-api-design/auth']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai7IdTokenFlow from '../../../../components/anim/lessons/Ai7IdTokenFlow.tsx';
+import Ai7IdScopePicker from '../../../../components/anim/lessons/Ai7IdScopePicker.tsx';
+
+## The problem
+
+Your agent can call a ticket API, a billing API, and a user directory. Every one of those APIs asks the same question: who is calling, and are they allowed? An agent is not a person. It has no account in your product. So whose permission does it use?
+
+The wrong answer is expensive, because an agent reads untrusted text. A web page, an email, or a tool result can push it to make a call the user never wanted ([lesson A3.4](/learn/ai/a3-llm-apis/tool-calling-protocol/) covers this boundary, and module A10 covers prompt injection). Identity is the control that limits the damage when that happens. The question is not only "can it call the API". It is "what is the worst call it can make, and for whom".
+
+<CrossTrackLink id="03-api-design/auth">
+HTTP forgets who you are between requests, so each request must carry proof. A session ID or a signed token does that job. OAuth 2.0 lets a user grant an app limited access to their data without giving it their password, and PKCE protects the authorization code on its way back. This lesson assumes that base and adds what changes when the caller is an agent.
+</CrossTrackLink>
+
+## Naive solution: one shared service account
+
+The easy design gives the agent one long-lived API key with broad rights, often an admin key. It works on day one. It fails in three ways.
+
+First, the API can no longer tell users apart. Every call looks like the same caller, so "show my tickets" can return anyone's tickets. Second, a stolen key is a master key. Third, the audit log says "the agent did it" and nothing more.
+
+This is the **confused deputy** problem. A deputy is a program with real authority. It is "confused" when it uses its own authority on behalf of a caller who has none. The agent holds admin rights, a user with no such rights asks for something, and the agent does it. The user did not break a control. The agent was the control, and it was talked into acting.
+
+## The mechanism: act on behalf of the user
+
+The fix is a rule: the agent never has more rights than the user it works for, and never more than the task needs. Three levels of design, from weakest to strongest:
+
+1. **Shared service account.** One identity for all users. Too broad.
+2. **The user's own token.** The user logs in through OAuth and consents. The agent calls APIs with a token that says "user A, these scopes". The API enforces A's rights.
+3. **A scoped, short-lived token per run.** The token also carries only the scopes this task needs, and it expires soon. A leak is small and short.
+
+Level 3 is the design to aim for. The animation shows the full flow for one tool call, then a replay that fails.
+
+<Ai7IdTokenFlow client:visible />
+
+The flow is the standard OAuth authorization code flow with PKCE, with the **resource** parameter added. That parameter names the one service the token is for. The authorization server writes that service into the token as its **audience**. Each service then checks the audience, so a token minted for the ticket API is useless at the billing API.
+
+### What the MCP spec requires
+
+The Model Context Protocol ([lesson A6.6](/learn/ai/a6-agents/mcp/)) has an authorization section for HTTP transports. I read the current page on 2026-10-16. Its URL path carries the version 2026-07-28. Four rules matter for agents.
+
+Authorization is optional, and it is for HTTP only. The spec says implementations using an STDIO transport "SHOULD NOT follow this specification, and instead retrieve credentials from the environment". A local STDIO server gets its credentials from the process that starts it.
+
+The client must say which service the token is for. In the spec's words: "MCP clients **MUST** implement Resource Indicators for OAuth 2.0 as defined in RFC 8707 to explicitly specify the target resource for which the token is being requested." The `resource` parameter must be in both the authorization request and the token request.
+
+The server must check the audience: "MCP servers **MUST** validate that access tokens were issued specifically for them as the intended audience". It must also refuse foreign tokens: "MCP servers **MUST NOT** accept or transit any other tokens."
+
+If the MCP server calls another API, it is a client of that API and needs a separate token. The spec says: "The MCP server **MUST NOT** pass through the token it received from the MCP client." The Security Best Practices page lists why passthrough is forbidden. It breaks rate limits that depend on the audience, it hides which client did what in the logs, and it lets a stolen token work across services.
+
+Also from the spec: authorization servers "SHOULD issue short-lived access tokens to reduce the impact of leaked tokens", clients MUST use PKCE, and access tokens "MUST NOT be included in the URI query string". Refresh tokens must be kept confidential in storage and in transit, so store them encrypted on the server side and never give one to the agent.
+
+<Callout type="deep" title="The spec page changed since older write-ups">
+Many articles describe the 2025-06-18 version. The current page also adds OAuth Client ID Metadata Documents as the preferred way to register a client, and it calls Dynamic Client Registration deprecated and kept for compatibility. The audience rules above did not change. Always read the version you build against.
+</Callout>
+
+### Token exchange: calling a second service as the same user
+
+Sometimes your own backend, not an MCP server, must call another internal API for the user. The user's token has the wrong audience for it. **Token exchange** (RFC 8693) trades one token for a new one. You send the user's token as the `subject_token`, "a security token that represents the identity of the party on behalf of whom the request is being made", and the agent's own token as the `actor_token`, "a security token that represents the identity of the acting party". You also ask for the new audience and a narrower scope.
+
+```python title="token_exchange.py"
+import requests
+
+resp = requests.post(
+    "https://auth.example.com/oauth/token",
+    data={
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "subject_token": user_access_token,
+        "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "actor_token": agent_token,
+        "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "audience": "https://billing.example.com",
+        "scope": "billing:read",
+    },
+    auth=(CLIENT_ID, CLIENT_SECRET),
+    timeout=10,
+)
+billing_token = resp.json()["access_token"]  # aud=billing, user's rights, narrower scope
+```
+
+The result is a **delegation** token. RFC 8693 separates delegation, where "principal A still has its own identity separate from B", from impersonation, where A is given all of B's rights. Delegation fits agents, because the log can show both parties. The `act` claim in the new token holds that record: "The outermost `act` claim represents the current actor while nested `act` claims represent prior actors." Whether your authorization server supports token exchange is a product question. Check it before you design around it.
+
+## Scopes and blast radius
+
+A **scope** is a named permission on a token, such as `tickets:read`. Least privilege is a principle with no magic number: give the token the fewest scopes the task needs, and for the shortest time. The MCP Security Best Practices page lists the cost of broad scopes: a stolen broad token gives "expanded blast radius", makes revocation disruptive, and fills the audit log with noise.
+
+Try it. The API below is made up: 10 operations, 3 users, 4 tickets each. Pick a task, pick whose rights the token carries, and tick scopes. The widget counts what a thief could do.
+
+<Ai7IdScopePicker client:visible />
+
+Check the arithmetic by hand. A shared admin token with all scopes allows 10 operations on 3 x 4 = 12 tickets, so 120 operation and ticket pairs. A user token with only `tickets:read` allows 2 operations on 4 tickets, so 8 pairs. For "Summarize my open tickets" the second token loses nothing and the thief's reach is 15 times smaller (120 / 8). Per-tool scopes give you this: each tool maps to one scope, and the tool API enforces it.
+
+Scopes alone do not stop one user reading another user's records. The resource server must also check the record's owner against the token's subject on every read. That is the third check in the animation, and it is what the confused-deputy diagnosis below turns on.
+
+## Audit and isolation
+
+Log every call with four fields: which user, which agent (and run id), which tool, and what arguments. The `act` claim and the `sub` claim give you the first two for free. Without them you cannot answer "who deleted this" after an incident. The MCP Best Practices page makes the same point: passthrough tokens leave "accountability and audit trail issues", because the downstream log shows the wrong identity.
+
+Isolate per tenant. Key stored state, such as memory and cached tool results, by tenant and user, and derive that key from the verified token, never from an argument the model wrote. The model's tool arguments are data from a probabilistic text generator, so treat a `user_id` argument the way you treat user input.
+
+For revocation, keep access tokens short-lived and let the authorization server revoke the refresh token when the user disconnects the app. A long-running background agent ([lesson A7.7](/learn/ai/a7-agents-prod/background-agents-queues/)) needs a refresh path. Re-consent when scopes grow, which the MCP spec calls step-up authorization: the server answers 403 with `insufficient_scope` and the scopes it needs, and the client asks the user again.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Shared service account | Simple setup, no consent screens | No per-user rights, big blast radius, weak audit | Never for user data. Maybe for a read-only public tool |
+| User's own token | Per-user rights enforced by the API | Consent flow, token storage, refresh handling | An agent acts for a user in a product |
+| Scoped, short-lived token per run | Small leak impact, clear audit | More token traffic, step-up prompts | Any write or sensitive read |
+| Token exchange (delegation) | Narrow token for a second service, both identities logged | Needs authorization server support | Your backend calls another internal API for the user |
+| Token passthrough | Nothing to build | Forbidden by the MCP spec, breaks audit and audience checks | Never |
+
+## Interview lens
+
+<Callout type="tip">
+Say it as a chain: "The agent never has its own rights. It acts with the user's OAuth token, minted for one audience and a few scopes, short-lived. Every tool API checks audience, scope, and record owner. No token passthrough: a server that needs another API gets its own token, by exchange if supported. Every call logs user, agent, tool, and arguments." That covers identity, least privilege, and audit.
+</Callout>
+
+<Callout type="mistake">
+Do not answer "use an API key in an environment variable". Do not claim that scopes alone make it safe: a scope says what kind of call, not whose record. And do not invent numbers for "least privilege". It is a rule you apply per task, not a quantity.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Under the MCP authorization spec, what must an MCP server do with an access token whose audience is a different service?',
+      options: [
+        'Reject it, as servers accept only their own tokens',
+        'Accept it, since the signature is valid and the user is known',
+        'Pass it to the other service so that service can validate it',
+        'Accept it only when the request comes over a trusted network',
+      ],
+      answer: 0,
+      explain: 'The spec says MCP servers MUST validate that tokens were issued for them as the audience, and MUST NOT accept or transit any other tokens. A valid signature proves who issued the token, not who it is for.',
+    },
+    {
+      q: 'An MCP server must call an upstream billing API for the user. What does the spec say about the token the server received from the client?',
+      options: [
+        'Forward it unchanged, since the user already consented to it',
+        'Strip the scopes first and then forward the same token',
+        'Never pass it on; get a separate upstream token',
+        'Forward it only when the upstream API is in the same company',
+      ],
+      answer: 2,
+      explain: 'The server acts as an OAuth client of the upstream API and must use a token issued by that API\'s authorization server. Passthrough breaks audience checks and hides which client made the call.',
+    },
+    {
+      q: 'In RFC 8693 token exchange for an agent, what do the subject_token and the actor_token represent?',
+      options: [
+        'Actor is the user and subject is the agent',
+        'Both identify the user, one for read, one for write',
+        'Subject is the old token and actor is the new one',
+        'Subject is the user and actor is the agent',
+      ],
+      answer: 3,
+      explain: 'The subject_token represents the party on whose behalf the request is made, here the user. The actor_token represents the acting party, here the agent. The new token can record both, which is delegation.',
+    },
+    {
+      q: 'A leaked token carries 2 of 10 operations and reaches 4 tickets. A shared admin token carries all 10 operations and reaches 12 tickets. How many times larger is the admin token reach, counted as operation and ticket pairs?',
+      options: [
+        'About 5 times, since 10 operations divided by 2 is 5',
+        'About 15 times: 120 pairs over 8 pairs',
+        'About 3 times, since 12 tickets divided by 4 is 3',
+        'About 8 times, since 120 pairs divided by 15 is 8',
+      ],
+      answer: 1,
+      explain: 'Admin: 10 x 12 = 120 pairs. Narrow: 2 x 4 = 8 pairs. 120 / 8 = 15. Dividing only the operations or only the tickets gives 5 and 3, and each misses the other factor.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai7-shared-admin-token"
+  title="User A reads user B's tickets"
+  scenario="A support agent calls the ticket API with one shared admin token. A user asks, 'show the tickets for jane.doe'. The agent returns another customer's tickets, and the ticket API log shows only 'agent-service'."
+  facts={[
+    'token: sub=agent-service, scope=tickets:* , no tenant claim',
+    'API checks: signature valid, scope tickets:read present',
+    'log line: GET /tickets?user=jane.doe 200 caller=agent-service',
+  ]}
+  steps={[
+    {
+      prompt: 'Which control is missing?',
+      options: [
+        'A per-user token the API can enforce',
+        'A larger model that follows the system prompt more closely',
+        'A rate limit on the agent so it asks for fewer tickets',
+        'A longer system prompt that forbids reading other accounts',
+      ],
+      answer: 0,
+      explain: 'The API sees only the agent, so it cannot tell whose rights apply. A prompt rule is not an access control: injected text or a plain mistake can bypass it. Rate limits do not stop one wrong read.',
+    },
+    {
+      prompt: 'What should the ticket API check on each read?',
+      options: [
+        'Only that the signature is valid and the scope is present',
+        'Audience, scope, and ticket owner',
+        'Only that the request came from the agent service network',
+        'Only that the model reported the right user in its arguments',
+      ],
+      answer: 1,
+      explain: 'Audience and scope say the token is for this API and this kind of call. The owner check says the record is the caller\'s. Trusting a user id the model wrote repeats the bug, because that argument is untrusted data.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [MCP specification: authorization](https://modelcontextprotocol.io/specification/latest/basic/authorization)
+- [MCP specification: security best practices](https://modelcontextprotocol.io/specification/latest/basic/security_best_practices)
+- [RFC 8693: OAuth 2.0 Token Exchange](https://www.rfc-editor.org/rfc/rfc8693.html)

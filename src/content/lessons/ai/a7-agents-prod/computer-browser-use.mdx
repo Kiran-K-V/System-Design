@@ -1,0 +1,228 @@
+---
+summary: 'Computer use lets a model drive a screen: it sees a screenshot, emits a click or a keystroke, and sees the next screenshot. It works where no API exists, but every step costs image tokens and time, errors compound over many steps, and any text on the page can steer the agent.'
+requires: ['ai/a7-agents-prod/sandboxes-code-execution', 'ai/a7-agents-prod/loop-control']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai7CuLoop from '../../../../components/anim/lessons/Ai7CuLoop.tsx';
+import Ai7CuCalc from '../../../../components/anim/lessons/Ai7CuCalc.tsx';
+
+## The problem
+
+Your agent must file an expense in a vendor portal. The portal has no API, no export, and no MCP server. A person does it with a mouse. The only interface the agent has is the one a human has: pixels in, clicks out.
+
+Two older answers exist. A script with fixed selectors (Selenium, Playwright code) breaks when the page changes a class name. A person doing the work by hand does not scale. A model that reads the screen and decides the next click sits between them. It adapts to a layout change, but it is slower, costs more per step, and gets things wrong more often than an API call. This lesson shows the loop, the cost, and the controls that make it safe enough to run.
+
+## The mechanism: a screenshot and action loop
+
+You already know the shape from the tool-calling protocol ([lesson A3.4](/learn/ai/a3-llm-apis/tool-calling-protocol/)). Computer use is one tool whose results are pictures. Anthropic's docs describe four steps:
+
+1. You give the model the computer tool and a task.
+2. The model replies with `tool_use` blocks: take a screenshot, click here, type this.
+3. Your app runs them in order and returns one `tool_result` for each, usually with a fresh screenshot.
+4. The loop ends when the model replies with text and no tool calls.
+
+The model never touches the machine. Your app owns a virtual display and executes every action, which is why you can put checks in front of it. Step through one task and watch the image tokens add up.
+
+<Ai7CuLoop client:visible />
+
+### Coordinates and scale
+
+The model returns coordinates in the pixel space of the screenshots you sent, origin at the top left. Two traps follow. If you shrink a screenshot before sending it, you must scale the model's coordinates back up before you click. If a click lands consistently off to one side, the docs say unscaled coordinates are the usual cause. On a Retina screen, either downscale the capture by 2x or halve the returned coordinates.
+
+Image limits matter too (images as input are covered in [lesson A3.5](/learn/ai/a3-llm-apis/files-images-input/)). The docs say newer models accept up to 2,576 pixels on the long edge and 4,784 visual tokens, counted as `ceil(width / 28) x ceil(height / 28)`. Earlier models accept 1,568 pixels and about 1.15 megapixels. An oversized image is rejected, not resized for you. The docs recommend 1280x720 or 1024x768 for desktop and 1280x800 or 1366x768 for web apps, and advise against anything above 1920x1080.
+
+By that formula, a 1280x800 screenshot is 46 x 29 = 1,334 visual tokens. The docs' own estimate is "roughly 1,000 to 1,800 input tokens" per screenshot, so 1,334 sits inside it.
+
+### Batches
+
+The model may return several actions in one turn. Your app runs them in order and stops at the first failure. Later actions get an error result such as "Not executed: an earlier computer action in this turn failed." A batch can end with a screenshot, which saves a round trip. Fewer round trips means fewer screenshots sent and less time.
+
+```python title="cu_loop.py"
+def run_task(task, max_turns=30):
+    messages = [{"role": "user", "content": task}]
+    for _ in range(max_turns):                      # hard cap: see lesson A7.2
+        reply = call_model(messages)                # sends the computer toolset
+        messages.append({"role": "assistant", "content": reply.content})
+        calls = [b for b in reply.content if b.type == "tool_use"]
+        if not calls:
+            return reply                            # text only: the model says it is done
+        results, failed = [], False
+        for b in calls:
+            if failed:
+                results.append(error_result(b.id, "Not executed: an earlier action failed."))
+                continue
+            ok, shot = run_action(b.input)          # scale coordinates back up here
+            failed = not ok
+            results.append(tool_result(b.id, shot, is_error=not ok))
+        messages.append({"role": "user", "content": results})
+        messages = drop_old_screenshots(messages, keep=3)   # or server-side clearing, see docs
+    raise RuntimeError("step cap reached")
+```
+
+This is a sketch. Check the computer-use docs for the exact request shape and tool version. As of 2026-10-16 the current toolset is `computer_toolset_20260801`, and the docs say Claude 5.5 and later models return an error for the older `computer_20251124` and `computer_20250124` versions.
+
+## What it costs
+
+Cost has three parts: tokens, time, and reliability.
+
+**Tokens.** The API is stateless (lesson [A3.1](/learn/ai/a3-llm-apis/api-anatomy/)), so each call resends everything. If you keep every screenshot, call k carries k images. Over n steps you send 1 + 2 + ... + n = n(n+1)/2 images. For 30 steps that is 30 x 31 / 2 = 465 sends. The docs give one option for this: keep the last 3 screenshots and prune every 25 turns, so the prefix stays byte-identical between prunes. For Opus 5.5, Sonnet 5.5, and Haiku 5.5 they advise against pruning on the client, because removing an earlier screenshot invalidates the later thinking blocks. They suggest resizing to 2,000 pixels or less per side and using server-side tool result clearing instead. Either way the effect is the same, so the model here is "keep 3": call k carries min(k, 3) images, and the total is 1 + 2 + 28 x 3 = 87 sends. That is 5.3 times fewer than 465. Prompt caching ([lesson A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) also lowers the price of the repeated part, but dropping old images cuts the tokens themselves.
+
+**Time.** Each step is a model call plus a screen action plus a page load. The docs give no latency per step, and I found no primary figure, so treat any number as an assumption. The widgets use 5 seconds per step and label it illustrative. Measure your own. The point holds at any value: 30 steps of N seconds is a task measured in minutes, not milliseconds.
+
+**Reliability.** A task is a chain of steps, and every step can fail. If each step goes right with probability p, an n-step task finishes with probability p^n (lesson [A7.2](/learn/ai/a7-agents-prod/loop-control/)). The per-step values below are illustrative:
+
+| Per-step success | 10 steps | 30 steps |
+|---|---|---|
+| 99% | 90.4% | 74.0% |
+| 98% | 81.7% | 54.5% |
+| 95% | 59.9% | 21.5% |
+
+Derivation: 0.98^30 = e^(30 x ln 0.98) = e^(-0.606) = 0.545. Errors are not always independent, so treat this as a shape, not a forecast. The lever is fewer steps: batch actions, use shortcuts, and give the model an API tool for any part that has one.
+
+<Ai7CuCalc client:visible />
+
+How hard is the task class? The OSWorld benchmark has 369 tasks on real web and desktop apps. Its paper reports that humans finish over 72.36% of them, and that the best model at publication, in 2024, scored 12.24%. I did not find a current model score on a primary page, so I do not quote one. Read the live leaderboard before you decide, and run your own task set, because your portal is not OSWorld.
+
+<Ballpark
+  client:visible
+  title="A 30-step browser task"
+  scenario="A 30-step task on a 1280x800 page. Each step sends a screenshot of about 1,400 tokens, and you keep every earlier screenshot. Count image input tokens only. Sonnet 5.5 input costs $2 per 1M tokens (claude.com/pricing, 2026-10-16)."
+  steps={[
+    {
+      prompt: 'How many screenshot sends happen across the 30 calls?',
+      unit: 'images',
+      answer: 465,
+      within: 1.1,
+      explain: 'Call k carries k images. 1 + 2 + ... + 30 = 30 x 31 / 2 = 465.',
+    },
+    {
+      prompt: 'How many image input tokens is that?',
+      unit: 'tokens',
+      answer: 651000,
+      within: 1.1,
+      explain: '465 x 1,400 = 651,000 tokens.',
+    },
+    {
+      prompt: 'What does it cost, in dollars?',
+      unit: 'dollars',
+      answer: 1.3,
+      within: 1.1,
+      explain: '651,000 x $2 / 1,000,000 = $1.30 for one task, before output tokens, text, and caching. At 5 seconds a step the run takes about 150 s, or 2.5 minutes (illustrative).',
+    },
+    {
+      prompt: 'Now keep only the last 3 screenshots. What do the image tokens cost?',
+      unit: 'dollars',
+      answer: 0.24,
+      within: 1.15,
+      explain: '1 + 2 + 28 x 3 = 87 sends. 87 x 1,400 = 121,800 tokens. At $2 per million, that is $0.24, about one fifth of the cost.',
+    },
+  ]}
+/>
+
+## Pixels or page structure
+
+A browser is easier than a whole desktop, because a web page has structure. Microsoft's Playwright MCP server gives a model structured accessibility snapshots of the page, "bypassing the need for screenshots or visually-tuned models". Its snapshot tool is described as better than a screenshot, and the screenshot tool is view-only: "You can't perform actions based on the screenshot." The model acts on elements it names from the snapshot, not on coordinates.
+
+| | Pixels (computer use) | Page structure (accessibility snapshot) |
+|---|---|---|
+| Works on | Any app, including canvas, games, and native desktop apps | Web pages that expose a usable accessibility tree |
+| Model input | Screenshot, roughly 1,000 to 1,800 tokens | Text. Size follows the page, so measure it |
+| Needs a vision model | Yes | No |
+| Typical failure | Misjudged coordinates, small targets, scale errors | Missing or badly labelled elements, huge snapshots on dense pages |
+| Choose it when | No DOM is available, or layout is the point | The target is a web app and you control or know the page |
+
+Many agents use both: structure to act, pixels to check what the page looks like. The cheapest option is neither. If the vendor has an API, or an MCP server exists (lesson [A6.6](/learn/ai/a6-agents/mcp/)), call it. One API call replaces a whole chain of clicks.
+
+## Controls
+
+An agent that clicks through the web reads untrusted text all day. A page can contain instructions, and the docs warn that the model may follow instructions found in page content. This is prompt injection through the screen (module A10 covers it). Anthropic's precautions are a good baseline, and they match the sandbox rules from lesson [A7.4](/learn/ai/a7-agents-prod/sandboxes-code-execution/):
+
+- Run it in a dedicated virtual machine or container with minimal privileges.
+- Give it no sensitive data, such as login credentials. Start with a clean, isolated browser profile and no logged-in sessions.
+- Limit internet access to an allow list of domains.
+- Ask a human to confirm anything with real-world consequences: purchases, accepting terms, sending messages. That is the approval gate from lesson [A7.3](/learn/ai/a7-agents-prod/human-in-the-loop/).
+
+One detail from Playwright MCP deserves attention. Its default profile is persistent, so cookies and logins survive between runs. The `--isolated` flag keeps the profile in memory and drops it when the browser closes. Its `--allowed-origins` option defaults to allowing all origins, and the docs say it "does not serve as a security boundary and does not affect redirects". They also say the server as a whole is "not a security boundary". Enforce the domain allow list outside the agent, at the network or VM level, not in a flag the page can route around.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| API or MCP tool | Fast, cheap, reliable | Needs one to exist | Always, first |
+| Page structure | Text input, no vision model | Fails on poor accessibility data | Web apps you can inspect |
+| Pixels | Works on any screen | Tokens and time per step, scale bugs | No DOM, legacy or desktop apps |
+| Keep all screenshots | Full history | n squared token growth | Short tasks only |
+| Drop old screenshots | About 5x fewer image tokens at 30 steps | Less visual history | Long tasks |
+| Isolated profile | No leaked logins | Re-login for each run | Default for untrusted pages |
+
+## Interview lens
+
+<Callout type="tip">
+Lead with the order of preference: "API first, then an MCP tool, then page structure, then pixels, because each step down costs more tokens, time, and reliability." Then give the numbers: one screenshot is about 1,000 to 1,800 tokens, a 30-step task at 98% per step finishes 55% of the time, and every page is untrusted input, so the browser runs in a disposable VM with an allow list and a human gate before any submit or payment.
+</Callout>
+
+<Callout type="mistake">
+Do not offer computer use as the default way to integrate with a system that has an API. And do not say a domain allow list "is in the browser config" if the page can redirect around it. Enforce it where the agent cannot edit it.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A computer-use agent clicks about 100 pixels left and above every target, on every step. Which cause fits best?',
+      options: [
+        'The prompt told the model to be careful with small buttons',
+        'The model is overloaded and guessing at random each time',
+        'Clicks were not scaled back up after a resize',
+        'Too many screenshots are kept, so the model sees stale pages',
+      ],
+      answer: 2,
+      explain: 'The model gives coordinates in the pixel space of the screenshot it saw. If you shrank the image, you must multiply the point back up. A steady offset in one direction points at scale, not at random error or stale pages.',
+    },
+    {
+      q: 'You keep every screenshot in context for a 40-step task. How many screenshot sends happen across all calls?',
+      options: [
+        '40, one image for each step',
+        '820, because call k carries k images',
+        '120, since only 3 images fit in context',
+        '1,600, because each call resends all 40 images',
+      ],
+      answer: 1,
+      explain: 'Call k carries k images, so the total is 40 x 41 / 2 = 820. The count of 40 forgets that the API is stateless. 1,600 would be true only if all 40 images existed on call 1.',
+    },
+    {
+      q: 'A task has 20 steps and each step succeeds 95% of the time. About how often does the whole task succeed?',
+      options: [
+        'About 95%, since each step is likely to work',
+        'About 75%, as five steps of twenty fail',
+        'About 36%, since 0.95 multiplied 20 times is 0.36',
+        'About 5%, because one failure ruins the whole run',
+      ],
+      answer: 2,
+      explain: '0.95^20 = 0.358. Success multiplies across steps. A fraction of failures is not the same as the chance that none occur. Five percent is the chance of failing at a single step.',
+    },
+    {
+      q: 'Your browser agent gets a domain allow list through a Playwright MCP flag. Why is that not enough on its own?',
+      options: [
+        'It is no security boundary and ignores redirects',
+        'The flag only works on Linux hosts and fails on macOS',
+        'Allow lists are checked after the page has already loaded',
+        'The flag blocks only images and lets scripts run freely',
+      ],
+      answer: 0,
+      explain: 'The Playwright MCP docs say the option does not act as a security boundary and does not affect redirects. Enforce the allow list at the network or VM level, outside the agent.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: computer use tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool)
+- [OSWorld paper (arXiv 2404.07972)](https://arxiv.org/abs/2404.07972)
+- [Playwright MCP server](https://github.com/microsoft/playwright-mcp)
+- [Anthropic pricing](https://claude.com/pricing)

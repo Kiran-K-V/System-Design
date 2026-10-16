@@ -1,0 +1,193 @@
+---
+summary: 'An agent that runs code can leak keys or wreck files, so run it in a disposable box with no ambient credentials, a network allow list, a limited file view, and time and memory caps. Choose the box (process, container, gVisor, microVM) by who wrote the code.'
+requires: ['ai/a6-agents/mcp', '03-api-design/auth']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai7BoxWalk from '../../../../components/anim/lessons/Ai7BoxWalk.tsx';
+import Ai7BoxPicker from '../../../../components/anim/lessons/Ai7BoxPicker.tsx';
+
+## The problem
+
+Many useful agents run code. A data agent runs a Python script. A coding agent runs tests and shell commands. A research agent runs a parser on a downloaded file. The model writes the code, and the model reads untrusted text, such as a web page or an issue comment. A hidden instruction in that text can steer the code it writes (lesson [A3.4](/learn/ai/a3-llm-apis/tool-calling-protocol/) introduced this as prompt injection, and module A10 covers it).
+
+Now ask where that code runs. If it runs as your service, on your host, with your environment variables, it has your reach. It can read `~/.ssh`. It can open a connection to any address. It can delete files. The model does not need to be malicious. One confused step is enough.
+
+Anthropic's Claude Code sandboxing post makes the point in two sentences. Without network isolation, "a compromised agent could exfiltrate sensitive files like SSH keys". Without filesystem isolation, "a compromised agent could easily escape the sandbox and gain network access". It says "effective sandboxing requires both". You need to close both doors, because each one alone leaves the other open.
+
+## The naive design: run it next to the app
+
+The first version calls `subprocess.run` in the service, or runs a container that mounts the host's cloud credentials "so tools just work". Both have the same fault. The code inherits whatever the process can reach, which is called **ambient authority**. The agent got no permission on purpose. It got every permission that was lying around.
+
+## The mechanism: a box, plus a policy
+
+Two separate choices decide the damage.
+
+1. **The box** is the isolation technology. It sets how hard it is for code to reach the host.
+2. **The policy** is what the code is allowed to see and do inside the box.
+
+A strong box with a weak policy still leaks. A weak box with a strict policy is only as good as its kernel.
+
+### The box: four layers
+
+<Ai7BoxWalk client:visible />
+
+- **Process.** Same user, same kernel, same files. No box at all.
+- **Container.** Namespaces and resource limits restrict what a process sees and uses. All containers on a host still share one host kernel. A kernel bug can break out of the box.
+- **gVisor.** A **user-space kernel** written in Go. Its Sentry answers the container's system calls. The gVisor docs say "the Sentry does not pass system calls through to the host kernel". A Gofer process mediates file access. The docs state the cost: "reduced application compatibility and higher per-system call overhead", and that gVisor "may provide poor performance for system call heavy workloads". It avoids large fixed overheads, so it starts light. It does not implement every system call, so some programs fail.
+- **MicroVM.** A small virtual machine with its own guest kernel behind a hardware boundary. Firecracker uses the Linux Kernel-based Virtual Machine (KVM), and adds a jailer, "a second line of defense in case the virtualization barrier is ever compromised". Its site states boot in under 125 ms and under 5 MiB overhead per VM, and up to 150 microVMs created per second per host. These are the vendor's own figures, and the page gives no test conditions. Measure on your hardware.
+
+Derived from the vendor number: 1,000 idle microVMs at no more than 5 MiB each add no more than 5,000 MiB, about 4.9 GiB, of monitor overhead. The guest's own memory is extra.
+
+Hosted services package these choices. Modal Sandboxes offer two runtimes. gVisor "provides strong isolation and is suitable for most workloads". VMs "run the Sandbox in a virtual machine with its own Linux kernel", for work such as running Docker, mounting FUSE filesystems, or nested cgroups. Its GPU sandboxes work only on gVisor, and a sandbox has a default maximum lifetime of 5 minutes, which a `timeout` can raise to 24 hours. E2B is another hosted option. Its docs page that I read gives no isolation technology, start time, or timeout, so I will not quote any.
+
+### The policy: five controls
+
+Pick a box, then apply these. None depends on the box.
+
+1. **No ambient credentials.** The box starts with no cloud keys, no SSH keys, no token in the environment. Give it only what this run needs, as a scoped, short-lived secret (see [auth basics](/learn/backend/03-api-design/auth/) and lesson [A7.8](/learn/ai/a7-agents-prod/agent-identity-oauth/) for token design). Delete it when the run ends.
+2. **Network egress allow list.** Deny all outbound traffic by default. Allow the few hosts the task needs. This is the control that stops data from leaving even after a read.
+3. **A limited file view.** Writes go to one working directory. Reads cover only what the task needs.
+4. **Time and memory caps.** A run ends on a timeout and a memory limit, as the loop caps in lesson [A7.2](/learn/ai/a7-agents-prod/loop-control/) do.
+5. **Disposable.** Make a new box for each run, or at least each tenant, and throw it away. State from one run cannot leak into the next.
+
+Treat everything that comes out of the box as untrusted input. A file the code wrote can hold text aimed at the next model call.
+
+## A real default to learn from
+
+The Claude Code docs describe the defaults of its Bash sandbox. They are worth reading because they are not what most people assume:
+
+- **Writes:** the working directory, a per-user temp directory, and directories you added. Protected paths stay write-denied.
+- **Reads:** "Most of the machine, including credential files such as `~/.ssh` and `~/.aws/credentials`." You must add `denyRead` rules to close this.
+- **Network:** no direct route out. Connections go through a proxy on the machine that checks each host against your allowed domains, which start empty.
+- **Environment variables:** inherited from Claude Code, including any secrets in its environment.
+- **Not covered:** the file tools (Read, Edit, Write), MCP servers, and hooks run outside the sandbox. The sandbox is also off by default.
+
+It builds on Linux bubblewrap and macOS seatbelt. Anthropic reports that, in its internal use, sandboxing "safely reduces permission prompts by 84%". That is the point of a good box: a person approves less (lesson [A7.3](/learn/ai/a7-agents-prod/human-in-the-loop/)), because the blast radius is small. It is an internal figure from one team. Do not assume your number.
+
+Notice the lesson inside the defaults. A write-only box still lets code read `~/.ssh`, and the network rule is what stops the key from leaving. Closing one door was not enough. You must set read rules, not only write rules.
+
+## Choosing
+
+Use the picker as a rule of thumb. It encodes the facts above and nothing more.
+
+<Ai7BoxPicker client:visible />
+
+## Trade-offs
+
+| Box | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Process plus OS sandbox | Cheapest, fast, no new service | Shared host kernel | Your own code on a dev machine |
+| Container | Easy tooling | Shared host kernel | Trusted code, low risk |
+| gVisor | A user-space kernel with no large fixed overhead | Per-call cost, some programs fail | Model-written code, light on system calls |
+| MicroVM | Own kernel, hardware boundary | Image to build, memory per VM | Untrusted tenants, or full Linux needed |
+| Hosted sandbox service | No boxes to run yourself | Vendor limits (lifetime, egress options) | You want to ship fast |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I separate the box from the policy. The box depends on who wrote the code: an OS sandbox for my own, gVisor or a microVM for model-written or tenant code. The policy is always the same: no ambient credentials, an egress allow list, a limited file view, time and memory caps, a new box per run. I treat output as untrusted." That shows both layers.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we run it in Docker" as if that were a full answer. A container shares the host kernel and says nothing about credentials, egress, or file reads. Also do not set only write limits. Reads of `~/.ssh` and a free network path are how keys leave.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Which of these isolation options shares the host kernel with the agent code?',
+      options: [
+        'A Firecracker microVM, which has its own guest kernel',
+        'gVisor, where the Sentry answers system calls',
+        'A plain container with cgroup limits',
+        'A VM on KVM, behind a hardware boundary',
+      ],
+      answer: 2,
+      explain: 'Containers share one host kernel, so a kernel bug can break the box. A microVM and a KVM VM each run a guest kernel. gVisor answers system calls in a user-space kernel and does not pass them through to the host kernel.',
+    },
+    {
+      q: 'You enable the Claude Code Bash sandbox with default settings. A sandboxed command runs cat ~/.ssh/id_ed25519. What happens?',
+      options: [
+        'It is blocked, since the sandbox denies every read outside the working directory',
+        'It succeeds, since default reads cover most of the machine',
+        'It prompts the person, since credential files always need approval',
+        'It returns an empty file, since the sandbox hides keys by default',
+      ],
+      answer: 1,
+      explain: 'The docs say default reads cover most of the machine, including ~/.ssh and ~/.aws/credentials. The default limit is on writes and on the network. Add denyRead rules or credential settings to close the read path.',
+    },
+    {
+      q: 'An agent runs in a microVM. The VM was started with the host user\'s AWS keys in its environment. What is wrong?',
+      options: [
+        'Nothing, since a microVM isolates the code from every secret',
+        'The VM needs a longer boot time, so the keys can be removed',
+        'The keys are fine, but gVisor would be a stronger box',
+        'The box is strong, but the code can use the keys in it',
+      ],
+      answer: 3,
+      explain: 'The box limits reach to the host. Anything placed inside is ambient authority for the code. Start the VM with no keys, or with a scoped short-lived secret, and use an egress allow list.',
+    },
+    {
+      q: 'Firecracker states under 5 MiB overhead per microVM. You run 1,000 idle microVMs on a host. What is the most monitor overhead, ignoring guest memory?',
+      options: [
+        'About 5 GB, as 1,000 x 5 MiB is 5,000 MiB',
+        'About 5 MB, since each VM shares one small monitor',
+        'About 50 GB, since each VM needs 50 MiB to be safe',
+        'About 500 MB, since only half of the VMs are active',
+      ],
+      answer: 0,
+      explain: '1,000 x 5 MiB = 5,000 MiB, about 4.9 GiB. This is the vendor ceiling and excludes the guest memory. The other figures come from changing the per-VM number or the count.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai7-sandbox-ssh-read"
+  title="The agent that read ~/.ssh"
+  scenario="A data agent runs model-written Python in a sandbox. A log shows the code opened ~/.ssh/id_ed25519 and then made an HTTPS POST to an unknown domain. The sandbox limited writes to the working directory."
+  facts={[
+    'sandbox: writes limited to ./work',
+    'read rules: none set (defaults)',
+    'network: open, no allow list',
+    'environment: host user keys present',
+  ]}
+  steps={[
+    {
+      prompt: 'Which controls were missing for the read?',
+      options: [
+        'A smaller model, so that the code would be simpler',
+        'A read limit on credentials and no keys inside',
+        'A longer timeout, so the code has less time to act',
+        'A bigger memory cap, so that the code runs more slowly',
+      ],
+      answer: 1,
+      explain: 'The write limit did not cover reads. The key file was readable because no read rule and no empty home directory existed. Model size, timeout, and memory do not decide what the code can open.',
+    },
+    {
+      prompt: 'Which extra control would have stopped the key leaving even after the read?',
+      options: [
+        'A bigger working directory for the sandbox',
+        'A review of the output once the run ends',
+        'An egress allow list with no unknown domains',
+        'A second, identical sandbox that runs the code twice',
+      ],
+      answer: 2,
+      explain: 'With default-deny egress, the POST to an unknown domain fails, so the key stays inside. Reviewing the output comes too late. A second sandbox repeats the same gap. Defense in depth means both doors are closed.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: Claude Code sandboxing](https://www.anthropic.com/engineering/claude-code-sandboxing)
+- [Claude Code: configure the sandboxed Bash tool](https://code.claude.com/docs/en/sandboxing)
+- [Firecracker](https://firecracker-microvm.github.io/)
+- [gVisor documentation](https://gvisor.dev/docs/)
+- [Modal: Sandboxes](https://modal.com/docs/guide/sandboxes)

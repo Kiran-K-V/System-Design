@@ -1,0 +1,217 @@
+---
+summary: 'An agent that works for minutes must not hold an HTTP request. Submit the task, get a run id, let a worker pool run it in its own sandbox, and notify on completion with a pull request as the output. Add per-tenant queues, fair share, cost caps, and a capacity plan.'
+requires: ['ai/a7-agents-prod/durable-graph-runtime', '06-async/queues', '09-patterns/long-running-tasks']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai7BgLife from '../../../../components/anim/lessons/Ai7BgLife.tsx';
+import Ai7BgFair from '../../../../components/anim/lessons/Ai7BgFair.tsx';
+import Ai7BgCalc from '../../../../components/anim/lessons/Ai7BgCalc.tsx';
+
+## The problem
+
+A user asks an agent to fix a failing test and open a pull request. The run takes 6 minutes. It reads files, runs the test suite, edits code, and runs the suite again. The user closes the laptop after 30 seconds.
+
+If the agent runs inside the HTTP request, this fails in three ways. Load balancers and browsers cut idle connections long before 6 minutes. A dropped connection loses the work, and the user pays for tokens that produced nothing. And 500 users at once need 500 open connections, each tied to a worker, so a burst becomes an outage.
+
+Backend engineers solved this shape years ago. The agent version adds a few new parts: a sandbox for every run, a durable state store, cost caps, and a human who may need to answer in the middle.
+
+<CrossTrackLink id="09-patterns/long-running-tasks">
+Work that takes minutes cannot hold a request open. Accept the task, return a job id with HTTP 202, run it on a worker, and let the client poll or subscribe. Leases and heartbeats let another worker take over a job if one dies. Every pattern in this lesson sits on that base.
+</CrossTrackLink>
+
+<CrossTrackLink id="06-async/queues">
+A queue lets a producer hand work to workers and move on. It absorbs bursts and survives worker crashes, but it adds no capacity and delivers at least once. The visibility timeout, which hides a claimed message and then returns it if the worker is silent, is the part that matters most for runs that last minutes.
+</CrossTrackLink>
+
+## The mechanism: submit, queue, run, notify
+
+The flow has five parts.
+
+1. **Submit.** The API validates the request, stores a run record, enqueues it, and returns a run id at once.
+2. **Queue.** The run waits, usually in a queue per tenant, until a worker is free and the tenant is under its limit.
+3. **Worker and sandbox.** A worker claims the run and boots an isolated sandbox for it. The agent loop runs there (lesson [A7.4](/learn/ai/a7-agents-prod/sandboxes-code-execution/) covers the sandbox).
+4. **Progress.** The agent writes each step to a trace. Clients poll the run id or subscribe to events.
+5. **Finish.** The result is stored with the trace, and a notification goes out.
+
+Step through one run, including the case where the agent needs a human.
+
+<Ai7BgLife client:visible />
+
+```python title="submit_run.py"
+@app.post("/runs", status_code=202)
+def submit(req: RunRequest, tenant: Tenant = Depends(auth)):
+    run, created = db.get_or_create_run(
+        tenant_id=tenant.id,
+        idempotency_key=req.idempotency_key,       # a webhook retry must not start a second run
+        task=req.task,
+        budget_usd=min(req.budget_usd, tenant.max_run_usd),
+    )
+    if created:
+        queue.enqueue(f"tenant:{tenant.id}", run.id)
+    return {"run_id": run.id, "status_url": f"/runs/{run.id}"}
+```
+
+Two details in that handler matter. The idempotency key stops a retried webhook from starting two runs ([lesson A3.6](/learn/ai/a3-llm-apis/limits-retries-idempotency/) covers keys for model calls; the [backend idempotency lesson](/learn/backend/03-api-design/idempotency/) covers the general case). The budget is clamped to the tenant's maximum, so a caller cannot ask for an unlimited run.
+
+### Triggers
+
+A run need not start from a user click. Common triggers are a schedule, a webhook, and a new email or ticket. Claude Code's GitHub Action shows all three in one product. It runs on GitHub-hosted runners and starts from an `@claude` mention, from pull request events, or from a cron schedule. Its docs add rules that apply to any trigger design:
+
+- Issue and pull request events need a user with write access. A schedule has no user, so that check is skipped.
+- A bot actor is rejected unless you list it in `allowed_bots`. This keeps bots from triggering the agent in a loop.
+- GitHub runs scheduled workflows only from the default branch, and in public repositories it disables the schedule after 60 days without repository activity.
+- Commits pushed with the default `GITHUB_TOKEN` do not trigger other workflows. If you expect CI to run on the agent's commits, authenticate differently.
+
+### When the worker dies
+
+A worker can crash 5 minutes into a 6-minute run. Two recovery styles exist. With a durable runtime (lesson [A7.1](/learn/ai/a7-agents-prod/durable-graph-runtime/)), state is checkpointed, and another worker resumes from the last checkpoint. With a plain queue, the message becomes visible again after the visibility timeout, and another worker runs the whole task. That second style needs idempotent steps, or the retry sends the email twice.
+
+The timeout must fit the job. If a run takes 6 minutes and the timeout is 30 seconds, the queue hands the same run to a second worker while the first is still working. The fix is a heartbeat or lease that extends the timeout while the worker is alive, as the long-running tasks lesson explains.
+
+### The output is a pull request
+
+The agent should not push to the main branch. Every cloud agent product we checked ends in a reviewable artifact. Claude Code in the cloud works on a branch and lets you create a pull request. Codex cloud lets you review changed files and test results, then commit or open a pull request. Cursor's cloud agents push to a separate branch and "produce merge-ready PRs with artifacts". A human merges. That human step is the approval gate from lesson [A7.3](/learn/ai/a7-agents-prod/human-in-the-loop/), moved to the end of the run.
+
+## What real products do
+
+The primary docs agree on the main design, and differ in the details. All of what follows is from each vendor's own pages, as of 2026-10-16.
+
+| Product | Where it runs | Notes from the docs |
+|---|---|---|
+| Claude Code GitHub Actions | GitHub-hosted runners | Consumes GitHub Actions minutes and API tokens. Docs advise `--max-turns`, workflow timeouts, and concurrency controls |
+| Claude Code in the cloud | An isolated, Anthropic-managed VM per session | Keeps running after you close the laptop. Git credentials stay outside the VM, behind a proxy. Sessions run in parallel and share your plan limits |
+| Codex cloud | A cloud environment with its own workspace per task | Tasks can keep running while your computer sleeps. Internet access is set per environment |
+| Cursor cloud agents | Isolated VMs in the cloud | Environments come from a snapshot, a Dockerfile, or agent-led setup. Cursor manages capacity |
+
+One detail from the Claude Code docs shows why state must be durable. A cloud session's VM is reclaimed after a period of inactivity. Reopening the session provisions a new VM. The conversation is restored, but background work that was still running, such as subagents and shell commands, is not. A run that waits for a human therefore cannot count on its VM surviving. Save state, and treat the sandbox as disposable.
+
+## Many tenants, one pool
+
+A shared worker pool has a weak spot. If tenant A submits 400 runs and tenant B submits 5, a single first-in, first-out queue serves A's 400 first. B waits behind a burst it did not cause.
+
+The standard fixes are a queue per tenant, a concurrency limit per tenant, priorities, and fair share. Fair share means the scheduler takes one run from each tenant in turn. Priorities let a paid interactive run jump ahead of a nightly batch. Set a cost limit per queue as well, because a looping agent spends money even while it waits on nothing.
+
+<Ai7BgFair client:visible />
+
+Try 100 runs from tenant A on 4 workers. First in, first out makes B's mean wait 151.2 minutes. Derivation: A's 100 runs need 100 / 4 = 25 rounds of 6 minutes, so B's first runs start at round 25, 150 minutes in. With fair share, B's five runs start at 0, 0, 6, 6, and 12 minutes, a mean of 4.8. The last run in either mode starts at 156 minutes. Fair share adds no capacity. It decides who waits.
+
+## Capacity and cost
+
+Sizing a pool is Little's law: runs in flight = arrival rate x time per run. The plan's example is 500 runs per hour at 6 minutes each. That is 500 x 6 = 3,000 busy minutes per hour, or 3,000 / 60 = 50 workers busy at the same time. At exactly 100% busy, queue wait grows without bound, so you add headroom. 2x headroom gives 100 workers.
+
+Cost has two lines. Model spend is bounded by the per-run cap, such as the `max_budget_usd` option in the Claude Agent SDK. The docs warn the last response can pass the cap by its own cost plus any running subagent spend, so leave margin. Sandbox spend is busy time times the sandbox price, plus idle capacity you keep warm. Boot time counts as busy time with no useful work in it.
+
+<Ai7BgCalc client:visible />
+
+<Ballpark
+  client:visible
+  title="Workers for 500 runs an hour"
+  scenario="500 runs arrive every hour, spread evenly. Each run takes 6 minutes, boot included. Every run has a $1 budget cap. Assume 2x headroom."
+  steps={[
+    {
+      prompt: 'How many runs are in flight at the same time, on average?',
+      unit: 'runs',
+      answer: 50,
+      within: 1.1,
+      explain: '500 runs/hour x 6 minutes = 3,000 busy minutes per hour. 3,000 / 60 = 50.',
+    },
+    {
+      prompt: 'How many workers with 2x headroom?',
+      unit: 'workers',
+      answer: 100,
+      within: 1.1,
+      explain: '50 x 2 = 100. The headroom absorbs bursts and boot time, and keeps the queue from growing without bound.',
+    },
+    {
+      prompt: 'What is the most the model spend can reach in one day, if every run hits its cap?',
+      unit: 'dollars',
+      answer: 12000,
+      within: 1.1,
+      explain: '500 x 24 = 12,000 runs. 12,000 x $1 = $12,000. This is an upper bound. Real spend is lower unless runs loop to the cap, which is why you alert on runs that reach it.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Hold the request open | Simplest code | Timeouts, lost work, no scale | Runs under a few seconds |
+| Queue and workers | Burst absorption, retries, no open connections | A status API and an event channel | Any run over about 30 seconds |
+| Durable runtime resume | Continue from the last checkpoint | A runtime to operate | Long, costly, or human-gated runs |
+| Visibility timeout and retry | Simple, uses the queue you have | Whole run repeats, needs idempotent steps | Short, safe-to-repeat runs |
+| Sandbox per run | Isolation, disposable state | Boot time and cost per run | Agents that run code or tools |
+| Per-tenant queues and fair share | A noisy tenant cannot starve others | More scheduler logic | Any shared multi-tenant pool |
+
+## Interview lens
+
+<Callout type="tip">
+Describe it as a pipeline: "Submit returns a run id with 202 and an idempotency key. A queue per tenant feeds a worker pool with fair share and concurrency limits. Each run gets its own sandbox, state is checkpointed so a worker crash resumes instead of restarting, and the output is a PR plus a notification. Capacity is runs per hour x minutes per run / 60 in flight, times 2 for headroom. Each run has a budget cap, and each queue has a cost limit."
+</Callout>
+
+<Callout type="mistake">
+Do not leave out the visibility timeout. A 6-minute run with a 30-second timeout runs twice. And do not let the agent push to the main branch: a background agent works unwatched, so its output needs a review gate.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A queue has a 30-second visibility timeout and your agent runs take 6 minutes with no heartbeat. What happens?',
+      options: [
+        'The queue gives the same run to a second worker',
+        'The first worker is stopped and the run is lost with no retry',
+        'The queue waits for the run to end before it offers any other message',
+        'The run finishes once, because the queue tracks worker progress by itself',
+      ],
+      answer: 0,
+      explain: 'The message becomes visible again after 30 seconds, and another worker claims it. A heartbeat or lease would extend the timeout. The queue cannot see progress by itself, and nothing is lost, but the run is duplicated.',
+    },
+    {
+      q: 'Tenant A submits 400 runs, then tenant B submits 5, to one FIFO queue. Which change helps B without adding workers?',
+      options: [
+        'A longer visibility timeout for the runs of tenant B',
+        'A larger model for every run from tenant A',
+        'Fair share, taking one run from each tenant in turn',
+        'A second queue that holds the exact same messages',
+      ],
+      answer: 2,
+      explain: 'Fair share serves B early and moves the wait to A, the tenant that caused the burst. The timeout setting does not change the order. A larger model changes nothing about scheduling.',
+    },
+    {
+      q: '800 runs arrive per hour and each takes 3 minutes. How many are in flight at once, on average?',
+      options: [
+        '13, from 800 / 60',
+        '40, from 800 x 3 / 60',
+        '267, from 800 divided by 3',
+        '2,400, from 800 x 3',
+      ],
+      answer: 1,
+      explain: '800 x 3 = 2,400 busy minutes per hour. 2,400 / 60 = 40 runs in flight. The other options skip the conversion from minutes to hours or invent a divisor.',
+    },
+    {
+      q: 'A cloud agent VM is reclaimed after the user leaves a run waiting for approval. Which design survives this?',
+      options: [
+        'Keep the sandbox alive for 24 hours, whatever the cost',
+        'Store the conversation in the sandbox disk for later',
+        'Hold the approval request open in a long HTTP call',
+        'Persist state off-box, then resume on a new VM',
+      ],
+      answer: 3,
+      explain: 'The Claude Code docs say a reclaimed session restores the conversation but not background work. Durable state outside the sandbox is the portable answer. Sandbox disk dies with the sandbox, and a long HTTP call times out.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Claude Code GitHub Actions](https://code.claude.com/docs/en/github-actions)
+- [Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web)
+- [Cursor: cloud agents](https://cursor.com/docs/cloud-agent)
+- [OpenAI Codex cloud](https://learn.chatgpt.com/docs/cloud)

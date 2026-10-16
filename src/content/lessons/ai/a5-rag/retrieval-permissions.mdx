@@ -1,0 +1,190 @@
+---
+summary: 'A RAG system must never show a chunk the user cannot open. Compare post-filter, pre-filter and per-tenant indexes, see how each fails, and trace how an ACL change reaches every layer, including caches.'
+requires: ['ai/a5-rag/vector-db-filters', 'ai/a5-rag/freshness-updates', '03-api-design/auth']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai5AclWalk from '../../../../components/anim/lessons/Ai5AclWalk.tsx';
+import Ai5AclSim from '../../../../components/anim/lessons/Ai5AclSim.tsx';
+
+## The problem
+
+You build an internal assistant over the company drive. It indexes wiki pages, tickets and HR files. An engineer asks, "What are the salary bands for my level?" The retriever finds the best match by meaning. The best match is a spreadsheet only HR can open. The model reads it and writes the numbers into the answer.
+
+No one broke a rule in the code that checks file access. The file system said no. The index never asked. A vector index ranks by similarity, and it has no idea who is asking. The model also cannot keep a secret it has been handed: whatever is in the prompt can end up in the reply. So the rule must be enforced before text reaches the prompt.
+
+<CrossTrackLink id="03-api-design/auth">Authentication says who the caller is. Authorization says what that caller may do. Tokens carry an identity and claims such as roles or groups, and the service checks them on every request. Here the check moves from the API to the data: the identity decides which chunks may be read.</CrossTrackLink>
+
+OWASP lists this under vector and embedding weaknesses. It names "inadequate or misaligned access controls", and context leakage when several user groups share one vector store ([OWASP LLM08](https://genai.owasp.org/llmrisk/llm082025-vector-and-embedding-weaknesses/)). Its advice is "permission-aware vector and embedding stores" and "strict logical and access partitioning". The rest of this lesson turns that advice into designs. Vendor-specific enterprise search patterns are not covered, because this lesson uses no vendor claims. It works from first principles.
+
+## Naive solution: filter after the search
+
+The first idea is to leave the search alone and check each hit against the permission system. Take the top 10 chunks, drop those the user cannot read, send the rest to the model.
+
+It does not leak chunks. It fails in other ways.
+
+1. **Too few results, or none.** The top 10 were chosen without regard to the user. If the best matches are all private, the user gets 0 or 2 chunks while 50 readable ones exist further down. Lesson [A5.3](/learn/ai/a5-rag/vector-db-filters/) showed the same effect for metadata filters in pgvector, where the filter is applied after the index scan ([pgvector README](https://github.com/pgvector/pgvector)).
+2. **Side channels.** A page that says "10 matches, 1 shown", a citation count, or a different latency tells the user that restricted material exists on the topic. That can be a leak by itself.
+3. **Cost.** You fetch and check chunks you will throw away. For an unlucky user the check runs on every hit.
+
+Step through two users with the same query.
+
+<Ai5AclWalk client:visible />
+
+## The mechanism: put the permission test inside the search
+
+### Pre-filter
+
+A **pre-filter** is a condition on the search itself: "the nearest chunks among those where `allowed_groups` contains one of my groups." The index returns k readable chunks. The user never receives a forbidden chunk, and the list is full when enough readable chunks exist. Whether the index applies the filter during graph traversal or afterwards depends on the store. Lesson [A5.3](/learn/ai/a5-rag/vector-db-filters/) covers how filters hurt graph search and how stores answer. Check your store's filter path before you trust it with a restrictive ACL.
+
+Store the ACL as fields on each chunk: tenant, and a list of group ids or user ids. At query time load the caller's groups from your identity system and pass them as the filter. Two limits to know:
+
+- Filters have size limits. Pinecone's docs say each `$in` operator "accepts a maximum of 10,000 values" ([Pinecone](https://docs.pinecone.io/guides/search/filter-by-metadata)). A user in thousands of groups cannot be one list. Model access as a few coarse labels (team, level, project), or resolve it in two steps.
+- The rule must live in one place. If the filter is built in five services, one of them will be wrong.
+
+### Where to enforce: shared index or one per tenant
+
+| Layout | Gain | Pay | Choose when |
+|---|---|---|---|
+| One shared index, tenant filter | Simple, cheap, one thing to operate | One bad filter leaks across tenants | Many small tenants, low sensitivity |
+| One index per tenant | A bug cannot cross tenants; delete a tenant by deleting its index | Many indexes to build, size and monitor | Few large tenants, strict contracts |
+| Per-tenant index plus group filter inside | Hard wall between tenants, fine control within | Both costs | Regulated tenants with internal roles |
+
+A per-tenant index is the "strict logical and access partitioning" OWASP asks for. It does not remove the need for ACLs inside the tenant: Ana and Raj work at the same company and see different files. The simulator below shows both layers.
+
+<Ai5AclSim client:visible />
+
+### Document level or chunk level
+
+Most systems store one ACL per document and copy it to every chunk. That is simple and matches the source system. Chunk-level ACLs fit cases where a single file has restricted sections, such as a contract with a confidential annex. They are costly: the source system rarely exposes section-level permissions, so you invent and maintain them. Start at document level. Copy the ACL to each chunk, and write the document id on the chunk so one ACL change can update all of them with one filter.
+
+### Keeping ACLs fresh
+
+This is the freshness problem from lesson [A5.8](/learn/ai/a5-rag/freshness-updates/), with a worse failure. A stale document is a wrong answer. A stale ACL is a breach. Revoking access must reach every layer that holds a copy:
+
+1. **Source of truth.** The identity system or file system. Updated at once.
+2. **ACL fields in the index.** Updated by the same CDC path as content, or by a dedicated, faster path. The delay is a leak window.
+3. **Group membership cache.** If your service caches a user's groups, a removed user keeps old groups until the entry expires.
+4. **Answer and result caches.** A cached answer was built under old permissions. If the cache key is only the question, the next user with the same question gets the answer built for someone else.
+5. **Eventual reads.** If the store serves stale reads, the ACL change can lag. turbopuffer says eventual-consistency queries can show staleness of "up to about one hour in the worst case" and that strong consistency is the default ([turbopuffer](https://turbopuffer.com/docs/architecture)).
+
+Treat access removal as a high-priority event. Ship it on its own queue, and measure the time from revoke to "no query can return this chunk". Set a target, such as seconds, not minutes. Key answer caches by the set of groups, or skip them for restricted content.
+
+A different design avoids copying ACLs into the index. Cursor's secure indexing keeps a copy of the client's Merkle tree on the server as "content proofs" and drops search results for files the client cannot prove it has ([Cursor](https://cursor.com/blog/secure-codebase-indexing)). The check uses proof of possession rather than a stored ACL. It suits code on a user's own disk. For shared drives with explicit sharing rules you usually need ACL fields.
+
+## Trade-offs
+
+| Strategy | Leaks chunks? | Full result lists? | Main risk |
+|---|---|---|---|
+| No check | Yes | Yes | Everything leaks |
+| Post-filter | No | No, can be empty | Count and timing side channels |
+| Pre-filter | No, if the filter is right | Yes | Wrong or stale filter; filter limits |
+| Index per tenant | Not across tenants | Yes | Operations cost; still needs ACLs inside |
+
+<Callout type="tip">
+In an interview, say the rule in one sentence: "the model can only leak what is in its prompt, so permissions are enforced at retrieval, inside the query." Then name the failure of the post-filter, the tenant layout, and the revocation path with its leak window.
+</Callout>
+
+<Callout type="mistake">
+Do not put "do not reveal restricted data" in the system prompt and call it access control. A prompt is not an access control. Do not forget the answer cache and the group cache. Do not show counts of hidden hits.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="a5-9-revoked-employee"
+  title="A revoked employee still gets the answer"
+  scenario="At 10:00 HR removes a contractor from the 'finance' group. At 10:20 the contractor asks about the Q3 budget and the bot answers with numbers from a finance-only document."
+  facts={[
+    'identity system:  contractor removed from finance 10:00:00',
+    'index ACL field:  doc budget-q3 updated 10:00:40',
+    'group cache:      TTL 60 s, contractor groups reloaded 10:01',
+    'answer cache:     key = hash(question), TTL 1 h, entry made 09:50',
+    'query at 10:20:   answer cache HIT',
+  ]}
+  steps={[
+    {
+      prompt: 'Which layer served the stale access?',
+      options: [
+        'The ACL field in the index, which updated 40 s late',
+        'The group cache, which kept the old groups',
+        'The identity system, which did not record the removal',
+        'The answer cache, keyed on the question alone',
+      ],
+      answer: 3,
+      explain: 'The ACL field and the group cache were current by 10:01. The cached answer was made at 09:50 for someone who was allowed, and it is returned to anyone who asks the same question for an hour. The identity system logged the removal.',
+    },
+    {
+      prompt: 'What change closes the hole?',
+      options: [
+        'Key the cache by caller groups, or bypass it',
+        'Shorten the group cache TTL from 60 s down to 10 s',
+        'Update the index ACL field faster than the current 40 s',
+        'Ask the model to refuse any question about finance data',
+      ],
+      answer: 0,
+      explain: 'A key that ignores who asks is the root cause. Faster layers still leave the cache. A prompt rule is not access control and fails when the text is in context.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A user has 200 readable chunks on a topic. A post-filter after a top-10 search returns 0 chunks. Why?',
+      options: [
+        'The model rejected the chunks as irrelevant',
+        'The embedding model cannot encode the query for that user',
+        'The top 10 were chosen first and none were readable',
+        'The vector store deletes chunks that a filter touches',
+      ],
+      answer: 2,
+      explain: 'The search ranked everything with no knowledge of the user. If the 10 best matches are private, filtering leaves nothing, even though readable chunks sit at ranks 11 and beyond. A pre-filter ranks only readable chunks.',
+    },
+    {
+      q: 'A page shows "12 matches" and lists 1 chunk to a user. What does the count leak?',
+      options: [
+        'That restricted material exists on this topic',
+        'The size of the embedding vectors in use',
+        'The exact text of the 11 hidden chunks',
+        'Nothing, since the hidden chunks were never shown',
+      ],
+      answer: 0,
+      explain: 'The text is not shown, but the count proves that 11 more chunks matched. That tells a curious user a restricted document exists. Show only what the user may see, or hide counts.',
+    },
+    {
+      q: 'Which cost belongs to one index per tenant, compared with a shared index and a tenant filter?',
+      options: [
+        'A tenant filter on every query',
+        'A leak across tenants after one bad filter',
+        'Slower embeddings for every tenant',
+        'Many small indexes to build and operate',
+      ],
+      answer: 3,
+      explain: 'Per-tenant indexes add operational load: build, size, monitor and upgrade many indexes. In return a filter bug cannot cross tenants. The tenant filter and the cross-tenant leak risk belong to the shared design.',
+    },
+    {
+      q: 'A user is removed from a group at time T. After the index ACL updates, which layer can still serve old access?',
+      options: [
+        'The tokenizer, which keeps its old vocabulary',
+        'A cached answer from old permissions',
+        'The embedding model, which stores user names',
+        'The chunk text, which stays in the source system',
+      ],
+      answer: 1,
+      explain: 'A cached answer was made when access was allowed and does not re-check it. The tokenizer and the embedding model hold no user permissions. The chunk text staying in the source is expected and harmless.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [OWASP LLM08: Vector and Embedding Weaknesses](https://genai.owasp.org/llmrisk/llm082025-vector-and-embedding-weaknesses/): access control and cross-context leakage.
+- [Cursor: Securely indexing large codebases](https://cursor.com/blog/secure-codebase-indexing): content proofs and dropped results.
+- [pgvector README](https://github.com/pgvector/pgvector): filters applied after the index scan; partial indexes and partitioning.
+- [Pinecone: Filter by metadata](https://docs.pinecone.io/guides/search/filter-by-metadata): filter operators and the 10,000-value limit.

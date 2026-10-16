@@ -1,0 +1,210 @@
+---
+summary: 'A long agent run needs a different interface from a chat reply. Stream the plan and the steps so the run does not look frozen, let users interrupt and steer, make actions undoable with checkpoints, and ask for approval only where it matters, because users approve 97 percent of prompts.'
+requires: ['ai/a3-llm-apis/streaming', 'ai/a3-llm-apis/tool-calling-protocol']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai7UxTimeline from '../../../../components/anim/lessons/Ai7UxTimeline.tsx';
+import Ai7UxSignals from '../../../../components/anim/lessons/Ai7UxSignals.tsx';
+
+## The problem
+
+A chat reply takes seconds. An agent run can take minutes. In that time the agent reads files, calls tools, edits things, and sometimes goes the wrong way. The user is waiting and has only a spinner to look at.
+
+That creates three problems. The user cannot tell if the run is working or stuck. The user cannot stop a wrong turn until it ends. And when it ends with a bad result, the user cannot easily undo it. Good agent UX answers three questions at every moment: what is it doing, can I change course, and can I take it back.
+
+This lesson covers the interface. The reliability side lives elsewhere: lesson [A7.2](/learn/ai/a7-agents-prod/loop-control/) stops runaway loops, and lesson [A7.3](/learn/ai/a7-agents-prod/human-in-the-loop/) gates actions with a human. Here we ask what the human sees.
+
+## Naive design: a spinner, then a result
+
+The simplest agent UI shows "Thinking..." and, at the end, a final answer. It has two failures.
+
+The first is **opacity**. [Lesson A3.2](/learn/ai/a3-llm-apis/streaming/) showed that users feel the time to the first visible output, not the time to the last token. An agent run is that problem at a larger scale. A run with no visible progress looks frozen after a few seconds, and users cancel or resubmit runs that were working fine.
+
+The second is **a blind approval gate**. Many designs add a popup before each risky action: "Allow this tool call? Yes / No". It feels safe. Anthropic's data says it often is not. In its post on making auto mode the default in Claude Code (dated 2026-08-07), Anthropic writes: "Data suggests that manual review can become habitual: users approve 97% of permission prompts in Claude Code." The same post reports that "when Claude presents a plan for approval, users reject 39% of them". The numbers are for Claude Code users. They show the shape of the problem, not a law for your product. But a prompt that is approved 97 times in 100 is a rubber stamp. The 3 that matter hide among the 97.
+
+## Show progress: the plan, then the steps
+
+Anthropic's agent-design guide says: "Prioritize transparency by explicitly showing the agent's planning steps." Two kinds of signals do most of the work.
+
+A **plan** says where the run is going before it starts. It is short, and the user can reject it cheaply. The 39% plan rejection rate in the Anthropic post suggests users do act on a plan when they see one, and that a wrong plan is cheaper to catch than a wrong edit.
+
+A **step stream** says where the run is now. Each tool call or file edit becomes one row: "Reading config.py", "Running tests". The rows come from the same events you already stream (lesson [A3.2](/learn/ai/a3-llm-apis/streaming/)). Group them: show the current step in full and fold the older ones into one line. Show what the agent found, not only what it did, and link sources so the user can check them.
+
+Add **time and cost so far**. A run with a budget cap (lesson [A7.2](/learn/ai/a7-agents-prod/loop-control/)) can show spend against the cap. Show it in plain units, such as elapsed time and dollars, and do not show a number you did not measure. A cost meter also answers the question "is it stuck": if elapsed time grows and no new step appears, say so.
+
+A small handler turns raw events into rows. The event shape here is made up for illustration. Real SDKs name their events differently.
+
+```typescript title="progress.ts"
+type AgentEvent =
+  | { type: 'plan'; steps: string[] }
+  | { type: 'step_start'; id: string; label: string }
+  | { type: 'step_end'; id: string; ok: boolean }
+  | { type: 'error'; message: string };
+
+function reduce(rows: Row[], e: AgentEvent): Row[] {
+  switch (e.type) {
+    case 'plan':
+      return [...rows, { kind: 'plan', lines: e.steps }];
+    case 'step_start':
+      return [...rows, { kind: 'step', id: e.id, label: e.label, state: 'running' }];
+    case 'step_end':
+      return rows.map((r) => (r.kind === 'step' && r.id === e.id ? { ...r, state: e.ok ? 'done' : 'failed' } : r));
+    case 'error':
+      return [...rows, { kind: 'error', message: e.message }];
+  }
+}
+```
+
+## Interrupt, steer, and rewind
+
+A user who sees a wrong turn should be able to say so now. **Interrupting** stops the run. **Steering** adds a message that changes it mid-run. In Claude Code, a user can type while the agent works. The docs call this queueing messages while Claude works.
+
+The undo side is **checkpoints**. The Claude Code checkpointing docs say it "automatically captures the state of your code before each prompt you send that starts a turn". Every such prompt creates a new checkpoint. Run `/rewind`, or press Esc twice when the prompt box is empty, to open the rewind menu. The menu lists these actions: restore code and conversation, restore conversation only, restore code only, summarize from here, summarize up to here. The docs list the limits too: rewind does not track files changed by Bash commands, a subagent's edits are usually not restored, and edits made outside the session are normally not captured. The docs say plainly that checkpoints are not a replacement for version control.
+
+Follow one run. It has a steer and a rewind. Notice that the steer message gets no checkpoint of its own. The docs say a message typed mid-turn "has none of its own", and the edits after it count toward the prompt that started the turn.
+
+<Ai7UxTimeline client:visible />
+
+The design lesson: an **undo** is only as good as what it covers. If the agent can change things the checkpoint does not track, the UI must say so before the run, not after. Prefer reversible actions by default: write a draft and not a send, stage a change and not a deploy, propose a diff and not an overwrite. Put the one-way actions behind a gate.
+
+## Approvals that mean something
+
+Approval fatigue is a quantity you can compute. Say a run asks for 40 approvals. If users approve 97% of prompts, the expected number of rejections is 40 x (1 - 0.97) = 1.2. About 33 prompts pass for each rejection (1 / 0.03). That is the rate for Claude Code users, and I apply it here as an assumption to your product. The lesson is the shape: when almost every prompt is approved, a user stops reading them.
+
+Four changes help.
+
+- **Ask less.** Gate only the actions that are hard to undo or reach outside the sandbox (lesson [A7.4](/learn/ai/a7-agents-prod/sandboxes-code-execution/)). Let reversible ones run, and let rewind cover them.
+- **Show the exact action.** Show the command or the diff, not "Allow this tool?". A reviewer can only judge what they can see.
+- **Make the rare prompt stand out.** If 3 in 40 prompts are risky, style them differently and say why.
+- **Gate the plan.** One plan review replaces many step reviews, and the 39% figure shows people reject bad plans.
+
+Log each decision ([lesson A7.8](/learn/ai/a7-agents-prod/agent-identity-oauth/) audit trail) so you can measure your own approval rate and see if it drifts toward 100%.
+
+## Failure states and correction
+
+Design the failure screens as carefully as the happy path. A run can fail in at least four ways: a tool errors, the model refuses, a limit stops it, or the user's network drops. For each one the UI should say what happened, what was kept, and what the user can do next: retry, edit the prompt, or rewind. "Something went wrong" tells the user nothing.
+
+Make correction cheap. If the user can edit the prompt, regenerate, or mark a step as wrong in one click, they correct small errors early. Each correction is also a labeled signal: log it with the run id for your evals (module A8). Show confidence only if it is calibrated against real outcomes. An unearned "95% sure" teaches users to over-trust.
+
+That is **trust calibration**. Over-trust means approving without looking. Under-trust means re-doing the agent's work by hand. The right amount of visible signal moves users between the two. Try it. The widget below adds or removes signals on a made-up 12-step run and counts how many user questions get answered against how many lines the screen grows by. The line counts are for this run only.
+
+<Ai7UxSignals client:visible />
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Spinner only | Clean screen | No trust, cancelled runs | Runs under a few seconds |
+| Plan up front | Cheap review of direction | One more step before work starts | Runs that edit or spend |
+| Full step stream | Users see liveness and detail | Noise, more to read | Long runs, power users |
+| Approve every action | Feels safe | Fatigue, rubber stamps | Almost never |
+| Approve risky actions only | Prompts that get read | You must classify risk | Mixed reversible and one-way actions |
+| Checkpoints and rewind | Cheap undo for tracked changes | Limits: untracked changes remain | Edits to files or state you can snapshot |
+
+## Interview lens
+
+<Callout type="tip">
+Answer in three layers: "Show progress, so the run is not a black box: a plan, then streamed steps with elapsed time and cost. Allow control: interrupt, steer, and rewind to a checkpoint. Gate only the risky, one-way actions, with the exact command visible, because users approve 97% of generic prompts and stop reading them." Then say how you would measure it: approval rate, rewind rate, and correction rate.
+</Callout>
+
+<Callout type="mistake">
+Do not say "add a confirmation dialog" as the whole safety plan. Do not claim undo covers everything: it covers what it tracks. And do not hide failure behind a generic error. Say what was kept and what to do next.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In Claude Code, a user types a message while the agent is working. Which statement about checkpoints is correct?',
+      options: [
+        'The message gets its own checkpoint, so it can be rewound alone',
+        'It has none; its edits join the turn\'s checkpoint',
+        'The message cancels the current checkpoint and creates a new one',
+        'The message is checkpointed only if it contains a file edit request',
+      ],
+      answer: 1,
+      explain: 'Checkpoints are taken for prompts that start a turn. A message typed mid-turn has none of its own, and the edits after it belong to the prompt that started the turn.',
+    },
+    {
+      q: 'An agent run deletes files with a Bash command (rm). The user opens rewind and restores code. What happens to the deleted files?',
+      options: [
+        'They are restored, because rewind snapshots the whole disk',
+        'They are restored only if the user also restores the conversation',
+        'They stay deleted; Bash changes are not tracked',
+        'They are restored only after a retention sweep of about 30 days',
+      ],
+      answer: 2,
+      explain: 'The docs say checkpointing does not track files modified by Bash commands, so rewind cannot undo them. Use version control for those. The 30-day sweep deletes old snapshots, it does not restore anything.',
+    },
+    {
+      q: 'A run asks for 40 approvals. Users approve 97% of prompts. About how many rejections do you expect, and what does it imply?',
+      options: [
+        'About 12, so most prompts are read carefully before approval',
+        'About 3, so users reject one prompt in 13 on average',
+        'About 20, so half of the prompts are risky and rejected',
+        'About 1, so the prompts are mostly a rubber stamp',
+      ],
+      answer: 3,
+      explain: '40 x (1 - 0.97) = 1.2 rejections, about 1. At that rate most prompts add friction and little safety. The 12 and the 20 do not follow from a 3% rejection rate.',
+    },
+    {
+      q: 'Which change best fixes an approval step that users click through by habit?',
+      options: [
+        'Gate only one-way actions; show the exact command',
+        'Add a second popup that repeats the same question for every action',
+        'Make the Approve button smaller so users must aim at it carefully',
+        'Remove all approvals and rely on the model to avoid risky actions',
+      ],
+      answer: 0,
+      explain: 'Fewer, more specific prompts get read. Repeating the popup raises fatigue, and a small button is friction without information. Removing every gate drops control for actions that cannot be undone.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai7-wrong-actions-accepted"
+  title="Users accept wrong agent actions"
+  scenario="A coding agent asks 'Allow this action?' before every tool call. Reviews of past runs find that users accepted a wrong file deletion without reading it, and the run could not be undone."
+  facts={[
+    'prompts per run: 35',
+    'approval rate: 98%',
+    'the deletion prompt text: "Allow Bash?" (the command was hidden)',
+    'rewind covers file edits; the deletion ran through Bash',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the main cause?',
+      options: [
+        'Too many generic prompts, so users approve by habit',
+        'The model is too weak to propose safe deletions',
+        'The users are careless and need a training course',
+        'The agent runs too slowly, so users stop paying attention',
+      ],
+      answer: 0,
+      explain: 'With 35 prompts and 98% approval, the prompt is a reflex. The hidden command made it worse: the user could not judge what they approved. Training does not fix a design that rewards clicking.',
+    },
+    {
+      prompt: 'Which change helps most?',
+      options: [
+        'Ask once at the start of the run and never ask again',
+        'Show the command, gate one-way actions, stage deletes',
+        'Add a thumbs-up button after every action the agent takes',
+        'Hide the tool calls so users are not tempted to react to them',
+      ],
+      answer: 1,
+      explain: 'Show the exact command, ask only where undo is impossible, and make deletes reversible, for example by moving files to a trash folder. One approval at the start gives no control. Thumbs-up gives a signal, not a gate. Hiding actions removes oversight.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: auto mode is the default in Claude Code](https://claude.com/blog/auto-mode-default-in-claude-code)
+- [Claude Code: checkpointing](https://code.claude.com/docs/en/checkpointing)
+- [Anthropic: building effective agents](https://www.anthropic.com/engineering/building-effective-agents)

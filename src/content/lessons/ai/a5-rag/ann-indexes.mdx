@@ -1,0 +1,223 @@
+---
+summary: 'At a billion vectors the index, not the search, is the problem: flat storage is 6.1 TB. Compare flat, IVF, PQ, HNSW and DiskANN by memory per vector, then tune nprobe and efSearch against recall that you measure.'
+requires: ['ai/a5-rag/embedding-models', '10-advanced/vector-databases']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai5AnnHops from '../../../../components/anim/lessons/Ai5AnnHops.tsx';
+import Ai5AnnCalc from '../../../../components/anim/lessons/Ai5AnnCalc.tsx';
+
+## The problem
+
+Lesson [A5.1](/learn/ai/a5-rag/embedding-models/) priced one embedding: 6,144 bytes at 1,536 dimensions. Now scale it. A company that indexes every paragraph of its documents, tickets and code can reach a billion vectors. One billion times 6,144 bytes is 6.1 TB. The FAISS guide says that "all Faiss indexes are stored in RAM." A machine with 6 TB of memory is not a normal machine, and every query would still read all of it.
+
+So the question changes from "which vectors are close?" to "how do we find them without holding or scanning everything?"
+
+<CrossTrackLink id="10-advanced/vector-databases">
+Exact search compares the query with every stored vector, which costs N x d work. Approximate search (ANN) trades a little recall for a large cut in work. IVF groups vectors into clusters and scans only the nearest few. HNSW is a layered graph that a query walks greedily from the top. pgvector filters after the scan. This lesson does not repeat the walk-through. It adds the memory math, the knobs, and the billion-scale options.
+</CrossTrackLink>
+
+## Naive solution: one flat index
+
+A **flat** index stores every vector as it is and compares the query to all of them. The FAISS wiki gives its memory as 4 x d bytes per vector. It has perfect recall. It also has no tuning, and it is the right answer up to a modest size (backend lesson 10.4 gives about 100,000 vectors as a rough line).
+
+At 1 billion vectors of 1,536 dimensions the arithmetic is: 4 x 1,536 = 6,144 bytes, times 10^9 = 6.144 TB. Each query reads all of it. Even at a memory bandwidth of 50 GB/s, one pass takes over two minutes. That is the number to beat.
+
+## The mechanism: four ways to cut
+
+Each family cuts a different cost. The FAISS wiki lists bytes per vector for the first three.
+
+| Index | Bytes per vector | What it cuts |
+|---|---|---|
+| Flat | 4 x d | Nothing. Exact. |
+| IVFFlat | 4 x d + 8 | Work per query. The 8 bytes store the id. |
+| PQ | ceil(M x nbits / 8) | Memory. Each vector becomes a short code. |
+| HNSW | 4 x d + M x 2 x 4 | Work per query. Adds graph links to the vectors. |
+
+**IVF** scans only a few clusters. It saves time but not memory: it still stores the full vectors. **PQ** (product quantization) [senior] cuts each vector into M pieces, replaces each piece by the id of its nearest entry in a small learned table, and stores only those ids. With M = 96 and 8 bits per piece, a vector is 96 bytes. The FAISS wiki allows nbits of 8, 12 or 16. The price is lost precision: distances from codes are estimates. **HNSW** is fast and accurate, but it keeps full vectors and adds links on top.
+
+### Worked example: 1 billion x 1,536
+
+| Index | Bytes per vector | Total |
+|---|---|---|
+| Flat | 6,144 | 6.144 TB |
+| IVFFlat | 6,152 | 6.152 TB |
+| HNSW, M = 16 | 6,144 + 128 = 6,272 | 6.272 TB |
+| PQ, M = 96, 8 bits | 96 | 96 GB |
+
+The PQ code is 6,144 / 96 = 64 times smaller than the float vector. 96 GB fits on one large server. But those 96 bytes are only the codes. You also keep the codebooks, and usually the full vectors on cheaper storage so you can re-score the best few hundred candidates. Try other values in the calculator.
+
+<Ai5AnnCalc client:visible />
+
+### DiskANN: keep the graph on the SSD
+
+HNSW needs the whole graph and all vectors in RAM. **DiskANN** [senior] (NeurIPS 2019) keeps most of the index on an SSD and a compressed copy in memory. The abstract reports that one workstation with 64 GB of RAM and an inexpensive SSD can index and search SIFT1B, a billion-point benchmark. On a 16-core machine it served more than 5,000 queries per second at under 3 ms mean latency and 95% or better 1-recall@1. The paper says FAISS and a similar system with a like memory footprint plateau at about 50% 1-recall@1. It also claims 5 to 10 times more points per node than HNSW or NSG at high recall.
+
+Read this with care. It is one benchmark on one dataset, from the authors, in 2019. SIFT vectors are not 1,536-dimension text embeddings. Treat it as proof that the approach works, not as your latency.
+
+### Watch the HNSW walk
+
+Our toy has 16 points and three layers. A query enters at the top, hops to the closest neighbor, drops a layer, and repeats.
+
+<Ai5AnnHops client:visible />
+
+The layered shape is why the walk touches few points at large N. Backend lesson 10.4 derives the layer sizes.
+
+## Tuning: the recall and latency knobs
+
+**Recall** here has a second meaning: the share of the true top-k (found by an exact search) that the index returns. A recall of 0.95 means 19 of 20 true neighbors are returned. Every knob below moves recall against time.
+
+| Knob | Index | Default (source) | Raise it and you get |
+|---|---|---|---|
+| `nprobe` | IVF | 8 in Milvus; 1 in pgvector | Better recall, slower query |
+| `nlist` | IVF | 128 in Milvus, range 32 to 4,096 | Finer clusters, slower build |
+| `efSearch` | HNSW | 40 in pgvector (`hnsw.ef_search`) | Better recall, slower query |
+| `M` | HNSW | 16 in pgvector; hnswlib says 12 to 48 suits most cases | Better recall, more memory |
+| `ef_construction` | HNSW | 64 in pgvector | Better graph, slower build |
+
+Defaults are from the Milvus IVF_FLAT docs, the pgvector README and the hnswlib parameter guide, read on 2026-10-16. The HNSW paper has its own suggested values, but we could not read the paper body, so we cite the library defaults. The hnswlib guide adds that `ef` can be anything from k up to the dataset size, and that a recall below 0.9 on your test means there is room to improve.
+
+Two rules from the docs. Milvus says to set `nprobe` in proportion to `nlist`. The FAISS guide says `nlist` should be 4 x sqrt(N) to 16 x sqrt(N) for datasets under 1 million vectors, and IVF needs 30 x nlist to 256 x nlist training vectors.
+
+Raising a knob has no fixed payoff: it depends on your data. So the method is a sweep. Take your A5.1 query set, compute the exact top-k once, then run the index at several `efSearch` or `nprobe` values. Plot recall against latency, and pick the cheapest setting that meets your bar.
+
+```python title="sweep_hnsw.py"
+import faiss, numpy as np
+
+d, M = 1536, 16
+index = faiss.IndexHNSWFlat(d, M)       # 4*d + M*2*4 bytes per vector
+index.hnsw.efConstruction = 64
+index.add(vectors)                      # float32 array, shape (n, d)
+
+for ef in (16, 40, 100, 200):
+    index.hnsw.efSearch = ef
+    _, found = index.search(queries, 10)
+    recall = np.mean([len(set(f) & set(t)) / 10 for f, t in zip(found, exact_top10)])
+    print(ef, recall)
+```
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Flat, 1B x 1,536 | 6.144 TB | Derived: 4 x 1,536 x 10^9 |
+| HNSW M=16, 1B x 1,536 | 6.272 TB | Derived: (6,144 + 128) x 10^9 |
+| PQ M=96 8-bit, 1B | 96 GB, 64x smaller | Derived: 96 x 10^9 |
+| DiskANN, SIFT1B | 64 GB RAM, over 5,000 QPS, under 3 ms, 95%+ 1-recall@1 | DiskANN abstract |
+| pgvector HNSW | m 16, ef_construction 64, ef_search 40 | pgvector README |
+| Milvus IVF | nlist 128, nprobe 8 | Milvus docs |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Flat | Exact results, no tuning | N x d work per query | Under about 100,000 vectors |
+| IVFFlat | Fast build, tunable work | Full vectors in RAM; recall depends on nprobe | Data changes slowly |
+| PQ | 64x less memory in our example | Estimated distances, lost recall | RAM is the limit |
+| HNSW | Best speed for a given recall | Vectors plus links in RAM | Millions of vectors, live updates |
+| DiskANN | A billion points on one box | SSD reads, a more complex build | Billions of vectors, RAM-limited |
+
+## Interview lens
+
+<Callout type="tip">
+Lead with the memory math: "A billion 1,536-dimension float vectors is 6.1 TB flat. PQ with 96 one-byte codes is 96 GB. I would keep codes in RAM and full vectors on SSD to re-score the top few hundred." Then say how you tune: "I sweep efSearch against recall on a labelled query set and pick the cheapest setting that meets the bar."
+</Callout>
+
+<Callout type="mistake">
+Do not say HNSW "scales to billions" without its memory: it holds full vectors plus links, so a billion vectors is terabytes of RAM. Do not quote a recall without saying how you measured it. Do not copy a DiskANN number as your own latency: it is one benchmark on SIFT1B.
+</Callout>
+
+<Callout type="deep" title="Why codes lose recall">
+PQ replaces each piece of a vector by its nearest table entry. Two different vectors can share a code, so their estimated distance to the query is identical when the true ones differ. That is why systems re-score a candidate list with the full vectors. The first pass is cheap and wide, and the second is exact and narrow.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Memory for a billion vectors"
+  scenario="You index 1 billion vectors of 1,536 dimensions, float32. Use the FAISS bytes-per-vector formulas."
+  steps={[
+    {
+      prompt: 'Flat index memory, in TB?',
+      unit: 'TB',
+      answer: 6.144,
+      within: 1.1,
+      explain: '4 x 1,536 = 6,144 bytes per vector. Times 10^9 vectors = 6.144 x 10^12 bytes = 6.144 TB.',
+    },
+    {
+      prompt: 'PQ with M = 96 and 8 bits per code: memory in GB?',
+      unit: 'GB',
+      answer: 96,
+      within: 1.1,
+      explain: 'ceil(96 x 8 / 8) = 96 bytes per vector. Times 10^9 = 96 GB, 64 times less than flat.',
+    },
+    {
+      prompt: 'HNSW with M = 32: bytes per vector?',
+      unit: 'bytes',
+      answer: 6400,
+      within: 1.1,
+      explain: '4 x 1,536 + 32 x 2 x 4 = 6,144 + 256 = 6,400 bytes. The links add about 4% here, so the vectors dominate.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An IVFFlat index with nprobe 8 gives recall that is too low. What is the cheapest change to try first?',
+      options: [
+        'Rebuild the index with half the vectors',
+        'Raise nprobe and measure recall again',
+        'Switch the vectors from float32 to PQ codes',
+        'Lower nlist to 1 so that one list holds all vectors',
+      ],
+      answer: 1,
+      explain: 'nprobe is a query-time setting: more clusters scanned means better recall and slower queries. No rebuild is needed. Dropping vectors loses data, and nlist of 1 turns IVF into a flat scan.',
+    },
+    {
+      q: 'Why does PQ with M = 96 and 8-bit codes shrink 1,536-dimension float32 vectors by 64 times?',
+      options: [
+        'It stores 96 bytes where float32 needed 6,144',
+        'It drops 63 of every 64 dimensions at random',
+        'It stores only the vector ids and rebuilds them later',
+        'It halves the bits in each number six times over',
+      ],
+      answer: 0,
+      explain: '96 bytes against 6,144 bytes is a ratio of 64. PQ keeps one small code per piece of the vector, not a subset of dimensions. The loss is precision, not missing data.',
+    },
+    {
+      q: 'Which index family keeps the full float vectors and also adds graph links in RAM?',
+      options: [
+        'PQ with 8-bit codes',
+        'IVFFlat with a small nprobe',
+        'A flat index with no links',
+        'HNSW with M links per node',
+      ],
+      answer: 3,
+      explain: 'HNSW uses 4 x d + M x 2 x 4 bytes per vector: the full vector plus links. PQ stores codes. IVFFlat stores vectors plus an 8-byte id, with no links. Flat stores vectors only.',
+    },
+    {
+      q: 'The DiskANN abstract reports more than 5,000 QPS on SIFT1B. What is the safest way to use that number?',
+      options: [
+        'As proof of the same latency on your text embeddings',
+        'As the latency you promise users in a contract',
+        'As a sign that SSD graphs can reach a billion points',
+        'As a reason to drop all RAM-based indexes',
+      ],
+      answer: 2,
+      explain: 'It shows the approach works on one benchmark, with 128-dimension SIFT vectors, on a 16-core machine. Your data, dimensions and hardware differ, so you must measure your own latency.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [FAISS wiki, Faiss indexes](https://github.com/facebookresearch/faiss/wiki/Faiss-indexes): the bytes-per-vector table.
+- [FAISS wiki, Guidelines to choose an index](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index): nlist sizing, RAM note, HNSW memory.
+- [Subramanya et al., DiskANN (NeurIPS 2019)](https://suhasjs.github.io/files/diskann_neurips19.pdf): the SIFT1B abstract.
+- [hnswlib, ALGO_PARAMS](https://github.com/nmslib/hnswlib/blob/master/ALGO_PARAMS.md): M, ef_construction and ef in plain words.

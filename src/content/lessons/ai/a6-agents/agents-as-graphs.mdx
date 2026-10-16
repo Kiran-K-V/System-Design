@@ -1,0 +1,225 @@
+---
+summary: 'An agent is a graph. State is a typed object, nodes are functions that update it, edges say what runs next, and a conditional edge routes on state. A fixed workflow is a DAG. An agent is a cycle, and every cycle needs an exit edge guarded by a budget.'
+requires: ['ai/a6-agents/agent-loop', 'ai/a6-agents/workflows-vs-agents', '08-technologies/temporal']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai6GraphBuild from '../../../../components/anim/lessons/Ai6GraphBuild.tsx';
+import Ai6GraphRun from '../../../../components/anim/lessons/Ai6GraphRun.tsx';
+
+## The problem
+
+The loop in lesson [A6.1](/learn/ai/a6-agents/agent-loop/) is 25 lines and it works. Then the questions start. The run crashed at step 7. Can it resume from step 7, not step 1? The tool step failed. Can you retry only that step? A reviewer must approve a refund before the agent sends it. Where does the run wait? A test must check the routing logic. How do you test one decision without running the whole loop?
+
+In a plain `while` loop, the steps are not visible to anything but your code. State is local variables. The next step is an `if` buried in the body. You cannot pause the loop, save it, or test one part of it. This lesson shows a different shape for the same agent: a graph with explicit state, explicit steps, and explicit edges.
+
+## The idea: state, nodes, edges
+
+A **graph** here has four parts.
+
+- **State.** One typed object that holds everything the run knows: the message list, a plan, scratch data, counters. Nodes pass data to each other only through state.
+- **Nodes.** Each node is a function. It reads the state and returns an update. One node calls the model. Another runs tools. Another checks a result.
+- **Edges.** An edge says which node runs next. A fixed edge always goes to the same node.
+- **Conditional edges.** A routing function reads the state and returns the next node. "Tool calls in the last message? Go to `tools`. Otherwise go to `END`."
+
+Now the two shapes from lesson [A6.2](/learn/ai/a6-agents/workflows-vs-agents/). A workflow with fixed steps is a **DAG**, a directed graph with no cycle. It has one path and it always ends. An agent loop is a **cycle**: the `tools` node has an edge back to the `agent` node. The graph can run any number of times round the cycle, so it needs an exit.
+
+Step through the build.
+
+<Ai6GraphBuild client:visible />
+
+## Why a graph, not a loop
+
+Explicit steps give you things a bare loop cannot:
+
+- **Checkpoints.** The runtime can save the state after each node. If the process dies, a new process loads the last saved state and goes on. Lesson [A7.1](/learn/ai/a7-agents-prod/durable-graph-runtime/) covers the runtime and persistence. Here, remember only that it needs explicit state and explicit steps.
+- **Retries.** You retry one node, not the whole run.
+- **Tracing.** Each node run is one span, with its input state and its output update.
+- **Tests.** A node is a function. Give it a state, check the update. A routing function is a pure function of state, so a unit test covers every branch.
+- **Human steps.** A node can pause the run and wait for a decision.
+
+## The same graph in LangGraph
+
+LangGraph is one library that implements this model. Its `StateGraph` is built from a state schema. The docs say the schema can be a `TypedDict`, a dataclass, or a Pydantic model. Each state key has a **reducer**, a function that merges a node's update into the old value. With no reducer, an update replaces the value. With `operator.add` on a list, the update is appended. The `add_messages` reducer merges message lists by ID.
+
+```python title="graph.py"
+from operator import add
+from typing import Annotated, TypedDict
+from langgraph.graph import END, START, StateGraph
+
+MAX_STEPS = 6
+
+class State(TypedDict):
+    messages: Annotated[list, add]   # reducer: append
+    steps: int                       # default reducer: replace
+
+def agent(state: State):             # node: reads state, returns an update
+    reply = call_model(state["messages"])
+    return {"messages": [reply], "steps": state["steps"] + 1}
+
+def run_tools(state: State):
+    return {"messages": run_requested_tools(state["messages"][-1])}
+
+def route(state: State):             # conditional edge: reads state only
+    if state["steps"] >= MAX_STEPS:  # exit guard
+        return END
+    return "tools" if state["messages"][-1].get("tool_calls") else END
+
+g = StateGraph(State)
+g.add_node("agent", agent)
+g.add_node("tools", run_tools)
+g.add_edge(START, "agent")
+g.add_conditional_edges("agent", route, ["tools", END])
+g.add_edge("tools", "agent")         # the cycle
+app = g.compile()
+app.invoke({"messages": [first_message], "steps": 0}, {"recursion_limit": 25})
+```
+
+`call_model` and `run_requested_tools` stand for your model call and tool dispatch from lesson [A6.1](/learn/ai/a6-agents/agent-loop/). This code was run with stub model and tool functions to check the API names. `invoke` stopped when the stub model stopped asking for tools.
+
+Four details from the LangGraph docs matter for design:
+
+- A node returns a **partial** update. It does not need to return the whole state.
+- `START` and `END` mark the entry and the exit. You must call `compile()` before you can run the graph. Compile also does basic structure checks, such as finding orphaned nodes.
+- Execution runs in **super-steps**. A super-step is one round of node runs. Nodes that run in parallel share one super-step. The docs advise that for each node you choose one routing mechanism: fixed edges or conditional edges, not both. A node with two outgoing fixed edges runs both targets in the next super-step.
+- The `recursion_limit` caps super-steps. The docs say that starting in version 1.0.6 the default is 1000. When it is reached, LangGraph raises `GraphRecursionError`. A limit of 1000 is a weak budget for an agent that calls a model each time round. Treat it as a last resort, and set your own guard in the router.
+
+## Every cycle needs an exit
+
+The conditional edge in the animation has two ways out: the model sends no tool calls, or the step counter reaches its budget. The first is the model's choice. The second is yours. Without the second, a model that keeps asking for tools keeps the graph running until the framework's limit fires.
+
+Run a small graph by hand. You choose what each node produces. The router is real: it reads the state and picks the edge. Turn the guard off, make the model always ask for a tool, and see what stops the run.
+
+<Ai6GraphRun client:visible />
+
+Notice two things. With the guard on, the run ends with a clean status, and your code decides what to return. With the guard off, the run ends in an error from the framework, and any work in the state is held only if you saved it.
+
+## State, resume, and side effects
+
+When a graph runs with a checkpointer, LangGraph saves state at super-step boundaries, not in the middle of a node function. The docs say that if a run stops and resumes, for example after an interrupt or a retry, the affected node runs again from the start of its function. Code before the pause runs again too. So a node that sends an email must be safe to run twice. Lesson [A3.6](/learn/ai/a3-llm-apis/limits-retries-idempotency/) gave you idempotency keys for this. The graph does not remove the need for them.
+
+## The backend view: a state machine
+
+You have built this before. A graph is a **state machine**. The state is the row in your database. Each node is a transition handler. A conditional edge is the guard on a transition. The cycle is a transition from a state back to itself or to an earlier state. The only new part is that the model decides which guard condition is true.
+
+<CrossTrackLink id="08-technologies/temporal">
+Temporal runs a multi-step process as ordinary code. It records each step in an event history, and a new worker replays that history to continue after a crash. Workflow code must be deterministic, and activities hold the side effects, such as API calls. An agent graph has the same split: the routing is orchestration, and the model and tool calls are the steps that touch the outside world. LangGraph and Temporal both let a run continue after a crash, by different means.
+</CrossTrackLink>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Plain loop | Least code, easy to read | No checkpoints, hard to test in parts | A short run you can simply restart |
+| Explicit graph | Checkpoints, retries, tracing, per-node tests | More structure, a framework to learn | Runs that are long, need review, or must resume |
+| Rely on the framework recursion limit | Nothing to write | A weak, late stop with a generic error | Never, as the only guard |
+| Guard in the router | Clean stop and your own return value | A counter in state | Every cycle |
+| Fixed edges (DAG) | Predictable path, simple tests | No flexibility | Steps are known (lesson [A6.2](/learn/ai/a6-agents/workflows-vs-agents/)) |
+
+## Interview lens
+
+<Callout type="tip">
+Say it in backend terms: "The agent is a state machine. State is a typed object, nodes are functions from state to update, edges are transitions, and a conditional edge routes on state. A fixed workflow is a DAG. The agent is a cycle, so I add an exit edge guarded by a step budget in the router, not only the framework limit. Explicit state gives me checkpoints, retries, and a test per node."
+</Callout>
+
+<Callout type="mistake">
+Do not draw an agent graph with a cycle and no exit that you control. Also do not put side effects in a node and assume it runs once. A resumed node runs again from its first line.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In an agent graph, what does a conditional edge do?',
+      options: [
+        'It runs two nodes at once, so the graph can branch',
+        'It retries the previous node when that node has failed',
+        'It reads the state and picks the next node',
+        'It saves the state to storage after each node run',
+      ],
+      answer: 2,
+      explain: 'A conditional edge is a routing function of state that returns the next node, for example "tools" or END. Parallel runs come from several fixed edges. Retries and saving state belong to the runtime, not to an edge.',
+    },
+    {
+      q: 'What makes an agent graph different from a fixed workflow graph?',
+      options: [
+        'It has a cycle, so it can repeat nodes until an exit',
+        'It has more nodes, so it needs a larger state object',
+        'It uses a model, and a workflow graph cannot hold one',
+        'It has no START node, because the model picks where to begin',
+      ],
+      answer: 0,
+      explain: 'A workflow with fixed steps is a DAG: no cycle, one path. An agent loops from the tools node back to the agent node. Workflow nodes can call models too, so a model is not the difference.',
+    },
+    {
+      q: 'A graph has a cycle and the router has no step budget. The model keeps asking for tools. What stops the run?',
+      options: [
+        'The model stops on its own after about ten tool rounds',
+        'Only the framework limit, 1000 by default',
+        'The checkpointer ends the run when the state grows too big',
+        'The compile step rejects any graph that has a cycle',
+      ],
+      answer: 1,
+      explain: 'LangGraph raises GraphRecursionError when the recursion limit is reached. The docs give a default of 1000 super-steps since version 1.0.6. Compile does not reject cycles, and the model has no built-in round limit.',
+    },
+    {
+      q: 'A node sends a confirmation email, then pauses for human approval. The run resumes after the approval. What happens to the email?',
+      options: [
+        'It is not sent again, because the checkpointer stores each side effect',
+        'The node resumes at the line after the pause, so nothing repeats',
+        'The framework deletes the first email once the run resumes',
+        'The node restarts from its first line, so the email may send twice',
+      ],
+      answer: 3,
+      explain: 'LangGraph saves state at super-step boundaries, so a resumed node runs again from the start of its function. Side effects before the pause run again. Make them idempotent, for example with an idempotency key.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai6-retry-until-valid"
+  title="Retry until valid"
+  scenario="A graph has two nodes. generate writes a JSON reply. validate checks it. validate has one edge to END when the JSON is valid, and one edge back to generate when it is not. For one input the model never produces valid JSON. (Illustrative numbers.)"
+  facts={[
+    'validate -> END if valid',
+    'validate -> generate if invalid',
+    'run time: 14 minutes, 1,000 node runs, then GraphRecursionError',
+    'state keys: messages, draft',
+  ]}
+  steps={[
+    {
+      prompt: 'What is missing from the graph?',
+      options: [
+        'A bigger model for the generate node',
+        'A third node that formats the JSON for the user',
+        'A reducer for the draft key in the state',
+        'An exit edge guarded by an attempt counter',
+      ],
+      answer: 3,
+      explain: 'The only edges out of the cycle depend on the model succeeding. Nothing your code controls can end it. A reducer or a formatting node does not give the cycle an exit, and a bigger model only lowers the chance of the loop.',
+    },
+    {
+      prompt: 'Which fix is best?',
+      options: [
+        'Add attempts to state, and route to END or a review node at 3',
+        'Raise the recursion limit so the run has more room to finish',
+        'Lower the temperature to 0 so the model stops failing',
+        'Catch GraphRecursionError and retry the whole graph run',
+      ],
+      answer: 0,
+      explain: 'A counter in state plus a routing rule gives a clean exit and a place to hand off to a person. A higher limit only lets the loop burn more. Temperature 0 does not guarantee valid output. Retrying the whole run repeats the same loop.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [LangGraph: Graph API overview](https://docs.langchain.com/oss/python/langgraph/graph-api)
+- [LangGraph: Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts)
+- [Anthropic: Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)

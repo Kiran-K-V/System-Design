@@ -1,0 +1,185 @@
+---
+summary: 'A document changes and the index must follow. Follow one edit through CDC, chunking, embedding, upsert and delete, see why HNSW deletes are tombstones, and size staleness, bursts and a full re-embed.'
+requires: ['ai/a5-rag/ann-indexes', '06-async/cdc']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai5FreshWalk from '../../../../components/anim/lessons/Ai5FreshWalk.tsx';
+import Ai5FreshCalc from '../../../../components/anim/lessons/Ai5FreshCalc.tsx';
+
+## The problem
+
+A support bot answers from your policy pages. On Monday at 09:00 legal changes the refund window from 30 days to 14. At 09:05 a customer asks about refunds. The bot says 30 days. The page is correct. The index is not.
+
+A search index is a copy of your data. Every copy can go stale. In RAG the copy has two extra problems. The text was cut into chunks, so one edit touches several index entries. The entries are vectors, and making a vector costs a model call. So "keep the index fresh" means a small pipeline, a delete path, and a number you promise to meet.
+
+## Naive solution: rebuild the index every night
+
+A nightly job reads all documents, chunks them, embeds them, and writes a new index. It is simple and it works. It fails in three ways.
+
+1. Staleness is up to 24 hours. A refund rule that changed at 09:00 is wrong until the next run.
+2. The cost scales with the corpus, not with the change. If 0.1% of pages change per day, you pay for 100% of the embeddings.
+3. Deletes are easy to miss. A job that only adds new chunks never removes the old ones.
+
+The fix is to move only the change. Step through one edit.
+
+<Ai5FreshWalk client:visible />
+
+## The mechanism: an incremental pipeline
+
+The pipeline has five stages. Each one can fail on its own.
+
+1. **Change event.** Do not poll the source table. Read its commit log and publish an event per change. The backend track covers this.
+
+<CrossTrackLink id="06-async/cdc">Change data capture reads the database log and publishes each committed change as an event. The outbox pattern writes the event in the same transaction as the data, so a crash cannot lose one. Events can arrive twice or out of order, so consumers must be idempotent. Here the event says "document 881 changed to version 12".</CrossTrackLink>
+
+2. **Re-chunk and diff.** Cut the new version into chunks. Hash each chunk. Compare with the stored hashes. Only changed chunks continue. Cursor's indexer works this way: it hashes every file into a Merkle tree, where each folder hash comes from its children, and it "walks only the branches where hashes differ". It also "caches embeddings by chunk content", so an unchanged chunk is never embedded again ([Cursor](https://cursor.com/blog/secure-codebase-indexing)).
+3. **Embed.** Send the changed chunks to the embedding model, in batches.
+4. **Upsert.** Write each new vector under a stable chunk id. Upsert means insert, or replace if the id exists. Retries then do no harm.
+5. **Delete.** Remove chunks that no longer exist. If version 12 has 7 chunks and version 11 had 8, chunk 8 must go. This is the stage that gets forgotten.
+
+Store the document id and version as fields on every chunk. Then "delete all chunks of document 881 older than version 12" is one filter, and you do not depend on remembering chunk ids.
+
+### What a delete does inside the index
+
+A graph index such as HNSW (lesson [A5.2](/learn/ai/a5-rag/ann-indexes/)) links each vector to its neighbours. Removing a node means repairing every link that pointed to it, while queries run. That is slow and hard to do safely. So stores mark the point as deleted and skip it in results. The Qdrant docs say deleted points are "marked as deleted to avoid slow disk operations during queries" and keep using memory until a vacuum optimizer removes them ([Qdrant optimizer](https://qdrant.tech/documentation/ops-optimization/optimizer/)). The hnswlib library has the same shape: `mark_deleted` "marks the element as deleted, so it will be omitted from search results", and an option lets new items take the place of deleted ones ([hnswlib](https://github.com/nmslib/hnswlib)). Updating a vector under an existing label works, but the README says it is slower than inserting a new one.
+
+What this means for you:
+
+- A deleted chunk disappears from results at once. Disk and memory come back later.
+- Heavy churn builds up tombstones. Memory grows and search does extra work until compaction runs.
+- Vacuum starts by a rule. In its sample config Qdrant shows `deleted_threshold: 0.2` and `vacuum_min_vector_number: 1000`. The page does not call these defaults, so treat them as example values and check your version.
+- Some stores put new writes in a log first. turbopuffer commits one log entry per second per namespace, and data not yet indexed is still searched exhaustively ([turbopuffer](https://turbopuffer.com/docs/architecture)). So a write can wait up to about a second before it is visible.
+
+### Re-embedding when the model changes
+
+Vectors from two models live in different spaces. You cannot compare them. A model change means a full re-embed, as in lesson [A5.1](/learn/ai/a5-rag/embedding-models/). Do it with a **versioned index**: build `docs_v2` beside `docs_v1`, keep writing every change to both, check quality on your golden set, then switch the alias that queries use from v1 to v2 (a blue/green swap). Keep v1 for a short time so you can switch back. The rebuild competes with live updates for embedding capacity, so give it its own quota.
+
+## Numbers: a staleness SLO
+
+A **freshness SLO** is a promise such as "99% of edits are searchable within 60 seconds." Measure it end to end. Put a timestamp on each change event at the source. When the chunk becomes searchable, record the difference. Report the 99th percentile, not the mean. A mean hides the burst that makes users complain.
+
+The model below is simple. A quiet change waits for the CDC delay, its own embedding time, and the commit delay. A burst waits for the queue to drain at the spare capacity. All inputs are your assumptions. Try the defaults: 5 changed documents per second, 8 chunks each, 100 chunks per second of capacity. Arrivals are 5 x 8 = 40 chunks per second, 40% of capacity. A burst of 10,000 documents adds 80,000 chunks, which drain at 100 - 40 = 60 per second: 80,000 / 60 = 1,333 s, about 22 minutes. A full re-embed of 50M chunks at 100 per second is 500,000 s, about 5.8 days.
+
+<Ai5FreshCalc client:visible />
+
+## Trade-offs
+
+| Choice | Gain | Pay | Choose when |
+|---|---|---|---|
+| Nightly rebuild | Simple, no delete bugs | Hours of staleness, full cost | Content changes slowly |
+| CDC pipeline with upsert | Seconds of staleness, pay per change | Queue, ordering, delete path | Content changes during the day |
+| Write-through (embed in the request) | Fresh at once | Slow writes, failures reach the user | Small corpus, low write rate |
+| Versioned index and swap | Safe model change, easy rollback | Double storage during the swap | Any model or chunking change |
+
+<Callout type="tip">
+In an interview, name the freshness SLO first. Then draw CDC, queue, embed, upsert, and say that delete is its own stage. Say that you tag chunks with document id and version, so deletes and re-embeds are filters.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we update the vector when the document changes" and stop. Say what happens to the old chunks. Do not forget that deletes are tombstones, so memory does not drop at once. Do not rebuild the full index in place when the embedding model changes.
+</Callout>
+
+<Callout type="deep" title="A stale index can also be a worse index">
+Some index types learn from the data. An IVF index picks cluster centres from the vectors it saw at build time. After heavy changes the new vectors may sit far from those centres, so recall can drop even though every document is present. This is a reasoned effect, not a measured one here. If you use such an index, schedule a rebuild and watch recall on your golden set.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="a5-8-deleted-doc"
+  title="The deleted page still answers"
+  scenario="Legal deleted the page 'Old refund policy' (document 881) at 09:00. At 11:00 the bot still quotes it. You check each stage."
+  facts={[
+    'source DB:   row 881 deleted 09:00:00',
+    'CDC topic:   delete event for 881 at 09:00:02',
+    'worker log:  lookup chunk ids for doc 881 -> 0 ids found',
+    'index:       points doc881#0 .. doc881#7 present',
+    'index:       chunk payload has no document_id field',
+  ]}
+  steps={[
+    {
+      prompt: 'Which stage failed?',
+      options: [
+        'The delete event never left the source database, so CDC missed it',
+        'The worker found no chunk ids, so nothing was deleted',
+        'The embedding model still ranks the old text as the best match',
+        'The vector store has not run its vacuum yet, so points remain',
+      ],
+      answer: 1,
+      explain: 'The event arrived at 09:00:02, so CDC worked. The worker found 0 ids and did nothing. Vacuum only frees memory for points already marked deleted, and a marked point is not returned anyway. These points were never marked.',
+    },
+    {
+      prompt: 'What is the fix that also prevents the next case?',
+      options: [
+        'Run the nightly rebuild more often to clear the old points',
+        'Lower the vacuum threshold so tombstones go away sooner',
+        'Cache the delete event so the worker can retry it later',
+        'Store document id on each chunk and delete by that field',
+      ],
+      answer: 3,
+      explain: 'With a document id on every chunk, one filter delete removes all chunks, with no id lookup to break. A rebuild hides the bug. A lower vacuum threshold does nothing for points that were never deleted. A retry would fail the same way.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A page is edited and 2 of its 8 chunks change. With content-hash diffing and an embedding cache, how many embedding calls does the update need?',
+      options: [
+        '8, one per chunk of the page',
+        '2, one per changed chunk',
+        '1, one per edited page',
+        '0, vectors update on their own',
+      ],
+      answer: 1,
+      explain: 'Hashes show 6 chunks are the same, so their cached vectors are reused. Only the 2 changed chunks are embedded. Embedding all 8 is the naive path.',
+    },
+    {
+      q: 'Why does a vector store mark a deleted point instead of removing it at once?',
+      options: [
+        'Deleted vectors must stay for legal audit reasons',
+        'A removed point would need to be embedded again',
+        'The mark makes the deleted point rank higher in results',
+        'Removing a node from the graph during queries is slow',
+      ],
+      answer: 3,
+      explain: 'Graph links point to every node, so a real removal means repairing links while queries run. The store marks the point, skips it in results, and a vacuum job frees the space later. Nothing is re-embedded.',
+    },
+    {
+      q: 'Steady arrivals are 40 chunks per second, capacity is 100, and a burst adds 60,000 chunks. How long does the burst take to drain?',
+      options: [
+        '1,000 s, about 17 min',
+        '600 s, about 10 min',
+        '1,500 s, about 25 min',
+        'It never drains',
+      ],
+      answer: 0,
+      explain: 'The spare capacity is 100 - 40 = 60 chunks per second. 60,000 / 60 = 1,000 s. Using the full 100 gives 600 s, which forgets that normal traffic keeps arriving.',
+    },
+    {
+      q: 'You change the embedding model. What do you do with the existing index?',
+      options: [
+        'Nothing, since old and new vectors share one space',
+        'Re-embed only the chunks that changed lately',
+        'Re-embed all chunks into a new index, then swap',
+        'Delete the old vectors and keep the chunk text',
+      ],
+      answer: 2,
+      explain: 'Vectors from different models are not comparable, so every chunk needs a new vector. Build it beside the old index and switch an alias. Re-embedding only recent chunks leaves a mixed index that returns wrong neighbours.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Cursor: Securely indexing large codebases](https://cursor.com/blog/secure-codebase-indexing): Merkle tree sync and embeddings cached by chunk content.
+- [Qdrant: Optimizer](https://qdrant.tech/documentation/ops-optimization/optimizer/): deleted points and the vacuum optimizer.
+- [turbopuffer: Architecture](https://turbopuffer.com/docs/architecture): write-ahead log, one commit per second, consistency.
+- [hnswlib README](https://github.com/nmslib/hnswlib): mark_deleted, replace_deleted, and updating a label.

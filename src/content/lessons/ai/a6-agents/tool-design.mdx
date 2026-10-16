@@ -1,0 +1,204 @@
+---
+summary: 'Tools are the interface between an agent and your systems. A good tool set is small, has clear names, returns short and useful results, fails with advice, and is tested by running an agent on real tasks. Every tool definition also costs tokens on every call.'
+requires: ['ai/a6-agents/agent-loop', 'ai/a3-llm-apis/tool-calling-protocol']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai6ToolWalk from '../../../../components/anim/lessons/Ai6ToolWalk.tsx';
+import Ai6ToolCost from '../../../../components/anim/lessons/Ai6ToolCost.tsx';
+
+## The problem
+
+You have an API with 80 endpoints. A teammate wraps each one as a tool, because it is quick. The agent now has 80 tools. It picks the wrong one, calls the same one again and again, and the bill grows. Nothing is broken in the code. The tool set is hard to use.
+
+Lesson [A3.4](/learn/ai/a3-llm-apis/tool-calling-protocol/) showed the protocol: the model writes a call, your code runs it, and the result goes back. This lesson is about the design of what the model sees. Treat the tool set as an interface for a new kind of user. That user reads names and descriptions, cannot ask you a question, and pays for every token it reads. Anthropic calls this the agent-computer interface and says to invest as much in it as you would in a human interface (building effective agents, linked below).
+
+## Naive design: one tool per endpoint
+
+The naive design maps your API one to one. It has `search`, `find`, `lookup`, `get_order`, `get_data`, and `query`. A developer knows how they differ. The model sees only six short names and six short descriptions. It must guess.
+
+Three things go wrong. The names overlap, so the model picks the wrong tool. The results are raw: every field, every row. And the errors say "invalid input", so the model repeats the call. Anthropic's tool-writing guide puts the first point this way: "More tools don't always lead to better outcomes", and "too many tools or overlapping tools can also distract agents from pursuing efficient strategies." Watch the same task run on a confusing set and a clear set. The runs are scripted and illustrative, but the pattern is the one the guide describes.
+
+<Ai6ToolWalk client:visible />
+
+## What a good tool looks like
+
+The guide gives a set of rules. Each one has a reason that a backend engineer will know.
+
+**Fewer, higher-level tools.** A tool can do several API calls inside. The guide says tools "can consolidate functionality, handling potentially multiple discrete operations (or API calls) under the hood." Instead of `list_users`, `list_events`, and `create_event`, build one `schedule_event` that finds a time and books it. This is the same idea as a good API gateway endpoint: shape the call for the caller's task, not for your database tables. Do not go too far. A tool that does five unrelated things is hard to describe, and that is its own failure.
+
+**Clear names and descriptions.** Describe the tool as you would to a new hire, says the guide. Name each parameter without doubt: `user_id`, not `user`. Say what the tool is for, when to use it, and when not to. The guide gives one example of a description bug. Claude kept adding "2025" to a web search query for no reason, and a better tool description fixed it.
+
+**Namespacing.** When many tools come from many services, a shared prefix helps the model choose: `asana_search` and `jira_search`. The guide found that prefix or suffix naming "has non-trivial effects" on its tool-use evaluations. It adds that "effects vary by LLM", so you should pick a scheme using your own evaluations. Do not copy a scheme from a blog and assume it works on your model.
+
+**Small, useful results.** Return "only high signal information", says the guide. Resolve opaque IDs into readable names where the model needs them. Use pagination, range selection, filtering, or truncation, with sensible default values. Their example: a detailed response of 206 tokens against a concise one of 72 tokens for the same content. The concise form is about one third of the size. Claude Code limits tool responses to 25,000 tokens by default. The cost link is in lesson [A3.4](/learn/ai/a3-llm-apis/tool-calling-protocol/): every result is resent on each later call.
+
+**Errors that say what to do.** Give the model an error with a next step, not "an opaque error code or traceback", in the guide's words. "Rate limit exceeded. Retry after 60 seconds" teaches the model something. "Failed" does not. Lesson [A3.4](/learn/ai/a3-llm-apis/tool-calling-protocol/) covers how to return it with `is_error`.
+
+**Poka-yoke.** The building-effective-agents appendix says: "Change the arguments so that it is harder to make mistakes." Poka-yoke is a Japanese manufacturing term for mistake-proofing. Use enums, required fields, and full identifiers where a short one is easy to confuse. Strict schemas reject bad calls before your code runs.
+
+## The hidden cost: definitions are tokens
+
+Every tool definition is text. The API builds it into the prompt, so each model call carries every definition. The API is stateless (lesson [A3.1](/learn/ai/a3-llm-apis/api-anatomy/)), so the definitions are sent again on each call of the loop. A large tool set is a fixed tax on every request, before the user has said a word.
+
+How big is the tax? That depends on your tools. The docs do not give one number. They give hints: an `input_examples` entry adds about 20 to 50 tokens for a simple example (lesson [A3.4](/learn/ai/a3-llm-apis/tool-calling-protocol/)). So measure your own definitions with a token counter. Then use the calculator. All sizes in it are assumptions. Prices are from claude.com/pricing as of 2026-10-16.
+
+<Ai6ToolCost client:visible />
+
+Prompt caching (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) helps a lot here. Tool definitions sit at the start of the prompt and rarely change, so they cache well. But caching lowers the price only. It does not remove the extra choices the model must read. A crowded tool set still confuses selection, whatever it costs.
+
+<Ballpark
+  client:visible
+  title="The price of 40 tools"
+  scenario="An agent has 40 tools. Each definition is about 300 tokens (illustrative). A task takes 10 model calls, and every call sends all definitions. The model is Sonnet 5.5 at $2 per 1M input tokens. Count definition tokens only."
+  steps={[
+    {
+      prompt: 'How many definition tokens does one task send in all?',
+      unit: 'tokens',
+      answer: 120000,
+      within: 1.1,
+      explain: '40 tools x 300 tokens = 12,000 per call. 12,000 x 10 calls = 120,000 tokens.',
+    },
+    {
+      prompt: 'What do they cost per task, with no caching?',
+      unit: 'dollars',
+      answer: 0.24,
+      within: 1.1,
+      explain: '120,000 x $2 / 1,000,000 = $0.24 per task.',
+    },
+    {
+      prompt: 'With prompt caching (write 1.25x on call 1, read 0.05x on calls 2 to 10), what does it cost per task?',
+      unit: 'dollars',
+      answer: 0.0408,
+      within: 1.2,
+      explain: 'One call of definitions costs 12,000 x $2 / 1M = $0.024. Cost = $0.024 x (1.25 + 9 x 0.05) = $0.024 x 1.7 = $0.0408. Cheaper, but the model still reads 40 tools.',
+    },
+  ]}
+/>
+
+## Test tools with an agent
+
+How do you know a tool set is good? You measure it. The guide's method is plain. Write evaluation tasks "inspired by real-world uses", and pair each one with "a verifiable response or outcome". Run an agent on them. Track accuracy, total runtime, number of tool calls, token use, and tool errors. The guide gives no pass numbers, so set your own bar.
+
+Then read what the numbers say. The guide gives two hints. "Lots of redundant tool calls" suggests that pagination or token-limit settings need work. "Lots of tool errors for invalid parameters" suggests that tools need clearer descriptions or better examples. Read the transcripts too, because the agent's own words show where it was confused.
+
+This is the same loop as any other engineering work: a test set, a metric, a change, a re-run. Module A8 covers evals in depth.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Few high-level tools | Fewer wrong picks, fewer calls | Each tool is harder to write and describe | The agent does the same multi-step jobs often |
+| Many small tools | Simple code per tool | Choice errors, more calls, more definition tokens | Rare. Prefer when jobs are truly separate |
+| Concise results | Fewer tokens per round | Another call if the detail is needed | Default for most tools |
+| Detailed results | One call gives all the facts | More tokens, resent every round | The model needs the detail to decide |
+| Strict schemas and enums | Bad calls fail early | Less flexible inputs | Writes and money actions |
+| Prefix namespacing | Easier choice across services | Longer names | Many services share one agent |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I treat tools as an interface for the agent. I merge steps that always go together, name tools by system and job, return short results with a cursor, and make errors say what to try. Then I measure: eval tasks with verifiable outcomes, and track calls, errors, tokens, and time. Tool definitions are tokens on every call, so I count them." That covers design, measurement, and cost.
+</Callout>
+
+<Callout type="mistake">
+Do not wrap every endpoint as a tool and call it done. Do not say "more tools make the agent more capable" without measuring. And do not tune descriptions by feel: the guide says to test with an agent and verifiable tasks. Also do not claim a number for how many tools is too many. No source gives one. Measure on your model.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An agent keeps picking `find` when it needs `lookup`. Both tools search orders and have one-line descriptions. What is the best first fix?',
+      options: [
+        'Merge them, or say when to use each one',
+        'Add three more tools so that each case has its own',
+        'Raise the model temperature so it tries both tools',
+        'Cut the system prompt so the descriptions stand out',
+      ],
+      answer: 0,
+      explain: 'Overlapping tools with vague descriptions confuse selection. Merge them or say exactly when to use each. More tools add more overlap. Temperature adds randomness, not clarity.',
+    },
+    {
+      q: 'A tool returns a 206-token detailed answer or a 72-token concise one with the same facts. The task makes 8 more model calls that resend the result. How many tokens does the concise form save across those 8 calls?',
+      options: [
+        'About 134, the gap for one copy of the result',
+        'About 1,072, the gap multiplied by 8 resends',
+        'About 1,648, the full detailed size multiplied by 8',
+        'About 576, the concise size multiplied by 8 resends',
+      ],
+      answer: 1,
+      explain: '206 - 72 = 134 tokens per copy. Each of the 8 later calls resends the result, so the saving is 134 x 8 = 1,072 tokens. Counting one copy misses the resends.',
+    },
+    {
+      q: 'You run an eval and see many tool calls with invalid-parameter errors. What does Anthropic say this suggests?',
+      options: [
+        'The model is too small to call any tools correctly',
+        'The pagination limits are set too high for the tool',
+        'Tools need clearer descriptions or examples',
+        'The loop cap is set too low for the task length',
+      ],
+      answer: 2,
+      explain: 'The guide ties invalid-parameter errors to unclear descriptions or missing examples. Many redundant calls point at pagination or token-limit settings instead. A size problem is a guess with no evidence.',
+    },
+    {
+      q: 'You connect a server with 25 tools of 300 tokens each. A task makes 6 model calls, with no caching. How many definition tokens does one task send?',
+      options: [
+        'About 7,500, since the definitions are sent once',
+        'About 18,000, since only three calls use a tool',
+        'About 1,800, since only one tool is chosen per call',
+        'About 45,000, since each call resends all 25',
+      ],
+      answer: 3,
+      explain: '25 x 300 = 7,500 tokens per call. The API is stateless, so all 6 calls carry them: 7,500 x 6 = 45,000 tokens. Counting the definitions once, or by chosen tool, misses the resend.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai6-tool-search-14"
+  title="Fourteen searches per task"
+  scenario="Your support agent calls the search tool about 14 times for each task. Task success is fine, but cost and latency are high. Here is what you know from a run of your eval set."
+  facts={[
+    'search(query) returns 5 results, newest first',
+    'result has no total count and no next page cursor',
+    'tool errors for invalid parameters: 1 per 100 calls',
+    'description: "Search tickets."',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause of the many calls?',
+      options: [
+        'The model cannot tell if more results exist',
+        'The description is so unclear that most calls are rejected',
+        'The model is too small to stop a loop once it has started',
+        'The 5-result page is too large and wastes the context',
+      ],
+      answer: 0,
+      explain: 'Errors are rare (1 per 100), so the parameters are not the main problem. The result has no total or cursor, so the agent cannot know whether it has seen all matches and asks again. This is the pagination signal from the guide.',
+    },
+    {
+      prompt: 'Which change would you try first, and how do you check it?',
+      options: [
+        'Rewrite the description and hope that the call count drops',
+        'Switch to a stronger model and compare it by feel',
+        'Add total_count and next_cursor, then re-run the eval',
+        'Remove the tool and let the agent answer from memory instead',
+      ],
+      answer: 2,
+      explain: 'Give the missing signal, then measure calls per task, tokens, and success on the same eval set. A description rewrite does not fix a missing cursor. A model swap or a tool removal changes too many things at once to learn anything.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: Writing effective tools for agents](https://www.anthropic.com/engineering/writing-tools-for-agents)
+- [Anthropic: Building effective agents (appendix on tool prompt engineering)](https://www.anthropic.com/engineering/building-effective-agents)
+- [Anthropic: Define tools](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools)

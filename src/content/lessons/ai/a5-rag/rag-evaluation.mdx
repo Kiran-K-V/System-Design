@@ -1,0 +1,185 @@
+---
+summary: 'Split a RAG failure into retrieval and generation. Compute recall, precision, MRR and nDCG by hand, learn the RAGAS generation metrics, and build a golden set that tells you which half to fix.'
+requires: ['ai/a5-rag/chunking-contextual', 'ai/a5-rag/reranking-rewriting', '08-technologies/elasticsearch']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai5EvalWalk from '../../../../components/anim/lessons/Ai5EvalWalk.tsx';
+import Ai5EvalCalc from '../../../../components/anim/lessons/Ai5EvalCalc.tsx';
+
+## The problem
+
+Users say "the bot gives wrong answers." That sentence hides two different faults. Either the right text never reached the model, or it did and the model ignored or distorted it. The fixes are different. Retrieval faults call for chunking, hybrid search, reranking. Generation faults call for prompts, context order, a different model. If you guess, you spend a week on the wrong half.
+
+A RAG system is two components in a row. Measure each on its own, then measure the whole. This lesson gives the metrics, a golden set to compute them on, and a rule for what to fix first. The full eval method, including how to trust a judge, is in lesson A8.2.
+
+## Naive solution: read some answers and judge by feel
+
+A developer asks 10 questions, reads the replies, and says "looks good". It fails because 10 samples are noisy, you remember the good ones, and a change that helps one question may hurt twenty. You cannot tell whether last week's chunking change helped. You also cannot tell which half broke.
+
+## The mechanism: a golden set and two sets of metrics
+
+### Build the golden set first
+
+A **golden set** is a list of test cases. Each case holds a question, the ids of the chunks (or documents) that contain the answer, and a short reference answer. Build it in this order:
+
+1. Sample real questions from logs or support tickets. Questions invented by the team sound like the documents. Real ones do not.
+2. For each, find the gold chunks by hand or by a first pass with a model, then check by hand.
+3. Write the reference answer in one or two sentences.
+4. Cover easy and hard cases: exact terms, paraphrases, questions with no answer in the corpus, questions that need two chunks.
+
+Start with 50 to 200 cases. Keep it versioned like code. Add every production failure to it. If the chunking changes, gold chunk ids change too, so store the source passage as well as the chunk id.
+
+### Retrieval metrics
+
+These need no LLM. They compare the ranked list to the gold labels. Take one query where the retriever returns 5 chunks and the 3 relevant chunks that exist are in the corpus. Ranks 1 and 3 are relevant, ranks 2, 4 and 5 are not.
+
+- **Recall@k**: of all relevant chunks, what share is in the top k? Here 2 found out of 3 exist: 2 / 3 = 0.667. Use it to ask "did the evidence reach the model?"
+- **Precision@k**: of the k returned, what share is relevant? 2 / 5 = 0.4. It measures noise in the prompt.
+- **MRR** (mean reciprocal rank): the reciprocal rank is 1 divided by the rank of the first relevant chunk. Here the first is at rank 1, so 1. Average that over all queries. If a second query has its first hit at rank 3, its value is 1/3, and MRR = (1 + 0.333) / 2 = 0.667. It rewards putting a good chunk first.
+- **nDCG@k** (normalized discounted cumulative gain): a hit at rank i earns 1 / log2(i + 1), so lower ranks count less. DCG = 1 / log2(2) + 1 / log2(4) = 1 + 0.5 = 1.5. The best possible list puts all 3 relevant chunks first: 1 + 0.631 + 0.5 = 2.131. nDCG = 1.5 / 2.131 = 0.704. It rewards the whole order, and it needs graded labels if some chunks are better than others.
+
+Recall@k is the one to watch for RAG, since the model needs the evidence somewhere in the context. Anthropic reports its contextual retrieval results as the failure rate "1 minus recall@20" ([Anthropic](https://www.anthropic.com/news/contextual-retrieval)). Try the list below. Click ranks to flip them.
+
+<Ai5EvalCalc client:visible />
+
+### Generation metrics
+
+These need an LLM as a judge, because the output is free text. RAGAS is an open-source library that defines several. The definitions below come from its docs, fetched 2026-10-16.
+
+- **Faithfulness** "measures how factually consistent a response is with the retrieved context." The judge lists the claims in the response, checks each against the context, and the score is "Number of claims in the response supported by the retrieved context" divided by "Total number of claims in the response" ([RAGAS](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/faithfulness/)). A 5-claim answer with 4 supported claims scores 0.8. This is the groundedness check.
+- **Response relevancy** (also called answer relevancy) "measures how relevant a response is to the user input" and penalizes answers that are incomplete or include unnecessary details. RAGAS generates artificial questions from the answer (3 by default) and averages the cosine similarity to the real question ([RAGAS](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/answer_relevance/)).
+- **Context precision** "evaluates the retriever's ability to rank relevant chunks higher than irrelevant ones". It is the mean of precision@k over the chunks, where precision@k is the number of relevant chunks at rank k over the chunks at rank k ([RAGAS](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/)).
+- **Context recall** "measures how many of the relevant documents (or pieces of information) were successfully retrieved": reference claims supported by the retrieved context over total reference claims ([RAGAS](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_recall/)).
+- **Noise sensitivity** "measures how often a system makes errors by providing incorrect responses" when given relevant or irrelevant documents. Lower is better ([RAGAS](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/noise_sensitivity/)).
+
+Note that RAGAS context recall counts claims in the reference answer, so it needs no chunk ids. The classic recall@k needs labeled chunks but no LLM. Pick by what labels you can afford.
+
+The judge is a model, so it costs money and adds variance. The RAGAS docs say its LLM-based metrics may use one or more LLM calls. Two runs can give different numbers. Spot-check the judge against human labels before you trust it. Lesson A8.2 covers this in detail.
+
+### Component and end-to-end
+
+**Component evals** run one stage alone: the retriever on the golden set, the generator on fixed, correct context. They are cheap, fast and tell you where the fault is. **End-to-end evals** run the whole chain and score the final answer against the reference. They tell you what the user sees. Use component evals in development and each commit, end-to-end evals before release and on a sample of production traffic.
+
+Step through the pipeline and two failing cases.
+
+<Ai5EvalWalk client:visible />
+
+The decision rule: **fix retrieval first.** If the gold chunk is not in the context, no prompt can recover it. If recall@k is high and faithfulness is low, the model is the problem. If both are high and users still complain, check that the golden set looks like real questions.
+
+## Numbers and trade-offs
+
+| Metric | Needs | Cost | Tells you |
+|---|---|---|---|
+| Recall@k | Gold chunk labels | No LLM | Did the evidence arrive |
+| Precision@k, MRR, nDCG | Gold chunk labels | No LLM | Noise and ordering |
+| Faithfulness | Answer and context | LLM calls | Did the model stay grounded |
+| Response relevancy | Question and answer | LLM and embeddings | Did it answer the question |
+| Context recall | Reference answer | LLM calls | Did context cover the reference |
+
+<Callout type="tip">
+In an interview, say "I split retrieval from generation." Name recall@k for the first and faithfulness for the second. Say you build the golden set from real queries, and that you fix retrieval first.
+</Callout>
+
+<Callout type="mistake">
+Do not report one blended "accuracy" for a RAG system. Do not tune prompts while recall@k is low. Do not trust a judge score you never checked against human labels. Do not build the golden set only from questions the team wrote.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="a5-10-recall-95"
+  title="Retrieval is fine, users disagree"
+  scenario="Users say answers are wrong. Your weekly eval on the 200-case golden set looks healthy for retrieval."
+  facts={[
+    'recall@5:        0.95',
+    'faithfulness:    0.64',
+    'response relev.: 0.88',
+    'golden set:      200 questions written by the team',
+  ]}
+  steps={[
+    {
+      prompt: 'Where do you look first?',
+      options: [
+        'The chunk size, since recall@5 is not 1.0',
+        'The embedding model, which ranks poorly',
+        'The generation step, where answers drift',
+        'The vector index, which may need more recall',
+      ],
+      answer: 2,
+      explain: 'Recall of 0.95 means the gold chunk is in the top 5 for 95% of questions. Faithfulness of 0.64 means about a third of the claims are not backed by that context. The fault is in how the model uses the context: prompt, context order, or model.',
+    },
+    {
+      context: 'You raise faithfulness to 0.91. Users still complain, mostly about questions that are not in the golden set.',
+      prompt: 'What do you do next?',
+      options: [
+        'Add more reranking to push recall@5 to 1.0',
+        'Sample real user queries into the golden set',
+        'Switch to a larger embedding model for all queries',
+        'Lower k so the model sees less context',
+      ],
+      answer: 1,
+      explain: 'The set was written by the team, so it may not match real questions. Adding sampled production queries shows the real failures. More reranking, a new model, or a smaller k tune the wrong thing.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'The top 5 has relevant chunks at ranks 2 and 4. Three relevant chunks exist in total. What is recall@5?',
+      options: [
+        '0.40',
+        '0.67',
+        '0.50',
+        '1.00',
+      ],
+      answer: 1,
+      explain: 'Two of the three relevant chunks were found: 2 / 3 = 0.67. The value 0.40 is precision@5 (2 / 5). The value 0.50 is the reciprocal rank of the first hit.',
+    },
+    {
+      q: 'Two queries have their first relevant chunk at rank 1 and rank 4. What is the MRR?',
+      options: [
+        '0.400',
+        '0.250',
+        '1.250',
+        '0.625',
+      ],
+      answer: 3,
+      explain: 'Reciprocal ranks are 1 / 1 = 1 and 1 / 4 = 0.25. The mean is (1 + 0.25) / 2 = 0.625. Adding them gives 1.25, which is not a mean and exceeds 1.',
+    },
+    {
+      q: 'An answer has 5 claims. The judge finds that 4 are supported by the retrieved context. What is the faithfulness score?',
+      options: [
+        '0.80',
+        '0.20',
+        '1.25',
+        '0.50',
+      ],
+      answer: 0,
+      explain: 'Faithfulness is supported claims over total claims: 4 / 5 = 0.80. The value 0.20 is the unsupported share. The score cannot exceed 1.',
+    },
+    {
+      q: 'Which metric can you compute without any LLM call?',
+      options: [
+        'Faithfulness against the context',
+        'Response relevancy to the question',
+        'Recall@k on gold chunk ids',
+        'Noise sensitivity of the answers',
+      ],
+      answer: 2,
+      explain: 'Recall@k compares the returned ids with gold ids, so it is a count. The RAGAS metrics for faithfulness, response relevancy and noise sensitivity use an LLM judge.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RAGAS: Faithfulness](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/faithfulness/): claims supported over total claims.
+- [RAGAS: Context Precision](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/): rank-aware retrieval precision.
+- [RAGAS: Context Recall](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_recall/): reference claims covered by the context.
+- [Anthropic: Contextual Retrieval](https://www.anthropic.com/news/contextual-retrieval): failure rate as 1 minus recall@20.

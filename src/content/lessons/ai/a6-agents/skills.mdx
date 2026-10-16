@@ -1,0 +1,209 @@
+---
+summary: 'A skill is a folder with a SKILL.md file. Only its name and description sit in context. The body, the reference files, and the scripts load only when a task needs them. This keeps the prompt small while the agent holds many procedures.'
+requires: ['ai/a6-agents/tool-design', 'ai/a6-agents/mcp']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai6SkillWalk from '../../../../components/anim/lessons/Ai6SkillWalk.tsx';
+import Ai6SkillSim from '../../../../components/anim/lessons/Ai6SkillSim.tsx';
+
+## The problem
+
+Your team has an agent that must follow 30 procedures: how to fill a PDF form, how to write a release note, how to run the data-quality checks, and so on. Each procedure is 1,000 to 2,000 tokens of instructions. Where do they live?
+
+The first answer is the system prompt. Paste all 30 in. It works, and it fails in three ways. The prompt is now about 40,000 tokens (30 x 1,300 is our illustrative average). Every request pays for it, though most requests use one procedure or none. The window is crowded, so the instructions that matter compete with 29 that do not. And one team now owns one giant prompt that everyone edits.
+
+You want the agent to hold many procedures and read only the one it needs. A backend engineer knows this shape: an index in memory, the data on disk, a read on a hit.
+
+## What a skill is
+
+A skill is a folder. Per the Agent Skills specification ([agentskills.io](https://agentskills.io/specification), fetched 2026-10-16), it contains at minimum a `SKILL.md` file, and may contain `scripts/` (executable code), `references/` (documentation), and `assets/` (templates and data). Anthropic's own description is "At its simplest, a skill is a directory that contains a SKILL.md file".
+
+The `SKILL.md` file starts with YAML frontmatter. Two fields are required:
+
+- `name`: 1 to 64 characters, lowercase letters, digits, and hyphens only. It must not start or end with a hyphen, must not have two hyphens in a row, and must match the folder name.
+- `description`: 1 to 1,024 characters. It should say what the skill does and when to use it.
+
+An optional `compatibility` field takes up to 500 characters, and `allowed-tools` is marked experimental. The Markdown body after the frontmatter holds the instructions. Here is a small one:
+
+```markdown title="pdf-forms/SKILL.md"
+---
+name: pdf-forms
+description: Fills in PDF forms and extracts form fields. Use when the user mentions a PDF form, fields, or signing a PDF.
+---
+
+# PDF forms
+
+1. List the fields: run `scripts/list_fields.py input.pdf`.
+2. Fill them from the user's data: run `scripts/fill_form.py input.pdf data.json`.
+3. For checkbox and date rules, read `references/forms.md`.
+```
+
+The `description` is the whole routing signal. The spec's own poor example is `Helps with PDFs.` Its good example names the actions and the trigger words. The model decides whether to use a skill from this text alone, so write it like an API contract, not a slogan.
+
+## Progressive disclosure
+
+This is the core idea. Skills load in three levels. The spec says metadata is about 100 tokens per skill and is loaded at startup for all skills. The `SKILL.md` body is loaded when the skill is activated, and the spec recommends under 5,000 tokens, and under 500 lines. Files in `scripts/`, `references/`, and `assets/` load only when required. Anthropic puts it this way: "At startup, the agent pre-loads the name and description of every installed skill into its system prompt." The full `SKILL.md` is read only if Claude judges the skill relevant.
+
+Scripts are special. They run, and their code is not read. Anthropic: Claude "can run this script without loading either the script or the PDF into context". A 400-line script costs nothing in tokens. Only what it prints does. It is also deterministic, so the result is repeatable.
+
+<Ai6SkillWalk client:visible />
+
+## The arithmetic
+
+With 30 skills the startup cost is 30 x 100 = 3,000 tokens. Against a 40,000-token prompt, that is 7.5% of the size. A request that uses one 1,300-token skill adds that body: 4,300 tokens in all. A request that uses none adds nothing.
+
+Now prices. Claude Sonnet 5.5 input costs $2 per million tokens, and a cache read costs 0.05 times that (as of 2026-10-16, [claude.com/pricing](https://claude.com/pricing)). Without a cache, 1,000 requests with the 39,000-token prompt cost 39,000 x 1,000 x $2 / 1,000,000 = $78. With skills they cost 4,300 x 1,000 x $2 / 1,000,000 = $8.60. With the big prefix cached, the big prompt costs 39,000 x 0.05 = 1,950 token-equivalents per request, or $3.90 per 1,000. Skills with a cached 3,000-token prefix plus 1,300 uncached cost (150 + 1,300) x 1,000 x $2 / 1,000,000 = $2.90.
+
+So caching (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) closes most of the dollar gap. Skills still win on the other two problems: window space and attention. A 39,000-token prompt of mixed procedures is a context-rot risk (lesson [A4.3](/learn/ai/a4-context/context-budgeting/)), and it takes room from the work. Try the numbers.
+
+<Ai6SkillSim client:visible />
+
+## Skills, tools, MCP, system prompt
+
+These four are often mixed up. They answer different questions.
+
+| Mechanism | What it is | In context | Use it for |
+|---|---|---|---|
+| System prompt | Text always sent | All of it, every call | Rules that apply to every task |
+| Tool | A callable action with a schema (lesson [A3.4](/learn/ai/a3-llm-apis/tool-calling-protocol/)) | Its definition, always | One action: search, send, read |
+| MCP server | A protocol that serves tools and data from another system (lesson [A6.6](/learn/ai/a6-agents/mcp/)) | Tool definitions, unless loaded later | Connecting a system |
+| Skill | A folder of instructions and code | A short description, then the body on demand | A procedure: how to do a job well |
+
+A short way to say it: tools do actions, MCP connects systems, and skills teach a procedure. A skill can use tools and MCP, and Anthropic says it plans to explore how skills "can complement Model Context Protocol (MCP) servers by teaching agents more complex workflows". Its post does not compare skills with subagents. The SDK does show how they meet: an `AgentDefinition` has a `skills` list that preloads skill content into a subagent. The docs say a non-fork subagent does not receive preloaded skill content unless it is listed there, though unlisted skills stay invocable through the Skill tool.
+
+## Using skills in the SDK
+
+In the Agent SDK, skills are files on disk. The SDK has no API to register one in code. It finds them through the `user` and `project` setting sources, for example `.claude/skills/<name>/SKILL.md`. It reads the metadata at startup and loads the full content when Claude invokes the skill. The `skills` option narrows what Claude may invoke: a list of names, `"all"`, or `[]` for none. An unlisted skill returns `Skill <name> is not in this session's skills allowlist`.
+
+Read the next part carefully. The allowlist is not a security boundary. The docs say unlisted skills' files "remain on disk and stay reachable through Read and Bash". If a skill must not be reachable, do not install it in that environment.
+
+## A skill is code: review it
+
+A skill contains instructions and may contain scripts. That is a supply chain. Anthropic's advice: "We recommend installing skills only from trusted sources", and audit the bundled code and resources of anything less trusted, because a malicious skill could introduce vulnerabilities or direct the agent to exfiltrate data. Treat a skill like a dependency: pin it, read it, and review changes. Lesson A10.4 covers this in the security module.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Everything in the prompt | Always present, no routing step | Tokens on every call, crowded window | Few, short rules that always apply |
+| Skills | Small startup cost, shared know-how | A routing step that can miss, files to maintain | Many procedures, few used per task |
+| A tool for each procedure | Typed inputs, code runs the logic | Definitions always in context | A single action with a clear schema |
+| Script in a skill | Deterministic, code not in context | Needs an environment that runs code | Repeatable steps like parsing and fills |
+
+## Interview lens
+
+<Callout type="tip">
+Say it as lazy loading: "A skill is a folder with a SKILL.md. Only the name and description, about 100 tokens each, sit in the system prompt. The body loads when the task matches, and references and scripts load only if needed. Scripts run without their code entering context. I would move rarely used procedures out of the prompt into skills, keep the description specific so routing works, and review skills like dependencies."
+</Callout>
+
+<Callout type="mistake">
+Do not write a vague description: a skill the model never matches is dead weight. Do not call the allowlist a sandbox. And do not say skills save money in every case: with a prompt cache the dollar gap is small, and the main gain is window space and attention.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'At startup, what does the agent load into its system prompt for each installed skill?',
+      options: [
+        'The full SKILL.md file with every linked reference',
+        'Its name and description from the frontmatter',
+        'The code of every file in its scripts folder',
+        'Only the folder name, with no other text',
+      ],
+      answer: 1,
+      explain: 'Progressive disclosure loads metadata first: the name and description. The body loads when the skill is used, and other files only when needed. A folder name alone would give the model nothing to match a task against.',
+    },
+    {
+      q: 'An agent has 30 skills. The spec says metadata is about 100 tokens per skill. How many tokens does startup add, before any task?',
+      options: [
+        'About 300 tokens',
+        'About 1,000 tokens',
+        'About 30,000 tokens',
+        'About 3,000 tokens',
+      ],
+      answer: 3,
+      explain: '30 x 100 = 3,000 tokens. 30,000 would be the cost if each skill loaded 1,000 tokens of body at startup, which does not happen.',
+    },
+    {
+      q: 'A skill runs scripts/fill_form.py, a 400-line script. What enters the context?',
+      options: [
+        'Only what the script prints',
+        'The script text and its output',
+        'The script text if it is under 500 lines',
+        'Nothing, not even the output',
+      ],
+      answer: 0,
+      explain: 'Anthropic says Claude can run a script without loading the script into context. The output returns as a tool result, so it does enter the context. The 500-line figure is the spec\'s advice for SKILL.md length, not a script rule.',
+    },
+    {
+      q: 'In the SDK you set skills=["pdf"], and a skill named docx is installed. Which statement is true?',
+      options: [
+        'The docx files are deleted from the disk at start',
+        'The docx files can no longer be opened by any tool',
+        'The docx files stay readable through Read and Bash',
+        'The docx skill still runs whenever Claude asks for it',
+      ],
+      answer: 2,
+      explain: 'The allowlist hides unlisted skills from the model and the Skill tool rejects them. It does not remove or block the files, so it is not a security boundary.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai6-skill-fat-prompt"
+  title="The 40,000-token prompt"
+  scenario="Illustrative case. A support agent has a system prompt of about 40,000 tokens. It holds 30 procedures at about 1,300 tokens each. Most requests use one procedure or none. Quality on rare procedures is dropping, and the bill is high."
+  facts={[
+    'Every request sends all 30 procedures.',
+    'Prompt prefix is the same on every call.',
+    'The team wants the agent to keep all 30 procedures.',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the main design problem?',
+      options: [
+        'Rarely used procedures occupy the window on every request',
+        'The model cannot read a prompt larger than 10,000 tokens',
+        'The procedures are written in plain text instead of JSON',
+        'The prompt is stable, and stable prompts cannot be cached',
+      ],
+      answer: 0,
+      explain: 'Each request pays window space and attention for procedures it does not use. Models do read long prompts, plain text is fine, and a stable prefix is exactly what a cache needs.',
+    },
+    {
+      prompt: 'What is the best redesign?',
+      options: [
+        'Cut each procedure to one sentence and keep them in the prompt',
+        'Make each procedure a skill, and keep big references in files',
+        'Move every procedure into its own tool definition instead',
+        'Split the agent into 30 subagents, one for each procedure',
+      ],
+      answer: 1,
+      explain: 'Skills load the body on demand and keep large references in separate files. One-sentence procedures lose the detail. Tool definitions are always in context, and 30 subagents add cost and a handoff for every request.',
+    },
+    {
+      prompt: 'After the redesign, about how many tokens of skill metadata load at startup?',
+      options: [
+        'About 300 tokens',
+        'About 3,000 tokens',
+        'About 12,000 tokens',
+        'About 40,000 tokens',
+      ],
+      answer: 1,
+      explain: '30 skills x about 100 tokens = about 3,000 tokens (the spec\'s estimate). A used skill adds its body, about 1,300 tokens here. Bodies of unused skills never load.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Agent Skills specification](https://agentskills.io/specification)
+- [Anthropic: Equipping agents for the real world with Agent Skills](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
+- [Claude Agent SDK: skills](https://code.claude.com/docs/en/agent-sdk/skills)

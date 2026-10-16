@@ -1,0 +1,212 @@
+---
+summary: 'Five loop patterns let a model improve its own work: ReAct, critique loops, Reflexion, generate-verify-fix, and plan-execute-replan. They differ in where the feedback signal comes from. A loop that has only the model''s own opinion adds cost and little else, and a code check is the most reliable signal when you have one.'
+requires: ['ai/a6-agents/agent-loop', 'ai/a6-agents/workflows-vs-agents']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai6PatTraces from '../../../../components/anim/lessons/Ai6PatTraces.tsx';
+import Ai6PatSlider from '../../../../components/anim/lessons/Ai6PatSlider.tsx';
+
+## The problem
+
+A model's first answer is wrong some of the time. A natural fix is a loop: look at the answer, find what is wrong, try again. Lesson [A6.1](/learn/ai/a6-agents/agent-loop/) gave you the loop and its budgets. Lesson [A6.2](/learn/ai/a6-agents/workflows-vs-agents/) named one loop, evaluator-optimizer. This lesson compares the loops that people use, and asks one question of each: where does the feedback come from?
+
+That question decides whether the loop helps. A loop is a way to spend more calls to get a better answer. It only pays if the extra calls carry information the first call did not have.
+
+## Five loop patterns
+
+**ReAct.** The model writes a short thought, takes an action (a tool call), reads the observation, and thinks again. The name joins "reasoning" and "acting". The feedback is the tool result. It fits tasks that need facts or state from outside the model. One more round costs one model call plus one tool call, and it resends the history.
+
+**Critique loop.** A draft is critiqued, then revised, then critiqued again. In **Self-Refine**, one model plays all three roles: generator, feedback provider, and refiner. In Anthropic's **evaluator-optimizer**, one call generates and another evaluates, in a loop. It is the same shape with two calls. The feedback is the model's judgment. It fits tasks where criteria are clear, such as style or tone, and where a human's feedback would visibly improve the draft. One round costs two model calls.
+
+**Reflexion.** The agent attempts a task, gets a signal such as test results, and writes a short **reflection** in plain words: what went wrong and what to do next. The next attempt reads the reflection from memory. It fits tasks with a checkable outcome, such as code with tests. One round costs an attempt, an evaluation, and a reflection call.
+
+**Generate, verify, fix.** The model generates. A check that is code runs on the result: unit tests, a schema validator, a linter, a type checker. The exact errors go back to the model, which fixes the output. The feedback is the check's output. It fits any task where you can write the check. One round costs a generation plus a cheap check that is not a model call.
+
+**Plan, execute, replan.** A planner writes the steps. An executor runs them. When a step fails, a replanner revises the remaining plan. The LangChain team describes the design as one where the larger model "is only called for (re-)planning steps and to generate the final response", while smaller models can run the sub-tasks. The feedback is the result of each step. Lesson [A6.8](/learn/ai/a6-agents/planning/) covers planning in full.
+
+Step through one failing case for each.
+
+<Ai6PatTraces client:visible />
+
+## What the papers show
+
+### ReAct: not always better
+
+The ReAct paper (Yao et al., 2022) tested prompting methods on a 540-billion-parameter PaLM model. Table 1 of the paper reports these results:
+
+| Method | HotpotQA (exact match) | Fever (accuracy) |
+|---|---|---|
+| Standard | 28.7 | 57.1 |
+| CoT (chain of thought) | 29.4 | 56.3 |
+| CoT-SC (self-consistency) | 33.4 | 60.4 |
+| Act (actions only) | 25.7 | 58.9 |
+| ReAct | 27.4 | 60.9 |
+| CoT-SC, then ReAct | 34.2 | 64.6 |
+| ReAct, then CoT-SC | 35.1 | 62.0 |
+
+In the two combined rows, "ReAct, then CoT-SC" falls back to CoT-SC when ReAct gives no answer within a step limit, and "CoT-SC, then ReAct" falls back to ReAct when the CoT-SC samples do not agree on a majority answer. Now read the table carefully. On HotpotQA, ReAct alone (27.4) scores below CoT (29.4). On Fever, ReAct (60.9) beats CoT (56.3). So ReAct is not simply better. The authors say ReAct "slightly lags behind CoT on HotpotQA". The authors labelled 50 failed trajectories for each method. For ReAct, 47% were reasoning errors, including failing to recover from repetitive steps, and 23% were search results that were empty or not useful. CoT has no search step, but 56% of its failures were hallucinated facts, against 0% for ReAct. The combinations that mix tool use with internal reasoning scored best on both tasks. The lesson: tool feedback fixes made-up facts, and it brings new failure modes of its own. These are 2022 results on one model, so read the pattern, not the scores.
+
+### Reflexion: an outside signal does the work
+
+The Reflexion paper (Shinn et al., 2023) reports 91% pass@1 on HumanEval in Python, against 80.1% for the GPT-4 baseline it compares with. The result is not uniform. On MBPP in Python, Reflexion scored 77.1% against 80.1% for GPT-4. The authors trace this to false positives: their self-generated tests wrongly passed code 16.3% of the time on MBPP Python, against 1.4% on HumanEval Python. A wrong verifier lets wrong answers through.
+
+Their ablation is the useful part. On the 50 hardest HumanEval problems in Rust, with GPT-4:
+
+| Setup | Pass@1 |
+|---|---|
+| Base model | 0.60 |
+| Reflection, no test generation | 0.52 |
+| Test generation, no reflection | 0.60 |
+| Both (full Reflexion) | 0.68 |
+
+Reflection without tests did worse than no loop at all. The authors conclude the agent is "unable to determine if the current implementation is correct without unit tests". Tests without reflection did not help either. The two worked together: a signal, and a way to use it.
+
+### Self-Refine
+
+The Self-Refine abstract reports that, across 7 tasks, outputs from the loop were preferred over one-step generation, improving by about 20% absolute on average. The model is its own critic there. The abstract does not describe a stopping rule. Read it as evidence that a critique loop can help on some tasks, and test it on yours. Reflexion's ablation shows what can go wrong when the task has a right answer that the model cannot judge.
+
+## The signal comes first
+
+Put the five patterns on one axis: how far the feedback sits from the model's own opinion.
+
+- A **critique loop** with the same model as the judge has only its own view. It shares the generator's blind spots. If the model does not know a fact is wrong, it will not flag it.
+- **ReAct** and **plan-execute-replan** get tool and step results. These are facts about the world, though the model can still misread them.
+- **Reflexion** and **generate-verify-fix** get a check that runs on the output.
+
+When a verifier exists as code, it is the most reliable signal in this list, for one reason: it does not share the model's blind spots. A test fails the same way every time, for the same cause, and it can tell you the line. A model judge is a probabilistic component too (lesson [A0.3](/learn/ai/a0-orientation/probabilistic-components/)), so the same draft can get different verdicts. That is not a claim that a verifier is always right. A test suite with gaps passes wrong code, as Reflexion's false-positive rate shows.
+
+So verify in this order. First, rules and code: schemas, types, tests, linters. Second, checks that run something, such as rendering a page and reading it. Third, a model as judge, with the weakest trust, and calibrated against human labels (lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/)).
+
+Anthropic's agents guide gives the same idea in one line: during execution it is crucial for agents to gain "ground truth" from the environment at each step, such as tool results or code execution.
+
+Try the slider. It models a generate-check-retry loop. The numbers are made up for illustration, and the formulas are exact.
+
+<Ai6PatSlider client:visible />
+
+At 50% verifier accuracy the loop adds nothing: the returned answer is correct exactly as often as one try. That is the "reflection without tests" case. As accuracy rises, correct answers rise and the silent failures (wrong answers the verifier passed) fall. Even a perfect verifier leaves some runs that hit the cap. The difference is that you know they failed.
+
+## The cost of one more round
+
+Each round adds a call and resends the history. Take a 2,000-token start that grows by 1,000 tokens a round (illustrative). Input tokens over R rounds are R x 2,000 + 1,000 x R(R - 1) / 2. For R = 1 that is 2,000. For R = 4 it is 8,000 + 6,000 = 14,000, seven times as much for four times the rounds. Latency adds up too: every round is a generation, and a check that is a model call adds a second wait.
+
+So cap the rounds, and stop early when the signal stops moving. If two rounds in a row give the same check failure, a third round will probably not help. Return the failure to the user, or send it to a person.
+
+## Trade-offs
+
+| Pattern | Feedback from | You gain | You pay | Choose it when |
+|---|---|---|---|---|
+| ReAct | Tool observations | Facts and state from outside | Tool calls, longer history, new failure modes | The task needs outside data |
+| Critique loop | Model opinion | Polish on clear criteria | Two calls a round, shared blind spots | No checker exists, criteria are clear |
+| Reflexion | Tests plus a written note | Learning across attempts | Reflection calls, memory to manage | You can run a check on each attempt |
+| Generate, verify, fix | Code check output | A reliable signal, exact errors | Writing the check | A check can be written as code |
+| Plan, execute, replan | Step results | Fewer big-model calls, a visible plan | Replanning when steps fail | Many steps, some predictable |
+
+## Interview lens
+
+<Callout type="tip">
+Ask first where the feedback comes from: "A loop is only as good as its signal. If a check exists as code, I use generate-verify-fix: tests, schema, linter, with exact errors fed back and a round cap. If I only have the model's opinion, I do not expect much gain, and I measure it with an eval. Each round resends the history, so I cap rounds and stop when the failure repeats." This shows you know the pattern, the cost, and the limit.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the agent reflects and gets better" with no signal named. Reflexion's own ablation shows reflection without tests did no better than the base model on the Rust subset. Also do not trust a verifier you have not tested: a test suite with gaps passes wrong answers.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In the ReAct paper\'s Table 1, ReAct scores 27.4 and CoT scores 29.4 on HotpotQA. What follows?',
+      options: [
+        'ReAct is better than CoT on every task in the paper',
+        'ReAct alone trails CoT, and combined methods win',
+        'CoT is better because search always adds noise to the answer',
+        'The scores are equal because they are within one point',
+      ],
+      answer: 1,
+      explain: 'ReAct alone is lower on HotpotQA, though higher on Fever (60.9 vs 56.3). The two combined methods (34.2 and 35.1 on HotpotQA) beat both. A one point gap is not "equal", and the paper does not say search always adds noise.',
+    },
+    {
+      q: 'In the Reflexion ablation on Rust HumanEval, reflection ran with no test generation. What did pass@1 do, compared with the 0.60 base model?',
+      options: [
+        'It rose to 0.68, the same as full Reflexion',
+        'It stayed at 0.60, so reflection added nothing',
+        'It rose a little, to about 0.64',
+        'It fell to 0.52, below the base model',
+      ],
+      answer: 3,
+      explain: 'Reflection without tests scored 0.52. The agent could not tell whether its code was correct, so extra rounds could make harmful edits. Tests without reflection stayed at 0.60. Only the pair reached 0.68.',
+    },
+    {
+      q: 'A loop checks each draft with a verifier that is a coin flip: it accepts a correct draft half the time and rejects a wrong one half the time. One try is right 40% of the time. How often is the returned answer right?',
+      options: [
+        'About 40%, the same as a single try',
+        'About 70%, since the loop gets several tries',
+        'About 20%, since two bad verdicts are likely',
+        'About 90%, since retries make errors rare',
+      ],
+      answer: 0,
+      explain: 'With a coin-flip verifier, acceptance does not depend on whether the draft is right. Each draft is right 40% of the time whether or not it is accepted, so the loop returns a right answer 40% of the time. Extra rounds add cost and no accuracy.',
+    },
+    {
+      q: 'You add a tests-based loop with a 2,000-token start that grows by 1,000 tokens each round, all resent. How many input tokens does a 4-round run send in total?',
+      options: [
+        'About 8,000, which is 4 rounds of 2,000 each',
+        'About 6,000, which is just the growth over the rounds',
+        'About 14,000, 8,000 plus the resent growth',
+        'About 20,000, which is 4 rounds of 5,000 each',
+      ],
+      answer: 2,
+      explain: 'Round i sends 2,000 + (i - 1) x 1,000 tokens: 2,000 + 3,000 + 4,000 + 5,000 = 14,000. The figure 8,000 ignores the growth, 6,000 counts only the growth, and 20,000 assumes every round carries the largest history.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai6-reflection-flat-pass-rate"
+  title="The loop that improves nothing"
+  scenario="A team adds a reflection loop to a code-fixing agent. After each failed attempt, the model writes a note and tries again, up to 4 rounds. Reviewers say the final answers read better. The eval pass rate has not moved."
+  facts={[
+    'pass rate before the loop: 38 of 100 tasks',
+    'pass rate after the loop: 39 of 100 tasks',
+    'average rounds used: 3.6',
+    'cost per task: 3.1x higher',
+    'the loop stops when the model says "this looks correct"',
+  ]}
+  steps={[
+    {
+      prompt: 'Which signal is missing?',
+      options: [
+        'A larger context window for the notes',
+        'An outside check, such as the repo\'s tests',
+        'A lower temperature in the reflection call',
+        'A longer reflection note after every round',
+      ],
+      answer: 1,
+      explain: 'The loop stops on the model\'s own opinion, so it cannot tell a fix from a plausible edit. Reflexion\'s ablation shows reflection without tests gave no gain. Context size, temperature, and note length do not add information about whether the code works.',
+    },
+    {
+      prompt: 'What is the best change?',
+      options: [
+        'Run the repo\'s tests each round, feed back failures',
+        'Add a second model that judges the first one\'s notes',
+        'Raise the round cap from 4 to 10 so it has more tries',
+        'Ask the model to be stricter when it reviews its work',
+      ],
+      answer: 0,
+      explain: 'Test output is a signal from outside the model, with exact errors, and it gives a real stop rule: stop when the tests pass. A second model judge shares the same blind spots. More rounds and a stricter prompt raise cost without new information.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [ReAct: Synergizing Reasoning and Acting in Language Models (arXiv 2210.03629)](https://arxiv.org/abs/2210.03629)
+- [Reflexion: Language Agents with Verbal Reinforcement Learning (arXiv 2303.11366)](https://arxiv.org/abs/2303.11366)
+- [Self-Refine: Iterative Refinement with Self-Feedback (arXiv 2303.17651)](https://arxiv.org/abs/2303.17651)
+- [Anthropic: Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)

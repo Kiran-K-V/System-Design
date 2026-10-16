@@ -1,0 +1,226 @@
+---
+summary: 'A subagent is a separate agent with a fresh window and a narrow task. It does the noisy work and returns a short summary, so the parent window stays small and independent tasks run at the same time. It costs more tokens in total and fits coupled tasks badly.'
+requires: ['ai/a6-agents/agent-loop', 'ai/a6-agents/tool-design']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai6SubWalk from '../../../../components/anim/lessons/Ai6SubWalk.tsx';
+import Ai6SubSim from '../../../../components/anim/lessons/Ai6SubSim.tsx';
+
+## The problem
+
+You ask an agent to compare how three services handle authentication, billing, and search. Each topic needs 10 file reads and searches. Done in one window, the agent reads 30 results into one history. Every later call re-reads all of them. Lesson [A6.9](/learn/ai/a6-agents/long-running-context/) showed how fast that grows.
+
+There is a second cost. The three topics do not depend on each other, yet the agent does them one after another. Wall time is the sum of the three.
+
+A subagent addresses both. It is the same idea as a worker process: give a narrow job to a separate unit with its own memory, and take back only the result.
+
+## What a subagent is
+
+A **subagent** is a separate agent instance that your main agent starts to handle a focused subtask. The Claude Agent SDK docs list its main benefits. **Context isolation**: each subagent "runs in its own conversation", and "intermediate tool calls and results stay inside the subagent; only its final message returns to the parent". **Parallelization**: concurrent subagents finish "in the time of the slowest one rather than the sum of all of them". The docs also list specialized instructions and tool restrictions (source: [Subagents in the SDK](https://code.claude.com/docs/en/agent-sdk/subagents), fetched 2026-10-16).
+
+The mapping for a backend engineer: the parent is a coordinator and a subagent is a worker with private memory. The brief is the job message. The final message is the job result. The parent never sees the worker's scratch state, the same way a queue consumer's local variables are not in the message it returns.
+
+Two facts about what crosses the boundary matter most. The docs say a fresh subagent receives its own system prompt, the project CLAUDE.md, tool definitions, and the Agent tool's prompt string. It does not receive "the parent's conversation history or tool results". And "the only content you pass from parent to subagent is the Agent tool's prompt string, so include any file paths, error messages, or decisions the subagent needs directly in that prompt."
+
+## Defining one
+
+In the SDK, you pass an `agents` map. Each entry is an `AgentDefinition`. The required fields are `description`, which tells the parent when to use it, and `prompt`, which is the subagent's system prompt. Optional fields include `tools` (omit it and the subagent inherits every tool available to subagents), `disallowedTools`, `model`, and `maxTurns`. The parent starts a subagent through the `Agent` tool, so `Agent` must be in the allowed tools. This example follows the docs:
+
+```python title="agent.py"
+from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
+
+options = ClaudeAgentOptions(
+    allowed_tools=["Read", "Grep", "Glob", "Agent"],
+    agents={
+        "code-reviewer": AgentDefinition(
+            description="Expert code review specialist. Use for quality and security reviews.",
+            prompt="You are a code review specialist. Be thorough but concise.",
+            tools=["Read", "Grep", "Glob"],  # read-only: no Edit, Write, or Bash
+            model="sonnet",
+        )
+    },
+)
+# async for message in query(prompt="Review the auth module", options=options): ...
+```
+
+Read-only `tools` is a design choice, not a detail. A tool you leave out "isn't in the subagent's session at all". That makes a subagent a place to isolate a risky tool, such as a shell, from the main agent. A cheaper `model` for a search worker is a cost lever, as lesson [A6.8](/learn/ai/a6-agents/planning/) described for executors.
+
+## Step through a fan-out
+
+<Ai6SubWalk client:visible />
+
+## Writing a good brief
+
+The brief is the only channel in. A vague brief gives a vague result. Anthropic's multi-agent research team found that "each subagent needs an objective, an output format, guidance on the tools and sources to use, and clear task boundaries". They also logged failures from early versions: "spawning 50 subagents for simple queries", subagents repeating each other's work, and endless searches for sources that did not exist ([source](https://www.anthropic.com/engineering/multi-agent-research-system)).
+
+A usable brief has four parts:
+
+1. **Goal.** One question, one deliverable.
+2. **Output format.** "Return at most 300 words: findings, then file paths." Anthropic reports typical summaries of 1,000 to 2,000 tokens ([Effective context engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)). Ask for less if you can.
+3. **Tools and sources.** Where to look, and where not to.
+4. **Stop rule.** A turn cap (`maxTurns`) and a boundary such as "do not edit files".
+
+For large outputs, Anthropic suggests that subagents store their work in external systems and pass "lightweight references back to the coordinator". This avoids copying a big result through the parent window.
+
+## The cost
+
+Subagents are not free. The same Anthropic post says agents use about 4 times the tokens of chat, and multi-agent systems about 15 times. In their research system, an Opus 4 lead with Sonnet 4 subagents "outperformed single-agent Claude Opus 4 by 90.2%" on an internal research eval. They also report that, on a browsing benchmark (BrowseComp), token usage by itself explained 80% of the variance in performance. Read that carefully: part of the gain came from spending more tokens. The 15 times figure is an average for that system, not a law, and the 90.2% is on their own eval, not yours.
+
+Where do the extra tokens come from? Three places. Every subagent re-sends its own system prompt and tool definitions. Subagents cannot see each other, so they may repeat work. And the parent still pays for the briefs and the summaries.
+
+But a fan-out can also save tokens. A subagent's window is small, and a small window is cheap to re-read. The calculator below models this. Its assumptions are ours: independent topics of equal size, a parent holding 8,000 tokens, 500-token briefs, 1,500-token summaries, and 6 seconds per call. The default is the walk above: 3 topics, 10 calls each, 3,000 tokens per result.
+
+- One agent: 30 calls. Input is 30 x 8,000 + 3,000 x (0 + 1 + ... + 29) = 240,000 + 1,305,000 = 1,545,000 tokens. Time is 30 x 6 = 180 s.
+- Three subagents: each reads 10 x 3,500 + 3,000 x 45 = 170,000. Three give 510,000. The parent adds 8,000 + (8,000 + 3 x 2,000) = 22,000. Total 532,000 tokens, about a third. Time is (10 + 2) x 6 = 72 s, because the three run at once.
+
+<Ai6SubSim client:visible />
+
+Now raise "repeated work" to 200%. The saving disappears and then reverses. Drop the calls per topic to 1 and the parent's fixed cost dominates. The model shows the shape: subagents win when each topic is deep and independent, and lose when topics are shallow, overlapping, or coupled.
+
+## Limits you set
+
+Claude decides on its own how many subagents to start, and a subagent can start its own. The SDK docs give three caps (as of 2026-10-16). Depth defaults to 3 layers of nesting, set by `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`. Concurrency defaults to 20 running at once, set by `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`, and at the limit a spawn call returns `Concurrent subagent limit reached`. Spend is capped by `max_budget_usd` (`maxBudgetUsd` in TypeScript), which counts subagent requests too. Without a budget there is no limit. Set all three in production, as lesson [A6.1](/learn/ai/a6-agents/agent-loop/) argued for single agents. The docs also say that subagents run in the background by default when the call omits `run_in_background`.
+
+## When not to use them
+
+Anthropic says some domains "are not a good fit for multi-agent systems today": those where all agents need the same context or have many dependencies between them. They add that most coding tasks have fewer truly parallelizable parts than research does. If step B needs the exact details of step A, a handoff by summary will lose something. Also skip a subagent when the whole task fits in a small window: you pay overhead for nothing. Orchestration patterns for fleets of agents are the topic of lesson [A7.6](/learn/ai/a7-agents-prod/multi-agent-orchestration/).
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| One agent | Shared context, simple | Window grows, steps run in sequence | Small or tightly coupled tasks |
+| Subagent per topic | Small windows, parallel time | Brief quality, summary loss, start-up tokens | Deep, independent topics |
+| Cheaper model for workers | Lower price per token | Weaker search and reading | Narrow, checkable tasks |
+| Read-only tools for workers | Safer, less damage | Cannot fix what it finds | Search and review |
+| Caps on depth, count, spend | Bounded cost | Some work refused | Always in production |
+
+## Interview lens
+
+<Callout type="tip">
+Say it as isolation plus a contract: "A subagent gets a fresh window and only the brief I pass. It returns a short summary, so the parent window stays small and independent work runs in parallel. The brief has a goal, an output format, tools, and a stop rule. It costs more tokens overall, Anthropic reports about 15 times chat for its research system, so I cap depth, concurrency, and spend, and I do not use it for tightly coupled work."
+</Callout>
+
+<Callout type="mistake">
+Do not claim that subagents always save tokens, or that they always cost more. It depends on depth, independence, and duplicated work. Also do not write a brief like "fix the bug we discussed": the subagent has no history. And do not quote 15 times or 90.2% as universal numbers.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A parent starts a subagent with the prompt "Fix the bug we discussed". What goes wrong?',
+      options: [
+        'It has no parent history, so "we discussed" is empty',
+        'The subagent reads the parent window, then duplicates its tokens',
+        'The SDK rejects the call because the prompt has no file paths',
+        'The subagent asks the parent for the missing history by message',
+      ],
+      answer: 0,
+      explain: 'The only thing passed from parent to subagent is the prompt string. A fresh subagent does not receive the parent history or tool results, so the brief must carry paths, errors, and decisions.',
+    },
+    {
+      q: 'Multi-agent systems use about 15 times the tokens of a chat, per Anthropic. A chat on this task would use 10,000 tokens. What is the estimate for a multi-agent run?',
+      options: [
+        'About 25,000 tokens',
+        'About 75,000 tokens',
+        'About 1,500,000 tokens',
+        'About 150,000 tokens',
+      ],
+      answer: 3,
+      explain: '15 x 10,000 = 150,000 tokens. The 15 times figure is an average for Anthropic\'s research system, so treat the result as a rough budget, not a promise.',
+    },
+    {
+      q: 'Which task is the poorest fit for subagents?',
+      options: [
+        'Comparing pricing pages of five unrelated vendors',
+        'Refactoring tightly coupled code in one module',
+        'Searching four separate repositories for the same string',
+        'Summarizing three long, unrelated reports for a user',
+      ],
+      answer: 1,
+      explain: 'Anthropic says tasks with shared context or many dependencies are a poor fit, and most coding has fewer parallel parts than research. The other three split into independent pieces.',
+    },
+    {
+      q: 'With SDK defaults, Claude tries to start 25 subagents at once. What happens to the extra calls?',
+      options: [
+        'All 25 run, and only the spend cap can stop them',
+        'The last 5 wait in a hidden queue until others finish',
+        'The extra spawn calls get a "limit reached" result',
+        'The SDK raises an error and ends the whole query',
+      ],
+      answer: 2,
+      explain: 'The default concurrency limit is 20. At the limit the spawn call returns "Concurrent subagent limit reached" as the Agent tool result, and Claude can try again when the count drops.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Cost of a multi-agent run"
+  scenario="A single chat answer to this task uses 10,000 tokens. Anthropic reports that its multi-agent research system uses about 15 times the tokens of a chat. For this estimate, count every token as input at $2 per million (Claude Sonnet 5.5, as of 2026-10-16, claude.com/pricing)."
+  steps={[
+    {
+      prompt: 'How many tokens does the multi-agent run use?',
+      unit: 'tokens',
+      answer: 150000,
+      within: 1.1,
+      explain: '15 x 10,000 = 150,000 tokens.',
+    },
+    {
+      prompt: 'What does that cost, in dollars?',
+      unit: 'dollars',
+      answer: 0.3,
+      within: 1.1,
+      explain: '150,000 x $2 / 1,000,000 = $0.30. The chat costs 10,000 x $2 / 1,000,000 = $0.02. The ratio of 15 is the same for price. Output tokens cost more, so the real figure is higher.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai6-sub-fifty-spawns"
+  title="Fifty subagents for a lookup"
+  scenario="Illustrative case. A research agent can start subagents. Asked 'What year was our API v2 released?', it starts 50 subagents. The answer is right. The bill is 20 times the usual cost for this kind of question."
+  facts={[
+    'The system prompt says "use subagents for research tasks".',
+    'No spend cap, no concurrency cap is set.',
+    'Each subagent got a one-line brief: "find out about API v2".',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The subagents are too large, so each call costs more',
+        'Nothing tells the agent how much effort a lookup needs',
+        'The parent window was full, so it moved work out of it',
+        'The model is too weak to make a decision about delegation',
+      ],
+      answer: 1,
+      explain: 'The prompt says to delegate but gives no rule for scale. Anthropic logged the same early failure: spawning 50 subagents for simple queries. Nothing here shows a full parent window.',
+    },
+    {
+      prompt: 'What is the best fix?',
+      options: [
+        'Add effort rules to the prompt, and set count and spend caps',
+        'Switch every subagent to the largest model for better accuracy',
+        'Remove subagents, and run all research in one long window',
+        'Raise the concurrency limit so the 50 finish faster in parallel',
+      ],
+      answer: 0,
+      explain: 'Rules such as "a simple lookup needs no subagent" steer the model, and caps bound the damage when steering fails. A bigger model raises the bill. Removing subagents drops the benefit for deep tasks. A higher limit only widens the fan-out.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Claude Agent SDK: subagents](https://code.claude.com/docs/en/agent-sdk/subagents)
+- [Anthropic: How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system)
+- [Anthropic: Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)

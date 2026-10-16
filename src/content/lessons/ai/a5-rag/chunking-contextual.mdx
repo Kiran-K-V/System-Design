@@ -1,0 +1,258 @@
+---
+summary: 'A chunk is the unit a RAG system retrieves. Cut it badly and the answer is split or has no subject. Compare fixed, recursive and semantic cuts, read the Chroma results, then add a generated context prefix and see top-20 failures fall from 5.7% to 3.7%, 2.9% and 1.9%.'
+requires: ['ai/a5-rag/embedding-models', 'ai/a2-inference-cost/prompt-caching']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai5ChunkWalk from '../../../../components/anim/lessons/Ai5ChunkWalk.tsx';
+import Ai5ChunkCalc from '../../../../components/anim/lessons/Ai5ChunkCalc.tsx';
+
+## The problem
+
+Your index does not store documents. It stores **chunks**: pieces of documents, each with one vector. A search returns chunks, and the model answers from the chunks it gets. The chunk is the unit of retrieval.
+
+That makes chunking a quality decision, not a detail. Make chunks too big and each vector blurs many topics, so the search is noisy and you pay to send extra text to the model. Make them too small and a chunk loses the facts around it. A chunk that says "revenue grew 3% over the previous quarter" has no company and no year. No embedding model can find it for the question "how much did ACME grow in Q2 2023?", because the words that matter are not in the chunk.
+
+Lesson [A5.1](/learn/ai/a5-rag/embedding-models/) chose the embedding model. This lesson decides what text you give it.
+
+## Naive solution: cut every N tokens
+
+The first version most teams ship is a fixed-size splitter. Cut every 800 tokens, maybe with 400 tokens of overlap, and move on. It is easy and it is predictable. It also ignores the text. A cut can fall in the middle of a sentence, a table row or a rule that needs two paragraphs.
+
+Step through four ways to cut one document, and then the second problem: a good cut can still lose the subject.
+
+<Ai5ChunkWalk client:visible />
+
+## Three ways to cut
+
+**Fixed-size** chunking cuts every N tokens. It is fast and gives chunks of equal size, which keeps the index easy to size. It breaks structure.
+
+**Recursive** chunking tries a list of separators from the largest to the smallest: paragraph break, line break, sentence end, then space. It splits on the first one that makes pieces small enough. Structure survives when it can. This is the usual default in the common RAG toolkits, and it needs no model call.
+
+**Semantic** chunking cuts where meaning changes. One method embeds each sentence and cuts where the distance between neighbours jumps. Another asks an LLM to choose the cuts. It finds better boundaries and costs a model pass before indexing.
+
+**Overlap** repeats the end of one chunk at the start of the next. It protects text that a cut would split. Its price is storage and embedding cost for the repeated text, and duplicate hits in the results.
+
+Add structure on top of any of these. Split Markdown on headings. Keep a table or a code block in one piece. Carry the heading path ("Billing > Refunds") with each chunk.
+
+## What the measurements say
+
+Chroma tested chunkers on a retrieval benchmark. They used OpenAI's text-embedding-3-large, retrieved the top 5 chunks, and measured recall, precision and IoU. IoU (intersection over union) [mid] is the share of the retrieved tokens that are also in the answer text. It drops when a chunker returns redundant or extra text.
+
+| Chunker | Overlap | Mean chunk | Recall | IoU |
+|---|---|---|---|---|
+| LLM chunker (GPT-4o) | 0 | ~240 tokens | 91.9% | 3.9% |
+| ClusterSemantic, size 400 | 0 | ~182 tokens | 91.3% | 4.5% |
+| Token splitter, size 400 | 0 | 400 | 89.2% | 2.7% |
+| Token splitter, size 400 | 200 | 400 | 88.6% | 2.7% |
+| Recursive, size 200 | 0 | ~137 tokens | 88.1% | 6.9% |
+| Token splitter, size 800 (OpenAI default) | 400 | 800 | 87.9% | 1.4% |
+| Recursive, size 800 | 400 | ~661 tokens | 85.4% | 1.5% |
+
+Source: [Chroma, "Evaluating Chunking"](https://www.trychroma.com/research/evaluating-chunking), read 2026-10-16.
+
+Three things stand out. The spread is about 6.5 points of recall (85.4% to 91.9%), so chunking matters but it is not the biggest lever. The smart cutters (LLM and cluster) lead on recall. And the default setting, 800 tokens with 400 overlap, is near the bottom on both recall and IoU. Chroma writes that "reducing chunk overlap improves IoU scores, as this metric penalizes redundant information". Dropping the 200-token overlap from the 400-token splitter moved recall by 0.6 points (88.6% to 89.2%) and left IoU at 2.7%.
+
+Read this carefully. It is one benchmark, one embedding model and top 5. It does not say recursive-200 beats everything. It says test your own data, with your own queries, before you accept the default.
+
+## The lost-subject problem
+
+A well-cut chunk can still fail. Chunks are embedded one at a time, and each loses the document around it. The company name is in the title. The year is in the header. The chunk holds only the sentence.
+
+**Contextual retrieval**, described by Anthropic, fixes this at index time. For each chunk, an LLM reads the whole document and the chunk, and writes a short context that places the chunk in the document. Anthropic says this text is "usually 50-100 tokens". It is put in front of the chunk before the chunk is embedded and before it is added to the BM25 index (the keyword index from lesson [A5.5](/learn/ai/a5-rag/hybrid-rrf/)). Only the index changes. The text sent to the answering model can still be the plain chunk.
+
+Anthropic measured the effect with the top-20 failure rate, which is 1 minus recall@20: the share of questions where no right chunk is in the top 20.
+
+| Setup | Top-20 failure | Cut vs. baseline |
+|---|---|---|
+| Embeddings only | 5.7% | none |
+| + contextual embeddings | 3.7% | 35% |
+| + contextual BM25 | 2.9% | 49% |
+| + reranking (lesson [A5.6](/learn/ai/a5-rag/reranking-rewriting/)) | 1.9% | 67% |
+
+Source: [Anthropic, "Introducing Contextual Retrieval"](https://www.anthropic.com/news/contextual-retrieval), read 2026-10-16. The post does not name its corpus in the text we read, so treat the percentages as one test on one data set. Your numbers will differ.
+
+Read the table as a stack of fixes. Each stage removes a different kind of miss: context repairs the lost subject, BM25 repairs exact terms, the reranker repairs ordering. The last row is 3 times better than the first (5.7 / 1.9 = 3).
+
+## What the context step costs
+
+The context step is an LLM call per chunk. A naive version resends the whole document with each chunk. A 10-chunk document would pay for itself 10 times. Prompt caching ([lesson A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) removes that. You write the document into the cache once, and then each chunk's call reads it at a small fraction of the input price.
+
+Anthropic states the result: "the one-time cost to generate contextualized chunks is $1.02 per million document tokens". Their assumptions are 800-token chunks, 8k-token documents, a 50-token instruction and 100 tokens of context per chunk. The post's price basis is older than today's price list, so we recomputed it on one current model.
+
+Recomputed with Claude Haiku 5.5 (our choice of model; $0.10 input, $0.50 output, $0.125 cache write, $0.01 cache read per 1M tokens, as of 2026-10-16 from [claude.com/pricing](https://claude.com/pricing)), per 8,000-token document with 10 chunks:
+
+- Cache write: 8,000 x $0.125 / 1M = $0.00100
+- Cache reads for 9 more chunks: 9 x 8,000 x $0.01 / 1M = $0.00072
+- Instruction plus chunk input: 10 x 850 x $0.10 / 1M = $0.00085
+- Output, 100 tokens per chunk: 10 x 100 x $0.50 / 1M = $0.00050
+- Total: $0.00307 per document. One million tokens is 125 such documents, so about **$0.38 per million document tokens**.
+
+Two things to remember. It is a one-time index cost, not a per-query cost. And it repeats whenever documents change, so a fast-changing corpus pays it again (lesson [A5.8](/learn/ai/a5-rag/freshness-updates/)). Contextual chunks are also longer by 50 to 100 tokens, so the embedding bill grows a little.
+
+Try the numbers below. Chunk count, repeated tokens and cost all move with size and overlap.
+
+<Ai5ChunkCalc client:visible />
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Recall spread across 7 chunkers | 85.4% to 91.9% | Chroma |
+| Default 800/400 splitter, recall and IoU | 87.9%, 1.4% | Chroma |
+| Top-20 failure, baseline to full stack | 5.7% to 1.9% | Anthropic |
+| Context length added per chunk | usually 50 to 100 tokens | Anthropic |
+| One-time context cost | $1.02 per 1M document tokens | Anthropic |
+| Same step on Haiku 5.5, our arithmetic | about $0.38 per 1M document tokens | Derived above |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Fixed-size cuts | Simple, even chunks | Cuts through rules | A first version, or uniform logs |
+| Recursive split | Keeps paragraphs, no model | Sizes vary a little | The default for prose |
+| Semantic or LLM cuts | Best boundaries in Chroma's test | A model pass at index time | Dense, mixed documents worth the cost |
+| Overlap | Protects split text | Repeated storage, duplicate hits | Fixed cuts you cannot change |
+| Context prefix | Fewer lost-subject misses | An LLM call per chunk, longer chunks | Chunks lose entity, date or section |
+| Smaller chunks | Precise hits, less noise | More vectors, less context per hit | Short factual answers |
+
+## Interview lens
+
+<Callout type="tip">
+Say what you measure. "I would build a small gold set of real questions with the chunk that answers each one, then compare chunkers on recall@k and on tokens sent to the model. Then I would add a context prefix if the misses are lost-subject cases." That is a measured plan, not a default.
+</Callout>
+
+<Callout type="mistake">
+Do not say "800 tokens with 400 overlap is the standard setting" as if it were proven. In Chroma's test that setting was near the bottom for recall and IoU. Also do not forget the cost of contextual retrieval: it is one LLM call per chunk, and it repeats when documents change.
+</Callout>
+
+<Callout type="deep" title="Late chunking and other ideas">
+Another family embeds the whole document first and then pools token vectors into chunk vectors, so each chunk vector sees its surroundings. We did not load a source for it here, so treat it as a pointer to search for, not a result. The common idea is the same as the context prefix: a chunk vector should know where it came from.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Index a 200M-token corpus"
+  scenario="A corpus has 200 million tokens. Chunks are 800 tokens with no overlap. Anthropic's one-time context cost is $1.02 per million document tokens."
+  steps={[
+    {
+      prompt: 'How many chunks does the corpus hold?',
+      unit: 'chunks',
+      answer: 250000,
+      within: 1.1,
+      explain: '200,000,000 / 800 = 250,000 chunks.',
+    },
+    {
+      prompt: 'One-time cost of the context step at $1.02 per million document tokens, in dollars?',
+      unit: '$',
+      answer: 204,
+      within: 1.1,
+      explain: '200 million tokens is 200 units of 1M. 200 x $1.02 = $204.',
+    },
+    {
+      prompt: 'Chunks if you add 400 tokens of overlap (stride 400)?',
+      unit: 'chunks',
+      answer: 500000,
+      within: 1.1,
+      explain: 'Each new chunk adds 800 - 400 = 400 new tokens. 200,000,000 / 400 = 500,000 chunks, twice as many to embed and store.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai5-chunk-split-rule"
+  title="The rule that nobody finds"
+  scenario="A policy bot answers 'what is the late fee for tier 2?' wrongly. The rule is in the source: the first paragraph gives the fee, the second paragraph says it applies to tier 2 only. Retrieval returns the paragraph about tier 1."
+  facts={[
+    'splitter: fixed 500 tokens, overlap 0',
+    'the two paragraphs sit on each side of a cut',
+    'chunk text: "The same fee applies to tier 2 only."',
+    'no document title or section in the chunk text',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The cut splits one rule, and each half lacks the other',
+        'The embedding model is too small to read tier numbers',
+        'The model temperature is too high for policy answers',
+        'The index uses too few dimensions for each vector',
+      ],
+      answer: 0,
+      explain: 'The fee and its scope sit in different chunks, and the second chunk has no subject. Neither chunk alone answers the question. Model size and temperature do not explain a rule that is split at the data level.',
+    },
+    {
+      prompt: 'What is the best first fix?',
+      options: [
+        'Split on headings and add a context prefix per chunk',
+        'Raise top-k from 5 to 200 and send everything',
+        'Switch to a larger embedding model, then re-embed',
+        'Lower the chunk size to 100 tokens and add overlap',
+      ],
+      answer: 0,
+      explain: 'Structure-aware cuts keep the rule together and a prefix puts the policy and tier in the chunk. A huge top-k hides the problem and costs tokens. A bigger model cannot embed text that is not in the chunk. Tiny chunks split more rules.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In Chroma\'s chunking test, which setting did the OpenAI default (800 tokens, 400 overlap) show against the others?',
+      options: [
+        'It had the highest recall of all seven chunkers',
+        'It was near the bottom for recall and IoU',
+        'It tied the LLM chunker on IoU',
+        'It had no overlap, so IoU was unaffected',
+      ],
+      answer: 1,
+      explain: 'It scored 87.9% recall and 1.4% IoU, below the LLM chunker (91.9%) and the cluster chunker (91.3%). The overlap is 400 tokens, which lowers IoU because the same text is returned twice.',
+    },
+    {
+      q: 'What does a contextual-retrieval prefix change in the index?',
+      options: [
+        'Text sent to the embedder and BM25',
+        'The answering model, which now reads a longer prompt',
+        'The query, which is rewritten before every search',
+        'The vector size, which grows by the prefix length',
+      ],
+      answer: 0,
+      explain: 'The generated context is put before the chunk for embedding and for the BM25 index. The query path does not change. Vector size is set by the embedding model, not by text length.',
+    },
+    {
+      q: 'Anthropic reports top-20 failure falling from 5.7% to 1.9% across the full stack. What is the improvement factor?',
+      options: [
+        '1.5 times',
+        '2 times',
+        '3 times',
+        '5 times',
+      ],
+      answer: 2,
+      explain: '5.7 / 1.9 = 3.0. The 67% cut they quote is the same fact: 1.9 is 33% of 5.7.',
+    },
+    {
+      q: 'Why does prompt caching matter for the context step?',
+      options: [
+        'It makes the generated context shorter',
+        'It lets the model skip the chunk text',
+        'It makes BM25 scores comparable to cosine scores',
+        'It avoids full-price document reads per chunk',
+      ],
+      answer: 3,
+      explain: 'Each chunk call needs the whole document. With caching the document is written once and read at a small fraction of the input price for the other chunks. The length of the context and the BM25 scoring are not affected.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic, Introducing Contextual Retrieval](https://www.anthropic.com/news/contextual-retrieval): the four failure rates and the $1.02 cost.
+- [Chroma, Evaluating Chunking](https://www.trychroma.com/research/evaluating-chunking): recall, precision and IoU for each chunker.
+- [Anthropic pricing](https://claude.com/pricing): the cache write and read rates used above.

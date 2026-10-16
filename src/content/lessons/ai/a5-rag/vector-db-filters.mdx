@@ -1,0 +1,203 @@
+---
+summary: 'Real queries filter by tenant, date or type. A filter applied after the index scan can return 4 rows when you asked for 10. Learn pre-filter, post-filter and filterable graphs, then choose pgvector, a dedicated database, or a managed service.'
+requires: ['ai/a5-rag/ann-indexes']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai5FiltPost from '../../../../components/anim/lessons/Ai5FiltPost.tsx';
+import Ai5FiltCalc from '../../../../components/anim/lessons/Ai5FiltCalc.tsx';
+
+## The problem
+
+A customer opens your support assistant and asks a question. The search must return the 10 chunks nearest to the question, but only chunks that customer is allowed to see. That is a vector search with a **filter**: a condition on stored fields such as tenant, date, language or document type.
+
+Lesson [A5.2](/learn/ai/a5-rag/ann-indexes/) tuned the index for speed and recall with no condition attached. A filter changes the problem. The index knows distances between vectors. It does not know which vectors belong to tenant A.
+
+<CrossTrackLink id="10-advanced/vector-databases">
+Backend lesson 10.4 already showed the trap. pgvector scans the approximate index first and applies the filter after, so a condition that matches 10% of rows with `ef_search` 40 leaves about 4 rows. It listed three fixes: iterative index scans, a B-tree index on the filter column, and partial indexes or partitions. This lesson goes through the strategies in order, shows the failure in motion, and adds how to choose a database.
+</CrossTrackLink>
+
+## Naive solution: search, then filter
+
+This is **post-filtering**. Ask the index for its nearest candidates, then drop those that fail the filter. The pgvector README states it plainly: "With approximate indexes, filtering is applied after the index is scanned." Its example: "If a condition matches 10% of rows, with HNSW and the default hnsw.ef_search of 40, only 4 rows will match on average."
+
+The expected count is simple. Rows kept = ef_search x share of matching rows = 40 x 0.10 = 4. A tenant that owns 1% of the data would see 0.4 rows. The failure is silent. The query runs, returns fewer rows than asked, and no error appears. The model downstream answers from less context than you planned.
+
+Step through the failure, then the first fix.
+
+<Ai5FiltPost client:visible />
+
+## The mechanism: three strategies
+
+**Pre-filtering.** Find the rows that match the filter first, then search only those. If the match set is small, you can compare the query with every one of them. That is an exact search over a subset, so recall is perfect and the answer always has min(k, matches) rows. The cost is work in proportion to the number of matching rows. The pgvector README says exact indexes "work well for conditions that match a low percentage of rows" and that otherwise approximate indexes "can work better." In Postgres, the start it gives is a B-tree index on the filter column.
+
+**Post-filtering with iterative scans.** Keep the approximate index and let the scan continue when too few rows pass. pgvector added iterative index scans in 0.8.0. You turn them on with `hnsw.iterative_scan`, set to `strict_order` or `relaxed_order`. Strict keeps results in exact order by distance. Relaxed allows them slightly out of order for better recall. The scan stops at `hnsw.max_scan_tuples`, 20,000 by default. At a 10% match it needs about 10 / 0.10 = 100 candidates for 10 rows. At 0.01% it would need 100,000, which is past the cap, so you get about 20,000 x 0.0001 = 2 rows.
+
+**Filterable HNSW.** Check the filter while walking the graph, and only keep matching points. This sounds ideal, but it has a trap. If most points are skipped, the walk can lose its path through the graph.
+
+Qdrant's article on filterable HNSW shows this. Its author ran a 2019 experiment on his own modified Python HNSW, not on the Qdrant product. With m = 16, precision@10 was 0.85 at one setting of his test parameter and 0.05 at the next. His explanation is that once enough nodes are removed, the graph splits into islands and the search cannot cross between them. The fix he proposes is extra edges built within each category, so each category stays connected on its own. Qdrant's docs tell you to create payload indexes on fields you filter by, ideally before you load data, so the engine can plan around them. Without an index, filtering still returns correct results, but it is not accelerated.
+
+### See the rows returned
+
+Move the share of matching rows down from 100% and watch each strategy.
+
+<Ai5FiltCalc client:visible />
+
+At 10% with the defaults: post-filter returns 4 of 10, the iterative scan returns 10, and the exact scan returns 10. At 0.01%, post-filter returns 0.004 rows (essentially none), the iterative scan about 2 of 10, and the exact scan over 1,000,000 rows compares just 100 vectors and returns 10. At very low selectivity, pre-filtering plus exact scan is the only strategy that returns the full 10. The numbers assume matching rows are spread evenly in the index. A tenant whose data sits in one region of the vector space behaves differently, so measure on your own filters.
+
+```sql title="filtered_search.sql"
+-- pgvector 0.8.0 or later
+CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
+CREATE INDEX ON items (tenant_id);          -- exact path for small tenants
+
+SET hnsw.iterative_scan = relaxed_order;    -- keep scanning until enough rows pass
+SET hnsw.max_scan_tuples = 20000;           -- the default cap
+
+SELECT id, content
+FROM items
+WHERE tenant_id = 42
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+## Choosing where vectors live
+
+Three families, and no single winner. These are decision points, not benchmarks.
+
+**pgvector in your Postgres.** Vectors sit beside your rows, in the same transaction, backup and permission model. A tenant filter is an ordinary `WHERE`. You get the limits of one node, and the vector index must share memory with everything else. The pgvector README lists vector indexes up to 2,000 dimensions for the `vector` type.
+
+**A dedicated vector database** such as Qdrant. It is built around filtered search, with payload indexes and a filterable graph, and it can shard vectors across machines. You pay for another system to run, and you must keep it in sync with your source of truth.
+
+**An object-storage-based service** such as turbopuffer. Its docs say object storage is the durable store and a write is durable once it returns. The first query on a namespace reads object storage directly: on 1 million documents, p50 874 ms. After that the namespace is cached on NVMe and the p50 is 14 ms (turbopuffer architecture docs, as of 2026-10-16). Cold queries take 3 to 4 round trips of about 100 ms each. The trade is cost and scale against a slow first query. Both numbers are medians for 1 million documents, so do not read them as p90 or as your latency.
+
+The docs of Pinecone and turbopuffer do not say whether their filters apply before or after the vector search. So ask: how does this system combine my filter with its index, and what happens at 0.1% selectivity? Then run your own filters at your own selectivity and count the rows that come back.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Post-filter rows, 10% match, ef_search 40 | about 4 | pgvector README; 40 x 0.10 |
+| Iterative scan | from pgvector 0.8.0; cap 20,000 tuples | pgvector README |
+| Filterable-HNSW experiment | precision@10 0.85 to 0.05, m = 16 | Qdrant article, author's 2019 Python test |
+| turbopuffer, 1M docs | p50 874 ms cold, 14 ms cached | turbopuffer docs |
+| Cold query round trips | 3 to 4, about 100 ms each | turbopuffer docs |
+
+## Trade-offs
+
+| Strategy | You gain | You pay | Choose when |
+|---|---|---|---|
+| Post-filter | One simple index scan | Short results at low selectivity | The filter keeps most rows |
+| Iterative scan | Full results at moderate selectivity | More scanning, a cap on work | Filter keeps 1% or more |
+| Pre-filter and exact | Perfect recall on the subset | Work grows with matching rows | A tenant or partition is small |
+| Filterable graph | Fast at many selectivities | Extra edges and index setup | A dedicated DB with payload indexes |
+| Partition or partial index | An index per tenant | Many indexes to maintain | Few big tenants |
+
+## Interview lens
+
+<Callout type="tip">
+Name the failure before you are asked: "A post-filter on an ANN index returns about ef_search x selectivity rows. At 10% that is 4 of 40. So I would use iterative scans or a B-tree index plus exact scan for small tenants, and I would test results at the smallest tenant size." Then say how you pick the store: scale, filter shape, and who runs it.
+</Callout>
+
+<Callout type="mistake">
+Do not claim a filter "just works" on a vector index. Do not quote the 0.85 to 0.05 figure as a Qdrant benchmark: it was the author's own 2019 experiment. And do not use a tenant filter as your only permission check without testing for results that leak across tenants (lesson [A5.9](/learn/ai/a5-rag/retrieval-permissions/) covers permissions).
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="a5-tenant-filter-short"
+  title="Three results instead of ten"
+  scenario="A support bot runs on Postgres with pgvector. A query for tenant 42 with LIMIT 10 returns only 3 rows. Other tenants get 10."
+  facts={[
+    'index: hnsw (m=16, ef_construction=64)',
+    'hnsw.ef_search = 40, hnsw.iterative_scan = off',
+    'tenant 42 owns about 7% of the 2,000,000 rows',
+    'no index on tenant_id',
+  ]}
+  steps={[
+    {
+      prompt: 'What explains the short result?',
+      options: [
+        'The index gives 40 rows, the filter keeps 7%',
+        'Tenant 42 has fewer than three documents in the table',
+        'LIMIT 10 is a soft hint and the planner can ignore it',
+        'The embedding model changed and old vectors no longer match',
+      ],
+      answer: 0,
+      explain: '40 x 0.07 = 2.8 rows on average, close to the 3 seen. The filter runs after the scan. Tenant 42 owns about 140,000 rows, so it is not a small tenant, and LIMIT is a cap, not a hint.',
+    },
+    {
+      prompt: 'Which change fixes it with the least new machinery?',
+      options: [
+        'Raise m to 64 and rebuild the index',
+        'Move the tenant to a separate database',
+        'Turn on hnsw.iterative_scan',
+        'Cut the vectors to 256 dimensions',
+      ],
+      answer: 2,
+      explain: 'Iterative scan keeps scanning until 10 rows pass: about 10 / 0.07 = 143 candidates, well under the 20,000 cap. A bigger m changes the graph, not the post-filter. A separate database is heavy, and fewer dimensions do not change selectivity.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A filter matches 2% of rows. A post-filtered HNSW query uses ef_search 100. About how many rows come back?',
+      options: [
+        'About 98, the share that fails the filter',
+        'About 20, one fifth of the candidates',
+        'About 2, which is the expected count',
+        'About 100, since ef_search sets the result size',
+      ],
+      answer: 2,
+      explain: 'Rows kept = ef_search x selectivity = 100 x 0.02 = 2. The candidate list holds 100 rows, but only the matching 2% survive the filter.',
+    },
+    {
+      q: 'What is the cleanest reason to pre-filter and scan exactly for a tiny tenant?',
+      options: [
+        'Exact search is always faster than an index at any size',
+        'It skips the filter, so permissions are checked by the vectors',
+        'It scans few rows and returns perfect recall on them',
+        'It removes the need for any embedding model at query time',
+      ],
+      answer: 2,
+      explain: 'A tiny match set is cheap to scan completely, so recall is perfect and the full k rows return. Exact search is not always faster. It still applies the filter, and the query still needs an embedding.',
+    },
+    {
+      q: 'The Qdrant filterable-HNSW article reports precision@10 falling from 0.85 to 0.05. How should you cite that number?',
+      options: [
+        'As what the author saw in a 2019 test on his own Python HNSW',
+        'As the precision you should expect from Qdrant in production',
+        'As a standard result that every HNSW index shows',
+        'As proof that pre-filtering is always safer than graph filtering',
+      ],
+      answer: 0,
+      explain: 'It came from the author\'s own modified Python implementation, not from the Qdrant product. It illustrates how removed nodes can split a graph. It is not a production benchmark or a rule for all HNSW indexes.',
+    },
+    {
+      q: 'turbopuffer docs give p50 874 ms for a cold query and 14 ms cached, on 1M documents. What do these numbers tell you?',
+      options: [
+        'The tail is below 874 ms for sure',
+        'Both are 1M-doc medians, not tails',
+        'Cached queries never touch object storage',
+        'Latency is the same at 1M and at 1B docs',
+      ],
+      answer: 1,
+      explain: 'They are p50 figures for 1 million documents. They say nothing about the tail or other sizes. The docs also say cached queries still make one object-storage round trip for strong consistency.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [pgvector README](https://github.com/pgvector/pgvector): the filtering section, iterative scans, defaults.
+- [Qdrant, Filterable HNSW](https://qdrant.tech/articles/filterable-hnsw/): the 2019 experiment and the per-category edges idea.
+- [Qdrant, Filtering](https://qdrant.tech/documentation/concepts/filtering/): payload indexes and unindexed filtering.
+- [turbopuffer, Architecture](https://turbopuffer.com/docs/architecture): object storage, NVMe cache, cold and cached p50.

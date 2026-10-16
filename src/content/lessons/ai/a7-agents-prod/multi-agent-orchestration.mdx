@@ -1,0 +1,196 @@
+---
+summary: 'A lead agent can split a task across subagents that work in parallel, each in its own context. Anthropic reports big gains on broad research for about 15 times the tokens of a chat. Cognition argues that for tightly coupled work, parallel agents make conflicting decisions. Learn which task shape wins.'
+requires: ['ai/a6-agents/subagents', 'ai/a7-agents-prod/durable-graph-runtime']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai7MultiFan from '../../../../components/anim/lessons/Ai7MultiFan.tsx';
+import Ai7MultiSim from '../../../../components/anim/lessons/Ai7MultiSim.tsx';
+
+## The problem
+
+You ask an agent: "Compare four vector databases on cost, limits, and hosting." One agent reads page after page, serially. Its context fills with raw search results from the first database before it reaches the fourth. It is slow, and the early material crowds out the late material.
+
+Splitting the job looks obvious. Four workers each research one database and report back. But the same idea applied to "build this feature" can go badly: two workers make two different design choices and nobody notices until merge time. Module A6 introduced subagents (lesson [A6.10](/learn/ai/a6-agents/subagents/)). This lesson asks when running many agents pays, and what it costs.
+
+## The mechanism: orchestrator and workers
+
+Anthropic describes its research system as an orchestrator-worker pattern. A lead agent plans, starts subagents, and merges their results. The subagents run in parallel, each with its own context window. Anthropic reports that the lead starts 3 to 5 subagents in parallel instead of working serially.
+
+This is a map and reduce shape you may know from batch jobs (the [queues lesson](/learn/backend/06-async/queues/) shows the same fan-out and fan-in). The difference is that each worker is a model loop that can search, read, and decide, and the lead must write the briefs and merge the answers.
+
+Three facts about how subagents work in the Claude Agent SDK explain the cost and the benefit. A subagent starts with a fresh conversation. Only its final response returns to the parent. Its spend counts toward the parent's budget. So the parent's context stays small, and the raw material stays out of it.
+
+<Ai7MultiFan client:visible />
+
+### Writing the brief
+
+Parallel workers are only as good as their instructions. Anthropic says each subagent needs an objective, an output format, guidance on tools and sources, and clear task boundaries. Without them, workers overlap: in Anthropic's example one subagent studied the 2021 auto chip shortage while two others repeated work on 2025 supply chains.
+
+```python title="orchestrate.py"
+import asyncio
+
+async def research(question: str, max_subagents: int = 5):
+    plan = await lead_plan(question)               # independent sub-questions
+    plan = plan[:max_subagents]                    # hard cap on fan-out
+    briefs = [make_brief(q) for q in plan]         # objective, format, tools, boundaries
+    answers = await asyncio.gather(*[run_subagent(b) for b in briefs], return_exceptions=True)
+    good = [a for a in answers if not isinstance(a, Exception)]
+    return await lead_merge(question, good)        # merge rules live here
+```
+
+The cap matters. Anthropic reports that early versions spawned 50 subagents for simple queries. The merge step also needs rules: what happens when two answers disagree, or one worker fails? The durable runtime from lesson [A7.1](/learn/ai/a7-agents-prod/durable-graph-runtime/) gives you fan-out, join, and a reducer. You still have to decide what the reducer does.
+
+## What it costs and what it buys
+
+Anthropic's numbers, all from its engineering post:
+
+- Agents use about 4 times the tokens of a chat. Multi-agent systems use about 15 times.
+- A lead of Claude Opus 4 with Claude Sonnet 4 subagents beat a single Opus 4 agent by 90.2% on Anthropic's internal research eval.
+- Parallelism cut research time by up to 90% on complex queries.
+- On the BrowseComp benchmark, token use alone explained 80% of the variance in performance. With tool calls and model choice, three factors explained 95%.
+
+The last point is the key to reading the rest. Much of the gain comes from spending more tokens on the problem. Subagents are a way to spend many tokens at once, each with a clean context. The 15x is the price of that.
+
+Treat these as one team's averages on one kind of task. The 90.2% is on an internal eval you cannot rerun, and the models are older ones. Your task will differ.
+
+For a 10,000-token chat turn, 15x is 150,000 tokens, against 40,000 for a single agent at 4x. That is 3.75 times a single agent for the same question.
+
+<Ballpark
+  client:visible
+  title="Cost of one multi-agent run"
+  scenario="A chat turn on this task uses 10,000 tokens. A multi-agent run uses about 15 times that. Price all tokens at the Sonnet 5.5 input rate of $2 per 1M (claude.com/pricing, 2026-10-16). This ignores the output price, so it is a floor."
+  steps={[
+    {
+      prompt: 'How many tokens does one multi-agent run use?',
+      unit: 'tokens',
+      answer: 150000,
+      within: 1.1,
+      explain: '15 x 10,000 = 150,000 tokens. This comes from Anthropic ratio, not from a measurement of your task.',
+    },
+    {
+      prompt: 'What does one run cost at $2 per million tokens?',
+      unit: 'dollars',
+      answer: 0.3,
+      within: 1.1,
+      explain: '150,000 x $2 / 1,000,000 = $0.30. A single agent at 4x (40,000 tokens) costs $0.08.',
+    },
+    {
+      prompt: 'At 1,000 runs a day, what is the daily bill at this floor?',
+      unit: 'dollars',
+      answer: 300,
+      within: 1.1,
+      explain: '1,000 x $0.30 = $300 a day. Output tokens cost more per token, so the real bill is higher. This is why Anthropic says multi-agent systems fit tasks whose value covers the cost.',
+    },
+  ]}
+/>
+
+Price levers exist. Subagents need not use the lead's model. Anthropic's own best result used a stronger lead and smaller workers. The price gap is wide: Opus 5.5 input is $4 per million and Haiku 5.5 input is $0.10 per million, 40 times less (claude.com/pricing, 2026-10-16). A cheap worker doing wide reads and a strong lead doing the merge is a common split. Check quality on your own eval first (module A8).
+
+## The case against: context fragmentation
+
+Cognition, the company behind the Devin coding agent, published "Don't Build Multi-Agents". It names two principles. First, share context, and share full agent traces, not just individual messages. Second, actions carry implicit decisions, and conflicting decisions carry bad results.
+
+Its example is a Flappy Bird clone split into two subtasks: a moving background with pipes, and a bird the player can move. One subagent misread its part and built a Super Mario Bros.-style background. The other built a bird that did not look or move like Flappy Bird's. The final agent had to merge two incompatible pieces. Neither worker was wrong given what it saw. Neither could see the other's decisions.
+
+Cognition recommends a single-threaded linear agent that keeps context continuous. Its limit is that very large tasks can overflow the context window. For those it suggests a separate model that compresses the history into key details and decisions, and it admits this is hard to get right.
+
+Anthropic agrees on the weak spot. It says most coding tasks involve fewer truly parallelizable tasks than research, and that current agents are not yet strong at real-time coordination and delegation.
+
+### Reading both
+
+These are not opposing claims. They describe different task shapes. My synthesis, not either company's rule: parallelize reads, serialize writes.
+
+- **Breadth-first research.** Sub-questions are independent. Each worker's output is a short summary that compresses well. A wrong or redundant answer is cheap to spot. Parallel workers win.
+- **Tightly coupled work, such as most coding.** Every edit depends on choices made in other edits: names, interfaces, style. The decisions are implicit and hard to summarize. One agent with a full trace wins. A read-only subagent that searches the codebase and returns a summary can still help.
+
+Try the slider. It uses a simple model: the coupled share of the work stays serial and the rest splits across subagents. The cut-offs for the verdict are a teaching rule, not a measured result.
+
+<Ai7MultiSim client:visible />
+
+## Handoffs are a different pattern
+
+Do not confuse fan-out with a handoff. In the OpenAI Agents SDK, a handoff transfers control to another agent. The model sees each handoff as a tool named `transfer_to_<agent_name>`, so "Refund Agent" becomes `transfer_to_refund_agent`. By default the receiving agent sees the whole prior conversation. An opt-in beta, `nest_handoff_history`, condenses earlier history into a summary, and a per-handoff input filter can change what is passed on. A handoff stays inside one run, and `max_turns` still counts model calls across agents.
+
+So a handoff is routing: one agent runs at a time, and the specialist inherits the context. Fan-out is parallelism: many agents run at once, and each starts clean. Use routing for a support bot that moves a user to billing. Use fan-out for wide research.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Single agent | Consistent decisions, one trace, lowest tokens | Serial time, one crowded context | Coupled work, most coding |
+| Parallel subagents | Less wall-clock time, clean contexts, wider coverage | About 15x chat tokens, merge logic, overlap risk | Broad, independent research of high value |
+| Read-only helper subagent | Context stays small | A summary can drop detail | Searching a large codebase |
+| Cheaper model for workers | Large drop in token price | Weaker worker answers | Wide reads with a strong lead |
+| Handoff | Specialist with full context | No parallel speed-up | Routing between roles |
+
+## Interview lens
+
+<Callout type="tip">
+Say it as a decision: "I fan out when the sub-tasks are independent and the output compresses to a summary, as in breadth-first research. Anthropic reports about 15x the tokens of a chat for it, so the task has to be worth that. For coupled work like most coding I keep one agent with a full trace, because parallel agents make conflicting implicit decisions. I cap the number of subagents, brief each with an objective, format, tools, and boundaries, and budget tokens for the whole tree."
+</Callout>
+
+<Callout type="mistake">
+Do not claim that "more agents means better results". Anthropic's own data says token use explains most of the variance, and its early system spawned 50 subagents for simple queries. Do not use the 90.2% figure as a promise for your task either. It comes from one internal eval.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A lead agent starts 4 subagents. In the Claude Agent SDK, what reaches the lead from each subagent?',
+      options: [
+        'The subagent full conversation, so the lead can audit each step',
+        'Only its final response',
+        'Every tool result, in the order that the subagent received them',
+        'Nothing, because subagents write to files and do not reply',
+      ],
+      answer: 1,
+      explain: 'A subagent starts with a fresh conversation and only its final response returns to the parent. That is why the lead context stays small. The full trace staying behind is also why a lead can miss details.',
+    },
+    {
+      q: 'Which task is the weakest fit for parallel subagents?',
+      options: [
+        'Comparing the pricing pages of six cloud vendors',
+        'Summarizing 40 independent support tickets by theme',
+        'Searching five public sources for a news timeline',
+        'Changing one shared interface in a codebase',
+      ],
+      answer: 3,
+      explain: 'Edits to one shared interface depend on each other, so parallel workers make conflicting implicit decisions. The other three are independent reads whose outputs compress to summaries.',
+    },
+    {
+      q: 'A single agent uses 4x a chat turn and a multi-agent run uses 15x. How many times more tokens is the multi-agent run than the single agent?',
+      options: [
+        'About 3.75 times',
+        'About 11 times',
+        'About 60 times',
+        'About 0.27 times',
+      ],
+      answer: 0,
+      explain: '15 / 4 = 3.75. Subtracting gives 11, which is the gap in chat-turn units and not a ratio. Multiplying gives 60, which is not a ratio of the two either. 0.27 is the ratio the other way round.',
+    },
+    {
+      q: 'In the OpenAI Agents SDK, what is a handoff to a "Refund Agent"?',
+      options: [
+        'A parallel subagent that returns a summary to the caller',
+        'A queue message that starts a separate run later on',
+        'A tool the model sees, named transfer_to_refund_agent',
+        'A guardrail that blocks refund requests before the model sees them',
+      ],
+      answer: 2,
+      explain: 'The model sees each handoff as a tool named transfer_to_<agent_name>, and control moves to that agent. By default it also sees the whole prior conversation. It is routing, not parallel fan-out and not a guardrail.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system)
+- [Cognition: Don't Build Multi-Agents](https://cognition.com/blog/dont-build-multi-agents)
+- [OpenAI Agents SDK: handoffs](https://openai.github.io/openai-agents-python/handoffs/)
+- [Anthropic pricing](https://claude.com/pricing)

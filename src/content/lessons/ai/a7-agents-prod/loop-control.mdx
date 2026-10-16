@@ -1,0 +1,190 @@
+---
+summary: 'An agent loop must end. Each step can fail, so success falls as steps grow, and a stuck loop spends money on every turn. Combine stop conditions, step and budget caps, and a stuck detector, and know that caps are checked after a response arrives.'
+requires: ['ai/a7-agents-prod/durable-graph-runtime', 'ai/a6-agents/loop-patterns', 'ai/a0-orientation/probabilistic-components']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai7LoopWalk from '../../../../components/anim/lessons/Ai7LoopWalk.tsx';
+import Ai7LoopSim from '../../../../components/anim/lessons/Ai7LoopSim.tsx';
+
+## The problem
+
+An agent loop asks the model what to do, runs a tool, and asks again. Who decides when to stop? In the happy case the model does: it replies with no tool call. But a loop that depends on the model alone has no hard end. The model can repeat a failing call, flip between two approaches, or chase a goal that cannot be met.
+
+Two things go wrong, and they feed each other. Quality falls as steps are added. Cost rises with every step, and rises faster than you expect. This lesson covers both: the math, the stop conditions, the caps, and the detector that catches a loop that is going nowhere.
+
+## Errors compound
+
+[Lesson A0.3](/learn/ai/a0-orientation/probabilistic-components/) shows the rule. If each step succeeds with probability p and steps are independent, a chain of n steps succeeds with probability p to the power n. Three numbers to remember (derived):
+
+- 95% per step, 10 steps: 0.95^10 = 59.9%, about 60%.
+- 95% per step, 20 steps: 0.95^20 = 35.8%, about 36%.
+- 90% per step, 10 steps: 0.90^10 = 34.9%, about 35%.
+
+A step that is "95% good" sounds fine. A 20-step run built from such steps fails almost two times in three. Independent errors are a simplification. In real runs, one bad step often makes the next one worse. So p^n is a gentle estimate.
+
+Four levers move it: fewer steps, a verifier after risky steps, retries on steps that are safe to repeat (idempotent, see lesson [A7.1](/learn/ai/a7-agents-prod/durable-graph-runtime/)), and checkpoints so a failure costs one step and not the run. Judge a run by its path, not only its final answer. Lesson A8.1 returns to that.
+
+## Naive solution: trust the model to stop
+
+Leave the loop with no limit. The Claude Agent SDK documents this case. Its `max_turns` and `max_budget_usd` options both default to "No limit". Without limits, the loop "runs until Claude finishes on its own, which is fine for well-scoped tasks but can run long on open-ended prompts". The same page says setting a budget "is a good default for production agents".
+
+What does a run with no limit cost? Take a flat illustration: each model call carries 30,000 input tokens of context. This is a made-up round number, not a measurement. Then 200 steps send 200 x 30,000 = 6,000,000 input tokens. At Sonnet 5.5 input price of $2 per million tokens (claude.com/pricing, as of 2026-10-16), that is 6 x $2 = $12, with no caching. At Opus 5.5 ($4 per million) it is $24. Prompt caching (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) cuts the repeated prefix, but the shape stays: cost is steps times context times price.
+
+LangGraph has a built-in ceiling. Its graph docs say "Starting in version 1.0.6, the default recursion limit is set to 1000 steps", and "once the limit is reached, LangGraph will raise `GraphRecursionError`". A step here is a super-step. At the same illustration, 1,000 steps x 30,000 tokens = 30 million input tokens, which is $60 on Sonnet 5.5 without caching. A default that protects the process does not protect the budget.
+
+## Stop conditions
+
+Build a stack of independent reasons to stop, and make each one report why it fired:
+
+1. **The model is done.** A reply with no tool calls. The SDK reports a `stop_reason` such as `end_turn`, `max_tokens`, or `refusal`.
+2. **A goal check passes.** Your code tests the result: tests pass, a field is filled, a verifier agrees.
+3. **Turn cap.** Max steps.
+4. **Budget cap.** Max tokens or dollars.
+5. **Wall-clock timeout.** A run that waits on a slow tool must also end.
+6. **User cancel.**
+7. **Stuck detector.** The loop is going nowhere.
+
+Each SDK defines "turn" its own way, and the difference matters:
+
+- Claude Agent SDK: `max_turns` "counts tool-use turns only". It caps tool-use round trips. A final text-only reply is not counted. When it fires, the result has subtype `error_max_turns`, and there is no `result` text.
+- OpenAI Agents SDK: the limit applies to "agent-loop turns (LLM calls)". It raises `MaxTurnsExceeded`. The page states no default, and says `max_turns=None` disables the limit.
+- LangGraph: `recursion_limit` counts super-steps, 1000 by default.
+
+The same number means different amounts of work. A limit of 10 in one SDK is not a limit of 10 in another.
+
+## Budget caps and overshoot
+
+A budget cap in dollars is the most direct control. The Claude Agent SDK has `max_budget_usd`. When it fires, the result subtype is `error_max_budget_usd`. The cap includes subagents: their spend counts toward the total, and once spend reaches the cap, spawning another subagent fails with "Budget limit reached".
+
+Know one detail: the cap is a check after the fact. The SDK docs say Claude Code compares spend with the cap "after model responses arrive". The response that reaches the cap "still completes and counts". Spend can pass the cap by the cost of that one response, plus whatever subagents still running spend before they stop. Set the cap below the real limit you can afford. A cap is a fence, not a wall.
+
+A budget cap alone also has a gap. It fires only when money is gone. A loop that repeats one useless call for 40 turns is wasteful long before it hits $5. For that you need a detector.
+
+## Stuck and oscillation detection
+
+A loop that makes no progress leaves signs. Three cheap ones:
+
+- **Same call, same arguments.** Count calls by (tool name, normalized arguments). Stop when one pair appears n times, say 3.
+- **Same state.** Hash the state after each step. If a hash repeats, the loop has come back to where it was. This also catches A, B, A, B swings, where no two neighbors match.
+- **Flat progress.** Track a number that should move: tests passing, items done, files changed. Stop when it is flat for k steps.
+
+Pick thresholds from real traces. A threshold of 2 will flag a legitimate retry. A threshold of 10 pays for 9 wasted turns.
+
+<Ai7LoopWalk client:visible />
+
+When a detector fires, you have four choices. **Stop** and report. **Summarize** what was tried, then stop. **Ask a human** with that summary (lesson [A7.3](/learn/ai/a7-agents-prod/human-in-the-loop/)). **Fall back** to a simpler path, such as a fixed workflow or a stronger model for one step. Pick one per cause. Never loop again with the same prompt and hope.
+
+Run the simulator. Turn the detector off and watch which cap ends a stuck run, and how late.
+
+<Ai7LoopSim client:visible />
+
+Notice three things. A stuck run with the detector on stops after n turns, at a small cost. With it off, the budget cap ends the run, and spend lands past the cap. A healthy run is never stopped by a detector set at 3 or more, because its calls differ. And a large turn cap with a small budget means the budget is your only real limit.
+
+## A hook as a stop point
+
+If you use Claude Code hooks, a `PreToolUse` hook can block a call. The hooks page says to "exit with code 2 to block the action". One caution from that page: a timed-out command hook does not block the tool call, and the default command timeout is 600 seconds. The hooks page says to set `onFailure: "block"` if the call must be blocked when the hook times out. A guard that can fail open is not a guard. The Claude Code GitHub Actions page lists three cost controls for CI: set `--max-turns` in `claude_args`, set workflow-level timeouts to avoid runaway jobs, and use GitHub concurrency controls to limit parallel runs.
+
+## Trade-offs
+
+| Control | Catches | Misses | Choose it when |
+|---|---|---|---|
+| Model says done | Normal finish | Any loop where the model never decides | Always on, never alone |
+| Turn cap | Long loops | Costly turns, and different meanings per SDK | Always, as a backstop |
+| Budget cap | Cost growth | Waste under the cap; overshoot by one response | Production runs |
+| Timeout | Slow tools, hangs | Fast useless loops | Always |
+| Stuck detector | Repeats, A-B swings | Loops with changing arguments | Agents that call tools |
+| Verifier per step | Wrong results early | Cost and latency of the check | High-risk steps |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "Success falls like p to the n, so I cut steps and verify risky ones. The loop has layered stops: done, goal check, turn cap, dollar cap, timeout, and a stuck detector on repeated calls. The caps are checked after a response, so I keep headroom. On a trigger I summarize and hand to a human." That shows math, layers, and the overshoot detail.
+</Callout>
+
+<Callout type="mistake">
+Do not offer "max steps" as the only answer. A step cap says nothing about cost per step, and one SDK's turn is not another's. Do not quote a dollar horror story as evidence either. Derive the cost from steps, context size, and price, and show the arithmetic.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A Claude Agent SDK run has max_turns set to 3. The task needs 5 tool-use turns. What does the caller get?',
+      options: [
+        'A success result with the partial answer in the result field',
+        'A result with subtype error_max_turns and no result text',
+        'An empty stream, since the limit is checked before the loop',
+        'A retry with the limit doubled to 6, then success',
+      ],
+      answer: 1,
+      explain: 'When the turn limit is hit, the SDK returns a ResultMessage with the error_max_turns subtype. The result field exists only on success, so check the subtype first. The SDK does not raise the limit by itself.',
+    },
+    {
+      q: 'A run has a $1.00 budget cap. Spend is $0.97 when a model response that costs $0.12 arrives. What is the likely final spend?',
+      options: [
+        'Exactly $1.00, since the SDK cuts the response at the cap',
+        'Exactly $0.97, since the SDK refuses a call that would pass the cap',
+        'About $1.09, as that response still completes',
+        'About $1.12, since the cap is only checked at the start of a turn',
+      ],
+      answer: 2,
+      explain: 'The cap is compared with spend after a response arrives, and that response still completes and counts. $0.97 + $0.12 = $1.09. The SDK does not know a response cost in advance, so it cannot refuse it.',
+    },
+    {
+      q: 'Each step of a 20-step agent run succeeds 95% of the time, and the steps are independent. What is the chance the whole run succeeds?',
+      options: [
+        'About 36%, since 0.95 to the 20th power is 0.358',
+        'About 75%, since each step loses 5% and 20 x 5% is 100%',
+        'About 90%, since 95% is the average over many runs',
+        'About 95%, since each step is independent of the others',
+      ],
+      answer: 0,
+      explain: 'Independent steps multiply: 0.95^20 = 0.358. Adding the errors (20 x 5%) does not give 75% and is not the rule. Independence is why the chances multiply, not why the total stays at 95%.',
+    },
+    {
+      q: 'An agent calls search with the same query 40 times and each call returns nothing new. Which control would stop it earliest?',
+      options: [
+        'A higher turn cap, so that the agent has more time to finish',
+        'A lower temperature, which makes the model less random',
+        'A bigger budget cap, which the loop needs to try other ideas',
+        'A counter of repeated identical calls',
+      ],
+      answer: 3,
+      explain: 'A repeat counter fires after n identical calls, long before any cap. A higher turn cap or budget only lets the waste continue. Lower temperature does not stop a loop that is stuck.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="A verifier on a 10-step run"
+  scenario="Each step is right 95% of the time. After every step a verifier catches 80% of the wrong answers, and a caught error is fixed. A wrong answer that the verifier misses is passed on. Assume independent errors and no false alarms."
+  steps={[
+    {
+      prompt: 'What share of steps still end wrong after the verifier, in percent?',
+      unit: '%',
+      answer: 1,
+      within: 1.1,
+      explain: 'A step is wrong 5% of the time. The verifier misses 20% of those: 5% x 0.20 = 1%.',
+    },
+    {
+      prompt: 'What is the end-to-end success of 10 such steps, in percent?',
+      unit: '%',
+      answer: 90.4,
+      within: 1.03,
+      explain: '0.99^10 = 0.904, so about 90.4%. Without the verifier it is 0.95^10 = 59.9%. The check costs extra calls and latency on every step.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Claude Agent SDK: how the agent loop works](https://code.claude.com/docs/en/agent-sdk/agent-loop)
+- [OpenAI Agents SDK: running agents](https://openai.github.io/openai-agents-python/running_agents/)
+- [LangGraph: graph API and the recursion limit](https://docs.langchain.com/oss/python/langgraph/graph-api)
+- [Anthropic: how we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system)

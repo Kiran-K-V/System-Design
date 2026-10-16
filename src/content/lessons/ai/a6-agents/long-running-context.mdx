@@ -1,0 +1,210 @@
+---
+summary: 'An agent adds tokens on every step, mostly from tool results, and re-sends them all on the next call. Keep it alive for hundreds of steps by clearing stale results, keeping notes in files, loading data just in time, and handing wide searches to subagents.'
+requires: ['ai/a4-context/compaction', 'ai/a6-agents/agent-memory']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai6CtxWalk from '../../../../components/anim/lessons/Ai6CtxWalk.tsx';
+import Ai6CtxSim from '../../../../components/anim/lessons/Ai6CtxSim.tsx';
+
+## The problem
+
+A chat adds a few hundred tokens per turn. An agent adds far more, because every step ends with a tool result: a file, a search page, a test log. The model reads the whole history on every call, so each step is more expensive than the one before.
+
+Anthropic's multi-agent write-up says agents "typically use about 4× more tokens than chat interactions" ([source](https://www.anthropic.com/engineering/multi-agent-research-system)). Picture a coding agent that reads files and runs tests for two hours. Its window is 200,000 tokens. If it adds 4,500 tokens a step, it hits the wall near step 44, in the middle of the job.
+
+Lesson [A4.3](/learn/ai/a4-context/context-budgeting/) taught how to budget a window and why quality drops as it fills (context rot). Lesson [A4.4](/learn/ai/a4-context/compaction/) taught the three general levers: clear stale tool results, compact, and keep facts in files. This lesson does not repeat them. It covers what is different for an agent that runs a loop for a long time, and how to combine the levers into one design.
+
+## What grows in an agent loop
+
+Each step adds three things: the model's output (reasoning and a tool call), the tool result, and sometimes a note. In the loop from lesson [A6.1](/learn/ai/a6-agents/agent-loop/), the whole list is sent again on the next call.
+
+Which part is the largest? No source I could find ranks the parts of an agent's context. So do not assume. Measure it for your agent, by logging tokens per message type. In the examples here I set tool results to 4,000 of 4,500 tokens added per step. That is our assumption, and it fits an agent that reads files. A chatty agent with small tool results will look different.
+
+What the source does say: Anthropic describes context as an "attention budget", where "every new token introduced depletes this budget by some amount", and it ties this to attention cost, "n² pairwise relationships for n tokens" ([Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)). So the cost of a long run is not only money. A fuller window can also make the model worse at finding the fact it needs.
+
+## Tactic 1: cap what comes in
+
+The cheapest token is the one that never enters. Cap and paginate tool output, and return only the fields the model needs. Claude Code limits tool responses to 25,000 tokens by default, per Anthropic's tool-writing guide. Lesson [A3.4](/learn/ai/a3-llm-apis/tool-calling-protocol/) covers this, and lesson [A6.5](/learn/ai/a6-agents/tool-design/) covers tool design for agents.
+
+## Tactic 2: clear old tool results
+
+Once the agent has used a result, the raw text rarely matters again. Anthropic calls tool result clearing "one of the safest lightest touch forms of compaction". It is safe because the data is usually not lost: a file can be read again, a search can be run again. A4.4 explained the API feature and its defaults. The design question for an agent is when to clear.
+
+Clear in batches, not on every step. Say your trigger is 100,000 tokens. The agent runs freely up to it, then drops all but the newest few results in one move. This is our reasoning, not a quoted rule: a prompt cache (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) matches an unchanged prefix. Clearing a little on each step would change the prefix on each step. One big clear changes it once and then leaves it stable until the next trigger. Keep the system prompt and tool definitions in front so they stay cached, as in lesson [A4.5](/learn/ai/a4-context/cache-friendly-layout/).
+
+## Tactic 3: notes outside the window
+
+Clearing removes the data. It does not remove the decision you made from the data. If the agent read a 4,000-token config file at step 8 and decided "use the adapter pattern", the decision must live somewhere that survives.
+
+Anthropic names the pattern: "Like Claude Code creating a to-do list, or your custom agent maintaining a NOTES.md file". Agents write notes to a file outside the window and pull them back later. In its long-running harness post, Anthropic uses a `claude-progress.txt` file that "keeps a log of what agents have done", plus git history. A new session is told to "read the git logs and progress files to get up to speed", because "each new session begins with no memory of what came before".
+
+For a backend engineer, this is a write-ahead log and a checkpoint. The window is volatile memory. The notes file is the durable store you replay from. Lesson [A6.7](/learn/ai/a6-agents/agent-memory/) covers memory in general. Here the point is narrow: notes are cheap, and they decide what clearing and compaction can safely drop.
+
+## Tactic 4: just-in-time retrieval
+
+You can load everything up front, or keep light identifiers and load on demand. Anthropic calls the second approach just-in-time: the agent keeps "file paths, stored queries, web links", and tools such as glob and grep "allow it to navigate its environment and retrieve files just-in-time". It also uses Bash commands such as `head` and `tail` to look at big data without loading all of it.
+
+The trade-off is speed against tokens. Preloading is one fast step but fills the window with data you may not use. Just-in-time costs extra tool calls, and each call is a model round trip. A path costs a few tokens. The file it points to may cost thousands.
+
+## Tactic 5: send the wide work to a subagent
+
+If a task needs a wide search, do not run it in the main window. A subagent explores in its own window and returns a short summary. Anthropic says the exploration "might use tens of thousands of tokens or more", and the sub-agent "returns only a condensed, distilled summary of its work (often 1,000-2,000 tokens)". Lesson [A6.10](/learn/ai/a6-agents/subagents/) covers this in full.
+
+Now watch one run with and without clearing and notes.
+
+<Ai6CtxWalk client:visible />
+
+## The cost of a long run
+
+Cost is the sum of the context size at every call, not the final size. In the walk above, the plain run sends 5,000 + 4,500 x (k - 1) tokens at call k. Over 44 calls that is 44 x 5,000 + 4,500 x (0 + 1 + ... + 43) = 220,000 + 4,500 x 946 = 4,477,000 input tokens. Add 44 x 500 = 22,000 output tokens. At Claude Sonnet 5.5 prices of $2 per million input and $10 per million output (as of 2026-10-16, [claude.com/pricing](https://claude.com/pricing)), that is $8.95 + $0.22 = $9.17, and the run still fails at call 45.
+
+The managed run clears when the next call reaches 100,000 tokens, and keeps the newest 3 results in full. It completes 50 calls with 2,902,100 input tokens: $5.80 + $0.25 = $6.05. It used a third less input, and it finished. Try your own numbers below. The model is ours: cleared results shrink to 20 tokens, no cache, notes add 200 tokens every 5 steps.
+
+<Ai6CtxSim client:visible />
+
+Notice two things. First, with large tool results the plain run dies early, and clearing is the difference between finishing and failing. Second, with small tool results (drag the slider to 500) clearing never fires, and it does nothing. Clearing is for the runs that grow.
+
+## Numbers
+
+Suppose each turn adds 6,000 tokens, all of it tool results, and the window is 200,000. With no action, 200,000 / 6,000 = 33.3, so 33 turns. Suppose clearing removes 70% of each result. Then the net growth is 6,000 x 0.30 = 1,800 tokens per turn, and 200,000 / 1,800 = 111 turns. Real agents also carry a system prompt and a reserve for the answer, and clearing is not instant, so treat 111 as an upper bound.
+
+<Ballpark
+  client:visible
+  title="Turns until the window is full"
+  scenario="Each agent turn adds 6,000 tokens, and all of them are tool results. The window is 200,000 tokens. Ignore the system prompt and the reply reserve."
+  steps={[
+    {
+      prompt: 'With no clearing, how many turns fit?',
+      unit: 'turns',
+      answer: 33,
+      within: 1.1,
+      explain: '200,000 / 6,000 = 33.3, so 33 turns.',
+    },
+    {
+      prompt: 'Clearing removes 70% of each tool result. How many turns fit now?',
+      unit: 'turns',
+      answer: 111,
+      within: 1.1,
+      explain: 'Net growth is 6,000 x 0.30 = 1,800 per turn. 200,000 / 1,800 = 111 turns. This is an upper bound: clearing happens in batches, so the window peaks higher between clears.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Tactic | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Cap tool output | Fewer tokens, no later work | The model may need another call | Always; set a cap |
+| Clear old results | Large, cheap token cut | Raw data is gone, cache prefix changes | Results are re-fetchable |
+| Notes file | Decisions survive clearing | A few tokens, write discipline | Any run with more than one clear |
+| Just-in-time loading | Small window, fresh data | More tool calls, more latency | Large or changing data |
+| Subagent | Main window stays small | Extra tokens in total (lesson [A6.10](/learn/ai/a6-agents/subagents/)) | Wide search, clear summary |
+| Compaction (A4.4) | Frees the most space | Lossy summary, extra model call | Last resort, near the limit |
+
+## Interview lens
+
+<Callout type="tip">
+Say it as a budget: "Cost is the sum of context over steps, so I attack growth at four points. I cap tool output, clear stale results at a trigger so the cache prefix stays stable, write decisions to a notes file so clearing is safe, and load files just in time by path. For wide searches I use a subagent. I measure tokens per message type before I decide which one matters."
+</Callout>
+
+<Callout type="mistake">
+Do not say "tool output is the biggest part of the context" as a fact. It is common in file-reading agents, but you must measure it. Also do not clear results without saving the decisions made from them. And do not pick 200,000 as your working limit: quality can fall well before the window is full.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An agent keeps only file paths in its context and runs grep and head to read what it needs. Which tactic is this?',
+      options: [
+        'Eager preloading of files',
+        'Prefix cache warming',
+        'Just-in-time loading',
+        'Tool-result clearing',
+      ],
+      answer: 2,
+      explain: 'Keeping light identifiers and loading data on demand is just-in-time retrieval. Preloading is the opposite. Clearing removes results that are already in context, and cache warming is a different idea.',
+    },
+    {
+      q: 'Clearing replaces a 4,000-token result with a 20-token placeholder. The agent made a design decision from that result. Where must the decision live to survive?',
+      options: [
+        'In a notes file it can re-read',
+        'In the placeholder, which the model keeps',
+        'In the model, which remembers cleared text',
+        'In the system prompt, rewritten each step',
+      ],
+      answer: 0,
+      explain: 'The placeholder holds no detail, and the model cannot recall removed text. A notes file survives. Rewriting the system prompt each step would also change the cached prefix on every call.',
+    },
+    {
+      q: 'A run starts at 5,000 tokens and adds 3,000 per call. The window is 200,000. With no clearing, how many calls fit?',
+      options: [
+        'About 33 calls',
+        'About 50 calls',
+        'About 100 calls',
+        'About 66 calls',
+      ],
+      answer: 3,
+      explain: 'Call k sends 5,000 + 3,000 x (k - 1) tokens. That is at most 200,000 for k - 1 up to 65, so 66 calls fit. 33 comes from dividing by 6,000, and 100 would need 1,950 tokens per step.',
+    },
+    {
+      q: 'Anthropic calls tool result clearing one of the safest lightest-touch forms of compaction. Why is it safer than summarizing the whole history?',
+      options: [
+        'It deletes the whole history in a single step',
+        'Results are re-fetchable and already used',
+        'It raises the prompt cache hit rate on each call',
+        'It keeps every tool result in the window in full',
+      ],
+      answer: 1,
+      explain: 'A used result can often be fetched again, so little is lost for good. A summary may drop a detail that cannot be rebuilt. Clearing does not keep results, and it changes the cached prefix, so it does not raise the hit rate.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai6-ctx-forgotten-decision"
+  title="The agent that changes its mind"
+  scenario="Illustrative case. A coding agent runs for three hours with clearing on. At step 70 it re-reads auth.py, which it first read at step 8, and picks a different token library than the one it chose at step 9. Tests that passed earlier now fail."
+  facts={[
+    'Clearing trigger: 100,000 tokens. Newest 3 results kept in full.',
+    'Clearings so far: 4. Peak context: 97,000 tokens.',
+    'No notes file or progress file is used.',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The window filled up, so the model could not read new text',
+        'The step 9 choice lived only in cleared text, so it was lost',
+        'The model is too small to keep a library choice for 70 steps',
+        'The system prompt was too long, so it overrode earlier choices',
+      ],
+      answer: 1,
+      explain: 'Peak context was 97,000, well below the window, so the window did not overflow. The reasoning at step 9 sat next to a result that clearing removed. With no notes, nothing recorded the choice.',
+    },
+    {
+      prompt: 'What is the best fix?',
+      options: [
+        'Turn clearing off and let the run use the whole window',
+        'Raise the trigger to 190,000 so clearing happens less often',
+        'Write decisions to a notes file, and re-read it after each clear',
+        'Keep only the newest result in full, so the window stays smaller',
+      ],
+      answer: 2,
+      explain: 'A notes file makes decisions durable, so clearing is safe. Turning clearing off or raising the trigger only delays the problem and raises cost. Keeping fewer results in full loses more context, not less.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+- [Anthropic: Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
+- [Anthropic: How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system)

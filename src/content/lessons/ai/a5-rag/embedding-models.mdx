@@ -1,0 +1,192 @@
+---
+summary: 'An embedding model is a choice with three bills: vector size, embedding cost, and the cost of switching later. Weigh dimensions, input limit, and domain fit, test on your own queries, and price a re-embed before you commit.'
+requires: ['ai/a1-model-function/embeddings']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai5EmbMrl from '../../../../components/anim/lessons/Ai5EmbMrl.tsx';
+import Ai5EmbCalc from '../../../../components/anim/lessons/Ai5EmbCalc.tsx';
+
+## The problem
+
+You are building search over 50 million document chunks. Lesson [A1.2](/learn/ai/a1-model-function/embeddings/) showed what an embedding is: a vector where distance stands for meaning. It did not say which embedding model to pick. That choice is harder to undo than most.
+
+Every vector in your index comes from one model. Vectors from two models live in two different coordinate systems, so you cannot compare them. If you change the model, you embed every chunk again and rebuild the index. So the pick sets your storage bill, your query quality, and the price of a future switch.
+
+## Naive solution: pick the top of a leaderboard
+
+The usual first move is to open a public leaderboard and take the model at the top. The **MTEB** [mid] paper (Massive Text Embedding Benchmark) built that kind of table. It covers 8 task types, 58 datasets, and 112 languages, and it tested 33 models. Its own abstract says "no particular text embedding method dominates across all tasks."
+
+That sentence is the warning. A model that wins on average can lose on your task. The leaderboard changes often, and the live page did not load for us, so we quote no rankings here. Use MTEB to build a shortlist. Do not use it to decide.
+
+## The mechanism: four knobs and one test
+
+Think of an embedding model as a function with four properties. Three show up in the price list, and one hides in your data.
+
+**Dimensions.** OpenAI documents `text-embedding-3-small` at 1,536 numbers per vector and `text-embedding-3-large` at 3,072. A float32 number takes 4 bytes. So a 1,536-dimension vector is 6,144 bytes and a 3,072-dimension vector is 12,288 bytes. Storage grows in a straight line with dimensions. So does search time, because every distance reads every number. Lesson [A5.2](/learn/ai/a5-rag/ann-indexes/) shows how much that hurts at scale.
+
+**Max input.** OpenAI's models take up to 8,192 tokens per input. Cohere lists `embed-v4.0` at a 128k context and its v3 models at 512 tokens (docs.cohere.com, as of 2026-10-16). The limit sets how big a chunk can be in one call. It is not a target. A chunk can be short and still sit under the limit. Lesson [A5.4](/learn/ai/a5-rag/chunking-contextual/) covers how to pick chunk size.
+
+**Price.** OpenAI lists $0.02 per million input tokens for `text-embedding-3-small`, $0.13 for `text-embedding-3-large`, and $0.10 for the older `text-embedding-ada-002` (developers.openai.com/api/docs/pricing, as of 2026-10-16). Embedding is a one-time cost per chunk, plus the cost of each query, which is one short text.
+
+**Domain fit.** A general model has seen mostly web text. If your corpus is legal clauses, source code, or product part numbers, the model may place them less well. We have no sourced number for how much. That is the reason for the test below.
+
+### Shorter vectors: Matryoshka
+
+Some models are trained so the first numbers of the vector carry the coarse meaning and later numbers add detail. This is **Matryoshka representation learning** [senior] (MRL), named after nesting dolls. You can cut the vector to a prefix and still use it. OpenAI exposes this as a `dimensions` parameter. Its guide says `text-embedding-3-large` cut to 256 dimensions still beats `text-embedding-ada-002` at 1,536 dimensions on MTEB. It also says that if you slice a vector yourself, you must divide by its L2 norm to bring the length back to 1.
+
+The MRL paper has hard numbers, but on images. A ResNet-50 on ImageNet-1K with a linear classifier scores 76.80% top-1 at 2,048 dimensions, 75.82% at 64, 75.03% at 32, 73.53% at 16, and 66.63% at 8 (Table 1). The abstract claims "up to 14x smaller embedding size" at the same accuracy. Step through the cut. The shape is what to take away: a long flat stretch, then a knee. For text, find the knee with your own queries.
+
+<Ai5EmbMrl client:visible />
+
+At 64 dimensions the vector is 32 times smaller than at 2,048 (256 bytes against 8,192) and the score is under one point lower. Notice what you cannot read off the paper: where the knee sits for your text model. Test it.
+
+### The test: recall@k on your own queries
+
+Build a small set of real queries. For each one, mark which chunk holds the answer. Then run each query against the index and ask: did the right chunk appear in the top k results? **Recall@k** [mid] is the share of queries where it did. If 82 of 100 queries find their chunk in the top 5, recall@5 is 82%.
+
+Do this for each shortlisted model and for each dimension you might cut to. A few hundred labelled queries is enough to tell models apart when the gap is large. Keep the set. You will need it again when a new model ships, and in the evaluation lesson of this module.
+
+```python title="compare_models.py"
+from openai import OpenAI
+
+client = OpenAI()
+
+def embed(texts, model, dims=None):
+    kwargs = {"model": model, "input": texts}
+    if dims:
+        kwargs["dimensions"] = dims  # shortens the vector, still length 1
+    resp = client.embeddings.create(**kwargs)
+    return [d.embedding for d in resp.data]
+
+# for each (model, dims) pair: embed chunks, embed queries,
+# take top-5 by dot product, count queries whose gold chunk is in it
+```
+
+## Numbers: the switch bill
+
+Move the sliders. The default is 50 million chunks of 500 tokens, which is 25 billion tokens.
+
+<Ai5EmbCalc client:visible />
+
+Work the three prices by hand. 25,000 million tokens at $0.02 per million is $500. At $0.10 it is $2,500. At $0.13 it is $3,250. These are list prices. They leave out retries, rate-limit waits, and batch discounts, and OpenAI's page lists no batch price for embeddings.
+
+Storage tells the other half. 50 million vectors at 1,536 dimensions, float32, is 50,000,000 x 6,144 = 307.2 GB before any index. At 256 dimensions it is 51.2 GB.
+
+So the dollar cost of a re-embed is small next to the other costs of a switch. You also pay for the engineering time to rebuild, a period with two indexes, and a re-run of your whole eval. Plan the switch like a database migration: build the new index beside the old, send a slice of queries to both, compare recall@k, then cut over.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| More dimensions | More detail per vector | Storage and search cost grow in a straight line | Hard queries, small corpus |
+| Fewer dimensions (MRL cut) | Smaller index, faster search | Some quality, measured on your data | Large corpus, tight memory |
+| Bigger, pricier model | Often better recall | 6.5x the per-token price (large against small) | Quality gap shows in your eval |
+| Long max input | Big chunks in one call | Vague vectors for mixed text | Long, tightly linked passages |
+| Domain-tuned model | Better fit to your jargon | Fewer choices, a vendor tie | Public models fail your eval |
+
+The 6.5x is $0.13 divided by $0.02, derived from the list prices above.
+
+## Interview lens
+
+<Callout type="tip">
+Show the whole bill: "I would shortlist two or three models from MTEB, then run recall@5 on a few hundred of our own labelled queries. I would also test a shorter dimension. 50 million 1,536-dimension vectors are about 307 GB, so a 256-dimension cut matters." Then name the switch cost: a re-embed of every chunk, and an old and a new index side by side.
+</Callout>
+
+<Callout type="mistake">
+Do not say "use the best model on MTEB" and stop. Do not mix vectors from two models in one index, or compare them with each other. And do not cut dimensions by slicing without renormalizing, or by assuming a model supports it: only models trained for it, or an API with a `dimensions` parameter, cut cleanly.
+</Callout>
+
+<Callout type="deep" title="Bi-encoders and why vectors are precomputed">
+An embedding model here is a **bi-encoder** [mid]: it encodes the query and each document separately. That is why you can embed the corpus once and store it. A model that reads the query and a document together can judge them better, but it must run once per pair. You cannot precompute that, so it only fits a short list of candidates. That is the reranker of lesson [A5.6](/learn/ai/a5-rag/reranking-rewriting/).
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Re-embedding 50 million chunks"
+  scenario="Your corpus has 50 million chunks of about 500 tokens each (illustrative). You consider moving from text-embedding-3-small to text-embedding-3-large. List prices as of 2026-10-16: $0.02 and $0.13 per 1M input tokens."
+  steps={[
+    {
+      prompt: 'Total tokens to embed, in tokens?',
+      unit: 'tokens',
+      answer: 25000000000,
+      within: 1.1,
+      explain: '50,000,000 chunks x 500 tokens = 25,000,000,000 tokens, or 25 billion.',
+    },
+    {
+      prompt: 'Cost to embed all of it once with text-embedding-3-small, in dollars?',
+      unit: 'USD',
+      answer: 500,
+      within: 1.1,
+      explain: '25,000 million tokens x $0.02 per million = $500.',
+    },
+    {
+      prompt: 'Cost with text-embedding-3-large, in dollars?',
+      unit: 'USD',
+      answer: 3250,
+      within: 1.1,
+      explain: '25,000 million tokens x $0.13 per million = $3,250. Add the 3,072-dimension storage: 50,000,000 x 12,288 bytes = 614 GB.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'You switch your index from one embedding model to another but keep the old vectors for old chunks. What goes wrong?',
+      options: [
+        'Distances between old and new vectors mean nothing',
+        'The index grows by 2x for every new chunk added',
+        'The new model refuses to read old chunk text',
+        'Cosine similarity stops working on 1,536 dimensions',
+      ],
+      answer: 0,
+      explain: 'Each model builds its own coordinate system, so a distance between vectors from two models has no meaning. You must re-embed every chunk. The size of the index and the text of the chunks are not the cause.',
+    },
+    {
+      q: 'What does recall@5 measure on your own labelled query set?',
+      options: [
+        'The share of tokens in the top 5 chunks that are relevant',
+        'How fast the model embeds five queries in a row',
+        'The share of queries whose gold chunk is in the top 5',
+        'The cosine score of the fifth result averaged over queries',
+      ],
+      answer: 2,
+      explain: 'Recall@k counts the queries for which the known correct chunk shows up in the top k results. It says nothing about speed. A score average is not a recall figure either.',
+    },
+    {
+      q: 'You cut a 1,536-dimension vector to 384 numbers. By how much does float32 storage per vector fall?',
+      options: [
+        'By 2 times, to 3,072 bytes',
+        'By 8 times, to 768 bytes',
+        'By 16 times, to 384 bytes',
+        'By 4 times, to 1,536 bytes',
+      ],
+      answer: 3,
+      explain: '1,536 / 384 = 4. Storage is 4 bytes x dimensions, so 6,144 bytes falls to 1,536 bytes. The quality cost of the cut must still be measured.',
+    },
+    {
+      q: 'A model tops the public MTEB table. Why is that not enough to choose it?',
+      options: [
+        'MTEB tests only English text, so it never applies elsewhere',
+        'No method wins on every task, and your data may differ',
+        'MTEB scores cannot be compared across any two models',
+        'A top model always has the largest vectors and costs the most',
+      ],
+      answer: 1,
+      explain: 'The MTEB authors found that no method dominates across all tasks. Your corpus and queries are one more task. The benchmark covers 112 languages, so the English-only claim is wrong, and price does not follow rank.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [OpenAI, Embeddings guide](https://developers.openai.com/api/docs/guides/embeddings): default dimensions, the `dimensions` parameter, 8,192-token input, normalization.
+- [OpenAI, API pricing](https://developers.openai.com/api/docs/pricing): the per-million-token embedding prices used above.
+- [Kusupati et al., Matryoshka Representation Learning](https://arxiv.org/abs/2205.13147): Table 1 and the 14x claim.
+- [Muennighoff et al., MTEB](https://arxiv.org/abs/2210.07316): the benchmark design and the no-dominant-method finding.

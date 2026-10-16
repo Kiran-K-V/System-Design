@@ -1,0 +1,231 @@
+---
+summary: 'Retrieve wide and cheap, then rerank narrow and exact. A cross-encoder reads the query and a chunk together, so it is more precise than a bi-encoder and too slow for a whole corpus. Learn the cascade, its latency and cost, and the query-side fixes: rewriting, HyDE, multi-query and decomposition.'
+requires: ['ai/a5-rag/hybrid-rrf']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai5RerankWalk from '../../../../components/anim/lessons/Ai5RerankWalk.tsx';
+import Ai5RerankCalc from '../../../../components/anim/lessons/Ai5RerankCalc.tsx';
+
+## The problem
+
+Hybrid search (lesson [A5.5](/learn/ai/a5-rag/hybrid-rrf/)) returns a list in which the right chunk is somewhere. It is often not first. Suppose it is at position 31 of 50. If you send the top 5 chunks to the model, the model never sees it. If you send all 50, you pay for 10 times the input tokens, and the model must find one useful chunk among 49 distractors. Lesson [A1.6](/learn/ai/a1-model-function/hallucination-context/) showed how models lose facts in long inputs.
+
+Two fixes exist, and they attack different ends. One improves the **order** of the candidates after retrieval. The other improves the **query** before retrieval.
+
+## Why the first-stage search is only approximate
+
+A **bi-encoder** [mid] embeds the query and each chunk separately. The chunk vectors are computed once, offline, and stored. At query time you embed only the query and compare. This is what makes search over millions of chunks fast.
+
+It is also a limit. The chunk vector was fixed before the query existed. It must carry everything about the chunk that any future query could need, in one vector. The vector and the query never meet inside the model.
+
+A **cross-encoder** [senior] reads the query and one chunk together as a single input. Its attention can compare every query word to every chunk word. It outputs one relevance score. It is more precise because it sees the pair. It cannot precompute anything: the input includes the query, so each new query needs a fresh forward pass for every chunk you want to score. For a corpus of a million chunks that is a million passes per query. So it is used only on a short list.
+
+**Late interaction** [senior], as in ColBERT, sits between them. It encodes the query and chunk separately, like a bi-encoder, but keeps one vector per token, not one per chunk. Scoring compares the query token vectors with the chunk token vectors. Chunk token vectors can still be computed offline. The ColBERT abstract reports that it stays competitive with BERT-based rerankers while running about a hundred times faster ([ColBERT](https://arxiv.org/abs/2004.12832)). The price is storage: one vector per token, not one per chunk. The ColBERTv2 abstract says it cuts the space of late-interaction models by 6 to 10 times. We cite these as the papers state them and do not give scores.
+
+| | Bi-encoder | Late interaction | Cross-encoder |
+|---|---|---|---|
+| Query and chunk meet | Never, only by vector distance | At token level, after encoding | Inside the model, together |
+| Precompute chunks | Yes, one vector | Yes, many vectors | No |
+| Cost per query | Lowest | Middle | Highest, per pair |
+| Best use | Stage 1 over the corpus | Stage 1 or 2 when you can store it | Stage 2 over a short list |
+
+## The cascade
+
+Put the cheap one first and the exact one second. Retrieve 50 chunks with dense plus BM25 plus RRF. Rerank those 50 with a cross-encoder. Send the top 5 to the LLM. Step through it, and the query-side fix first, because a bad query poisons both stages.
+
+<Ai5RerankWalk client:visible />
+
+If you know recommender systems: this is the same two-stage shape, a cheap candidate generator and then a heavier ranker. The classic version is elective E1.5, so we do not teach it here. The sbert docs describe the same pattern for text: a retriever returns, for example, 100 hits, and a re-ranker scores them and shows the top 5 ([sbert: retrieve and re-rank](https://www.sbert.net/examples/sentence_transformer/applications/retrieve_rerank/README.html)).
+
+Anthropic's contextual retrieval test (lesson [A5.4](/learn/ai/a5-rag/chunking-contextual/)) put numbers on one stack: adding a reranker took the top-20 failure rate from 2.9% to 1.9% ([Anthropic](https://www.anthropic.com/news/contextual-retrieval)). That is one test. It shows the direction, not a promise.
+
+## What the reranker costs
+
+Reranking adds a step to the latency path and a line to the bill.
+
+**Latency.** You score N pairs. Time is about N times the time per pair, divided by how many pairs the hardware scores at once. We found no published per-pair latency, so the calculator below takes it as an **illustrative** input. Measure your own reranker. Rerank time also grows with chunk length, since the model reads the query and the chunk together. Hosted rerankers cap the input: check the limit of the model you use.
+
+**Cost.** A hosted reranker bills by tokens. Voyage lists rerank-3 at $0.05 per 1M tokens and rerank-3-lite at $0.02 (as of 2026-10-16, [docs.voyageai.com](https://docs.voyageai.com/docs/pricing)). We assume billing counts the document tokens of every candidate. For 50 candidates of 500 tokens: 50 x 500 = 25,000 tokens, x $0.05 / 1M = **$0.00125 per query**, or $1,250 per million queries.
+
+Now the saving. If the LLM reads 5 chunks instead of 50, its input is 2,500 tokens instead of 25,000. At Claude Sonnet 5.5's $2 per 1M input tokens (as of 2026-10-16, [claude.com/pricing](https://claude.com/pricing)), that is $0.005 against $0.05 per query. The reranker costs $0.00125 and saves $0.045. Reranking often pays for itself on the model bill alone, and it can improve the answer.
+
+<Ai5RerankCalc client:visible />
+
+## Fixing the query
+
+A reranker repairs order. It cannot repair a query that never retrieved the right chunk. These four tools work on the query.
+
+**Query rewriting.** A small LLM rewrites the user's text into a better search query. The common case is a chat follow-up ("and for annual plans?") that needs the earlier turns to make sense. The Rewrite-Retrieve-Read paper adds a small rewriter tuned with feedback from a frozen LLM reader. Its abstract reports consistent improvements and gives no effect size in the part we read ([arXiv 2305.14283](https://arxiv.org/abs/2305.14283)). Cost: one short LLM call before every search.
+
+**HyDE** (hypothetical document embeddings). An LLM writes a made-up answer to the query. You embed that answer and search with it. The idea is that an answer looks more like a chunk than a question does. The HyDE paper reports it beats the unsupervised Contriever retriever and comes close to fine-tuned retrievers, and it warns that the made-up document can hold false details ([arXiv 2212.10496](https://arxiv.org/abs/2212.10496)). The fake answer is only a search key, never shown to the user, but a false detail can pull the search toward the wrong chunks. We give no effect sizes: the abstracts do not give any.
+
+**Multi-query.** The LLM writes 3 or 4 variants of the query. You search each and merge the lists with RRF, as in lesson [A5.5](/learn/ai/a5-rag/hybrid-rrf/). It improves recall for vague questions and multiplies the number of searches.
+
+**Query decomposition.** A question with parts ("Compare the refund rules for plan A and plan B") is split into sub-questions. Each is retrieved on its own, and the answers are combined. Without it, the top-k list fills with chunks about whichever part matches best, and the other part is missing.
+
+| Tool | Fixes | Costs | Risk |
+|---|---|---|---|
+| Rewrite | Follow-ups, typos, missing topic | One small LLM call | A bad rewrite loses the user's intent |
+| HyDE | Short or vague questions | One LLM call, one embed | False details steer the search |
+| Multi-query | Vague, many-phrasing questions | N searches | More noise to filter |
+| Decomposition | Questions with several parts | Several searches and calls | Latency, and a merge step |
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| ColBERT vs BERT reranking, speed | about 100x faster, competitive | ColBERT abstract |
+| ColBERTv2 space cut | 6 to 10x | ColBERTv2 abstract |
+| Voyage rerank-3, rerank-3-lite price | $0.05, $0.02 per 1M tokens | Voyage docs |
+| Rerank 50 x 500 tokens, one query | $0.00125 | Derived |
+| LLM input, 50 vs 5 chunks (Sonnet 5.5) | $0.05 vs $0.005 | Derived |
+| Latency per rerank pair | not sourced | Illustrative only |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| No reranker | Lowest latency and cost | Right chunk often out of top-k | Easy queries, tight latency |
+| Cross-encoder rerank | Better order, shorter LLM prompt | Latency, a model, a bill | Answer quality limits the product |
+| Larger N | More recall before the cut | Linear rerank time and cost | The right chunk is often deep |
+| Late interaction | Between the two in cost | Heavy index storage | You can afford token vectors |
+| Query rewriting | Fixes chat follow-ups | A call before search | Multi-turn products |
+
+## Interview lens
+
+<Callout type="tip">
+Describe the funnel with budgets: "Stage 1 retrieves 50 with hybrid search. A cross-encoder reranks them and I send 5 to the LLM. The reranker adds N times the per-pair latency but cuts LLM input by 10 times." Then say how you would measure it: recall@50 for stage 1, recall@5 after the rerank.
+</Callout>
+
+<Callout type="mistake">
+Do not put a cross-encoder over the whole corpus. Do not quote a latency or quality gain you did not measure. And do not add HyDE or rewriting by default: each adds an LLM call and a way to be wrong. Add them when you can show the failure they fix.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Cost of reranking 50 candidates"
+  scenario="Each query reranks 50 candidates of 500 tokens. Voyage rerank-3 costs $0.05 per 1M tokens, billed on document tokens (our assumption). The reranker scores 10 pairs at a time, 4 ms per pair (both illustrative)."
+  steps={[
+    {
+      prompt: 'Tokens the reranker reads per query?',
+      unit: 'tokens',
+      answer: 25000,
+      within: 1.05,
+      explain: '50 candidates x 500 tokens = 25,000 tokens.',
+    },
+    {
+      prompt: 'Cost per 1M queries, in dollars?',
+      unit: '$',
+      answer: 1250,
+      within: 1.1,
+      explain: '25,000 tokens x $0.05 / 1M = $0.00125 per query. Times 1,000,000 queries = $1,250.',
+    },
+    {
+      prompt: 'Rerank time per query, in ms?',
+      unit: 'ms',
+      answer: 20,
+      within: 1.1,
+      explain: '50 pairs x 4 ms = 200 ms of work. At 10 pairs in parallel that is 20 ms of wall time. The per-pair figure is illustrative.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai5-rerank-followup"
+  title="Good on turn one, bad on turn two"
+  scenario="A support bot answers first questions well. Follow-ups such as 'and for annual plans?' return chunks about unrelated topics. Recall@5 on a single-turn test set is 94%."
+  facts={[
+    'search text sent to the index: the last user message only',
+    'chat history is only given to the answering model',
+    'reranker is on: top 50 to top 5',
+    'follow-up recall@50, measured: low',
+  ]}
+  steps={[
+    {
+      prompt: 'Where is the failure?',
+      options: [
+        'The reranker model is too weak for chat',
+        'The search text lacks the topic from earlier turns',
+        'The LLM context window is too small for 5 chunks',
+        'The chunks are cut at the wrong place',
+      ],
+      answer: 1,
+      explain: 'Recall@50 is low, so the right chunk is not even a candidate. A reranker cannot reorder what was not retrieved. The query has no topic because history is not used for search.',
+    },
+    {
+      prompt: 'What is the best fix?',
+      options: [
+        'Rewrite each turn into a stand-alone query before search',
+        'Raise top-k to 200 and rerank all of it',
+        'Use a larger embedding model for the index',
+        'Turn off the reranker to save latency',
+      ],
+      answer: 0,
+      explain: 'A rewrite puts the topic from the history into the search text, at the cost of one short call. A larger window does not add the missing words, and a bigger embedding model embeds the same weak text.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why can a cross-encoder not be used as the first-stage search over millions of chunks?',
+      options: [
+        'It needs a fresh pass for every query and chunk pair',
+        'It cannot read a query that has more than ten words',
+        'It only works on chunks that have been cached before',
+        'It returns vectors that are too large to compare',
+      ],
+      answer: 0,
+      explain: 'The query is part of the input, so nothing about a chunk can be computed ahead of time. A million chunks means a million passes per query. It does not limit query length and it returns a score, not a vector.',
+    },
+    {
+      q: 'What does late interaction (ColBERT) store per chunk that a bi-encoder does not?',
+      options: [
+        'The full text of the chunk twice',
+        'A single larger vector',
+        'One vector per token',
+        'A trained query rewriter',
+      ],
+      answer: 2,
+      explain: 'It keeps a vector for each token so that scoring can compare query tokens with chunk tokens. That is why the index is larger. A bi-encoder keeps one vector per chunk.',
+    },
+    {
+      q: 'You rerank 50 candidates of 500 tokens at $0.05 per 1M tokens. What is the cost of 1,000 queries?',
+      options: [
+        '$0.125',
+        '$1.25',
+        '$12.50',
+        '$0.0125',
+      ],
+      answer: 1,
+      explain: '25,000 tokens x $0.05 / 1M = $0.00125 per query. 1,000 queries = $1.25.',
+    },
+    {
+      q: 'What is the main risk of HyDE?',
+      options: [
+        'It needs a labeled training set',
+        'It stops BM25 from working at all',
+        'It removes the need for a vector index',
+        'Made-up details can steer the search',
+      ],
+      answer: 3,
+      explain: 'The generated document is a guess. If it contains wrong facts, the embedding follows them. HyDE still uses an index and needs no labels, and it works with the same encoders.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction](https://arxiv.org/abs/2004.12832): late interaction and the speed claim.
+- [HyDE: Precise Zero-Shot Dense Retrieval without Relevance Labels](https://arxiv.org/abs/2212.10496): hypothetical document embeddings.
+- [Query Rewriting for Retrieval-Augmented LLMs](https://arxiv.org/abs/2305.14283): the Rewrite-Retrieve-Read idea.
+- [Sentence-Transformers: Retrieve and Re-Rank](https://www.sbert.net/examples/sentence_transformer/applications/retrieve_rerank/README.html): the bi-encoder plus cross-encoder pattern.

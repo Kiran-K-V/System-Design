@@ -1,0 +1,237 @@
+---
+summary: 'An agent forgets everything when its context window ends. Memory is a store outside the window that the agent writes to and reads from. The design questions are what to write, what to load, and when to forget, and each choice costs tokens and adds risk.'
+requires: ['ai/a4-context/compaction', 'ai/a6-agents/agent-loop']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai6MemWalk from '../../../../components/anim/lessons/Ai6MemWalk.tsx';
+import Ai6MemSim from '../../../../components/anim/lessons/Ai6MemSim.tsx';
+
+## The problem
+
+On Monday your coding agent learns that the project deploys with `make ship`. On Tuesday it starts a new session and tries `npm run deploy`. It fails, the user explains again, and the agent fixes it. On Wednesday the same thing happens.
+
+The model did not get worse. A model call is stateless (lesson [A3.1](/learn/ai/a3-llm-apis/api-anatomy/)). The only thing it knows is what is in the context window for this call. When the session ends, the window is gone. Anything the agent should keep must live somewhere else. That place is **memory**.
+
+## What "memory" means
+
+The word covers different things. The CoALA paper (a framework for language agents, linked below) gives clean names. It defines **working memory** as information that is "active and readily available" for "the current decision cycle". For a language model agent, that is the context window. It also defines three long-term kinds:
+
+- **Episodic memory** "stores experience from earlier decision cycles". Example: a log of past runs, what the agent tried, and how it ended.
+- **Semantic memory** "stores an agent's knowledge about the world and itself". Example: "this project deploys with `make ship`".
+- **Procedural memory** is knowledge about how to act. The paper says it has two forms: implicit knowledge in the model weights, and the agent's own code.
+
+The paper adds that "learning occurs by writing information to long-term memory". That is the whole job in one line. An agent that learns must write. An agent that benefits must read.
+
+Most product work sits in the first two long-term kinds. You cannot change the weights from a chat session. So in practice, memory is a store of notes: facts (semantic) and experience (episodic). A rules file that the agent reads at the start of every session is procedural in spirit, though that mapping is our reading, not the paper's.
+
+Lesson [A4.4](/learn/ai/a4-context/compaction/) covers what to do inside one session when the window fills: compaction. Memory is for what must survive the session, or survive a compaction.
+
+## A memory store you can build today
+
+Anthropic's memory tool shows the minimal design. It is **client-side**: "Claude requests file operations, and your application executes them." The model asks for a command. Your code runs it against storage you control and returns a `tool_result`. You turn it on with one entry in `tools`:
+
+```json title="tools-entry.json"
+{ "type": "memory_20250818", "name": "memory" }
+```
+
+The commands are `view`, `create`, `str_replace`, `insert`, `delete`, and `rename`. All paths sit under `/memories`, a prefix that your handler maps onto real storage, such as a per-user folder or keys in a database. When the tool is in your request, the API adds an instruction to the system prompt. In short, it says: view your memory directory before anything else, record progress as you go, and assume your context may be reset at any time.
+
+Watch one fact travel across sessions. The run is scripted and illustrative.
+
+<Ai6MemWalk client:visible />
+
+Your handler is a security boundary. The docs warn that a path such as `/memories/../../secrets.env` can reach files outside the memory folder, and that you must validate every path in every command. One safe pattern resolves the path to its canonical form and checks that it stays inside the root:
+
+```python title="memory_paths.py"
+from pathlib import Path
+
+ROOT = Path("/srv/agent-memory/user-42").resolve()
+
+def safe_path(p: str) -> Path:
+    if not p.startswith("/memories"):
+        raise ValueError("path must start with /memories")
+    full = (ROOT / p.removeprefix("/memories").lstrip("/")).resolve()
+    full.relative_to(ROOT)  # raises ValueError if full escapes ROOT
+    return full
+```
+
+Catch the `ValueError` and return it as an error result, so the model sees what went wrong. The docs also list URL-encoded sequences such as `%2e%2e%2f`, so decode the path before you check it.
+
+## Write, read, forget
+
+A store without a policy fills with noise. Decide three things.
+
+**What to write.** Write what is durable and useful in a later session: decisions, commands that work, user preferences, and lessons from failures. Do not write the whole transcript, and do not write guesses as facts. Keep notes short, one topic per file.
+
+**When to read.** The simplest rule is to read at session start. The memory tool's own system prompt says so. The docs describe memory as supporting "just-in-time context retrieval": the agent keeps notes outside the window and reads them back on demand, so the active context stays focused. The context engineering guide puts it this way: an agent can write a to-do list or a `NOTES.md` file, and pull it back later. That guide also names the trade-off of loading data at run time. It is slower than retrieving precomputed data and needs good tool guidance, or the agent wastes context.
+
+**When to forget.** The docs advise tracking file sizes, capping how large a file can grow, and deleting files that "haven't been accessed in a long time". A stale note is worse than none. The agent trusts it, acts on it, and the result is wrong with full confidence. Date your notes, and let the agent replace a note when a fact changes.
+
+**Sensitive data.** The docs say Claude "usually refuses to write sensitive information to memory files", and then say to add validation that strips it before the handler writes. Do not rely on the model alone. Passwords, tokens, and personal data do not belong in notes.
+
+## Retrieval-based memory
+
+A file folder works while the store is small. What if the agent has written 10,000 notes? Listing them is too much. Then you add search: embed each note, store it in an index, and fetch the few that match the current task. This is the same retrieval used for documents, and module A5 covers it. The difference is that here the agent writes the corpus itself.
+
+Retrieval changes the failure from "too many tokens" to "wrong notes". A search can miss the one note that matters. Try the model below. Every number in it is an assumption you set, and its arithmetic is shown under the results. It is a toy, not a benchmark.
+
+<Ai6MemSim client:visible />
+
+Set notes per day to 5 and expiry to 60 days. The store holds 5 x 60 = 300 notes. Loading all of them at 150 tokens each puts 45,000 tokens in front of the model, and only 3 of the 300 matter. Expiry is a cost control as well as a hygiene rule: with a 720-day expiry, the same store holds 3,600 notes.
+
+<Ballpark
+  client:visible
+  title="Load everything, or retrieve"
+  scenario="An agent writes 5 notes a day and keeps each for 60 days. Each note is 150 tokens. Only 3 notes matter for a given request. The model is Sonnet 5.5 at $2 per 1M input tokens (claude.com/pricing, 2026-10-16). Count input tokens only."
+  steps={[
+    {
+      prompt: 'How many tokens does it take to load every note into the context?',
+      unit: 'tokens',
+      answer: 45000,
+      within: 1.1,
+      explain: '5 x 60 = 300 notes. 300 x 150 = 45,000 tokens.',
+    },
+    {
+      prompt: 'What does loading every note cost for 1,000 requests?',
+      unit: 'dollars',
+      answer: 90,
+      within: 1.1,
+      explain: '45,000 x 1,000 x $2 / 1,000,000 = $90.',
+    },
+    {
+      prompt: 'Now retrieve the top 5 notes only. What do 1,000 requests cost?',
+      unit: 'dollars',
+      answer: 1.5,
+      within: 1.1,
+      explain: '5 x 150 = 750 tokens. 750 x 1,000 x $2 / 1,000,000 = $1.50. This is 60 times cheaper, but only if the 3 notes that matter are in the top 5.',
+    },
+  ]}
+/>
+
+## Risks: stale and poisoned memory
+
+Memory makes an agent's past part of its input. That has two risks.
+
+**Staleness.** A note says the API base URL is X. The team moved it last week. The agent now fails, or worse, writes to the old place. Fix it with dates, expiry, and a rule that the agent checks a note against the live system when it can.
+
+**Poisoning.** Lesson [A3.4](/learn/ai/a3-llm-apis/tool-calling-protocol/) showed that tool results can carry instructions from outside, which is called indirect prompt injection. Memory extends the reach of that risk. Suppose the agent reads a web page that hides an instruction, and then saves a "useful tip" from that page. The instruction now sits in the store, and every later session reads it as if the agent had learned it. We derive this risk from prompt injection. It is not a measured rate, and we give no number. The defenses follow from the same ideas: keep the source of each note, treat notes from untrusted content as lower trust, review what gets written for sensitive or action-like text, and let the user see and delete memories. Module A10 covers prompt injection in full.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Only the context window | Simple, nothing to secure | Forgets at session end | One-shot tasks |
+| File notes (memory tool) | Easy to read and audit, small code | Agent must read and write well | Small stores, coding agents |
+| Vector index of notes | Scales to many notes | Misses, another system to run | Thousands of notes |
+| Load all notes | Never misses a note | Tokens and cost grow with the store | Very small stores |
+| Expiry | Smaller store, fewer stale notes | A useful note may vanish | Most stores |
+| Write policy and review | Cleaner, safer notes | Missed lessons, extra work | Anything that acts for a user |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "The window is working memory. For long-term memory I keep notes outside it: facts and past experience, written by the agent through a tool I control. At session start it views the store, and I load only what the task needs. I cap size, expire unused notes, strip sensitive data, and record where each note came from, because memory can carry a prompt injection into later sessions." That shows the types, the cost, and the risk.
+</Callout>
+
+<Callout type="mistake">
+Do not say "just give the agent a vector database" without a write policy. Do not load all memories into every call: cost and noise grow with the store. And do not trust the model to keep secrets out of notes. The docs say Claude usually refuses, and still tell you to strip them in code.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An agent keeps a log of past runs: what it tried, and how each run ended. Which CoALA memory type is this?',
+      options: [
+        'Working memory, since the log lives in the window',
+        'Episodic memory, which holds earlier experience',
+        'Semantic memory, since the log holds facts about the world',
+        'Procedural memory, since the log changes how it acts',
+      ],
+      answer: 1,
+      explain: 'Episodic memory stores experience from earlier decision cycles. Semantic memory holds knowledge about the world and the agent. Working memory is the current cycle only, and procedural memory is weights and code.',
+    },
+    {
+      q: 'A model calls the memory tool with the path /memories/../../secrets.env. What must your handler do?',
+      options: [
+        'Run it, because the path starts with /memories',
+        'Strip the dots and run the cleaned path instead',
+        'Ask the model to confirm the path before it runs',
+        'Resolve the path and reject it if outside',
+      ],
+      answer: 3,
+      explain: 'A prefix check alone passes this path. The handler must resolve the canonical path, confirm it stays inside the memory root, and reject it if not. Stripping dots by hand misses encoded variants.',
+    },
+    {
+      q: 'A store holds 400 notes of 150 tokens each. Loading all of them uses about how many more tokens than retrieving the top 5?',
+      options: [
+        'About 750, the size of the top 5 alone',
+        'About 6,000, ten times the top-5 size',
+        'About 59,250, which is 60,000 minus 750',
+        'About 60,000, the whole size of the store',
+      ],
+      answer: 2,
+      explain: '400 x 150 = 60,000 tokens for all notes. The top 5 take 5 x 150 = 750. The gap is 60,000 - 750 = 59,250 tokens per request.',
+    },
+    {
+      q: 'An agent saves a tip from a web page it browsed. A later session obeys a hidden command in that tip. Which defense fits this risk best?',
+      options: [
+        'Log note sources and review untrusted writes',
+        'Make the notes longer so that the model weighs them less',
+        'Raise the model temperature so it ignores odd notes',
+        'Load notes at the end of the prompt so they are skipped',
+      ],
+      answer: 0,
+      explain: 'This is prompt injection carried through memory. Track where notes came from, lower trust in notes from untrusted content, and review what is written. Length, temperature, and position do not make the model safe.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai6-memory-repeat"
+  title="The mistake it made again"
+  scenario="On Monday your agent fixed a bug and wrote a lesson to memory. On Tuesday it made the same mistake. Here is what the logs show."
+  facts={[
+    'session 1: memory create /memories/lessons.md -> ok',
+    'session 2: tools sent in the request: [bash, edit]',
+    'session 2: memory calls: none',
+    'session 2: first tool call: bash',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The model forgot the file name, so it wrote a new one',
+        'The write on Monday failed and was never saved',
+        'The memory file expired overnight and was deleted',
+        'The memory tool was not sent in session 2',
+      ],
+      answer: 3,
+      explain: 'The write succeeded in session 1. Session 2 did not send the memory tool, so the model could not view the folder, and the API did not add the view-first instruction. Expiry overnight is unlikely with a long-idle rule.',
+    },
+    {
+      prompt: 'What is the fix?',
+      options: [
+        'Send the same memory tool entry and serve the same store',
+        'Write the lesson twice so that one copy always survives',
+        'Paste the whole of Monday\'s transcript into the prompt',
+        'Disable the path checks so that the file is easier to reach',
+      ],
+      answer: 0,
+      explain: 'The docs say a later conversation continues from the same memory when it sends the same tools entry and your handler serves the same store. Two copies do not help if nothing reads them. A pasted transcript is costly, and path checks must stay.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: Memory tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool)
+- [Anthropic: Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+- [CoALA: Cognitive Architectures for Language Agents](https://arxiv.org/abs/2309.02427)

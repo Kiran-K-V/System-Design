@@ -1,0 +1,223 @@
+---
+summary: 'An agent is a while loop: call the model, run the tools it asks for, add the results to the history, and call again until the model stops or a budget ends the run. Each turn costs more than the last, and small per-step error rates compound into low end-to-end success.'
+requires: ['ai/a3-llm-apis/tool-calling-protocol', 'ai/a0-orientation/probabilistic-components']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai6LoopWalk from '../../../../components/anim/lessons/Ai6LoopWalk.tsx';
+import Ai6LoopSim from '../../../../components/anim/lessons/Ai6LoopSim.tsx';
+
+## The problem
+
+Some tasks have no fixed number of steps. "Fix the failing test" may need one file read or twenty. You cannot write the sequence in advance, because the right next step depends on what the last step returned.
+
+A single model call cannot do this. It answers once and stops. To let a model work toward a goal, you wrap it in a loop and give it tools. That loop is what people mean by an **agent**. This lesson shows the loop, how it stops, what each turn costs, and why long loops fail more often than short ones.
+
+## The idea: a while loop around the tool round trip
+
+Lesson [A3.4](/learn/ai/a3-llm-apis/tool-calling-protocol/) covered one round trip: the model writes a `tool_use` request, your code runs it, and you send back a `tool_result`. An agent repeats that trip. Four things make the loop:
+
+1. A **history**: the list of messages so far, including every tool result.
+2. A **model call** that reads the whole history.
+3. **Tools** that your code runs when the model asks.
+4. A **stop rule**: what ends the loop.
+
+Anthropic's guide on agents describes the same thing: agents are "typically just LLMs using tools based on environmental feedback in a loop". The model gets real results from the environment at each step, such as tool output or code execution, and uses them to judge its own progress.
+
+Here is the loop in about 25 lines. The model name is Sonnet 5.5 and the limits are example values.
+
+```python title="agent.py"
+import time
+import anthropic
+
+client = anthropic.Anthropic()
+MODEL = "claude-sonnet-5-5"
+MAX_TURNS = 8          # step budget
+MAX_TOKENS = 50_000    # token budget
+DEADLINE_S = 120       # time budget
+
+def run(goal, tools, handlers):
+    messages = [{"role": "user", "content": goal}]
+    spent, start = 0, time.monotonic()
+    for turn in range(MAX_TURNS):
+        resp = client.messages.create(
+            model=MODEL, max_tokens=1024, tools=tools, messages=messages)
+        spent += resp.usage.input_tokens + resp.usage.output_tokens
+        messages.append({"role": "assistant", "content": resp.content})
+        if resp.stop_reason != "tool_use":      # model chose to stop
+            return "done", messages
+        results = []
+        for block in resp.content:
+            if block.type != "tool_use":
+                continue
+            try:
+                out, failed = handlers[block.name](**block.input), False
+            except Exception as e:              # errors are results
+                out, failed = f"{type(e).__name__}: {e}", True
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "content": str(out), "is_error": failed})
+        messages.append({"role": "user", "content": results})
+        if spent > MAX_TOKENS or time.monotonic() - start > DEADLINE_S:
+            return "budget", messages
+    return "max_turns", messages
+```
+
+Read it as a state machine with one exit chosen by the model and three exits chosen by you. The `for` loop, not `while True`, is deliberate: the step budget is part of the loop header, so it cannot be forgotten.
+
+## The naive version: let it run
+
+The first draft of most agents is `while True`. The only way out is the model deciding to stop. That is a bet that the model will always find the end. It will not. A tool can fail the same way every time, and a model can retry the same call. A vague goal such as "improve this codebase" has no natural end at all. The Claude Agent SDK docs say that without limits the loop "can run long on open-ended prompts" and that setting a budget "is a good default for production agents".
+
+Each wasted turn costs money and time. And a loop that never ends is an outage for the one user waiting on it.
+
+## Stop conditions
+
+A stop rule has two sources.
+
+**The model stops.** The reply has no `tool_use` block. The stop reason on that last turn is usually `end_turn`. The SDK docs list two other common values: `max_tokens` (the output limit was hit, so the reply may be cut off) and `refusal` (the model declined). Your loop must handle all three. A `max_tokens` stop with no tool call is not a finished answer.
+
+**Your code stops.** You set three budgets, and the loop ends when any one is spent:
+
+- **Steps.** A turn counter. Anthropic's guide says to include stopping conditions "such as a maximum number of iterations". In the Claude Agent SDK, `max_turns` counts tool-use turns only.
+- **Tokens or dollars.** A running sum of usage from each response. The SDK has `max_budget_usd`.
+- **Time.** A wall-clock deadline, because a user is waiting.
+
+Two details matter. First, a budget check runs after a response arrives, because the cost is known only from the usage in that response. The SDK docs say the response that reaches the cap still completes. So spend can pass the cap by one response. Set the cap below the real limit. Second, a retry is a turn. A tool that fails three times uses three turns and makes no progress. When you choose a step budget, count the retries.
+
+When a budget ends the run, do not throw the work away. Return what the agent has, with a reason such as `max_turns`, so the caller can show partial results or resume with a higher limit.
+
+Step through one run, including a tool failure and a cap that fires.
+
+<Ai6LoopWalk client:visible />
+
+## Why each turn costs more than the last
+
+The API is stateless (lesson [A3.1](/learn/ai/a3-llm-apis/api-anatomy/)). Every model call resends the full history. Turn 5 pays for the tokens from turns 1 to 4 again. So input tokens grow faster than the number of turns.
+
+Anthropic measured the effect at the system level. In their multi-agent research write-up, agents "typically use about 4× more tokens than chat interactions". Their number is an average for their own workloads, not a law, but the direction is general.
+
+Work one example. Assume a 2,000-token start (system prompt, tools, goal) and 1,000 new tokens in the history after each turn (the model's request plus the tool result). These numbers are illustrative. Call i sends 2,000 + (i - 1) x 1,000 tokens. Over 12 calls:
+
+<Math block tex="\sum_{i=1}^{12} \bigl(2000 + (i-1)\cdot 1000\bigr) = 12 \cdot 2000 + 1000 \cdot \tfrac{12 \cdot 11}{2} = 24{,}000 + 66{,}000 = 90{,}000" />
+
+If history did not grow, the same 12 calls would send 24,000 tokens. The growth adds 66,000. Prompt caching (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) makes the repeated prefix cheap, but only if the prefix stays stable. A loop that appends is a good fit for it.
+
+<Ballpark
+  client:visible
+  title="Cost of a 12-step run"
+  scenario="An agent runs 12 model calls. The first call sends 2,000 input tokens. After each call, the history grows by 1,000 tokens (the model's request plus the tool result). Each call resends the full history. Input costs $2 per million tokens (Sonnet 5.5, claude.com/pricing, as of 2026-10-16). Ignore output tokens and caching."
+  steps={[
+    {
+      prompt: 'How many input tokens does the whole run send?',
+      unit: 'tokens',
+      answer: 90000,
+      within: 1.1,
+      explain: 'Call i sends 2,000 + (i - 1) x 1,000 tokens. The sum over 12 calls is 12 x 2,000 + 1,000 x (0 + 1 + ... + 11) = 24,000 + 66,000 = 90,000.',
+    },
+    {
+      prompt: 'What does that input cost, in dollars?',
+      unit: 'dollars',
+      answer: 0.18,
+      within: 1.1,
+      explain: '90,000 x $2 / 1,000,000 = $0.18 per run. At 100,000 runs a day, that is $18,000 a day for input alone, before output tokens.',
+    },
+  ]}
+/>
+
+## Why long loops fail more often
+
+Every turn is a chance to go wrong. The model may pick the wrong tool, pass a bad argument, or misread a result. If each step is right with probability p, and a run needs n correct steps in a row, the run succeeds with probability:
+
+<Math block tex="P(\text{run succeeds}) = p^{n}" />
+
+Lesson [A0.3](/learn/ai/a0-orientation/probabilistic-components/) built this formula. Take a step that is right 95% of the time. Ten steps give 0.95 to the power 10, about 59.9%. Thirty steps give about 21.5% (derived: 0.95 to the power 30). Real agents recover from some errors, so the formula is a worst case. It still shows why a loop needs checks inside it.
+
+The second measure is about repeats. A **tau-bench** task puts an agent in a customer-service role with tools and a policy, and a model plays the customer. The score compares the final database state with the goal state. The authors define **pass^k** as the chance that all k independent trials of a task succeed, averaged over tasks. For their best function-calling agent, gpt-4o, they report a pass^1 of 61.2% on the retail domain. They also report that pass^8 is below 25% in retail. The same agent solves a task about six times in ten, yet it rarely solves the same task eight times in a row. The models are from 2024, so read the shape, not the numbers.
+
+Why is pass^8 not simply 0.612 to the power 8, which is about 2%? Because tasks differ. Some are easy and the agent nearly always gets them. Some are hard. A mix of easy and hard tasks keeps pass^k above the all-equal curve. Try it. The "tau-bench retail shape" preset uses a 61% average and a 30-point spread. That is an illustrative fit, not the paper's data.
+
+<Ai6LoopSim client:visible />
+
+The lesson for design: do not judge an agent by one run. Run each task several times. If users expect the same request to work every time, pass^k is the number that matches their experience, and it falls fast as k grows.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Low step cap (for example 8) | Bounded cost and time | Hard tasks end early | Tasks are short and well scoped |
+| High step cap (for example 50) | Room for long tasks | More cost on stuck runs, more compounding | Open-ended work with a token budget too |
+| Token or dollar budget | Direct cost control | Can pass the cap by one response | Any production agent |
+| Time deadline | A bounded wait for the user | Cuts good runs short | Interactive use |
+| Return partial work on a cap | The user keeps progress | The caller must handle partial results | Almost always |
+
+## Interview lens
+
+<Callout type="tip">
+Describe the loop and its exits in one breath: "It is a loop of model call, tool run, append result. The model can stop it, and I stop it with a step cap, a token budget, and a deadline. Each turn resends the history, so cost grows faster than the turn count. Reliability falls as p to the n, so I measure pass^k over repeated runs, not one run." That names the loop, the exits, the cost, and the metric.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the agent decides when it is done" and leave it there. Say what happens when it never decides. Also do not report one run's success as the agent's reliability. One success tells you almost nothing about the next run.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An agent loop has no step cap and a tool that always returns the error "failed". What is the likely result?',
+      options: [
+        'It may retry again and again, with no end',
+        'The API stops the loop after the third error on its own',
+        'The model always gives up at the first error and answers',
+        'The tool result is dropped from the history after one failure',
+      ],
+      answer: 0,
+      explain: 'Nothing in the API caps tool rounds. A vague error gives the model no next step, so it may repeat the call. Only your cap ends such a loop.',
+    },
+    {
+      q: 'A run needs 20 steps in a row. Each step is right with probability 0.9, and steps are independent. About how often does the whole run succeed?',
+      options: [
+        'About 90%, since each step is 90% likely to work',
+        'About 12%, since 0.9 to the 20th is 0.12',
+        'About 50%, since errors cancel out over many steps',
+        'About 2%, since 0.9 times 20 steps is small',
+      ],
+      answer: 1,
+      explain: 'The chance that all 20 steps work is 0.9 to the power 20, about 0.12. The 90% figure is for one step only. Errors do not cancel: each step multiplies the success rate by 0.9.',
+    },
+    {
+      q: 'You set max_budget_usd to $1.00. The loop has spent $0.97 when the next response arrives and costs $0.20. What can happen?',
+      options: [
+        'The response is cut off at exactly $1.00 of total spend',
+        'The call is refused before it runs, because it would exceed the cap',
+        'Spend ends near $1.17, a little past the cap',
+        'The cap is raised to $1.20 so that the response can finish',
+      ],
+      answer: 2,
+      explain: 'The cost of a response is known only after it arrives, so the SDK checks the cap after each response. The response that reaches the cap still completes, so spend can pass the cap by one response.',
+    },
+    {
+      q: 'An agent passes a task 6 times in 10 tries. A user sends the same task 8 times and wants every one to work. Which measure fits the user best?',
+      options: [
+        'pass@8, the chance at least one of 8 tries works',
+        'pass^1, the average success of one try',
+        'The mean number of tool calls for each try',
+        'pass^8, the chance all 8 tries work',
+      ],
+      answer: 3,
+      explain: 'pass^k is the chance that all k tries succeed, so it matches a user who needs every run to work. pass@k is the chance that at least one try works, which fits when you can pick the best result.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
+- [Claude Agent SDK: how the agent loop works](https://code.claude.com/docs/en/agent-sdk/agent-loop)
+- [Anthropic: How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system)
+- [tau-bench: Benchmarking tool-agent-user interaction (arXiv 2406.12045)](https://arxiv.org/abs/2406.12045)

@@ -1,0 +1,239 @@
+---
+summary: 'Top-k RAG answers local questions and fails on global ones such as "what are the main themes?". GraphRAG builds an entity graph and community summaries to answer them, at a heavy indexing cost. Then derive the cost per query of a 500K-token prompt against 5K of retrieved text, and decide when to pick which.'
+requires: ['ai/a5-rag/reranking-rewriting', 'ai/a1-model-function/hallucination-context', 'ai/a4-context/long-documents']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai5GraphWalk from '../../../../components/anim/lessons/Ai5GraphWalk.tsx';
+import Ai5GraphCalc from '../../../../components/anim/lessons/Ai5GraphCalc.tsx';
+
+## The problem
+
+A legal team indexes 800 contracts. They ask two questions. First: "What penalty does Acme owe if it delivers late?" Second: "What are the top risks across all our contracts?"
+
+The first question lives in one or two chunks. Vector search finds them. The second question lives in no chunk. It is a statement about the whole set. Top-k search returns the 5 chunks most similar to the words "top risks", and those come from whichever contracts happen to use that phrase. The answer looks confident and covers 5 chunks of 800 contracts.
+
+The GraphRAG paper (Edge et al., Microsoft) states this directly: "RAG fails on global questions directed at an entire text corpus", with "What are the main themes in the dataset?" as the example ([arXiv 2404.16130](https://arxiv.org/abs/2404.16130)).
+
+This lesson covers two ways around it. One is to build a summary structure at index time (GraphRAG). The other is to skip retrieval and put everything in the prompt (long context). Then it compares both with plain RAG on cost.
+
+## Naive solution: top-k and hope
+
+Raise k. Send 50 chunks, or 200. This helps a little and does not fix the shape of the problem. A question about "all contracts" needs information from every contract, and no k that fits in a prompt covers a corpus of 800. Rerankers (lesson [A5.6](/learn/ai/a5-rag/reranking-rewriting/)) reorder what was retrieved, so they cannot help either.
+
+## The mechanism: GraphRAG
+
+GraphRAG moves the work to index time. Step through it.
+
+<Ai5GraphWalk client:visible />
+
+The pipeline in four steps, following the paper and the [GraphRAG docs](https://microsoft.github.io/graphrag/):
+
+1. **Extract.** An LLM reads each chunk and lists entities, relationships and key claims.
+2. **Build the graph.** Entities become nodes and relationships become edges.
+3. **Find communities.** A clustering step (the docs name the Leiden technique) groups densely linked nodes, hierarchically.
+4. **Summarize.** An LLM writes a summary of each community, bottom-up. These summaries are stored.
+
+At query time there are two modes. **Global search** is "for reasoning about holistic questions about the corpus" by using the community summaries. Each summary produces a partial answer, and the partial answers are combined. **Local search** is "for reasoning about specific entities", and it fans out from an entity to its neighbors and their text.
+
+The Microsoft Research blog reports, from pairwise LLM-grader tests, that GraphRAG beat a baseline RAG on comprehensiveness and diversity of answers, and that faithfulness (measured with SelfCheckGPT) was similar. The test data was in the range of 1 million tokens. The blog gives no numeric win rates in the text we read, so we give none ([Microsoft Research](https://www.microsoft.com/en-us/research/blog/graphrag-unlocking-llm-discovery-on-narrative-private-data/)). The grader was a model, and the results are from one team's data sets.
+
+### The cost: heavy indexing
+
+Look at the steps. Step 1 is an LLM call over every chunk of the corpus. Step 4 is more LLM calls over all the communities. The Microsoft blog says the LLM processes the entire private dataset to build the graph. Neither the blog nor the docs gave a token or dollar figure, so we give none. Plan to measure it on a sample, then scale. Also plan for rebuilds: if documents change, the entities and summaries that depend on them go stale (lesson [A5.8](/learn/ai/a5-rag/freshness-updates/) covers update pipelines).
+
+For a backend engineer: it is a **materialized view** of the corpus. You pay to precompute an answer shape, so that a query type that would otherwise scan everything becomes cheap. Like any materialized view, it must be refreshed when the base data changes.
+
+## The alternative: put it all in the prompt
+
+Models now accept very long prompts. Claude's pricing page lists a context window of up to 1M tokens for its current models, and says Sonnet 5.5 has no tiered long-context price (as of 2026-10-16, [claude.com/pricing](https://claude.com/pricing)). Why build an index at all? Put the corpus in the prompt and ask.
+
+Three costs answer that. This lesson gives cost first, since it is the one you can derive.
+
+**Cost per query.** Take Claude Sonnet 5.5: $2 per 1M input tokens, $10 per 1M output tokens, $2.50 per 1M cache writes and $0.10 per 1M cache reads (as of 2026-10-16, same page). Use 200 question tokens and 300 answer tokens.
+
+- Long context, 500,000-token corpus, no cache: 500,000 x $2 / 1M = **$1.00** of input. Add 200 x $2 / 1M = $0.0004 and the answer 300 x $10 / 1M = $0.003. Total **$1.0034** per query.
+- RAG, 5,000 retrieved tokens: (5,000 + 200) x $2 / 1M = $0.0104. Plus the answer, $0.003. Total **$0.0134** per query. The ratio is 1.0034 / 0.0134 = about **75 times**.
+- Long context with the corpus cached ([lesson A2.5](/learn/ai/a2-inference-cost/prompt-caching/)): reads cost 500,000 x $0.10 / 1M = $0.05 per query. If 100 queries share one cache write ($1.25), add $0.0125 each. Total **$0.0659**, about 5 times RAG. This only works when queries arrive inside the cache window (5 minutes by default) and the text before the question is identical every time.
+
+The calculator uses the same model. Move the corpus size and see where each option crosses.
+
+<Ai5GraphCalc client:visible />
+
+**Quality.** A big window does not mean the model uses all of it well. Lost in the Middle (Liu et al.) found accuracy "is often highest when relevant information occurs at the beginning or end of the input context", and lower for facts in the middle (lesson [A1.6](/learn/ai/a1-model-function/hallucination-context/), [arXiv 2307.03172](https://arxiv.org/abs/2307.03172)). Databricks tested long-context RAG with several models, and the old models in the test degraded as context grew. Llama-3.1-405B averaged 0.623 at 16k, 0.594 at 32k and 0.587 at 64k. Claude-3-sonnet refused on copyright grounds in 3.7% of cases at 16k, 21% at 32k and 49.5% at 64k ([Databricks](https://www.databricks.com/blog/long-context-rag-performance-llms)). Those are 2024-era models. Newer models are better at long input, so test the model you will use. The direction is the warning.
+
+On the other side, a 2025 study compared the two directly. It found "LC generally outperforms RAG in question-answering benchmarks, especially for Wikipedia-based questions", RAG did better on dialogue and general queries, and chunk-based retrieval lagged summarization-based retrieval, which came close to long context ([arXiv 2501.01880](https://arxiv.org/abs/2501.01880)). We read only the abstract, so we do not know the models. It says long context can win on quality. It does not say it wins on cost.
+
+**Latency.** A long prompt must be prefilled before the first token, and prefill time grows with the prompt (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)). We have no sourced time for 500K tokens. A cache read can cut the work, and a cache miss will not.
+
+## When to pick which
+
+| Situation | Pick | Why |
+|---|---|---|
+| One document or a small set that fits | Long context | No index, no retrieval misses. Cache it for many queries. |
+| Large or growing corpus, many queries | RAG | Cost per query stays flat as the corpus grows. |
+| Questions about specific facts | RAG, local search | Few chunks hold the answer. |
+| Questions about the whole corpus | GraphRAG global, or map-reduce | No chunk holds the answer. |
+| Corpus changes every hour | RAG | A graph and summaries are costly to rebuild. |
+| Corpus beyond the window | RAG or GraphRAG | It does not fit. |
+
+For whole-document questions on one text that fits, lesson [A4.6](/learn/ai/a4-context/long-documents/) shows the map-reduce option. GraphRAG is that idea done at index time, over a corpus.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| Context window, current Claude models | up to 1M tokens | Anthropic pricing |
+| Sonnet 5.5 price | $2 in, $10 out per 1M | Anthropic pricing |
+| 500K-token prompt, one query | $1.0034 | Derived above |
+| 5K retrieved tokens, one query | $0.0134 | Derived above |
+| Long context vs RAG, uncached | about 75x | Derived: 1.0034 / 0.0134 |
+| Cached long context, 100 queries | $0.0659 | Derived above |
+| GraphRAG indexing cost | heavy, no figure found | Qualitative |
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Vector RAG | Cheap per query, local answers | Fails on global questions | Most question-answering |
+| GraphRAG | Global answers, themes | Heavy LLM indexing, rebuilds | Stable corpus, theme questions |
+| Long context | No index, whole-text view | Cost per query, middle-loss risk | One document or a short list |
+| Cached long context | Much lower input cost | Same-prefix rule, 5-minute window | Many queries on one fixed corpus |
+
+## Interview lens
+
+<Callout type="tip">
+Classify the question first. "Is it local or global? A local question needs a few chunks, so I use RAG. A global question needs a whole-corpus view, so I use summaries built at index time or a map-reduce." Then do the cost arithmetic out loud: 500K tokens at $2 per million is $1 per query.
+</Callout>
+
+<Callout type="mistake">
+Do not say long context makes RAG obsolete. At 500K tokens the cost is about 75 times higher per query unless you cache, and a large window does not guarantee the model uses all of it. Do not say GraphRAG is a better RAG for all questions. It targets global ones and costs far more to build.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="500K tokens or 5K tokens per question"
+  scenario="Claude Sonnet 5.5 costs $2 per 1M input tokens and $0.10 per 1M cached-read tokens. Count input cost only."
+  steps={[
+    {
+      prompt: 'Input cost of one question that carries a 500,000-token corpus, no cache, in dollars?',
+      unit: '$',
+      answer: 1,
+      within: 1.1,
+      explain: '500,000 x $2 / 1M = $1.00.',
+    },
+    {
+      prompt: 'Input cost when RAG sends 5,000 tokens, in dollars?',
+      unit: '$',
+      answer: 0.01,
+      within: 1.1,
+      explain: '5,000 x $2 / 1M = $0.01. That is 100 times lower than the long-context input.',
+    },
+    {
+      prompt: 'Input cost of the 500K corpus read from the cache (write cost ignored), in dollars?',
+      unit: '$',
+      answer: 0.05,
+      within: 1.1,
+      explain: '500,000 x $0.10 / 1M = $0.05. Still 5 times the RAG input cost, even with the cache hit.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai5-graph-top-risks"
+  title="Risks from one contract only"
+  scenario="A contract assistant uses top-5 chunk retrieval. Asked 'What are the top risks across all contracts?', it lists five risks, all from the same contract. Asked 'What is the notice period in the Acme contract?', it is correct."
+  facts={[
+    'corpus: 800 contracts',
+    'retrieval: dense top 5, then rerank',
+    'question type that fails: whole-corpus',
+    'question type that works: one named entity',
+  ]}
+  steps={[
+    {
+      prompt: 'Why does the first question fail?',
+      options: [
+        'It is a global question and top-k returns a few chunks',
+        'The embedding model cannot read legal text',
+        'The reranker removes risks from other contracts',
+        'The chunks are too long to be embedded',
+      ],
+      answer: 0,
+      explain: 'A whole-corpus question has no small set of chunks that holds the answer. Top-5 returns the chunks closest to the query words. The local question works, so the embedding model and chunking are fine.',
+    },
+    {
+      prompt: 'Which change addresses it?',
+      options: [
+        'Use a larger reranker on the top 5',
+        'Raise top-k to 20 and keep the same prompt',
+        'Add community summaries and answer with global search',
+        'Lower the temperature to remove the repeats',
+      ],
+      answer: 2,
+      explain: 'Summaries built at index time give a view of the whole corpus, and global search combines partial answers. A larger k still covers a small part of 800 contracts, and a reranker only reorders the same chunks.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Which question does GraphRAG global search target?',
+      options: [
+        'What is the notice period in one named contract?',
+        'What themes run across the corpus?',
+        'Which chunk holds the text of clause 4.2?',
+        'What did the user ask in the previous turn?',
+      ],
+      answer: 1,
+      explain: 'Global search uses community summaries for holistic questions. Questions about one entity, one clause or the chat history are local, and vector retrieval already handles them.',
+    },
+    {
+      q: 'Why is GraphRAG indexing costly?',
+      options: [
+        'It trains a new embedding model on the corpus',
+        'It stores every chunk three times in the graph',
+        'It needs a GPU to run the nearest-neighbor search',
+        'LLM calls over chunks and communities',
+      ],
+      answer: 3,
+      explain: 'Entity extraction is an LLM call over the whole corpus, and summaries are more LLM calls. It does not train an embedding model. The sources give no cost figure, so measure a sample.',
+    },
+    {
+      q: 'Sonnet 5.5 input costs $2 per 1M tokens. What is the input cost of one query with a 500K-token corpus, uncached, against 5K retrieved tokens?',
+      options: [
+        '$1.00 against $0.01',
+        '$0.10 against $0.01',
+        '$1.00 against $0.10',
+        '$10 against $0.10',
+      ],
+      answer: 0,
+      explain: '500,000 x $2 / 1M = $1.00. 5,000 x $2 / 1M = $0.01. The ratio is 100 times on input alone.',
+    },
+    {
+      q: 'You have one 300K-token manual and 50 questions, all asked within a few minutes. Which is the strongest default?',
+      options: [
+        'Build a GraphRAG index first',
+        'Put the manual in a cached prompt',
+        'Raise top-k to 100 on a vector index',
+        'Split the manual into 100-token chunks',
+      ],
+      answer: 1,
+      explain: 'One document that fits, many queries in a window: the cache makes each query cheap and there are no retrieval misses. GraphRAG is heavy for one document, and tiny chunks lose context.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [From Local to Global: A Graph RAG Approach to Query-Focused Summarization](https://arxiv.org/abs/2404.16130): the GraphRAG paper.
+- [Microsoft GraphRAG documentation](https://microsoft.github.io/graphrag/): indexing steps and the search modes.
+- [Lost in the Middle](https://arxiv.org/abs/2307.03172): accuracy by position in a long prompt.
+- [Databricks: Long Context RAG Performance of LLMs](https://www.databricks.com/blog/long-context-rag-performance-llms): failure rates as context grows.
