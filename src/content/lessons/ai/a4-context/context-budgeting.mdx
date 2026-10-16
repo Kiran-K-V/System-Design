@@ -12,7 +12,7 @@ import Ai4BudgetBar from '../../../../components/anim/lessons/Ai4BudgetBar.tsx';
 
 ## The problem
 
-An agent helps with a code repository. In the first turns it is sharp. By turn 25 it forgets a rule from the system prompt, re-reads a file it already read, and its answers get slower and more costly. At turn 34 the request fails with an error: the prompt is too long.
+An agent helps with a code repository. In the first turns it is sharp. By turn 25 it forgets a rule from the system prompt. It also re-reads a file it already read. Its answers get slower and more costly. At turn 34 the request fails with an error: the prompt is too long.
 
 Nothing leaked and nothing broke. The **context window** [junior] filled up. This is the maximum number of tokens the model reads in one request, and lesson [A1.6](/learn/ai/a1-model-function/hallucination-context/) introduced it. A chat looks like a stream, but each call is a fresh request that carries the whole history again. So a conversation is a list that only grows, inside a box that does not.
 
@@ -33,15 +33,15 @@ So a request has six spenders:
 | Chat history | Grows each turn | The user, and the tools |
 | Output reservation | Space kept free for the reply | You, through `max_tokens` |
 
-Windows are large now. As of 2026-10-16, Anthropic's docs list a 1M-token window for Claude Sonnet 5.5 and other current models, with up to 128K output tokens per request, and 200K for some older models ([context windows](https://platform.claude.com/docs/en/build-with-claude/context-windows)). Size is not the limit. Quality and cost are.
+Windows are large now. As of 2026-10-16, Anthropic's docs list a 1M-token window for Claude Sonnet 5.5 and other current models. Current models allow up to 128K output tokens per request. Some older models have a 200K window ([context windows](https://platform.claude.com/docs/en/build-with-claude/context-windows)). Size is not the limit. Quality and cost are.
 
 ## Why a big window is not a free one
 
-Anthropic's guide describes context as "a finite resource with diminishing marginal returns". It says that as the token count grows, the model's ability to recall details falls, and that this is "a performance gradient rather than a hard cliff". Chroma's study of 18 models (July 2025) reached the same view from tests: performance "grows increasingly unreliable as input length grows". The text gives no accuracy figures; they are only in charts, so treat the effect as real and size it on your own task. Anthropic's docs call this **context rot** [mid]: accuracy and recall degrade as the token count grows, even if the task stays the same.
+Anthropic's guide describes context as "a finite resource with diminishing marginal returns". It says that as the token count grows, the model's ability to recall details falls. It also says that this is "a performance gradient rather than a hard cliff". Chroma's study of 18 models (July 2025) reached the same view from tests. It found that performance "grows increasingly unreliable as input length grows". The text gives no accuracy figures. The figures are only in charts. So treat the effect as real and size it on your own task. Anthropic's docs call this **context rot** [mid]. Accuracy and recall degrade as the token count grows. This happens even if the task stays the same.
 
-Position matters too. Lesson [A1.6](/learn/ai/a1-model-function/hallucination-context/) showed the lost-in-the-middle curve: facts at the start or end of a long prompt are found more often than facts in the middle. So do not just fill the window. Order it. Put the instructions and the most important facts near the edges.
+Position matters too. Lesson [A1.6](/learn/ai/a1-model-function/hallucination-context/) showed the lost-in-the-middle curve. Facts at the start or end of a long prompt are found more often than facts in the middle. So do not just fill the window. Order it. Put the instructions and the most important facts near the edges.
 
-There is also the cost. Every call re-sends the history, so a 100K-token history costs 100K input tokens on each turn, unless a cache serves it. And attention work grows with length (lesson [A1.4](/learn/ai/a1-model-function/attention-cost/)).
+There is also the cost. Every call re-sends the history. So a 100K-token history costs 100K input tokens on each turn. Unless a cache serves it, that cost applies. And attention work grows with length (lesson [A1.4](/learn/ai/a1-model-function/attention-cost/)).
 
 ## The failing design: append forever
 
@@ -59,7 +59,7 @@ In words: the window size W divided by the tokens added per turn t, rounded down
 
 Plan it like capacity. Give each spender a share, a policy for when it is over, and a place on the page.
 
-**Reserve the output first.** The reply must fit. Thinking tokens count against `max_tokens` and the window. If the input alone exceeds the window, the API returns a 400 error. On Claude 4.5 and newer models, if input plus `max_tokens` exceeds the window the API still accepts the request, but generation may stop early with `stop_reason: "model_context_window_exceeded"`. A cut-off JSON reply is a bug that looks random. So subtract the reserve before you count the room.
+**Reserve the output first.** The reply must fit. Thinking tokens count against `max_tokens` and the window. If the input alone exceeds the window, the API returns a 400 error. On Claude 4.5 and newer models, if input plus `max_tokens` exceeds the window, the API still accepts the request. But generation may stop early with `stop_reason: "model_context_window_exceeded"`. A cut-off JSON reply is a bug that looks random. So subtract the reserve before you count the room.
 
 **Set a priority order.** When the budget is tight, something must go. Decide in advance:
 
@@ -81,7 +81,7 @@ Anthropic names a common failure: "bloated tool sets that cover too much functio
 
 **Offload work to sub-agents.** A sub-agent runs in its own window, reads a lot, and returns a short result. Anthropic reports that such a summary is often 1,000 to 2,000 tokens. The main window pays for the summary only, not for the 30K tokens the sub-agent read.
 
-**Keep notes outside the window.** An agent can write decisions and open items to a file and read them back when needed. The file does not spend budget until it is read.
+Rule: **keep notes outside the window**. An agent can write decisions and open items to a file and read them back when needed. The file does not spend budget until it is read.
 
 Try the budget. Drag a section and watch the headroom. Raise the retrieved documents until the output reservation turns red.
 
@@ -89,9 +89,9 @@ Try the budget. Drag a section and watch the headroom. Raise the retrieved docum
 
 ## Numbers
 
-Start from the defaults and work one case. A 200K window holds a 3K system prompt, 9K of tool definitions, 4K of examples, 40K of retrieved documents, 30K of history, and a 16K reply reserve. The input is 3 + 9 + 4 + 40 + 30 = 86K. The headroom is 200 - 86 - 16 = 98K. At 6K per turn, 98 / 6 = 16 more turns fit. Raise the documents to 100K and the input is 146K. The headroom is 38K and only 6 turns fit. One retriever setting cut the conversation length by 10 turns.
+Start from the defaults and work one case. A 200K window holds a 3K system prompt, 9K of tool definitions, and 4K of examples. It also holds 40K of retrieved documents, 30K of history, and a 16K reply reserve. The input is 3 + 9 + 4 + 40 + 30 = 86K. The headroom is 200 - 86 - 16 = 98K. At 6K per turn, 98 / 6 = 16 more turns fit. Raise the documents to 100K and the input is 146K. The headroom is 38K and only 6 turns fit. One retriever setting cut the conversation length by 10 turns.
 
-A window is also a cost line. A 150K-token history at $2 per million input tokens (Claude Sonnet 5.5, as of 2026-10-16, [pricing](https://platform.claude.com/docs/en/about-claude/pricing)) costs 150,000 / 1,000,000 × $2 = $0.30 of input per turn if nothing is cached. Over 20 such turns that is $6.00, for one user.
+A window is also a cost line. Claude Sonnet 5.5 charges $2 per million input tokens (as of 2026-10-16, [pricing](https://platform.claude.com/docs/en/about-claude/pricing)). A 150K-token history costs 150,000 / 1,000,000 × $2 = $0.30 of input per turn. That cost applies if nothing is cached. Over 20 such turns that is $6.00, for one user.
 
 <Ballpark
   client:visible
