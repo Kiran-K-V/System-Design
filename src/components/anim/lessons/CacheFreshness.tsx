@@ -5,17 +5,17 @@ import { decide, human, lifetime, type Directives, type Outcome } from './cacheF
 /** Widget: slide the age of a cached response and see what a CDN (shared cache) and a browser (private cache) do. */
 
 const PRESETS: { name: string; d: Directives; header: string }[] = [
-  { name: 'Hashed static file', d: { maxAge: 31_536_000, sMaxAge: null, swr: 0, sie: 0 }, header: 'Cache-Control: max-age=31536000, immutable' },
-  { name: 'Public API', d: { maxAge: 0, sMaxAge: 60, swr: 30, sie: 300 }, header: 'Cache-Control: max-age=0, s-maxage=60, stale-while-revalidate=30, stale-if-error=300' },
+  { name: 'File that never changes', d: { maxAge: 31_536_000, sMaxAge: null, swr: 0, sie: 0 }, header: 'Cache-Control: max-age=31536000, immutable' },
+  { name: 'Busy public API', d: { maxAge: 0, sMaxAge: 60, swr: 30, sie: 300 }, header: 'Cache-Control: max-age=0, s-maxage=60, stale-while-revalidate=30, stale-if-error=300' },
   { name: 'Short TTL', d: { maxAge: 60, sMaxAge: null, swr: 0, sie: 0 }, header: 'Cache-Control: max-age=60' },
 ];
 
 const OUTCOME_TEXT: Record<Outcome, { label: string; tone: string; text: string }> = {
   fresh: { label: 'HIT (fresh)', tone: 'var(--ok)', text: 'Served from cache. The origin is not called.' },
-  'stale-while-revalidate': { label: 'HIT (stale, revalidating)', tone: 'var(--warn)', text: 'Served stale at once. A background request refreshes the copy. The user does not wait.' },
-  'stale-if-error': { label: 'STALE served on error', tone: 'var(--warn)', text: 'The cache asked the origin, got an error, and served the stale copy inside the stale-if-error window.' },
-  revalidate: { label: 'MISS (stale)', tone: 'var(--bad)', text: 'Stale and out of window. The user waits while the cache asks the origin.' },
-  error: { label: 'ERROR to user', tone: 'var(--bad)', text: 'Origin is down and the copy is too old for stale-if-error. The user gets the error.' },
+  'stale-while-revalidate': { label: 'HIT (stale, revalidating)', tone: 'var(--warn)', text: 'The copy is stale, but the cache serves it at once. It refreshes the copy in the background. The user does not wait.' },
+  'stale-if-error': { label: 'STALE served on error', tone: 'var(--warn)', text: 'The cache asked the origin and got an error. The stale copy is still inside the stale-if-error window, so the cache serves it. The user sees an old page, not an error.' },
+  revalidate: { label: 'MISS (stale)', tone: 'var(--bad)', text: 'The copy is stale and past the extra window. The cache must ask the origin before it answers. The user waits.' },
+  error: { label: 'ERROR to user', tone: 'var(--bad)', text: 'The origin is down and the copy is too old for the stale-if-error window. The user gets the error.' },
 };
 
 const COLORS = { fresh: 'var(--ok)', swr: 'var(--warn)', sie: 'var(--accent)' };
@@ -61,11 +61,10 @@ export default function CacheFreshness() {
 
   return (
     <WidgetFrame
-      title="Freshness: what does each cache do at this age?"
+      title="Freshness: what does each cache do when the copy is this old?"
       caption={
         <>
-          A shared cache obeys <code>s-maxage</code> when present. A private cache ignores it. With the Public API preset, the browser's copy is stale at once (<code>max-age=0</code>), so the browser checks back, usually
-          with the CDN. The CDN absorbs those checks: for 60 s it answers without calling the origin.
+          A shared cache obeys <code>s-maxage</code> when present. A private cache ignores it. With the busy public API preset, the browser's copy is stale at once (<code>max-age=0</code>), so the browser checks back each time. It usually asks the CDN. The CDN absorbs those checks: for 60 s it answers without calling the origin.
           </>
       }
     >
@@ -80,14 +79,14 @@ export default function CacheFreshness() {
 
       <label className="mt-4 block text-sm">
         <span className="flex justify-between">
-          <span>Age of the stored response</span>
+          <span>Age of the stored copy (time since the origin made it)</span>
           <span className="font-mono tabular-nums">{human(a)} ({a} s)</span>
         </span>
         <input type="range" min={0} max={Math.round(total)} step={step} value={a} onChange={(e) => setAge(+e.target.value)} className="mt-1 w-full accent-[var(--accent)]" />
       </label>
       <label className="mt-2 flex items-center gap-2 text-sm">
         <input type="checkbox" checked={down} onChange={(e) => setDown(e.target.checked)} className="accent-[var(--accent)]" />
-        <span>Origin is down (returns 503)</span>
+        <span>Origin is down (it answers 503, which means "server unavailable")</span>
       </label>
 
       <div className="mt-4 space-y-4">

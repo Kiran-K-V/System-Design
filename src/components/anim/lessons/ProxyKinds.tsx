@@ -24,7 +24,7 @@ const PANELS: Panel[] = [
     right: ['Any site', 'Any site'],
     groupLabel: 'company network',
     groupSide: 'left',
-    lines: ['client knows it and is set up to use it', 'server sees the proxy, not the client', 'filter, log, cache, hide client IPs', 'example: office web gateway'],
+    lines: ['client knows it and is set up to use it', 'server sees the proxy, not the client', 'filter, log, cache, hide client addresses', 'example: an office web gateway'],
   },
   {
     x0: 365,
@@ -35,7 +35,7 @@ const PANELS: Panel[] = [
     right: ['App 1', 'App 2'],
     groupLabel: 'your data center',
     groupSide: 'right',
-    lines: ['client thinks it is the real server', 'client never sees the real servers', 'TLS, load balancing, cache, auth, compress', 'examples: nginx, CDN edge, API gateway'],
+    lines: ['client thinks it is the real server', 'client never sees the real servers', 'TLS, balance load, cache, check logins', 'examples: nginx, a layer 7 load balancer'],
   },
 ];
 

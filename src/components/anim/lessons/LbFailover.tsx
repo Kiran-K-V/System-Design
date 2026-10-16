@@ -14,7 +14,7 @@ interface Step {
 
 const steps: Step[] = [
   {
-    caption: 'Clients know one address: the load balancer (LB). Behind it, three identical servers share the work. The LB also sends each server a small health probe, such as GET /health, on a timer.',
+    caption: 'Clients know one address: the load balancer (LB). Behind it, three identical servers share the work. The LB also sends each server a small health probe (a test message, such as GET /health) on a timer.',
     s2: 'ok',
     packets: [],
     note: 'pool: server 1, server 2, server 3',
@@ -44,7 +44,7 @@ const steps: Step[] = [
     active: ['lb'],
   },
   {
-    caption: 'The next health probe to server 2 fails. One failure could be a blip, so the LB does not act yet. It waits for a set number of consecutive failures (the unhealthy threshold).',
+    caption: 'The next health probe to server 2 fails. One failure could be a blip, so the LB does not act yet. It waits for a set number of failures in a row (the unhealthy threshold).',
     s2: 'dead',
     packets: [{ from: 'lb', to: 's2', label: 'GET /health', tone: 'warn' }],
     note: 'probe failed: 1 of 2',
@@ -52,7 +52,7 @@ const steps: Step[] = [
     active: ['lb'],
   },
   {
-    caption: 'A second probe fails. The threshold is reached. The LB marks server 2 unhealthy and removes it from the pool. Detection time was about threshold x interval. With AWS ALB defaults that is 2 x 30 s = 60 s, and every second of it costs errors.',
+    caption: 'A second probe fails. The threshold is reached. The LB marks server 2 unhealthy and removes it from the pool. Detection time was about threshold x interval. With common cloud defaults (2 failures, probes 30 s apart) that is about 60 s, and every second of it costs errors.',
     s2: 'out',
     packets: [{ from: 'lb', to: 's2', label: 'GET /health', tone: 'bad' }],
     note: 'probe failed: 2 of 2 -> removed',
@@ -60,7 +60,7 @@ const steps: Step[] = [
     active: ['lb'],
   },
   {
-    caption: 'Traffic now flows to servers 1 and 3 only. Users see no errors. The two servers carry 50% each instead of 33%, so you must keep spare capacity: N+1.',
+    caption: 'Traffic now flows to servers 1 and 3 only. Users see no errors. This move of work is failover. The two servers carry 50% each instead of 33%, so you must keep spare capacity.',
     s2: 'out',
     packets: [
       { from: 'client', to: 'lb', label: 'req' },
@@ -72,7 +72,7 @@ const steps: Step[] = [
     active: ['lb'],
   },
   {
-    caption: 'The LB keeps probing the removed server. After it restarts and passes several probes in a row (ALB default: 5), the LB puts it back. Many LBs then ramp traffic up slowly so a cold server is not flooded.',
+    caption: 'The LB keeps probing the removed server. After it restarts and passes several probes in a row (a common default is 5), the LB puts it back. Many LBs then send it a small share first and raise it slowly, so a cold server is not flooded.',
     s2: 'ok',
     packets: [{ from: 'lb', to: 's2', label: 'GET /health', tone: 'ok' }],
     note: 'passed 5 of 5 -> back in the pool',

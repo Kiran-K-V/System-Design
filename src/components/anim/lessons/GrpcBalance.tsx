@@ -18,9 +18,9 @@ interface Step {
 const steps: Step[] = [
   {
     caption:
-      'A gRPC client talks to a service run by three identical backends, behind a load balancer. A gRPC client opens one HTTP/2 connection and keeps it open. That connection carries every call, each on its own stream.',
+      'A gRPC client talks to a service. Three identical copies of the service (backends) run behind a load balancer. The client opens one HTTP/2 connection and keeps it open. That connection carries every call, each call on its own stream.',
     note: 'one client, three backends',
-    lb: 'L4 LB',
+    lb: 'layer 4\nbalancer',
     counts: [0, 0, 0],
     edges: [false, false, false],
     mode: 'l4',
@@ -29,9 +29,9 @@ const steps: Step[] = [
   },
   {
     caption:
-      'The client connects. A layer 4 load balancer (lesson 2.4) picks a backend once, when the TCP connection opens. It chooses backend 1. From now on every byte of this connection goes to backend 1.',
-    note: 'L4 picks per connection: backend 1',
-    lb: 'L4 LB',
+      'The client connects. A layer 4 load balancer sees only connections and bytes. It picks a backend once, when the TCP connection opens. It chooses backend 1. From now on every byte of this connection goes to backend 1.',
+    note: 'layer 4 picks per connection: backend 1',
+    lb: 'layer 4\nbalancer',
     counts: [0, 0, 0],
     edges: [true, false, false],
     mode: 'l4',
@@ -40,13 +40,13 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Now the client makes 9 calls. All 9 are streams on the same connection. The load balancer cannot see them. It forwards bytes. Backend 1 receives every one.',
-    note: '9 RPCs, all on one connection',
-    lb: 'L4 LB',
+      'Now the client makes 9 calls. All 9 are streams on the same connection. The load balancer cannot see them. It only forwards bytes. Backend 1 receives every call.',
+    note: '9 calls, all on one connection',
+    lb: 'layer 4\nbalancer',
     counts: [9, 0, 0],
     edges: [true, false, false],
     mode: 'l4',
-    packets: [{ from: 'client', to: 'lb', label: 'rpc' }, { from: 'lb', to: 'b1', label: 'rpc', delay: 0.9 }],
+    packets: [{ from: 'client', to: 'lb', label: 'call' }, { from: 'lb', to: 'b1', label: 'call', delay: 0.9 }],
     active: ['b1'],
   },
   {
@@ -54,7 +54,7 @@ const steps: Step[] = [
       'The result: backend 1 does 100% of the work and backends 2 and 3 are idle. Adding a fourth backend changes nothing, because the client never opens a new connection. Balanced by connection, but not by load.',
     note: 'adding backends does not help',
     noteTone: 'bad',
-    lb: 'L4 LB',
+    lb: 'layer 4\nbalancer',
     counts: [9, 0, 0],
     edges: [true, false, false],
     mode: 'l4',
@@ -63,33 +63,33 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Fix 1: a layer 7 proxy (Envoy, nginx, a cloud L7 LB). It ends the HTTP/2 connection, reads each stream, and picks a backend per call. The client still holds one connection, to the proxy. The cost is an extra hop in the data path.',
-    note: 'L7 proxy: pick per RPC',
+      'Fix 1: a layer 7 proxy, a program in the middle that reads requests. It ends the HTTP/2 connection, reads each stream, and picks a backend for each call. The client still holds one connection, to the proxy. The cost is one extra network hop on every call.',
+    note: 'layer 7 proxy: pick per call',
     noteTone: 'ok',
-    lb: 'L7 proxy',
+    lb: 'layer 7\nproxy',
     counts: [3, 3, 3],
     edges: [true, true, true],
     mode: 'l7',
     packets: [
-      { from: 'lb', to: 'b1', label: 'rpc', tone: 'ok' },
-      { from: 'lb', to: 'b2', label: 'rpc', tone: 'ok', delay: 0.15 },
-      { from: 'lb', to: 'b3', label: 'rpc', tone: 'ok', delay: 0.3 },
+      { from: 'lb', to: 'b1', label: 'call', tone: 'ok' },
+      { from: 'lb', to: 'b2', label: 'call', tone: 'ok', delay: 0.15 },
+      { from: 'lb', to: 'b3', label: 'call', tone: 'ok', delay: 0.3 },
     ],
     active: ['lb'],
   },
   {
     caption:
-      'Fix 2: client-side load balancing. The client learns all backend addresses (from DNS or a service registry) and opens a connection to each. It picks a backend for every call. gRPC ships round_robin for this. No extra hop, but every client needs the logic.',
-    note: 'client picks per RPC',
+      'Fix 2: client-side load balancing. The client learns every backend address from DNS or a service registry (a shared list of the copies that are running). It opens a connection to each. It picks a backend for every call, taking turns in order. gRPC calls this rule round_robin. There is no extra hop, but every client needs the logic.',
+    note: 'client picks per call',
     noteTone: 'ok',
     lb: 'registry',
     counts: [3, 3, 3],
     edges: [true, true, true],
     mode: 'client',
     packets: [
-      { from: 'client', to: 'b1', label: 'rpc', tone: 'ok' },
-      { from: 'client', to: 'b2', label: 'rpc', tone: 'ok', delay: 0.15 },
-      { from: 'client', to: 'b3', label: 'rpc', tone: 'ok', delay: 0.3 },
+      { from: 'client', to: 'b1', label: 'call', tone: 'ok' },
+      { from: 'client', to: 'b2', label: 'call', tone: 'ok', delay: 0.15 },
+      { from: 'client', to: 'b3', label: 'call', tone: 'ok', delay: 0.3 },
     ],
     active: ['client'],
   },
@@ -111,7 +111,7 @@ export default function GrpcBalance() {
             w: 170,
             h: 62,
             label: `Backend ${k + 1}`,
-            sub: `${s.counts[k]} RPC${s.counts[k] === 1 ? '' : 's'}`,
+            sub: `${s.counts[k]} call${s.counts[k] === 1 ? '' : 's'}`,
             tone: (s.counts[k] === 0 && i > 0 ? 'muted' : s.counts[k] === 9 ? 'warn' : 'default') as Tone,
           })),
         ];
@@ -138,7 +138,7 @@ export default function GrpcBalance() {
             active={s.active}
             packets={s.packets}
             stepKey={i}
-            label="A gRPC client with one HTTP/2 connection and three backends behind a load balancer. A layer 4 balancer sends all calls to one backend. A layer 7 proxy or client-side balancing spreads them."
+            label="A gRPC client with one HTTP/2 connection and three backends behind a load balancer. A layer 4 balancer sends all calls to one backend. A layer 7 proxy or client-side balancing spreads the calls over all three."
           />
         );
       }}

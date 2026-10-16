@@ -1,5 +1,5 @@
 ---
-summary: gRPC calls a function on another machine using a typed schema, a compact binary encoding, and long-lived HTTP/2 connections. The gains are real. So is the load-balancing trap.
+summary: 'gRPC calls a function on another machine using a typed schema, a compact binary encoding, and long-lived HTTP/2 connections. The gains are real. So is the load-balancing trap.'
 requires: ['02-networking/http-tls', '02-networking/load-balancing']
 ---
 
@@ -14,29 +14,54 @@ import GrpcBalance from '../../../components/anim/lessons/GrpcBalance.tsx';
 
 ## The problem
 
-One user request often touches many internal services. A page load might call a profile service, a feed service, an ads service and a billing service. Those calls happen inside your own data center, between code you control.
+You open a shopping page. One click. Behind that click, the web server needs your name, your recent orders, some ads, and your payment status.
 
-Three things hurt at this scale.
+Each of those lives in a different program. A program that does one job and answers requests from other programs is a **service**. There is a profile service, a feed service, an ads service, and a billing service. They run on many machines in a **data center**, a building full of servers connected by a fast private network.
 
-- **Bytes and parsing.** JSON is text. It repeats every field name in every message and the receiver must parse it. Small cost per call, large cost at thousands of calls per second.
-- **No contract.** The caller reads documentation and hopes. When a team renames a field, the break shows up in production, not at compile time.
-- **Connection waste.** Each call needs a connection, or a pool of them. HTTP/1.1 (lesson 2.3) allows one request at a time per connection.
+So one page load is not one request. It is a chain of small requests between services. One service plays the client. The other plays the server. A busy system can make 50,000 of these calls every second.
 
-You do not need browser-friendly, human-readable text between two of your own services. You need a contract, a small encoding, and cheap calls. That is **RPC**, a remote procedure call: a network call that looks like a function call, `GetUser(42)`.
+Three things hurt at that scale.
+
+**Pain 1: bytes and parsing.** Services often send data as **JSON**. JSON is a text format. A user looks like `{"id":150,"name":"Ada","active":true}`. A person can read it. That is nice. But every message repeats every field name, and the receiver must **parse** it. To parse is to read the text and turn it into values that the program can use. It is like reading a hand-written form and typing each answer into a database. One parse is cheap. Fifty thousand parses a second are not.
+
+**Pain 2: no contract.** A **contract** is an agreement about what a message looks like. With plain JSON, the contract lives in a wiki page and in people's heads. Say team A renames `id` to `user_id`. Team B does not know. Nothing fails when A builds the code. It fails in production, when B reads an empty field. Think of two companies that make plugs and sockets without a shared standard. They find out at your house.
+
+**Pain 3: connection waste.** Lesson 2.1 showed that a new connection costs round trips. Lesson 2.3 showed that HTTP/1.1 sends one request at a time on a connection. Think of a one-lane road: the second car waits for the first. To send many requests at once, you need many connections. Each costs memory and a handshake.
+
+Between your own services, you do not need text that a person can read. You need a contract, small messages, and cheap calls.
+
+That is the idea of **RPC**, short for **remote procedure call**. It is a network call written so that it looks like a normal function call: `GetUser(42)`. The function runs on another machine. Your code does not deal with sockets, ports, or bytes. It calls a function and gets a result.
+
+Why does that help? Programmers already know how to call functions. RPC lets them reuse that habit.
+
+But an RPC is not a function call. A function call inside one program costs far less than a microsecond. A network round trip inside one data center costs about 0.5 ms (lesson 1.2). An RPC can be slow. It can fail. It can hang. Keep this in mind. It is the reason the deadline section below exists.
 
 ## Naive solution: REST and JSON between services
 
-REST with JSON is the default (lesson 3.1 covers it). It works. Debugging is easy because you can read the bytes. It fails in a specific way when it carries internal traffic.
+The usual first choice is **REST**. REST is a style for web APIs. Each thing has a URL, such as `/users/42`. You ask for it with an HTTP request (lesson 2.3). The reply is JSON.
 
-Take one small message: a user with an id, a name and a flag. As compact JSON it is `{"id":150,"name":"Ada","active":true}`, which is **37 bytes** (count the characters, or use the widget below). The real data is 3 digits, 3 letters and the word `true`. Most of the 37 bytes are field names, quotes, colons and braces. They are sent again on every call.
+This works. It has real strengths. Every language can speak it. You can read the bytes with your eyes when you debug. Browsers speak it.
 
-The contract is also unwritten. Nothing stops a service from sending `"id"` as a string tomorrow. So the fix has two parts: a schema both sides share, and an encoding that does not repeat names.
+It fails in a specific way when it carries internal traffic. Count the bytes of our small message:
+
+`{"id":150,"name":"Ada","active":true}`
+
+That is **37 bytes**. (A byte is one unit of storage. Lesson 1.1 used bytes. A single English letter takes one byte.) The real data is three digits, three letters, and one yes-or-no flag. Everything else is field names, quotes, colons, and braces. These are sent again with every call. It is like writing "First name:" and "Last name:" on every line of every envelope, a million times.
+
+The contract problem is still there too. Nothing stops a service from sending `"id"` as a string tomorrow.
+
+So the fix has two parts:
+
+1. A **schema** that both sides share. A schema is a written description of what a message must look like: which fields exist, and what type each one has. Think of a blank form with labelled boxes. Both sides hold the same form.
+2. An **encoding** that does not repeat names. Encoding means turning a message that lives in memory into a row of bytes to send. Another word for it is **serialization**. The reverse, turning bytes back into a message, is **decoding**. Think of flat-pack furniture. You take the table apart to fit it in a box. The receiver builds it again.
+
+One more word. A **text format** is one where each byte is a letter that a person can read, like JSON. A **binary format** is one where bytes are packed numbers. A person cannot read them without a tool. A recipe in plain words is text. A barcode is binary. Binary is smaller, because it does not spell things out. It is harder to read for a human.
 
 ## The mechanism
 
 ### Protocol Buffers: schema first, bytes second
 
-**Protocol Buffers** (protobuf) is the schema language and encoding that gRPC uses. You write a `.proto` file. A compiler generates typed code for each language.
+**Protocol Buffers**, or **protobuf**, is a schema language and a binary format made together. You write the schema in a `.proto` file:
 
 ```proto
 message User {
@@ -46,79 +71,192 @@ message User {
 }
 ```
 
-The numbers (`= 1`, `= 2`) are **field numbers**. They, not the names, go on the wire. Each field is written as a **tag** followed by a value. The tag packs the field number and a **wire type** (how to read the value): `(field_number << 3) | wire_type`. Wire type 0 means a variable-length integer. Wire type 2 means a length followed by bytes, used for strings.
+Read this like a form. `User` is the name of the message. Each line is one box on the form: a type, a name, and a number. `int32` is a whole number that fits in 32 bits, from about minus 2.1 billion to plus 2.1 billion. `string` is text. `bool` is true or false.
 
-An integer uses a **varint**: 7 bits of number per byte, and the top bit says "more bytes follow". Small numbers cost one byte. Step through how 150 becomes two bytes. With the one-byte field tag in front, the field costs three.
+Then you run a **compiler**. A compiler is a program that reads one kind of text and writes another. Here it reads your `.proto` file and writes ready-made code in your language: classes with typed fields. This step is called **code generation**. It is like a rubber stamp for forms. You do not hand-write the code that packs and unpacks messages. The compiler writes it, and it is always correct for your schema.
+
+Why does this fix pain 2? Because the typed code is checked at **compile time**. That is when you build your program, before it runs. Assign a string to `id` and the build fails on your laptop. You do not learn it from a broken page in production.
+
+Now look at the three numbers: `= 1`, `= 2`, `= 3`. These are **field numbers**. They are the key idea. On the wire (that means: in the bytes as they travel over the network), protobuf does not send the names `id`, `name`, and `active`. It sends the numbers. Both sides hold the same `.proto` file, so both know that box 1 is `id`.
+
+Think of a coat-check ticket. You hand over a coat and get ticket 17. Later you show "17", not "a long grey wool coat with a torn pocket". The number is a short stand-in for a long description.
+
+The field names cost bytes in JSON on every call. In protobuf they cost zero bytes. That is where most of the saving comes from.
+
+#### A little about bits, bytes, and hex
+
+To see how numbers are packed, you need three small tools.
+
+A **bit** is one switch that is 0 or 1. A **byte** is eight bits, like a row of eight light switches. Eight switches give 2 x 2 x 2 x 2 x 2 x 2 x 2 x 2 = 256 patterns. So one byte can hold 0 to 255.
+
+**Binary** is how you write a number in bits. You use only 0 and 1. Each place counts double the place to its right: 1, 2, 4, 8, 16, 32, 64, 128. So 150 is 128 + 16 + 4 + 2. That gives `10010110`. Eight bits.
+
+**Hex** is a short way to write a byte. It uses 16 symbols: 0 to 9 and then A to F. Two hex symbols make one byte. A `0x` in front says "this is hex". For example, `0x96` means 9 x 16 + 6 = 150. Why use hex? Eight 0s and 1s are hard to read. Two symbols are easy. Protobuf bytes in this lesson are shown in hex.
+
+#### The varint: small numbers use few bytes
+
+An obvious way to send a number is to give it a fixed 4 bytes. But most numbers in real data are small: ids, counts, flags. A fixed 4 bytes wastes room on every one.
+
+Protobuf uses a **varint**, a variable-length integer. A small number takes one byte. A bigger number takes more. Think of how you write numbers on paper. You write "7" with one digit and "150" with three. You do not write "0000000007".
+
+The rule is simple. In each byte, the top bit is a flag. It means "more bytes follow" (1) or "this is the last byte" (0). The other seven bits carry the number. So each byte carries 7 bits of number.
+
+Two examples:
+
+- 0 to 127 fit in 7 bits. They cost 1 byte.
+- 128 to 16,383 need two groups of 7 bits. They cost 2 bytes. Our number 150 is here.
+
+#### The tag
+
+A value alone is not enough. The reader must know which field it belongs to, and how to read it. So each field on the wire is a **tag** followed by a value.
+
+The tag packs two things. One is the field number. The other is the **wire type**. The wire type is a small number that tells the reader how to read the value that follows. Type 0 means "a varint". Type 2 means "a length, then that many bytes". Strings use type 2.
+
+The tag is computed like this:
+
+`(field number << 3) | wire type`
+
+Read it in two steps. `<< 3` means slide the bits three places to the left. That is the same as multiplying by 8. It leaves three empty bits on the right. The `|` sign means "fill in", here with the wire type, because it fits in those three bits. For field 1 with wire type 0: 1 slides to 8 (`1000` in binary), then adding 0 gives 8. In hex that is `0x08`.
+
+Why three bits? A wire type is a small number from 0 to 5. Three bits hold 0 to 7. That is enough. The tag is itself written as a varint. A one-byte varint holds up to 127. So a tag stays one byte only while the field number is 15 or less. Field 16 pushes the tag to two bytes. This is why the schema rules below say: give common fields the numbers 1 to 15.
+
+Now step through the whole thing for `id = 150`.
 
 <VarintWalk client:visible />
 
-Now try your own values. The widget encodes with the same rules, so you can check the layout byte by byte. Note what happens when a field holds its default value (0, empty string, false). Proto3 does not write it at all.
+The field costs 3 bytes: `08 96 01`. In JSON the same data, `"id":150`, costs 8 bytes.
+
+The other two fields follow the same pattern. The name `"Ada"` is field 2 with wire type 2. Its tag is (2 << 3) | 2 = 18 = `0x12`. Then comes the length, `03`, then the three letter bytes `41 64 61`. (In text, each letter is one byte. `0x41` is the letter A.) The flag `active = true` is field 3, type 0. Its tag is `0x18` and its value is `01`.
+
+Put together, our message is:
+
+`08 96 01 12 03 41 64 61 18 01`
+
+That is 3 + 5 + 2 = **10 bytes**, against 37 bytes for JSON. Now try your own values. The tool uses the same rules as above. It also shows the **default value** rule. A default value is the "nothing" value of a type: 0 for a number, empty text for a string, false for a bool. Protobuf does not write a field that holds its default. The reader fills in the default itself. It is like a form where a blank box means "none". It saves bytes. One cost: the reader cannot tell "sent 0" from "did not send".
 
 <WireCompare client:visible />
 
-For our message, protobuf writes `08 96 01 12 03 41 64 61 18 01`. That is 3 + 5 + 2 = **10 bytes**, against 37 for JSON. The saving comes from dropping names. It shrinks when strings dominate: a 500 character text field costs about 500 bytes in both formats.
+The saving comes from dropping names. It shrinks when strings dominate. A 500-character text field costs about 500 bytes in both formats.
 
 ### A schema is a promise: evolve it with rules
 
-Because only numbers are on the wire, the rules are about numbers. From the protobuf guide:
+Services do not all update at the same moment. A phone app from last year still talks to your newest server. So the schema must change in a way that old and new code can still understand each other.
 
-- Adding a field is safe. Old code ignores the field it does not know.
-- A field number cannot change once the message is in use.
-- Never reuse a number. If you delete a field, mark its number `reserved` so nobody picks it again.
-- Numbers 1 to 15 take a one-byte tag. 16 to 2047 take two. Give the common fields small numbers.
+Because only numbers go on the wire, the rules are about numbers. Think of a library where shelves have numbers, and people fetch books by shelf number. If you put a different book on shelf 4, everyone who asks for shelf 4 gets the wrong book. The rules, from the protobuf guide:
 
-Renaming a field is safe for the binary format, because the name is not on the wire. Changing its number or its type is not.
+- Adding a field is safe. Old code sees a number it does not know. The wire type tells it how many bytes to skip. It skips them.
+- A field number cannot change once the message is in use. Old data still has the old number.
+- Never reuse a number. If you delete a field, mark its number `reserved` in the `.proto` file. That tells the compiler to refuse any later use of it. Nobody can pick it by mistake.
+- Numbers 1 to 15 take a one-byte tag. Numbers 16 to 2047 take two. Give common fields small numbers.
+
+Renaming a field is safe, because the name is not on the wire. Changing its number or its type is not.
+
+Example: you delete `nickname = 4`. A year later someone adds `email = 4`. Old stored data still holds field 4 as a nickname. The new code reads it as an email. That is silent data corruption. Reserving 4 prevents it.
 
 ### gRPC: protobuf on HTTP/2
 
-**gRPC** is an RPC framework. The service is declared in the same `.proto` file (`rpc GetUser (GetUserRequest) returns (User);`). The compiler makes the client stub and the server skeleton. It sends calls over HTTP/2 (lesson 2.3): one TCP connection, many streams.
+Protobuf only solves the message. You still need a way to send calls. **gRPC** is an RPC framework from Google that uses protobuf for messages and HTTP/2 for transport.
 
-One call is a `POST` to a path like `/users.v1.Users/Get`. The body is **length-prefixed messages**. A 1-byte flag says whether the message is compressed. Next come 4 bytes of length (big endian). Then come the protobuf bytes. That is 5 bytes of overhead per message. The result status travels in HTTP/2 **trailers**, headers sent after the body.
+You declare the service in the same `.proto` file:
+
+```proto
+service Users {
+  rpc GetUser (GetUserRequest) returns (User);
+}
+```
+
+The compiler writes two pieces of code from this. The **client stub** is an object whose methods look local: `users.GetUser(request)`. Inside, it packs the message, sends it, waits, and unpacks the reply. A stub is like a receptionist. You hand over a note. The receptionist does the phoning. The **server skeleton** is the matching empty method on the other side. You fill it in with your real logic. The generated code between them handles everything else.
+
+Why HTTP/2? Lesson 2.3 showed that HTTP/2 can carry many requests at the same time on one TCP connection. Each request and reply pair gets its own **stream**. A stream is one numbered lane inside the connection. gRPC uses one lane for each call. So 100 calls can be in flight on one connection. With HTTP/1.1 you would need 100 connections.
+
+What does one call look like on the wire? gRPC sends it as an HTTP request. The method is `POST`, which in HTTP means "send this data to the server". Every gRPC call uses `POST`. The URL **path** is the service name plus the method name, such as `/users.v1.Users/Get`. It works like a street and a house number. It says which function to run.
+
+HTTP/2 cuts each stream into small labelled pieces. They are called **frames**, the same idea as the frames of lesson 2.1, but one layer higher. Two kinds matter here:
+
+- A **HEADERS** frame carries labels: lines of "name: value" that describe the call. These are the method, the path, and the content type. They also carry the **deadline**, which is a time limit on the call. The line `grpc-timeout: 200m` means "this client will wait at most 200 milliseconds" (the `m` is milliseconds). The next sections come back to deadlines.
+- A **DATA** frame carries the body. That is the protobuf message.
+
+The message inside a DATA frame has a short prefix. This is called **length-prefixed** framing. First comes 1 byte, a flag. It says whether the message is compressed (0 means no). Then comes 4 bytes that give the length of the message. They are written in **big-endian** order, which means the biggest part comes first, like when you write "1,000" with the thousands digit first. Then come the protobuf bytes.
+
+Why do we need the length? A TCP connection is a stream of bytes with no message boundaries (lesson 2.1). The receiver must know where one message ends and the next one starts. It is like a label on a parcel that says "contents: 10 bytes". The prefix costs 5 bytes per message. For our 10-byte message, the length bytes read `00 00 00 0A`. `0A` is hex for 10.
+
+The reply is similar. It sends HEADERS (with HTTP status 200, the "OK" of lesson 2.3), then DATA. Then it sends one more HEADERS frame. This last one is called the **trailers**. Trailers are headers that arrive after the body. They carry `grpc-status`. This is a **status code**, a small number that says how the call ended. For example, 0 means OK, 5 means NOT_FOUND, 4 means DEADLINE_EXCEEDED, and 14 means UNAVAILABLE.
 
 <GrpcFrames />
 
-Because the status comes last, an HTTP status of 200 does not mean the call worked. Read `grpc-status`.
+Why put the status last? Think of a restaurant bill. You get it at the end, because only then is the total known. A server can start a response, send many messages, and then fail. The HTTP status 200 was already sent at the start and cannot be taken back. So the true result must come after. That has a surprising effect: **an HTTP status of 200 does not mean the call worked**. Read `grpc-status`. A call can show 200 and `grpc-status = 14` together. That call failed.
 
 ### Four kinds of call
 
-A method can stream in either direction. Each message on a stream keeps its order within one call.
+So far each call was one request and one response. gRPC calls this a **unary** call. It is like asking one question and getting one answer.
+
+gRPC also allows **streaming**. Streaming means that one call carries more than one message in one direction. There are three kinds:
+
+- **Server streaming:** one request, many responses. Think of a radio station. You tune in once. It keeps sending.
+- **Client streaming:** many requests, one response. Think of uploading a big file in chunks, and then getting one receipt at the end.
+- **Bidirectional streaming:** both sides send many messages at the same time. Think of a phone call.
+
+In the `.proto` file, the keyword `stream` marks the streaming side. In the picture, `Req` and `Res` are short names for the request and response message types.
 
 <GrpcModes />
 
-Use streaming when the data is a sequence: a price feed, a large upload in chunks, or a long chat. Streams are a cheaper alternative to polling (lesson 2.5) between services. But a started stream is pinned to one backend. The gRPC performance guide says streams cannot be load balanced once they have started.
+Why does streaming exist? Without it, a live price feed needs the client to ask again and again. This is called **polling**. At one question per second, that is 3,600 calls per hour, and most replies say "nothing new". A stream is one call that stays open. The server sends a message only when it has news. Messages in one stream keep their order.
+
+There is a cost. A stream, once started, stays with one backend. A **backend** is one running copy of a service. The gRPC performance guide says streams cannot be load balanced once they have started. The last section before the numbers explains why this matters.
+
+Use streaming when the data is a sequence over time: a price feed, a large upload in chunks, or a long chat. Use unary for everything else.
 
 ### Deadlines: every call needs a time limit
 
-A gRPC call has **no deadline by default**. A client can wait "effectively forever". So always set one. If the deadline passes, the client fails the call with `DEADLINE_EXCEEDED`, and the server learns the call was cancelled.
+A **deadline** is the latest moment by which a call must finish. Think of telling a courier: "If the parcel is not here by 5 pm, do not bother." Without that, you wait on the porch forever.
 
-A deadline travels downstream. Say a client gives a call 300 ms. Service A spends 100 ms and calls service B. A should pass the remaining time, 200 ms, not a fresh 300. Also, gRPC sends the remaining time rather than a clock time. This avoids trouble from clocks that disagree. In Go and Java the deadline is propagated by default. Without this, the work of a call that already timed out keeps running deep in your system.
+gRPC has **no deadline by default**. A client can wait for a reply that never comes. Each waiting call holds a thread (lesson 1.1) and memory. Enough stuck calls will freeze your service. So always set one.
+
+When the deadline passes, the client stops waiting. It fails the call with the status `DEADLINE_EXCEEDED`. The server also learns that the call was cancelled, so it can stop working.
+
+A deadline must travel downstream. Say a client gives call A a 300 ms limit. Service A spends 100 ms. Then A calls service B. A must pass the remaining time, about 200 ms. It must not start a fresh 300 ms. If it does, B may work for 300 ms after the client gave up at 300 ms. All that work is wasted. In a deep chain of services, this waste piles up.
+
+gRPC sends the remaining time as a duration ("200 ms left"), not a clock time ("until 14:03:07.250"). Why? The clocks on different machines disagree by a little. A duration needs no shared clock. Each hop just counts down. In some languages, such as Go and Java, you carry the deadline forward by passing the incoming call's context into the outgoing call. Check how your language does it. Do not assume it happens by itself.
 
 ### The load balancing trap
 
-Lesson 2.4 said a layer 4 balancer picks a server when a connection opens. In gRPC, one connection is opened and kept. So one client lands on one backend for its whole life, and every call follows it.
+Lesson 2.4 showed how a load balancer spreads work over several identical backends. It also showed two kinds. A **layer 4** balancer (L4 for short) sees only connections and bytes. It picks a backend once, when a connection opens. A **layer 7** balancer (L7 for short) reads the requests inside the connection. It can pick a backend for each request.
+
+With old-style HTTP/1.1 clients, an L4 balancer works fine. Clients open many connections. Each one lands on some backend. The work spreads out by luck.
+
+gRPC breaks this. A gRPC client opens one HTTP/2 connection and keeps it open for a long time. It sends every call as a stream on that connection. The L4 balancer picked a backend once. All calls follow it. Watch it happen.
 
 <GrpcBalance client:visible />
 
-The two fixes both balance **per call**. A layer 7 proxy reads the HTTP/2 streams and chooses a backend for each. The client-side option puts a picker in the client. The picker keeps a connection to every backend. It uses a policy such as `round_robin`. The proxy costs a hop. Client-side balancing costs logic in every client.
+Here is the trap in numbers. One busy client makes 9 calls on 3 backends. An L4 balancer sends all 9 to backend 1. Backends 2 and 3 do nothing. You add a fourth backend. Nothing changes. The balancer spreads connections, but there is only one connection.
 
-One more limit. Each HTTP/2 connection has a cap on concurrent streams. When a channel reaches it, extra calls queue in the client. For heavy traffic, gRPC suggests a pool of channels.
+Both fixes balance **per call**, not per connection.
 
-### What about browsers?
+1. **A layer 7 proxy.** A **proxy** is a program in the middle that forwards traffic for you. This one ends the HTTP/2 connection, reads each stream, and picks a backend for every call. The client still keeps one connection, to the proxy. The cost is one extra network hop on every call, and one more program to run.
+2. **Client-side balancing.** The client gets a list of all backend addresses. The list comes from DNS (lesson 2.2) or from a **service registry**. A registry is a shared list of which copies of a service are running right now, and where. It is like a phone book that updates itself. The client opens a connection to every backend. For each call it picks one, by a rule such as `round_robin`. That rule means taking turns in order, like dealing cards. There is no extra hop. The cost is that every client needs this logic.
 
-A browser cannot speak gRPC directly. It does not give a page control of HTTP/2 frames and trailers. The usual answer is a translating layer (the gRPC-Web protocol, or a gateway) in front of your services. This is why public APIs stay REST or GraphQL, and gRPC stays inside.
+There is one more limit. A **channel** is gRPC's name for a client's connection to a service. Each HTTP/2 connection allows only some number of calls at once. This limit is set by the server, and it is often about 100. When a channel reaches it, extra calls wait in a queue inside the client. For heavy traffic, gRPC suggests a **pool** of channels. A pool is a small set of connections made ahead of time and reused.
+
+### Browsers and gRPC
+
+A web page cannot speak gRPC directly. A browser does not give a page control over HTTP/2 frames and trailers. The usual fix is a translator in front of your services. One option is the gRPC-Web protocol. Another is a **gateway**, a server at the edge that turns a public web request into an internal gRPC call. It is like an interpreter at a meeting.
+
+This is why public APIs stay REST, and gRPC stays inside.
 
 ## Numbers
 
-| Item | Value | Source |
+| Item | Value | How we know |
 |---|---|---|
 | Our example message in JSON | 37 bytes | counted from the text |
 | Same message in protobuf | 10 bytes | computed from the encoding rules |
-| Overhead per gRPC message | 5 bytes (1 flag + 4 length) | gRPC HTTP/2 spec |
-| Tag size, field 1 to 15 / 16 to 2047 | 1 byte / 2 bytes | protobuf guide |
+| Overhead per gRPC message | 5 bytes (1 flag + 4 length) | fixed by the gRPC message format |
+| Tag size, field 1 to 15 / 16 to 2047 | 1 byte / 2 bytes | derived from the tag formula |
 | Default deadline | none | gRPC guide |
 | Varint size | 1 byte for 0 to 127, 2 bytes up to 16,383 | derived: 7 bits per byte |
 
-At 50,000 calls per second, 37 bytes of payload is 1.85 MB per second. And 10 bytes is 0.5 MB per second (derived). The bytes matter less than you expect. The parse cost and the typed contract are the stronger argument. Measure your own services before you promise a speed-up.
+At 50,000 calls per second, 37 bytes of payload is 1.85 MB per second. And 10 bytes is 0.5 MB per second. The gRPC prefix adds 5 bytes to each message, so the real figure is 0.75 MB per second. All of these are derived from the table above.
+
+Now compare. 1.85 MB per second is about 15 megabits per second. That is roughly 1.5% of a 1 Gbps link (lesson 1.2). So the saved bytes matter less than you expect. The parse cost and the typed contract are the stronger argument. Measure your own services before you promise a speed-up.
 
 ## Trade-offs
 
@@ -132,7 +270,7 @@ At 50,000 calls per second, 37 bytes of payload is 1.85 MB per second. And 10 by
 ## In practice
 
 <Callout type="tip">
-Say where each style lives: "Public API is REST for caching and reach. Between our services we use gRPC: a typed contract in a shared proto repo. Messages are compact, and every call has a deadline. We put an L7 proxy or use client-side round robin, because L4 would pin each client to one pod." That one sentence covers the contract, the encoding and the trap.
+Say where each style lives: "Public API is REST for caching and reach. Between our services we use gRPC: a typed contract in a shared proto repo. Messages are compact, and every call has a deadline. We put an L7 proxy or use client-side round robin, because L4 would pin each client to one server copy." That one sentence covers the contract, the encoding and the trap.
 </Callout>
 
 <Callout type="mistake">
@@ -153,7 +291,7 @@ A server can start a streaming response, send many messages, and only then find 
       q: 'In `message M { int32 id = 1; }`, id is set to 300. How many bytes does the field take on the wire?',
       options: ['2', '4', '3', '8'],
       answer: 2,
-      explain: '300 in binary is 100101100: 9 bits, so it needs two 7-bit groups and two varint bytes (AC 02). The tag for field 1 with wire type 0 is one byte (08). Total: 1 + 2 = 3 bytes.',
+      explain: '300 in binary is 100101100: 9 bits, so it needs two 7-bit groups and two varint bytes (AC 02). The tag for field 1 with wire type 0 is one byte (08). Total: 1 + 2 = 3 bytes. A tempting answer is 2, which forgets the tag.',
     },
     {
       id: 'rpc-grpc-service-has-3-grpc',
@@ -242,6 +380,8 @@ No lesson text covers these cases. Use what you learned.
 />
 
 ## Further reading
+
+You do not need these to follow the course. They are the official sources for the numbers above.
 
 - [Protocol Buffers: Encoding](https://protobuf.dev/programming-guides/encoding/) (varints, tags, the 150 example)
 - [Protocol Buffers: Language Guide (proto3)](https://protobuf.dev/programming-guides/proto3/) (field numbers, reserved, adding fields)

@@ -29,7 +29,7 @@ const HIT: Cell = { sub: 'HIT', tone: 'ok' };
 const steps: Step[] = [
   {
     caption:
-      'One file, /logo.png, with Cache-Control: public, s-maxage=3600. Three groups of users, in Asia, Europe and the US. Each reaches an edge cache close to them. All edges share one shield cache in front of the origin, which holds the real file. At the start every cache is empty.',
+      'One file, /logo.png. The origin allows caches to keep it for one hour (3600 s). Three groups of users live in Asia, Europe and the US. Each group reaches an edge cache close to them. All edges share one shield cache that sits in front of the origin. The origin holds the real file. At the start every cache is empty.',
     note: 'cold start: all caches empty',
     packets: [],
     active: [],
@@ -40,7 +40,7 @@ const steps: Step[] = [
     origin: 0,
   },
   {
-    caption: 'A user in Asia asks for /logo.png. DNS or anycast routed her to the nearest edge. The edge builds a cache key from the URL (and any Vary headers) and looks it up. Nothing there: a MISS.',
+    caption: 'A user in Asia asks for /logo.png (GET means "please send me this"). The network routed her to the nearest edge. The edge turns the URL into a cache key and looks in its store. Nothing there: a MISS.',
     note: 'edge Asia: MISS',
     noteTone: 'bad',
     packets: [{ from: 'u1', to: 'e1', label: 'GET' }],
@@ -52,7 +52,7 @@ const steps: Step[] = [
     origin: 0,
   },
   {
-    caption: 'The edge forwards the request to the shield. The shield is empty too, so it goes to the origin. This long trip is the slow path. The origin receives its first request.',
+    caption: 'The edge passes the request to the shield. The shield is empty too, so it passes the request to the origin. This long trip is the slow path. The origin receives its first request.',
     note: 'shield MISS -> origin request #1',
     noteTone: 'bad',
     packets: [
@@ -68,7 +68,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'The origin answers. Each cache on the way back checks the response headers. The response says public with s-maxage=3600, so both the shield and the edge store it. The user gets the file. Only this first user paid the long trip.',
+      'The origin answers with 200, which means OK. Each cache on the way back reads the response headers. The headers say any cache may keep the file for one hour, so the shield and the edge both store it. The user gets the file. Only this first user paid the long trip.',
     note: 'response stored at shield and edge',
     noteTone: 'ok',
     packets: [
@@ -84,7 +84,7 @@ const steps: Step[] = [
     origin: 1,
   },
   {
-    caption: 'A second user in Asia asks for the same file. The edge finds it, and its age is under 3600 s, so it is fresh. A HIT. The answer comes from nearby. The shield and the origin never hear about this request.',
+    caption: 'A second user in Asia asks for the same file. The edge finds it, and its age is under one hour, so it is fresh. A HIT. The answer comes from nearby. The shield and the origin never hear about this request.',
     note: 'edge Asia: HIT. origin still at 1',
     noteTone: 'ok',
     packets: [
@@ -133,7 +133,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Tally for this one file in one TTL window. Without a shield, each of the 3 edges would have fetched from the origin: 3 origin requests. With the shield: 1. With 100 edges and a hot object, it is up to 100 against 1. When the 3600 s expire, each cache revalidates or refetches, and the cycle repeats.',
+      'Tally for this one file in one hour. Without a shield, each of the 3 edges would have fetched from the origin: 3 origin requests. With the shield: 1. With 100 edges and a popular file, it is up to 100 against 1. When the hour ends, each cache asks the origin again, and the cycle repeats.',
     note: 'origin saw 1 request. Without shield: up to 3',
     noteTone: 'ok',
     packets: [],

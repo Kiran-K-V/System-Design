@@ -1,5 +1,5 @@
 ---
-summary: A load balancer gives many servers one address, spreads requests across them, and removes the ones that fail. The algorithm and the health check decide how well it works.
+summary: 'A load balancer gives many servers one address, spreads requests across them, and removes the ones that fail. The algorithm and the health check decide how well it works.'
 requires: ['02-networking/http-tls', '01-one-machine/throughput-vs-latency']
 ---
 
@@ -12,109 +12,223 @@ import LayerFourSeven from '../../../components/anim/lessons/LayerFourSeven.tsx'
 
 ## The problem
 
-One server has a ceiling. In lesson 1.1 a pool of 200 threads, each waiting 50 ms, served at most 4,000 requests per second. Past that, requests queue (lesson 1.3). You can buy a bigger machine for a while. Then you hit the largest one.
+Your service runs on one server. Lesson 1.1 showed what limits that server. It had a pool of 200 threads. Each request kept one thread busy for 50 ms while the thread waited for a database.
 
-Also, one server is one point of failure. When it crashes, the site is down.
+One thread finishes 20 requests per second (1 second divided by 50 ms). 200 threads finish 4,000 requests per second. The 4,001st request in that second waits in a queue, as lesson 1.3 showed.
 
-So you run several identical servers. This creates new questions. Which address does the client call? Who decides which server gets this request? What happens when one server dies?
+You have two ways to raise that ceiling.
 
-## Naive solution: DNS round robin
+- Buy a bigger machine. This is **scaling up**. Picture one cashier in a shop who gets a faster till. It helps for a while. Then you own the biggest machine that exists, and the ceiling is still there.
+- Add more machines. This is **scaling out**. Picture the shop opening three tills instead of one. Three identical servers (same code, same settings) carry 3 x 4,000 = 12,000 requests per second.
 
-Publish several A records for one name, one per server. Resolvers rotate the list. Clients spread over servers. No new component.
+There is a second problem. One server is a **single point of failure**. That term means one part that, when it breaks, stops the whole system. Picture a one-lane bridge. One stalled car blocks every driver behind it.
 
-It fails in three ways (lesson 2.2):
+The numbers are not small. A server that works 99.9% of the time is still down for 0.1% of the year. That is about 9 hours (0.001 x 8,760 hours). With three servers, any two can carry on while the third is down.
 
-- **No health awareness.** DNS keeps returning the dead server's IP until the record changes and every cache expires.
-- **No load awareness.** Rotation ignores that one server is full and another is idle.
-- **Caching.** A resolver that cached one IP sends all of its users to that one server for a full TTL.
+Running several servers raises three new problems.
 
-DNS is fine for choosing a region. It is too slow and too blind to balance requests.
+1. The client knows one name. Which server does it call?
+2. Something must decide which server gets each request.
+3. Something must handle a server that dies.
 
-## The mechanism: a load balancer in front
+The rest of this lesson solves them. We start with the simplest idea and watch it fail.
 
-A **load balancer** (LB) is a server that sits in front of the pool. Clients connect to the LB's address. The LB picks a pool member and forwards the request. It has four parts:
+## The naive way: DNS round robin
 
-1. A **listener**: the port and protocol it accepts.
-2. A **pool** of backend servers, also called targets.
-3. A **routing algorithm** that picks a server.
-4. **Health checks** that decide which servers are in the pool.
+Lesson 2.2 showed that DNS turns a domain name into an IP address. A name can have several addresses. So here is a first plan: list the addresses of all three servers under one name.
 
-Step through the happy path, then a failure.
+The DNS server hands the addresses out in turns. The first asker gets server 1. The second gets server 2. The third gets server 3. The fourth gets server 1 again. Taking turns in a fixed order is called **round robin**. Picture a dealer who gives one card to each player in turn.
+
+This plan is cheap. It needs no new machine. With 3 servers, each one gets about a third of the new lookups.
+
+It fails in three ways.
+
+**1. DNS cannot see health.** The DNS server never checks whether a server is alive. Picture a receptionist who reads room numbers from a printed list. She does not notice that one room is on fire. When server 2 dies, DNS still hands out its address. One user in three gets an error. Some clients try the next address after a wait. Not all do, and every try adds delay.
+
+**2. DNS cannot see load.** Turn-taking counts users. It does not count work. A user who asks for a huge report and a user who asks for a tiny page both count as one turn.
+
+**3. Answers are cached.** Each DNS answer has a **TTL**, the time a resolver may keep the answer (lesson 2.2). Picture a printed flyer that people keep in their pockets. You cannot call the flyers back. Say the TTL is 300 seconds. After you remove a dead server from DNS, its address lives on in caches for up to 5 minutes.
+
+Caching also breaks the even split. A resolver that cached server 1 sends all its users there for the full TTL. If 5,000 office workers share one resolver, all 5,000 hit server 1.
+
+So DNS is fine for slow choices, such as which country's data center a user reaches. It is too slow and too blind to balance single requests. We need a component that sees every request and every server.
+
+## The fix: a load balancer in front
+
+A **load balancer** is a machine (or a program) that stands in front of the servers. Clients talk only to it. It passes each request to one server and passes the answer back. We write **LB** for short.
+
+Picture the host at a restaurant door. Every guest talks to the host. The host sends each guest to a table with a free waiter. Guests never see the kitchen.
+
+This solves the first problem. Clients know one address: the LB. The servers sit behind it. You can add, remove, or replace servers, and no client notices.
+
+Here are the four parts of every LB.
+
+1. A **listener**: the port and protocol the LB accepts traffic on. It is a standing order with its kernel, like the web server in lesson 2.1. For web traffic, the listener is on port 443 (encrypted) or port 80 (not encrypted).
+2. A **pool**: the set of servers behind the LB. People also call them **backends** or **targets**. Picture the group of waiters the host can choose from.
+3. A **routing algorithm**: the rule that picks one server from the pool for each request. This solves the second problem. We cover the rules below.
+4. A **health check**: the way the LB decides which servers are fit to stay in the pool. This solves the third problem.
+
+The LB adds one extra hop. A request now goes client, LB, server, LB, client. Inside one data center, an extra hop adds about one round trip of 0.5 ms (lesson 1.2). That small cost buys everything in this lesson.
+
+### Health checks
+
+An LB must learn when a server is dead. It finds out by asking. A **health check** is a small test the LB sends to every server on a timer. The test message is a **probe**. The probe is often a plain HTTP request, such as `GET /health`. `GET` is the HTTP request that reads something, and `/health` is a path where the server answers "OK" if it can work. For non-web traffic, a probe can be just a try to open a TCP connection.
+
+Picture a nurse who walks the ward every 30 seconds and asks each patient, "Are you fine?" A patient who gives no answer is a worry.
+
+One missed answer proves little. A server can be busy for a moment. So the LB counts. It marks a server **unhealthy** only after a set number of failed probes in a row. This number is the **unhealthy threshold**. A probe also has a **timeout**: the longest the LB waits for an answer before it counts the probe as failed. An unhealthy server leaves the pool, and the LB stops sending it requests. The LB keeps probing it. After a set number of passed probes in a row, the server returns to the pool.
+
+Example with real defaults: a probe every 30 s, a timeout of 5 s, two failures to remove a server. A server that dies right after a good probe is removed about 2 x 30 s = 60 s later. For that whole minute, the LB still sends it traffic.
+
+This is an **active** check, because the LB sends its own probes. A **passive** check works differently. The LB watches real requests and notes which ones fail. Picture a host who sees that every guest sent to table 3 never gets food. Nginx works this way by default. (Nginx is a popular web server program that can also act as an LB.) It marks a server as failed when a real request to it fails once. Most setups use both kinds.
+
+Step through a failure. Watch how many requests fail before the LB reacts.
 
 <LbFailover client:visible />
 
-The LB answers the failure question with a **health check**: a probe it sends to each server on a timer. A server that fails several probes in a row leaves the pool. It re-enters after several successes. This is an *active* check. A *passive* check watches real traffic instead. Nginx marks a server failed after real requests to it fail (default `max_fails` of 1). Most setups use both.
+What you just watched has a name: **failover**. The work of a failed server moves, with no human step, to the servers that still work. Picture a shop where one till closes and its queue splits across the open tills. In the animation, each of two survivors goes from 33% to 50% of the traffic. So the survivors must have spare room. We return to this in the numbers.
 
-### Layer 4 or layer 7
+Detection is not free. Say three servers share 3,000 requests per second, and the LB needs 60 seconds to notice a dead one. One request in three goes to the dead server. That is 1,000 failed requests per second, or 60,000 errors in the minute. (This assumes no retries.) The detection time is the cost of the health check.
 
-Network protocols stack in layers (lesson 2.1). **Layer 4** is the transport layer: TCP and UDP connections. **Layer 7** is the application layer: HTTP. A load balancer can work at either.
+## Layer 4 and layer 7 load balancers
+
+An LB can read different amounts of each request. In lesson 2.1 a packet looked like an envelope inside an envelope. Your data is the letter. The transport header (ports) wraps it. The IP header (addresses) wraps that. The frame wraps the rest. Each layer reads only its own header.
+
+An LB has the same choice. It can read only the outer envelopes, or it can open the letter.
+
+Engineers number these layers from the bottom: the frame is layer 2, the IP header is layer 3, the transport header is layer 4, and the letter itself (the HTTP request, which is the **application** layer) is layer 7. The numbers come from an old seven-layer model. You only need 4 and 7.
+
+**A layer 4 LB** reads the IP header and the transport header. It sees addresses and ports. It does not open the letter. Picture a mail clerk who sorts by the address on the outside and never opens an envelope.
+
+It picks a server when a connection opens. Then every packet of that connection goes to that same server. If an encrypted connection (TLS, lesson 2.3) comes in, the LB passes the encrypted bytes through. It cannot read them, and it does not need to.
+
+This is fast and works for any protocol. The price is that it is blind to requests. It keeps a small note for each open connection, a **flow table**, so it knows where each packet goes. AWS (Amazon Web Services, a company that rents servers by the hour) sells a layer 4 product called the Network Load Balancer. It forgets a connection after 350 seconds with no traffic. A client that waits longer than that and then sends finds a broken connection.
+
+**A layer 7 LB** opens the letter. It reads each HTTP request (lesson 2.3). It sees the **path**, which is the part of the web address after the domain name, such as `/api/users`. It sees the headers. It sees **cookies**. A cookie is a small piece of text that a server gives to a browser. The browser sends it back with every later request. Picture the ticket from a coat check: it tells the clerk which coat is yours.
+
+Because it reads requests, a layer 7 LB can do more.
+
+- Route by path. Send `/api` to one pool and `/images` to another.
+- Retry. If one server fails a request, send the same request to another server.
+- **Terminate TLS**. The LB does the TLS handshake and the decryption itself, then talks to servers over a private network. Servers skip that work. The certificate (lesson 2.3) lives on the LB. Picture a guard at the gate who checks IDs, so the staff inside do not each check them.
+
+The price is CPU, because the LB parses every request. AWS sells a layer 7 product called the Application Load Balancer, or ALB.
+
+Compare the two.
 
 <LayerFourSeven />
 
-A layer 4 LB sees only addresses, ports and flags. It picks a server when a connection opens, and every packet of that connection goes to that server. It is fast and protocol-agnostic. AWS Network Load Balancer works this way. It tracks a TCP flow and, by default, drops its state after 350 seconds of idle time.
+One more difference matters with HTTP/2. In HTTP/2, one connection carries many requests at once (multiplexing, lesson 2.3). A layer 4 LB picks a server per connection. So one busy client with one connection sends all its requests to one server. A layer 7 LB picks per request, so those requests spread out. Example: a client sends 300 requests on one HTTP/2 connection. A layer 4 LB gives one server all 300. A layer 7 LB can give each of 3 servers about 100. The same issue appears with gRPC, a request style built on HTTP/2. Lesson 2.6 returns to it.
 
-A layer 7 LB reads each HTTP request. It can send `/api` to one pool and `/images` to another, add headers, retry a failed request on another server, and terminate TLS so backends skip the handshake work. AWS Application Load Balancer works this way. The price is CPU, since it parses every request.
+## Routing algorithms
 
-With HTTP/2 or gRPC, one connection carries many requests. A layer 4 LB then pins all of them to one server. A layer 7 LB can spread them per request. Lesson 2.6 returns to this.
+The LB needs a rule to pick a server for each request. Here are four common rules. Each one has a picture, a use, and a flaw.
 
-### Algorithms
+**Round robin.** You met it in the DNS section. The LB takes turns: A, B, C, A, B, C. It is simple. Nine requests give each of 3 servers exactly 3. It works well when all requests cost the same and all servers are alike.
 
-| Algorithm | How it picks | Strength | Weakness |
-|---|---|---|---|
-| **Round robin** | Next server in order | Simple, even request count | Ignores request cost and server speed |
-| **Weighted round robin** | Order, with more turns for big servers | Handles mixed hardware | Weights are set by hand |
-| **Least connections** | Fewest active requests now | Adapts to slow requests | Needs live counts; new server gets a burst |
-| **Hash (client IP or key)** | Hash of a key, modulo pool size | Same client, same server (sticky) | Skewed if one key is hot; reshuffles when the pool changes |
+The flaw is that it counts requests, not work. Say most requests take 5 ms and a few take 2 s. A server that got two slow ones is busy. Its next turn still comes.
 
-Try them on identical traffic. One request in five is heavy, and one client is noisy. Switch algorithms, then kill a server.
+**Weighted round robin.** Each server gets a **weight**, which is its number of turns per round. A server twice as big gets weight 2. The turns go A, A, B. Picture a bigger shop that gets two deliveries for each delivery to a small shop. It handles servers of different size. The flaw: a person sets the weights by hand and must keep them right.
+
+**Least connections.** The LB counts how many requests each server is working on right now. It sends the next request to the server with the lowest count. Picture a shopper who walks to the shortest checkout line. Example: A has 5 active requests, B has 2, C has 4. The next request goes to B.
+
+It adapts to slow requests. A server stuck on heavy work has a high count, so it gets less. There are two costs. The LB must track live counts. And a new server starts at 0, so for a moment it wins every comparison and gets a flood. Picture a new till that opens, and the whole queue runs to it.
+
+**Hash.** A **hash** is a fixed recipe that turns any input, such as a client IP address, into a number. The same input always gives the same number. Different inputs give numbers that look random. Picture a locker office: it turns your name into a locker number by a fixed rule. You get the same locker every time.
+
+The LB then needs a server number from 0 to N-1, where N is the pool size. It uses **modulo**: the remainder after division. Write it `hash % N`. Example: the hash of a client is 17 and N is 3. 17 divided by 3 is 5 with remainder 2. So the client goes to server 2 (counting from 0).
+
+The same client always lands on the same server. We say the client is **sticky** to that server. This helps when a server keeps data for that client in memory. It has two flaws.
+
+1. **Hot keys.** If one client sends 40% of all traffic, one server takes 40% of the load, whatever you do.
+2. **The pool changes.** When N changes, `hash % N` changes for most keys. Take N from 3 to 4. Look at the hash values 0 to 11. A value keeps its server only if `hash % 3` equals `hash % 4`. That holds for 0, 1 and 2 only. That is 3 of 12 values, or 25%. About 75% of clients move to a new server. Every client that moves loses whatever that server remembered about it. A later lesson on consistent hashing (Module 4) fixes this.
+
+Now try all of them. First, a note on how the lab works. Time moves in **ticks**. A tick is one step of simulated time. Two requests arrive on each tick. One request in five is heavy and takes 8 ticks. The others take 1 or 2 ticks. One noisy client sends 40% of all traffic. The LB probes each server once per tick. It removes a server after 2 failed probes and restores it after 3 passed probes.
+
+Switch the algorithm. Then press Kill server and watch the Failed count.
 
 <LoadBalancerSim client:visible />
 
-Look at what happens with hash when a server dies. The pool size changes, so `hash % N` changes. Most clients move to a different server. With 3 servers going to 4, only 1 in 4 keys stays where it was. Module 4 fixes this with consistent hashing.
+Look at the hash case when you kill a server. The pool size changes, so `hash % N` changes. Many clients move at once.
 
 <Callout type="deep" title="Health checks can cause the outage">
-A deep health check that calls the database seems careful. But if the database slows down for 10 seconds, every server fails its check at once. The LB removes all of them. Many LBs avoid this by failing open: AWS ALB sends traffic to all targets when every target is unhealthy. Keep checks shallow (is this process able to serve?) unless you have a reason. Also set the thresholds on purpose. Slow detection means errors. Fast detection means a brief hiccup flaps servers in and out.
+A **dependency** is another system your server calls, such as a database. A deep health check calls the dependency, and that seems careful. But think about what happens when the database slows for 10 seconds. Every server fails its check at the same moment. The LB removes all of them. Now nothing serves traffic, and the database was the only thing that was ill.
+
+Some LBs guard against this by **failing open**: when every server looks unhealthy, they send traffic to all of them anyway. AWS ALB does this. Failing open is a safety net, not a design.
+
+Keep checks shallow. Ask only "can this process serve?" Alert on dependencies in a separate place. Set the thresholds with care too. A slow check means long errors. A fast check can cause **flapping**: a server that has one slow second is removed, comes back, is removed again, and so on.
 </Callout>
 
-### Sticky sessions
+## Sticky sessions
 
-Sometimes a user's state lives in one server's memory. The LB can pin the user with a cookie so later requests return to the same server. ALB supports this with a load-balancer cookie or an app cookie (1 day by default). It works, but it hurts: load becomes uneven, and if the pinned server dies the user loses their session. The better design is **stateless servers** with sessions in a shared store, so any server can serve any request.
+A **session** is what a server remembers about one user between requests: who is logged in, what is in the cart. Picture a waiter who remembers your order. If you wave over a different waiter, he knows nothing.
 
-### The LB is itself a single point of failure
+A server that keeps this memory itself is **stateful**. Picture notes kept in one teller's head. Only that teller can serve you well. A server that keeps nothing between requests is **stateless**. Picture a bank where every teller reads your account from one shared ledger. Any teller can serve you.
 
-Do not forget this. Run more than one LB node. Managed LBs do it for you: an AWS Network Load Balancer has one IP address per Availability Zone. Its DNS name returns them all. So DNS picks the LB node, and the LB node picks the server. The two techniques work together.
+If servers are stateful, the LB must send each user back to the same server. This is a **sticky session**. The LB gives the user a cookie that names a server. On the next request, the LB reads the cookie and sends the user there. The AWS ALB supports this. The cookie lasts 1 day by default.
+
+It works, but it hurts.
+
+- Load gets uneven. A server with a few heavy users stays hot.
+- If the pinned server dies, its users lose their sessions. If one of three servers dies, about a third of users are logged out at once.
+
+The better design is stateless servers. Keep sessions in a **shared store**, which is a database or a fast in-memory store that every server can reach. Then any server can take any request, and any server can die without a logout.
+
+## The LB is itself a single point of failure
+
+You solved the one-lane bridge for the servers. You built a new one-lane bridge at the front: if the LB dies, no client reaches any server. So run more than one LB.
+
+Managed LBs do this for you. **Managed** means the cloud company runs and repairs it. An AWS Network Load Balancer gets one IP address in each **Availability Zone**. An Availability Zone is one separate data center building inside a region, with its own power and network. A fire in one does not reach the others.
+
+The DNS name of that LB returns all of those addresses. So DNS picks the LB node, and the LB node picks the server. The two ideas work together. DNS is blind to health and load, but that is acceptable for choosing among a few LB nodes that the cloud company keeps healthy.
 
 ## Numbers
 
-| Setting | Typical value (AWS ALB defaults) |
+These are the AWS Application Load Balancer defaults. Other products use other values, but the shape is the same.
+
+| Setting | Typical value |
 |---|---|
-| Health check interval | 30 s |
+| Time between health probes | 30 s |
 | Probe timeout | 5 s |
 | Failed probes to remove a server | 2 |
 | Passed probes to restore a server | 5 |
-| Time a dead server keeps receiving traffic | about 2 x 30 s = 60 s |
-| NLB idle timeout for a TCP flow | 350 s |
+| Time a dead server keeps getting traffic | about 2 x 30 s = 60 s |
+| Network Load Balancer idle timeout for a TCP connection | 350 s |
+| Cookie life for sticky sessions | 1 day |
 
-Capacity math: with N servers sharing load evenly, losing one raises the load on each survivor by N / (N - 1). Three servers at 70% each carry 2.1 units. Two survivors would need 105%. So they overload. This is why you plan for N+1 and keep normal load below about (N - 1) / N.
+**Capacity math.** Say N servers share load evenly. When one dies, each survivor must absorb a share of the dead server's work. Each survivor's load rises by a factor of N / (N - 1).
+
+Example: three servers at 70% each carry 3 x 70% = 210% of one server's capacity. Two survivors must carry it. That is 105% each. They are overloaded, so requests queue and they may fail too. The failure spreads.
+
+So plan for **N+1**: enough servers to carry the whole load with one missing. The safe normal load is (N - 1) / N of capacity.
+
+| Servers | Safe normal load |
+|---|---|
+| 3 | about 67% |
+| 4 | 75% |
+| 10 | 90% |
+
+More servers means each one can run hotter, because one loss is a smaller share of the whole.
 
 ## Trade-offs
 
 | Choice | You gain | You pay | Pick it when |
 |---|---|---|---|
-| Layer 4 LB | Speed, any TCP/UDP protocol, TLS passes through | No view of requests, per-connection balancing only | Databases, game servers, very high throughput |
-| Layer 7 LB | Path routing, retries, TLS offload, per-request balancing | CPU per request, one more hop | Web and API traffic, HTTP/2 and gRPC |
+| Layer 4 LB | Speed, any TCP or UDP protocol, encrypted bytes pass through | No view of requests, balances per connection only | Databases, game servers, very high traffic |
+| Layer 7 LB | Routing by path, retries, TLS handled at the LB, balancing per request | CPU for every request, one more place to parse and fail | Web and API traffic, HTTP/2 and gRPC |
 | Round robin | Simplicity | Blind to load | Similar requests, similar servers |
-| Least connections | Handles uneven request cost | State and a cold-start burst | Long or variable requests |
-| Sticky sessions | Quick fix for in-memory state | Uneven load, lost sessions on failure | Short-term bridge only |
+| Least connections | Handles uneven request cost | Live counts, a flood onto a new server | Long or variable requests |
+| Hash | Same client, same server | Hot keys, most clients move when the pool changes | A server keeps useful data per client |
+| Sticky sessions | A quick fix for server memory | Uneven load, lost sessions when a server dies | A short bridge while you fix the state |
 
 ## In practice
 
 <Callout type="tip">
-Place the LB explicitly: "Clients resolve DNS to the LB. A layer 7 LB terminates TLS, routes by path, and checks health every few seconds. Servers are stateless, so any server can take any request. We keep N+1 capacity." Naming health checks and N+1 shows you have run production systems.
+Place the LB in your design on purpose. For example: "Clients resolve DNS to the LB. A layer 7 LB ends TLS, routes by path, and probes health every few seconds. Servers are stateless, so any server can take any request. We keep N+1 capacity." Naming the health check and N+1 shows that you have run a real service.
 </Callout>
 
 <Callout type="mistake">
-Do not draw one box labeled "Load Balancer" and move on. Say what happens when it fails, and what happens when a backend fails. Also do not use sticky sessions to avoid fixing server state. It trades a design problem for an outage.
+Do not draw one box labeled "Load Balancer" and move on. Say what happens when a backend fails, and what happens when the LB itself fails. Also do not use sticky sessions to avoid fixing server state. That trades a design problem for an outage.
 </Callout>
 
 ## Check yourself
@@ -127,42 +241,42 @@ Do not draw one box labeled "Load Balancer" and move on. Say what happens when i
       q: 'Your requests vary a lot: most take 5 ms, but some take 2 s. Round robin leaves some servers with a pile of slow requests. Which algorithm helps most?',
       options: ['Hash of client IP', 'Layer 4 instead of layer 7', 'Weighted round robin with equal weights', 'Least connections'],
       answer: 3,
-      explain: 'Least connections looks at how many requests each server holds right now, so it avoids a server stuck with slow ones. Round robin only counts turns.',
+      explain: 'Least connections counts how many requests each server is working on right now, so it avoids a server stuck with slow ones. Round robin only counts turns. Equal weights change nothing, and a hash ignores load.',
     },
     {
       id: 'load-balancing-three-servers-each-run',
       q: 'Three servers each run at 70% of capacity behind a load balancer. One crashes and is removed. What load does each survivor carry?',
       options: ['105%', '70%', '85%', '140%'],
       answer: 0,
-      explain: 'Total load is 3 x 70% = 210% of one server. Two survivors share it: 105% each. They are overloaded, requests queue, and they may fail too. Plan for N+1.',
+      explain: 'Total load is 3 x 70% = 210% of one server. Two survivors share it: 105% each. They are overloaded, requests queue, and they may fail too. This is why you plan for N+1.',
     },
     {
       id: 'load-balancing-health-checks-run-every',
-      q: 'Health checks run every 10 seconds. A server is removed after 3 consecutive failures. About how long can a dead server keep getting traffic?',
+      q: 'Health checks run every 10 seconds. A server is removed after 3 failed probes in a row. About how long can a dead server keep getting traffic?',
       options: ['Under 1 second', 'About 30 seconds', 'About 10 seconds', 'About 5 minutes'],
       answer: 1,
-      explain: 'Three failed probes at 10 s intervals take about 30 s. During that time, a share of requests (1 in N for N servers) fails. Shorter interval or lower threshold reduces it, but risks flapping.',
+      explain: 'Three failed probes at 10 s intervals take about 30 s. During that time, a share of requests (1 in N for N servers) fails. A shorter interval or a lower threshold cuts the delay, but a server then risks flapping in and out.',
     },
     {
       id: 'load-balancing-want-api-pool-servers',
       q: 'You want /api/* on one pool of servers and /static/* on another. Which load balancer can do it?',
       options: ['Layer 4, because it is faster and has less overhead', 'Neither; use DNS round robin for each path prefix', 'Layer 7, because it can read the URL path', 'Layer 4 with sticky sessions for each client'],
       answer: 2,
-      explain: 'A layer 4 LB sees only IPs and ports. Only a layer 7 LB parses the HTTP request and can route by path, host or header.',
+      explain: 'A layer 4 LB sees only addresses and ports. Only a layer 7 LB opens the HTTP request, so only it can route by path, host name or header. DNS has no idea what path a client will ask for.',
     },
     {
       id: 'load-balancing-balance-hash-client-n',
       q: 'You balance by hash(client) % N with N = 3. You add a fourth server. About what share of clients still reach the same server?',
       options: ['100%', '75%', '0%', '25%'],
       answer: 3,
-      explain: 'A key keeps its server only when hash % 3 equals hash % 4. That holds for 3 of every 12 values, which is 25%. About 75% of clients move. Consistent hashing (Module 4) cuts that to about 1 in 4 moving.',
+      explain: 'A key keeps its server only when hash % 3 equals hash % 4. That holds for 3 of every 12 values, which is 25%. About 75% of clients move. Consistent hashing (Module 4) fixes this so that only about 1 in 4 keys moves.',
     },
   ]}
 />
 
 ## Prove it
 
-No lesson text covers these cases. Use what you learned.
+No lesson text covers these cases directly. Use what you learned.
 
 <Diagnose
   client:visible
@@ -180,7 +294,7 @@ No lesson text covers these cases. Use what you learned.
         'Random: with enough requests, load always evens out across every server in the pool',
       ],
       answer: 0,
-      explain: 'Round robin counts requests, not work. Least connections sees that B still has many open requests and sends new ones elsewhere.',
+      explain: 'Round robin counts requests, not work. Least connections sees that B still has many open requests and sends new ones elsewhere. A faster health check does not help, because B is busy, not dead.',
     },
     {
       context: 'The health check endpoint queries the database. The database slows down. All 4 servers fail their checks, and the load balancer removes all 4.',
@@ -192,12 +306,14 @@ No lesson text covers these cases. Use what you learned.
         'No health check at all, and rely only on passive failure detection from real traffic',
       ],
       answer: 1,
-      explain: 'A deep check turns one shared dependency problem into a full outage. Keep the check about this server, and alert on dependencies separately.',
+      explain: 'A deep check turns one shared dependency problem into a full outage. Keep the check about this server, and alert on dependencies in a separate place.',
     },
   ]}
 />
 
 ## Further reading
+
+You do not need these to follow the course. They are the vendor pages that give the defaults used above.
 
 - [AWS: Target groups for Application Load Balancers](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html) (algorithms, sticky sessions, fail-open)
 - [AWS: Health checks for ALB target groups](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html) (default interval and thresholds)

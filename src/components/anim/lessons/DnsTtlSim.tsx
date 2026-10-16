@@ -28,7 +28,7 @@ export default function DnsTtlSim() {
 
   return (
     <figure className="not-prose my-8 overflow-hidden rounded-xl border border-line bg-bg shadow-[0_1px_2px_rgb(0_0_0/0.04)]">
-      <div className="border-b border-line bg-surface px-4 py-2 text-sm font-medium">TTL: failover speed against server load</div>
+      <div className="border-b border-line bg-surface px-4 py-2 text-sm font-medium">TTL: how fast a change spreads, against server load</div>
       <div className="grid gap-5 px-4 py-4 sm:grid-cols-[1fr_1fr]">
         <div className="space-y-4 text-sm">
           <fieldset>
@@ -48,12 +48,12 @@ export default function DnsTtlSim() {
             </div>
           </fieldset>
           <dl className="grid grid-cols-[1fr_auto] gap-y-1.5">
-            <dt className="text-muted">Worst case: users on the dead IP after you switch</dt>
+            <dt className="text-muted">Worst case: how long some users stay on the old IP after you switch</dt>
             <dd className="text-right font-mono font-semibold text-bad">{fmt(ttl)}</dd>
             <dt className="text-muted">Average wait until a given resolver refreshes</dt>
             <dd className="text-right font-mono">{fmt(ttl / 2)}</dd>
             <dt className="text-muted">Authoritative load ({RESOLVERS.toLocaleString('en-US')} resolvers, each asks once per TTL)</dt>
-            <dd className="text-right font-mono font-semibold">{qps >= 10 ? Math.round(qps).toLocaleString('en-US') : qps.toFixed(1)} q/s</dd>
+            <dd className="text-right font-mono font-semibold">{qps >= 10 ? Math.round(qps).toLocaleString('en-US') : qps.toFixed(1)} queries per second</dd>
           </dl>
         </div>
         <svg viewBox={`0 0 ${W} ${H}`} className="h-auto w-full" role="img" aria-label="Share of resolvers still serving the old IP, falling from 100 percent to 0 over one TTL">
@@ -69,7 +69,7 @@ export default function DnsTtlSim() {
       </div>
       <p className="border-t border-line px-4 py-3 text-[0.95rem] leading-relaxed">
         You move a service to a new IP. Every resolver keeps the old answer until its own copy expires. Copies expire at different times, so the share on the old IP falls in a
-        line from 100% to 0% over one TTL. Short TTL: fast failover, heavy load on your name servers. Long TTL: light load, slow failover.
+        line from 100% to 0% over one TTL. Short TTL: changes spread fast, heavy load on your name servers. Long TTL: light load, changes spread slowly.
       </p>
     </figure>
   );

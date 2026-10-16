@@ -35,7 +35,7 @@ const TICK_MS = 450;
 const ALGOS: { id: Algo; label: string; blurb: string }[] = [
   { id: 'rr', label: 'Round robin', blurb: 'Takes turns: A, B, C, A, B, C. Ignores how busy each server is.' },
   { id: 'lc', label: 'Least connections', blurb: 'Sends each request to the server with the fewest active requests right now.' },
-  { id: 'hash', label: 'Hash of client', blurb: 'The same client always lands on the same server (hash of client ID modulo pool size). Sticky, but blind to load.' },
+  { id: 'hash', label: 'Hash of client', blurb: 'The same client always lands on the same server: hash the client ID into a number, then take the remainder after dividing by the number of servers in the pool. Sticky, but blind to load.' },
 ];
 
 function rand(sim: Sim) {
@@ -243,7 +243,7 @@ export default function LoadBalancerSim() {
       </div>
 
       <p className="border-t border-line px-4 py-3 text-[0.95rem] leading-relaxed">
-        Two requests arrive each tick. One request in five is heavy, and one client sends 40% of all traffic. Run each algorithm and compare the Served share.
+        A tick is one step of simulated time. Two requests arrive each tick. One request in five is heavy, and one client sends 40% of all traffic. Run each algorithm and compare the Served share.
         Round robin spreads the count evenly but can stack heavy requests on one server. Least connections steers new work away from servers stuck on heavy requests, so
         compare Active as well as Served. Hash is sticky: the noisy client pins one server. Then press Kill server and watch the failed count rise until the health check removes it ({UNHEALTHY_AFTER} failed probes). Total so far: {totalServed} served, {totalFailed} failed.
       </p>

@@ -94,12 +94,12 @@ const SC: Scenario[] = [
 ];
 
 const steps = [
-  { caption: 'A page needs three files: app.js (slow: 300 ms of work), style.css (60 ms) and logo.png (60 ms). Assume a 50 ms round trip. We will load the same page five ways and watch when each file finishes.' },
+  { caption: 'A page needs three files: app.js (slow: 300 ms of work), style.css (60 ms) and logo.png (60 ms). Assume a 50 ms round trip. The numbers are illustrative. We will load the same page five ways and watch when each file finishes.' },
   { caption: 'HTTP/1.1, one connection. The connection carries one request at a time, and replies must come back in order. The two tiny files wait behind app.js. This is head-of-line blocking at the HTTP level. Setup is TCP plus TLS 1.3: 2 round trips = 100 ms.' },
   { caption: 'The browser works around it: open more connections (up to 6 per host). Now the small files finish early. But each connection pays its own TCP and TLS setup, and the server holds 3 connections for one page.' },
   { caption: 'HTTP/2 fixes it in the protocol. Many requests share one connection as separate streams, and the server interleaves their frames. One setup, no waiting in line. The small files finish at 160 ms.' },
   { caption: 'Now one packet is lost. TCP delivers bytes in order, and it does not know about streams. Every stream waits while the one missing packet is resent. The small files slip from 160 ms to 260 ms. This is head-of-line blocking at the TCP level.' },
-  { caption: 'HTTP/3 runs over QUIC on UDP. QUIC tracks loss per stream. The lost packet belonged to app.js, so only app.js waits. The small files finish at 110 ms. QUIC also sets up in 1 round trip instead of 2.' },
+  { caption: 'HTTP/3 runs over QUIC, a transport built on UDP. QUIC tracks loss per stream. The lost packet belonged to app.js, so only app.js waits. The small files finish at 110 ms. QUIC also sets up in 1 round trip instead of 2.' },
 ];
 
 const X0 = 112;

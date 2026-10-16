@@ -13,12 +13,12 @@ const bytes = varint(VALUE); // [0x96, 0x01]
 const tagBytes = tag(1, 0); // [0x08]
 
 const steps = [
-  { caption: 'A message has one field: int32 id = 1, and we set id to 150. Protobuf must turn "field 1 = 150" into bytes. It writes a tag (which field, and what type) and then the value.' },
-  { caption: 'First, the value in binary: 150 = 128 + 16 + 4 + 2 = 10010110. That is 8 bits. A varint (variable-length integer) carries only 7 bits per byte, because the 8th bit has another job. So 150 needs 2 bytes.' },
-  { caption: 'Split the bits into groups of 7, starting from the low end: the low group is 0010110 and the high group is 0000001. Small numbers fit in one group and cost 1 byte. This is why small ids are cheap.' },
-  { caption: 'Write the low group first. In every byte except the last, set the top bit to 1. It means "more bytes follow". That gives 1 0010110 = 0x96 and 0 0000001 = 0x01. The reader stops at the first byte whose top bit is 0.' },
-  { caption: 'Now the tag. It is (field number << 3) | wire type. Field 1, wire type 0 (varint): (1 << 3) | 0 = 8 = 0x08. The field name "id" is never sent. Both sides know field 1 from the .proto file.' },
-  { caption: 'The whole field is 08 96 01: 3 bytes. In JSON the same data, "id":150, costs 8 bytes because the name is sent as text every time. To decode, a reader sums 7-bit groups in the reverse order: 0000001 0010110 = 150.' },
+  { caption: 'A message has one field: int32 id = 1, and we set id to 150. Protobuf must turn "field 1 = 150" into bytes. It writes a tag (which field this is, and how to read the value) and then the value.' },
+  { caption: 'First, the value in binary: 150 = 128 + 16 + 4 + 2 = 10010110. That is 8 bits. A varint (variable-length integer) carries only 7 bits of number per byte, because the 8th bit has another job. So 150 needs 2 bytes.' },
+  { caption: 'Split the bits into groups of 7, starting from the right end (the low end, the part that counts least): the low group is 0010110 and the high group is 0000001. Small numbers fit in one group and cost 1 byte. This is why small ids are cheap.' },
+  { caption: 'Write the low group first. In every byte except the last, set the top bit to 1. It means "more bytes follow". That gives 1 0010110 = 0x96 and 0 0000001 = 0x01 (0x means hex, a short way to write a byte). The reader stops at the first byte whose top bit is 0.' },
+  { caption: 'Now the tag. It is (field number << 3) | wire type. The << 3 slides the field number 3 bits to the left (times 8), and the | fills the 3 free bits with the wire type. Field 1, wire type 0 (varint): (1 << 3) | 0 = 8 = 0x08. The name "id" is never sent. Both sides know field 1 from the .proto file.' },
+  { caption: 'The whole field is 08 96 01: 3 bytes. In JSON the same data, "id":150, costs 8 bytes because the name is sent as text every time. To decode, a reader puts the 7-bit groups back in the reverse order: 0000001 0010110 = 150.' },
 ];
 
 const CELL = 34;
@@ -59,7 +59,7 @@ export default function VarintWalk() {
                 set id = 150
               </HandText>
               <HandText x={360} y={180} size={15} color="var(--muted)">
-                tag (which field + type), then value
+                tag (which field, how to read it), then value
               </HandText>
             </g>
           )}
@@ -73,14 +73,14 @@ export default function VarintWalk() {
                 128 + 16 + 4 + 2 = 150
               </HandText>
               <HandText x={360} y={190} size={16} color="var(--bad)">
-                8 bits. One byte holds only 7 payload bits.
+                8 bits. One byte has room for only 7 bits of number.
               </HandText>
             </g>
           )}
           {i === 2 && (
             <g>
               <HandText x={360} y={32} size={18}>
-                regroup into 7 bits, low end first
+                split into groups of 7 bits
               </HandText>
               <Row x={90} y={95} bits={hi7} />
               <Row x={390} y={95} bits={lo7} />
@@ -98,7 +98,7 @@ export default function VarintWalk() {
           {i === 3 && (
             <g>
               <HandText x={360} y={32} size={18}>
-                add the continuation bit (top bit)
+                add a flag bit in front (the top bit)
               </HandText>
               <Row x={70} y={95} bits={'1' + lo7} flagFirst />
               <Row x={400} y={95} bits={'0' + hi7} flagFirst />

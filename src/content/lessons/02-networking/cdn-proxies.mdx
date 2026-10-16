@@ -1,5 +1,5 @@
 ---
-summary: A reverse proxy stands in front of your servers. A CDN is a fleet of caching reverse proxies placed near users, so most requests never travel to your origin.
+summary: 'A reverse proxy stands in front of your servers. A CDN is a fleet of caching reverse proxies placed near users, so most requests never travel to your origin.'
 requires: ['02-networking/dns', '02-networking/http-tls', '02-networking/load-balancing']
 ---
 
@@ -12,108 +12,196 @@ import CacheFreshness from '../../../components/anim/lessons/CacheFreshness.tsx'
 
 ## The problem
 
-Your servers are in New York. A user in London opens your site. Lesson 1.2 gave the physics: light in fiber moves at about 200,000 km per second. New York to London is about 5,600 km. One round trip takes at least 56 ms, before any routing or queueing.
+Your servers are in New York. A user in London opens your site.
 
-Lesson 2.3 counted how many round trips a cold HTTPS request needs: 3 with TLS 1.3 over TCP. That is at least 3 x 56 = 168 ms before the first byte (derived). This applies to every new visitor and to every file.
+Lesson 1.2 gave the physics. Light in fiber moves at about 200,000 km per second. New York to London is about 5,600 km. A round trip is there and back: 11,200 km. That takes at least 56 ms, before any routing or queueing.
 
-A second pain sits at your end. Say a launch image is requested 1 million times in an hour. Without help, your origin serves it 1 million times. It uses CPU, bandwidth and connections to send the same bytes.
+Lesson 2.3 counted the round trips for a first HTTPS request: 3 with TLS 1.3 over TCP. That is at least 3 x 56 = 168 ms before the first byte of the page arrives. A new visitor pays this. A repeat visitor on a new connection pays it too.
 
-Faster servers fix neither one. Distance is physics, and a copy of the same file is the same file.
+There is a second pain, and it sits at your end. Say a launch image is requested 1 million times in one hour. Your server sends the same bytes 1 million times. It spends CPU, network bandwidth, and open connections on a file that never changes.
 
-## Naive solution: more servers, in one place
+Faster servers fix neither pain. Distance is physics. And a copy of a file is the same file.
 
-Add more servers behind a load balancer (lesson 2.4). Your capacity grows. The London user still waits 168 ms. You can buy servers in London, but now you must run a full copy of your application in every region. You must also keep its data in every region. Module 4 shows how hard replicating data is. Most of what a page loads is not data that changes per user. It is the same logo, script and stylesheet for everyone.
+This lesson follows one idea from start to end. Keep copies of shared files close to users. Then deal with the problems that copies bring: who hands them out, how users find them, when they go out of date, and how you replace them.
 
-So separate the two. Keep the one authoritative **origin** where it is. Put cheap copies of the shared bytes near users.
+## The naive way: more servers, all in one place
+
+The first idea is to add more servers behind a load balancer (lesson 2.4). Your capacity grows. The London user still waits 168 ms, because the servers are still in New York.
+
+The second idea is to run a full copy of your application in London. Now you must also keep your data in London, and keep it in step with New York. Module 4 shows how hard that is.
+
+Look at what a page loads. Most of it is the same logo, script, and stylesheet for every visitor. Call these **static files**: files that are the same for everyone and change rarely. They need no database and no logic. Only the delivery is slow.
+
+So split the job in two.
+
+- Keep one **origin**. The origin is the server that owns the real, authoritative copy of everything. Think of a factory that makes the product.
+- Put cheap copies of the static files close to users. A saved copy of an answer, kept so it need not be fetched again, is a **cache**. Think of a corner shop that stocks the popular items. You do not drive to the factory for milk.
+
+Why does this work? The factory makes each item once. The shops hand it out a million times. Number to remember: one origin request can serve a million user requests, if the copy stays valid.
+
+Two problems remain. Someone must run the corner shop. And the shop must know when its stock is old. The next sections solve both.
 
 ## The mechanism
 
-### Proxies: who is the proxy working for?
+### Proxies: a server that speaks for someone else
 
-A **proxy** is a server that makes requests on behalf of someone else. Which side it stands on gives it a name (MDN uses the same split).
+A **proxy** is a server that makes requests on behalf of someone else. Think of a receptionist. You do not walk into the manager's office. You talk to the desk, and the desk talks to the manager. The receptionist can screen visitors, take messages, and answer easy questions without bothering the manager.
+
+A middle point is a good place to do shared work once, for many people. Number: one office with 500 laptops can send all its web traffic through one proxy, and the proxy can log and filter all 500.
+
+The name of a proxy depends on whose side it stands on.
+
+A **forward proxy** stands for the clients. The clients are set up to use it. A company office uses one to filter and log web access, or to hide the laptops' addresses. The website sees the proxy's address, not the laptop's.
+
+A **reverse proxy** stands for the servers. The client does not know it is there. It thinks it is talking to the real server. The proxy takes the request and passes it to a real server behind it. Think of a shop front: you talk to the counter, and never see the stockroom.
 
 <ProxyKinds />
 
-A **forward proxy** acts for the clients. An office uses one to filter and log web access, to cache for a group, or to hide client addresses. Clients are set up to use it. A **reverse proxy** acts for the servers. Clients think it is the real server. It can end TLS, balance load, cache, authenticate and compress.
+A reverse proxy does shared work for the servers behind it:
 
-You already met a reverse proxy: the layer 7 load balancer in lesson 2.4. A CDN edge, an API gateway (Module 8), and nginx in front of an app are all reverse proxies. Each has a different job. One side effect to know: the server now sees the proxy's address. The `X-Forwarded-For` header and the standard `Forwarded` header carry the original client address. So you must read them for logs and rate limits. Trust them only from your own proxies.
+- It can end the encryption. **TLS termination** means the proxy does the TLS work (lesson 2.3) and passes plain requests to the servers behind it. Think of a mailroom that opens sealed envelopes in the lobby, so the staff upstairs get plain letters. The benefit: the proxy sits near the user, so the TLS handshake round trips are short ones.
+- It can spread load across servers. You already met this: the layer 7 load balancer in lesson 2.4 is a reverse proxy.
+- It can keep a cache, check logins, and compress responses.
 
-### A CDN: reverse proxy caches near users
+Real examples: **nginx** (said "engine-x") is a popular free program that people run as a reverse proxy. An **API gateway** is a reverse proxy in front of an API. It checks logins and limits traffic. A CDN, which comes next, is also a reverse proxy.
 
-A **CDN** (content delivery network) runs reverse proxy caches in many cities. Each cache site is an **edge**. Your **origin** is the server that holds the truth. The edge stores responses and answers repeat requests itself.
+One side effect to know. The server now sees the proxy's address as the sender. Say your server rate-limits by address, and 10,000 users arrive through one proxy at `10.0.0.5`. The server counts 10,000 requests from one address and blocks them all. So the proxy adds a header, `X-Forwarded-For`, that holds the real client address. Your code reads that header for logs and rate limits. Trust it only when it comes from your own proxies, because any client can send a fake one.
 
-Two questions come first. How does a user reach the nearest edge, and what happens on a request?
+### CDN: a chain of corner shops
 
-**Reaching the edge.** There are two common tools. With **DNS routing**, the CDN's name servers answer with the IP of a nearby edge (lesson 2.2). With **anycast**, every site announces the same IP range over BGP, the internet's routing protocol. Routers send a packet along the shortest path, so the nearest site wins. Cloudflare describes this design. It works well for stateless protocols like UDP. TCP needed extra engineering to run over anycast without routes flapping.
+A **CDN** (content delivery network) is a company-run fleet of reverse proxies with caches, placed in many cities. Think of a chain of corner shops across the world, all stocked from your factory. Cloudflare, Amazon CloudFront, and Akamai are well-known CDNs.
 
-**The request.** The edge builds a **cache key** from the URL, plus the request headers that the response's `Vary` header names. If a fresh copy exists, that is a **hit**. The edge answers, and the origin never hears of it. If not, it is a **miss**. The edge fetches from the origin, stores the response if its headers allow, and returns it.
+Each shop is a site in one city. People call this site an **edge** or a **PoP** (point of presence). "Edge" means it sits at the edge of the network, close to users. The edge stores responses. When a user asks for a file the edge already holds, the edge answers itself.
 
-Many edges mean many misses for the same file. A popular file can be fetched by each edge once per expiry period. A **shield** fixes this. It is one more cache layer between the edges and the origin. All edges ask the shield, and the shield asks the origin. AWS says CloudFront Origin Shield consolidates requests for the same object, "resulting in as few as one request going to your origin". Step through it.
+The reason is simple: you cannot beat distance with faster hardware. You can only move the data closer. Number: the round trip to an edge in your own city is a few ms (assumed), against 56 ms to New York.
+
+### Reaching the nearest edge
+
+The user types `example.com`. Something must send that user to the London edge, not the Tokyo edge. Two tools do this.
+
+**DNS routing.** Lesson 2.2 showed that DNS turns a name into an IP address. A CDN's DNS servers can look at where the question came from, and answer with the address of a nearby edge. Two users asking for the same name get two different addresses.
+
+**Anycast.** Normally one IP address belongs to one machine. With anycast, many edges all announce the same IP address. Think of a national helpline number. You dial one number, and the phone network connects you to the nearest call center. How does the internet do it? Networks tell each other which addresses they can reach, using a system called **BGP** (Border Gateway Protocol). Each edge announces the shared address, and routers send your packet along the best path they know. That is usually the closest edge. It is closest by network path, which is not always the closest on a map.
+
+Each tool has a weak side. DNS routing is easy but depends on DNS answers, which get cached (the TTL from lesson 2.2). Anycast needs no DNS trick, and a failed edge simply drops its announcement and traffic moves on. The catch: a TCP connection must keep reaching the same edge. If routes change halfway, packets land at an edge that never saw the handshake. Cloudflare describes how it engineered around this.
+
+### How one request is served
+
+Before it can serve a copy, the edge needs a way to look one up. It builds a **cache key**: a label that names one stored response. Usually the key is the URL, such as `/logo.png`. Think of the index card in a library that tells the librarian which shelf to check. Same card, same book.
+
+Then one of two things happens.
+
+- A **cache hit**: the edge has a fresh copy under that key. It answers at once. The origin never hears about this request.
+- A **cache miss**: the edge has no copy, or the copy is out of date. It asks the origin, stores the answer if the answer's headers allow, and returns it. This request pays the long trip.
+
+The **hit ratio** is the share of requests that are hits. Number: with 10,000 requests per second and a 95% hit ratio, 9,500 are hits. Only 500 per second reach your origin. The origin load is requests x (1 - hit ratio). Moving from 95% to 99% cuts origin load from 500 to 100 per second. Every point of hit ratio matters.
+
+There is one more problem. You have many edges, and each starts empty. A popular file is a miss once on every edge. With 40 edges, your origin can get 40 requests for one file per expiry period. Fix this with a **shield**: one more cache layer between the edges and the origin. Think of a regional warehouse between the shops and the factory. The shops order from the warehouse. The warehouse orders from the factory, once. AWS says its Origin Shield can send "as few as one request" to your origin for the same file.
+
+Step through it below. In the picture, `GET` means "please send me this file", and `200` means "OK, here it is" (lesson 2.3). A packet is the little box moving along a line.
 
 <CdnWalk client:visible />
 
-### Cache headers: the origin controls the rules
+The shield makes the origin quiet. It does not make users faster. A miss now has an extra hop. The shield protects the origin, and the edge makes the user fast.
 
-The edge does not guess how long to keep a file. The origin says so in `Cache-Control` (RFC 9111). The directives that matter:
+### Cache-Control: how long a copy may be kept
 
-- `max-age=N`: the response is fresh for N seconds after it was made.
-- `s-maxage=N`: the same, for **shared caches** only (caches that serve many users, such as a CDN). It overrides `max-age` there. A **private cache** is one user's cache, such as the browser. It ignores `s-maxage`.
-- `public` and `private`: `private` means only a private cache may store it.
-- `no-store`: do not store it anywhere. `no-cache`: store it, but ask the origin before each reuse. Despite the name, `no-cache` does not mean "do not cache".
-- `stale-while-revalidate=N` (RFC 5861): after expiry, serve the stale copy for N more seconds while refreshing in the background. Users do not wait.
-`stale-if-error=N` (RFC 5861) applies if the origin fails with 500, 502, 503 or 504. In that case, serve the stale copy for N seconds.
+The edge does not guess. The origin says how long in a response header called **Cache-Control**. Think of the "best before" date on a food package. The shop reads the date. It does not decide.
 
-Slide the age and watch how a CDN and a browser disagree.
+The origin sends a list of directives. Each directive is one rule. Here are the ones you need.
+
+| Directive | What it says | Everyday picture | Example |
+|---|---|---|---|
+| `max-age=N` | The copy is **fresh** for N seconds after the origin made it. Fresh means the cache may serve it without asking anyone. After N seconds the copy is **stale**: old enough that it needs a check before the next use. | Best-before date | `max-age=60`: up to 60 s of fresh service |
+| `s-maxage=N` | Like `max-age`, but for shared caches only. A shared cache uses it instead of `max-age`. A private cache ignores it. | A bulk-buyer date on the crate, and a shorter date on the single item | `max-age=60, s-maxage=3600`: CDN keeps it 1 hour, browser 1 minute |
+| `public`, `private` | `public`: any cache may keep it. `private`: only one user's own cache may keep it. | A shop shelf against your own bag | `private` on a page with your name on it |
+| `no-store` | Do not keep it anywhere. | A note you read and burn | Private data |
+| `no-cache` | Keep it, but ask the origin before each reuse. Despite the name, it does not mean "do not cache". | Phone the factory before every sale | The HTML page that names your files |
+| `immutable` | This file will not change while it is fresh, so do not even check it. | A printed book edition | A file whose name changes when its content changes |
+
+Two words need care. A **private cache** is one user's own cache, such as a browser. A **shared cache** serves many users, such as a CDN edge. Why have `s-maxage` at all? You often want the CDN to keep a file for an hour, while browsers check back every minute.
+
+What does "ask the origin" cost? Less than a full fetch, if the cache uses **revalidation**. The cache sends the origin a fingerprint of its stale copy. This fingerprint is called an **ETag** (entity tag). It is a short string the origin gave out with the file, such as `"v7a3"`. The cache asks: "I hold version `v7a3`. Is it still current?" If yes, the origin answers `304 Not Modified`, which has no body. The 1 MB file is not sent again. The cache marks its copy fresh once more. If no, the origin sends the new file.
+
+Two more directives remove waiting and errors.
+
+- `stale-while-revalidate=N`: after the copy goes stale, the cache may serve the stale copy for N more seconds and refresh it in the background. Think of a shop that hands you the last loaf now and phones the bakery while you walk out. The user does not wait. Number: with `max-age=60, stale-while-revalidate=30`, requests in seconds 60 to 90 get an instant answer.
+- `stale-if-error=N`: if the origin fails (it answers 500, 502, 503, or 504, which all mean "the server broke"), the cache may serve the stale copy for N more seconds. Think of a shop that sells yesterday's bread when the bakery is closed. Users see an old page, not an error.
+
+Now try it. Slide the age. Watch the CDN and the browser disagree about the same copy. Then tick the box to take the origin down.
 
 <CacheFreshness client:visible />
 
-### What gets cached, and what does not
+### What is safe to cache
 
-Not every response is safe to share. Cloudflare's default is to cache by file extension (scripts, styles, images, fonts and so on) and not HTML or JSON. It also skips responses that carry `Set-Cookie` or `Cache-Control: private`, `no-store`, `no-cache` or `max-age=0`, and any method but GET. MDN notes that a request with an `Authorization` header is not stored in a shared cache. Such a request is stored only if the response says `public`.
+Not every response is safe to share. A shared cache that stores the wrong response shows one user's data to another.
 
-The danger is a personalized page cached under one URL. If `/account` is stored by the CDN, the next visitor sees the first user's data. Mark personal responses `private` or `no-store`. When a response varies by header (language, for example), use `Vary` so each variant gets its own key. Do not `Vary` on something with endless values like `Cookie`, or the hit ratio falls to zero.
+Picture a shop that keeps a pile of "my order" slips on the counter, and hands the top slip to whoever walks in. That is what happens if the CDN stores `/account`, the page with your name on it. The next visitor with the same URL gets the first visitor's page. That is a leak.
 
-Public JSON can be cached, with an explicit rule. A "trending posts" endpoint with `s-maxage=10` turns 10,000 requests per second into about 1 origin request per 10 seconds per edge (derived).
+So CDNs follow rules. Cloudflare's default is to cache by file extension: scripts, styles, images, fonts. It does not cache HTML or JSON by default. It also skips these:
 
-### Changing a file that is already cached
+- Any method but GET. A GET only reads. A POST changes something, so the CDN does not store its answer.
+- A response with `Set-Cookie`. A **cookie** is a small value the server asks the browser to send back on every later request, often to identify one user. A response that sets one is probably personal.
+- A response marked `private`, `no-store`, `no-cache`, or `max-age=0`.
 
-Two ways. **Invalidation** tells the CDN to drop the file, so the next request goes to the origin. It costs money past a free allowance, takes time to spread, and does not reach copies in browsers. **Versioned file names** avoid the problem: `app.3f9c2a.js` never changes, and a new build is `app.8b1d07.js`. Set `max-age=31536000, immutable` on the versioned file. The HTML that points to it uses `no-cache`, so it is always fresh. AWS recommends versioning as the primary method for files you change often.
+MDN notes one more case. A request that carries an `Authorization` header (a login credential) is not served from a shared cache, unless the response explicitly allows it, for example with `public`.
+
+Mark every personal response `private` or `no-store`. That is the safe default.
+
+Sometimes one URL has several valid versions, for example a page in English and in French. The response header `Vary` names the request header that decides the version, such as `Vary: Accept-Language`. The edge then adds that header's value to the cache key. English and French get separate copies. Number: with 2 languages you store 2 copies of the page.
+
+Be careful. Never `Vary` on something with endless values, like `Cookie`. If every user has a different cookie, every request gets its own key, and the hit ratio falls close to zero. The Diagnose below shows this.
+
+Public JSON can be cached, if you say so in the headers. A "trending posts" endpoint with `s-maxage=10` turns 10,000 requests per second into about 1 origin request per 10 seconds per edge (derived). The data is at most 10 seconds old. For trending posts, nobody minds.
+
+### Replacing a file that is already cached
+
+You fixed a typo in `app.js`. Thousands of copies of the old file sit in edges and in browsers. There are two ways to deal with it.
+
+**Invalidation** (also called **purge**) tells the CDN: drop your copy of this URL. The next request is a miss and fetches the new file. Think of a product recall notice that goes to every shop. It works, but it has limits. It costs money after a free allowance. It takes time to reach all edges. And it does not reach copies in browsers, because the CDN cannot call your users' laptops.
+
+**Versioned file names** avoid the problem. Put a **content hash** in the file name. A hash is a short fingerprint computed from the file's bytes. The same bytes always give the same fingerprint, and any change gives a different one. So `app.3f9c2a.js` never changes. When you ship a new build, its name is `app.8b1d07.js`. A new name is a new cache key, so no cache can hold a stale copy of it. Think of a new product with a new barcode: the old stock cannot be confused with it.
+
+Then set `max-age=31536000, immutable` on the versioned file. That is 365 days. The file never needs a check. The page that mentions the file, the HTML, is the one thing that must stay current. Give the HTML `no-cache`, so every visit asks the origin and sees the newest file names. AWS recommends versioning as the main method for files that change often. Keep invalidation for emergencies, such as a wrong file that went out.
 
 ## Numbers
 
 | Item | Value | How we know |
 |---|---|---|
-| NY to London, best-case round trip | at least 56 ms | lesson 1.2: 5,600 km at 200,000 km/s, there and back |
-| Cold HTTPS, TLS 1.3 over TCP | 3 round trips = at least 168 ms | lesson 2.3 times 56 ms |
-| Warm connection to a nearby edge | 1 short round trip | the edge is in your metro area, far below the 56 ms floor |
+| New York to London, best-case round trip | at least 56 ms | lesson 1.2: 5,600 km each way at 200,000 km/s |
+| First HTTPS request, TLS 1.3 over TCP | 3 round trips, at least 168 ms | lesson 2.3 times 56 ms |
+| Warm connection to a nearby edge | 1 short round trip | the edge is in your city, far below the 56 ms floor |
 | Origin load | requests x (1 - hit ratio) | definition |
-| Example: 10,000 requests/s, 95% hit ratio (assumed) | 500 requests/s reach the origin | derived |
-| Origin requests per object per TTL, E edges | up to E without a shield, 1 with | derived upper bound for popular objects |
+| 10,000 requests/s at a 95% hit ratio (assumed) | 500 requests/s reach the origin | derived |
+| Origin requests per file per freshness period, E edges | up to E without a shield, 1 with | derived upper bound for popular files |
+| One year of `max-age` | 31,536,000 s | 365 x 86,400 |
 
-Hit ratio is not a constant. It depends on how many different objects you serve and how long they live. Do not quote a typical CDN hit ratio. Say "I would measure it, and tune TTLs and cache keys to raise it".
+The hit ratio is not a constant. It depends on how many different files you serve and how long each stays fresh. Do not quote a "typical" CDN hit ratio. Say: "I would measure it, then tune freshness times and cache keys to raise it."
 
 ## Trade-offs
 
 | Choice | You gain | You pay | Pick it when |
 |---|---|---|---|
-| CDN for static files | Low latency, tiny origin load | Stale copies, cost per request or byte | Always, for public static assets |
-| Long TTL with versioned URLs | Highest hit ratio, instant rollback | A build step that renames files | Scripts, styles, images |
-| Short TTL on dynamic data | Small staleness window, big offload on hot URLs | Some staleness | Public, popular, non-personal data |
-| Origin shield | One origin fetch per object, not one per edge | Extra hop on a miss, extra charge | Many edges, expensive origin work |
+| CDN for static files | Low latency, tiny origin load | Stale copies, cost per request or byte | Always, for public static files |
+| Long freshness with versioned file names | Highest hit ratio, instant rollback | A build step that renames files | Scripts, styles, images |
+| Short freshness on dynamic data | Small staleness window, big offload on hot URLs | Some staleness | Public, popular, non-personal data |
+| Origin shield | One origin fetch per file, not one per edge | An extra hop on a miss, an extra charge | Many edges, expensive origin work |
 | Invalidation | Fast removal | Cost, spread time, browsers keep copies | Emergencies, such as a wrong file |
 
 ## In practice
 
 <Callout type="tip">
-For a global read-heavy system, say it at the edge: "Static files and public pages go through a CDN. Hashed asset names get a one-year max-age. The shield cuts origin fetches. Personalized responses are private and bypass the cache." Then add the numbers. A London user's round trip is at least 56 ms to New York. The round trip to a nearby edge takes a few ms.
+For a global read-heavy system, say it at the edge: "Static files and public pages go through a CDN. Versioned file names get a one-year max-age. A shield cuts origin fetches. Personal responses are private and skip the cache." Then add the numbers. A London user's round trip to New York is at least 56 ms. The round trip to a nearby edge takes a few ms.
 </Callout>
 
 <Callout type="mistake">
-Do not say "put the API behind a CDN" without saying what is cacheable. Cloudflare does not cache JSON by default. A per-user response cached under a shared key leaks data. Also do not answer "how do we ship a new version?" with "invalidate on every deploy". Version the file names. And do not claim a shield makes users faster. It protects the origin.
+Do not say "put the API behind a CDN" without saying what is cacheable. Cloudflare does not cache JSON by default. A per-user response stored under a shared key leaks data. Do not answer "how do we ship a new version?" with "invalidate on every deploy". Version the file names. And do not claim a shield makes users faster. It protects the origin.
 </Callout>
 
 <Callout type="deep" title="Why a hit can still be slow">
-A hit saves the long haul, but the user still opens a connection to the edge. The connection needs TCP and TLS handshakes (lesson 2.3). The edge is near, so each round trip is cheap, but the count is the same. A CDN can also reuse warm connections from edge to origin. So a miss need not pay a cold handshake across the ocean.
+A hit saves the long haul to the origin. But the user still opens a connection to the edge. That connection needs the TCP and TLS handshakes (lesson 2.3). The edge is near, so each round trip is cheap, but the count is the same. Say the edge round trip is 10 ms (assumed). A first HTTPS request then costs 3 x 10 = 30 ms, against 168 ms to New York.
+
+A CDN can also keep warm connections open from edge to origin and reuse them. A miss then skips the cold handshakes across the ocean.
 </Callout>
 
 ## Check yourself
@@ -126,7 +214,7 @@ A hit saves the long haul, but the user still opens a connection to the edge. Th
       q: 'A response has `Cache-Control: max-age=60, s-maxage=3600`. How long can a CDN edge serve it without asking the origin, and how long can the browser?',
       options: ['CDN 60 s, browser 3600 s', 'CDN 3600 s, browser 60 s', 'Max-age 60 s applies to the CDN and the browser', 'The s-maxage 3600 s applies to the browser too'],
       answer: 1,
-      explain: 's-maxage applies to shared caches and overrides max-age there. The browser is a private cache. It ignores s-maxage and uses max-age. This lets the CDN keep a copy long while browsers check back sooner.',
+      explain: 'A CDN edge is a shared cache. It uses s-maxage and ignores max-age. The browser is a private cache. It ignores s-maxage and uses max-age. So the CDN keeps a copy for 1 hour while browsers check back after 1 minute.',
     },
     {
       id: 'cdn-proxies-deploy-new-app-js',
@@ -138,14 +226,14 @@ A hit saves the long haul, but the user still opens a connection to the edge. Th
         'Turn the CDN off and serve every file from origin',
       ],
       answer: 1,
-      explain: 'A new name is a new cache key, so no cache holds an old copy of it. Invalidation cannot reach copies in browsers, and a 1 minute TTL gives up the hit ratio. The HTML itself must be no-cache so it always points at the newest name.',
+      explain: 'A new name is a new cache key, so no cache holds an old copy of it. Invalidation cannot reach copies in browsers. A 1 minute freshness time gives up the hit ratio. The HTML must be no-cache, so it always points at the newest name.',
     },
     {
       id: 'cdn-proxies-have-40-edge-locations',
       q: 'You have 40 edge locations. A hot object has a TTL of 10 minutes and every edge is asked for it all the time. About how many requests can your origin get for that object per 10 minutes, without a shield and with one?',
       options: ['1 without, 40 with', '40 without, 40 with', '40 without, 1 with', '400 without, 10 with'],
       answer: 2,
-      explain: 'Each edge fetches the object once per TTL window if it is the only cache. With a shield, edges ask the shield, and the shield fetches from the origin about once. This is an upper bound for popular objects.',
+      explain: 'Without a shield, each edge fetches the file once per 10 minutes, so up to 40 requests reach the origin. With a shield, all 40 edges ask the shield, and the shield asks the origin about once. This is an upper bound for popular files.',
     },
     {
       id: 'cdn-proxies-account-page-cached-cdn',
@@ -157,7 +245,7 @@ A hit saves the long haul, but the user still opens a connection to the edge. Th
         'A personal response was cached under a shared key',
       ],
       answer: 3,
-      explain: 'The edge stored the first user\'s response and served it to the next request with the same cache key. Personal data must be marked private or no-store, or the cache key must include what makes it personal.',
+      explain: 'The edge stored the first user\'s response and gave it to the next request with the same cache key. Mark personal responses private or no-store, or add what makes them personal to the cache key. A wrong edge or a missing shield changes speed, not who sees whose name.',
     },
     {
       id: 'cdn-proxies-origin-goes-down-stale',
@@ -169,14 +257,14 @@ A hit saves the long haul, but the user still opens a connection to the edge. Th
         'Waits until the origin recovers',
       ],
       answer: 0,
-      explain: 'stale-while-revalidate covers only 30 s after expiry. At 5 minutes (300 s) the edge asks the origin, gets a 5xx, and stale-if-error (600 s) allows the stale copy. Users see the old page instead of an error.',
+      explain: 'stale-while-revalidate covers only the first 30 s after expiry. At 5 minutes (300 s) the edge asks the origin and gets an error. The stale-if-error window is 600 s, and 300 s is inside it, so the edge serves the stale copy. Users see the old page, not an error.',
     },
   ]}
 />
 
 ## Prove it
 
-No lesson text covers these cases. Use what you learned.
+No lesson text covers these cases directly. Use what you learned.
 
 <Diagnose
   client:visible
@@ -199,7 +287,7 @@ No lesson text covers these cases. Use what you learned.
         'The edge servers ran out of disk space after the release',
       ],
       answer: 1,
-      explain: 'Vary adds the cookie to the cache key. With a different cookie for every user, almost every request is a miss.',
+      explain: 'Vary adds the cookie to the cache key. With a different cookie for every user, almost every request has a new key, so almost every request is a miss.',
     },
     {
       prompt: 'What is the fix?',
@@ -210,12 +298,14 @@ No lesson text covers these cases. Use what you learned.
         'Use no-store on the file so nothing is cached at all',
       ],
       answer: 2,
-      explain: 'Static files do not depend on who asks. Remove the cookie and Vary from them so one cached copy serves everyone.',
+      explain: 'Static files do not depend on who asks. Remove the cookie and the Vary from them, so one cached copy serves everyone.',
     },
   ]}
 />
 
 ## Further reading
+
+You do not need any of these for this course. They are the official sources behind the details above.
 
 - [RFC 9111: HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111) (shared and private caches, freshness, s-maxage) and [RFC 5861](https://www.rfc-editor.org/rfc/rfc5861) (stale-while-revalidate, stale-if-error)
 - [MDN: Cache-Control](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control) and [MDN: Proxy servers and tunneling](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Proxy_servers_and_tunneling)

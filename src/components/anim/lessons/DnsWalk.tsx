@@ -12,8 +12,8 @@ interface DnsStep {
 const IP = '203.0.113.7';
 
 const baseNodes: FlowNode[] = [
-  { id: 'client', x: 62, y: 150, w: 108, label: 'Browser', sub: 'stub resolver' },
-  { id: 'resolver', x: 250, y: 150, w: 120, h: 72, label: 'Resolver', sub: 'recursive' },
+  { id: 'client', x: 62, y: 150, w: 108, label: 'Browser', sub: 'your device' },
+  { id: 'resolver', x: 250, y: 150, w: 120, h: 72, label: 'Resolver', sub: 'does the walking' },
   { id: 'root', x: 598, y: 45, w: 200, label: 'Root server', sub: 'knows who runs .com' },
   { id: 'tld', x: 598, y: 150, w: 200, label: '.com TLD server', sub: 'knows who runs example.com' },
   { id: 'auth', x: 598, y: 255, w: 200, label: 'Authoritative', sub: 'holds example.com records' },
@@ -28,14 +28,14 @@ const edges: FlowEdge[] = [
 
 const steps: DnsStep[] = [
   {
-    caption: 'You type www.example.com. The browser needs an IP address. Its own cache and the OS cache have no entry. So it asks a recursive resolver, a server that does the lookup work on its behalf.',
+    caption: 'You type www.example.com. The browser needs an IP address. Its own cache and the operating system cache have no entry. So it asks a recursive resolver, a server that does the lookup work on its behalf.',
     active: ['client'],
     packets: [],
     cache: 'cache: empty',
     badge: null,
   },
   {
-    caption: 'Query 1: "What is the A record (IPv4 address) for www.example.com?" This is a recursive query. It means "do whatever it takes and bring me the answer". The resolver checks its cache. Nothing there.',
+    caption: 'Query 1: "What is the A record (IPv4 address) for www.example.com?" The browser asks the resolver to do the whole walk and bring back the final answer. The resolver checks its cache. Nothing there.',
     active: ['client', 'resolver'],
     packets: [{ from: 'client', to: 'resolver' }],
     cache: 'cache: empty (miss)',
@@ -52,13 +52,13 @@ const steps: DnsStep[] = [
     badge: 2,
   },
   {
-    caption: 'The resolver asks a .com TLD (top-level domain) server. It also lacks the IP. It knows which name servers own example.com, and refers the resolver there.',
+    caption: 'The resolver asks a .com top-level domain (TLD) server. It also lacks the IP. It knows which name servers own example.com, and refers the resolver there.',
     active: ['resolver', 'tld'],
     packets: [
       { from: 'resolver', to: 'tld' },
-      { from: 'tld', to: 'resolver', label: 'ask ns1', tone: 'warn', delay: 1 },
+      { from: 'tld', to: 'resolver', label: 'ask example.com servers', tone: 'warn', delay: 1 },
     ],
-    cache: 'cache: NS for .com',
+    cache: 'cache: who runs .com',
     badge: 3,
   },
   {
@@ -68,18 +68,18 @@ const steps: DnsStep[] = [
       { from: 'resolver', to: 'auth' },
       { from: 'auth', to: 'resolver', label: IP, tone: 'ok', delay: 1 },
     ],
-    cache: 'cache: NS .com, NS example.com',
+    cache: 'cache: who runs .com and example.com',
     badge: 4,
   },
   {
-    caption: `The resolver stores the answer for 300 seconds and returns it to the browser. Cold cost: 1 hop to the resolver plus 3 hops upstream. At ~10 ms to the resolver and ~30 ms per upstream hop (illustrative), that is ~100 ms before the first TCP packet.`,
+    caption: `The resolver stores the answer for 300 seconds and returns it to the browser. Cold cost: 1 round trip to the resolver plus 3 upstream. At ~10 ms to the resolver and ~30 ms per upstream hop (illustrative), that is ~100 ms before the first TCP packet.`,
     active: ['client', 'resolver'],
     packets: [{ from: 'resolver', to: 'client', label: IP, tone: 'ok' }],
     cache: `cache: www = ${IP} (300 s)`,
     badge: 5,
   },
   {
-    caption: 'Another user on the same resolver asks 20 seconds later. The resolver finds the answer in its cache and replies at once. No upstream server is touched. Cost: one hop, ~10 ms. This is why DNS survives billions of lookups.',
+    caption: 'Another user on the same resolver asks 20 seconds later. The resolver finds the answer in its cache and replies at once. No upstream server is touched. Cost: one round trip, ~10 ms. This is why DNS survives billions of lookups.',
     active: ['client', 'resolver'],
     packets: [
       { from: 'client', to: 'resolver' },
@@ -89,7 +89,7 @@ const steps: DnsStep[] = [
     badge: 6,
   },
   {
-    caption: 'After 300 seconds the entry expires. The next query must refresh it. But the resolver still remembers who runs .com and example.com (those records live much longer), so it skips the root and TLD and asks the authoritative server directly.',
+    caption: 'After 300 seconds the entry expires. The next query must refresh it. But the resolver still remembers who runs .com and example.com (those answers have much longer TTLs), so it skips the root and TLD and asks the authoritative server directly.',
     active: ['resolver', 'auth'],
     packets: [
       { from: 'resolver', to: 'auth' },

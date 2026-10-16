@@ -34,11 +34,11 @@ export default function GrpcFrames() {
         <HandText x={10} y={14} size={16} anchor="start" color="var(--muted)">
           Client sends, on one HTTP/2 stream:
         </HandText>
-        <Frame cx={130} cy={92} w={250} h={120} title="HEADERS" tone="var(--accent)" lines={[':method = POST', ':path = /users.v1.Users/Get', 'content-type: application/grpc', 'grpc-timeout: 200m']} />
-        <Frame cx={485} cy={92} w={440} h={120} title="DATA (end of stream)" tone="var(--accent)" lines={[]} />
+        <Frame cx={130} cy={92} w={250} h={120} title="HEADERS (labels)" tone="var(--accent)" lines={[':method = POST', ':path = /users.v1.Users/Get', 'content-type: application/grpc', 'grpc-timeout: 200m = 200 ms']} />
+        <Frame cx={485} cy={92} w={440} h={120} title="DATA (last frame from client)" tone="var(--accent)" lines={[]} />
         {[
           { x: 285, w: 34, t: '00', sub: 'flag', tone: 'var(--muted)' },
-          { x: 372, w: 110, t: lenHex, sub: 'length = 10', tone: 'var(--warn)' },
+          { x: 372, w: 110, t: lenHex, sub: 'length = 10 bytes', tone: 'var(--warn)' },
           { x: 575, w: 260, t: bodyHex, sub: 'protobuf message (10 bytes)', tone: 'var(--ok)' },
         ].map((c, i) => (
           <g key={i}>
@@ -54,9 +54,9 @@ export default function GrpcFrames() {
         <HandText x={10} y={185} size={16} anchor="start" color="var(--muted)">
           Server answers on the same stream:
         </HandText>
-        <Frame cx={115} cy={255} w={220} h={100} title="HEADERS" tone="var(--ok)" lines={[':status = 200', 'content-type:', 'application/grpc']} />
-        <Frame cx={360} cy={255} w={220} h={100} title="DATA" tone="var(--ok)" lines={['5 byte prefix +', 'protobuf response', 'message']} />
-        <Frame cx={605} cy={255} w={220} h={100} title="HEADERS (trailers)" tone="var(--warn)" lines={['grpc-status = 0', 'grpc-message (opt.)', 'end of stream']} />
+        <Frame cx={115} cy={255} w={220} h={100} title="HEADERS (labels)" tone="var(--ok)" lines={[':status = 200', 'content-type:', 'application/grpc']} />
+        <Frame cx={360} cy={255} w={220} h={100} title="DATA (the message)" tone="var(--ok)" lines={['5 byte prefix +', 'protobuf response', 'message']} />
+        <Frame cx={605} cy={255} w={220} h={100} title="HEADERS (trailers)" tone="var(--warn)" lines={['grpc-status = 0 (OK)', 'grpc-message (optional)', 'last frame of the call']} />
         <HandText x={360} y={346} size={14} color="var(--muted)">
           Status is in the trailers, after the body, so a server can fail late in a stream.
         </HandText>

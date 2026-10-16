@@ -63,7 +63,7 @@ export default function WireCompare() {
             <span className="font-mono tabular-nums font-semibold" data-testid="pb-size">{pbSize} bytes</span>
           </div>
           <div className="mt-1 flex flex-wrap gap-1" aria-label="Protobuf bytes">
-            {pb.length === 0 && <span className="text-sm text-muted">empty message (all fields hold defaults)</span>}
+            {pb.length === 0 && <span className="text-sm text-muted">empty message (every field holds its "nothing" value)</span>}
             {pb.map((p, pi) => (
               <span key={pi} className="inline-flex overflow-hidden rounded border border-line text-xs" title={`${p.field} ${KIND_STYLE[p.kind].label}`}>
                 {p.bytes.map((b, bi) => (
@@ -79,7 +79,7 @@ export default function WireCompare() {
 
         <div>
           <div className="flex items-baseline justify-between text-sm">
-            <span className="font-medium">JSON (compact)</span>
+            <span className="font-medium">JSON (spaces removed)</span>
             <span className="font-mono tabular-nums font-semibold" data-testid="json-size">{js.length} bytes</span>
           </div>
           <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all rounded bg-surface px-3 py-2 font-mono text-sm">{jsText}</pre>
@@ -87,8 +87,8 @@ export default function WireCompare() {
       </div>
       <p className="border-t border-line px-4 py-3 text-[0.95rem] leading-relaxed">
         {ratio === null
-          ? 'Every field holds its default, so protobuf writes nothing at all.'
-          : `JSON is ${ratio.toFixed(1)}x larger here. Protobuf sends numbers, not names. Try id = 0 (the field disappears), a long name (the text costs the same in both), or field number 16 (the tag grows to 2 bytes).`}
+          ? 'Every field holds its "nothing" value (0, empty text, false), so protobuf writes nothing at all.'
+          : `JSON is ${ratio.toFixed(1)}x larger here. Protobuf sends field numbers, not names. Try id = 0 (the field disappears), a long name (the text costs the same in both), or field number 16 (the tag grows to 2 bytes).`}
       </p>
     </figure>
   );

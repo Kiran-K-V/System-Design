@@ -17,7 +17,7 @@ const SETUPS: Setup[] = [
     parts: [
       { label: 'TCP', rtts: 1, color: TCP },
       { label: 'TLS', rtts: 2, color: TLS },
-      { label: 'req', rtts: 1, color: REQ },
+      { label: 'request', rtts: 1, color: REQ },
     ],
   },
   {
@@ -26,7 +26,7 @@ const SETUPS: Setup[] = [
     parts: [
       { label: 'TCP', rtts: 1, color: TCP },
       { label: 'TLS', rtts: 1, color: TLS },
-      { label: 'req', rtts: 1, color: REQ },
+      { label: 'request', rtts: 1, color: REQ },
     ],
   },
   {
@@ -34,18 +34,18 @@ const SETUPS: Setup[] = [
     detail: 'QUIC + TLS 1 + request 1',
     parts: [
       { label: 'QUIC+TLS', rtts: 1, color: TLS },
-      { label: 'req', rtts: 1, color: REQ },
+      { label: 'request', rtts: 1, color: REQ },
     ],
   },
   {
     name: 'HTTP/3, resumed (0-RTT)',
     detail: 'request rides the first flight',
-    parts: [{ label: 'req', rtts: 1, color: REQ }],
+    parts: [{ label: 'request', rtts: 1, color: REQ }],
   },
   {
     name: 'Any protocol, warm connection',
     detail: 'request 1',
-    parts: [{ label: 'req', rtts: 1, color: REQ }],
+    parts: [{ label: 'request', rtts: 1, color: REQ }],
   },
 ];
 
@@ -91,7 +91,7 @@ export default function HandshakeCost() {
         </ul>
       </div>
       <p className="border-t border-line px-4 py-3 text-[0.95rem] leading-relaxed">
-        Every block is one round trip. At 100 ms, the oldest setup costs 400 ms before the first byte and a warm connection costs 100 ms. Slide down to 1 ms: the gap almost vanishes
+        Every block is one round trip. At 100 ms, the TLS 1.2 setup costs 400 ms before the first byte and a warm connection costs 100 ms. Slide down to 1 ms: the gap almost vanishes
         inside a data center. The gap matters most for users far from the server.
       </p>
     </figure>

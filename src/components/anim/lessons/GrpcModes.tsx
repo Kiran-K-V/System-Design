@@ -14,7 +14,7 @@ const MODES: Mode[] = [
   { title: 'Unary', proto: 'rpc Get(Req) returns (Res)', req: 1, res: 1, use: 'look up one user' },
   { title: 'Server streaming', proto: 'returns (stream Res)', req: 1, res: 4, use: 'live price feed' },
   { title: 'Client streaming', proto: 'rpc Up(stream Req)', req: 4, res: 1, use: 'upload in chunks' },
-  { title: 'Bidirectional', proto: '(stream Req) returns (stream Res)', req: 4, res: 4, use: 'chat, telemetry' },
+  { title: 'Bidirectional', proto: '(stream Req) returns (stream Res)', req: 4, res: 4, use: 'chat, live sensor data' },
 ];
 
 const colX = (i: number) => 20 + (i % 2) * 350;
