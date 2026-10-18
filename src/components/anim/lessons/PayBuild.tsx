@@ -44,7 +44,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: every cent is auditable',
-    caption: 'A state change writes immutable double-entry ledger rows in the same database transaction as the payment row (lesson 4.4). Either both commit or neither does. A balance is the sum of its rows, never a field updated in place.',
+    caption: 'A state change writes ledger rows in the same database transaction. A ledger is an add-only list of money movements, and the debits and credits of each payment add up to the same total as the payment row (lesson 4.4). Either both commit or neither does. A balance is the sum of its rows, never a number edited in place.',
     packets: [{ from: 'api', to: 'ledger', label: 'entries' }],
   },
   {

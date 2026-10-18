@@ -5,7 +5,7 @@ const ACTORS = ['Client A', 'Client B', 'Cache', 'DB'];
 
 const BEATS: { m: SeqMessage; caption: string }[] = [
   {
-    m: { from: 'Client A', to: 'Cache', label: 'GET k' },
+    m: { from: 'Client A', to: 'Cache', label: 'get k' },
     caption: 'A hot key k was just deleted or expired. Client A asks the cache for it. Hundreds more clients are about to ask too. Two are drawn here.',
   },
   {
@@ -14,7 +14,7 @@ const BEATS: { m: SeqMessage; caption: string }[] = [
       'The cache has no value. It answers "miss" and also hands A a lease: a token bound to key k. In Facebook\'s memcache the token is 64 bits. The lease means "you may fill k, nobody else should".',
   },
   {
-    m: { from: 'Client B', to: 'Cache', label: 'GET k' },
+    m: { from: 'Client B', to: 'Cache', label: 'get k' },
     caption: 'Client B asks for k a moment later. Without leases, B would also go to the database. Here, the cache already has a lease out for k.',
   },
   {
@@ -23,7 +23,7 @@ const BEATS: { m: SeqMessage; caption: string }[] = [
       'The cache tells B to wait a short time and ask again. It does not send B to the database. In the Facebook paper the server hands out a token only once every 10 seconds per key. Every other request in that window gets this "wait" answer.',
   },
   {
-    m: { from: 'Client A', to: 'DB', label: 'SELECT k' },
+    m: { from: 'Client A', to: 'DB', label: 'read k' },
     caption: 'Only A, the lease holder, queries the database. The expensive work happens once, not once per waiting client.',
   },
   {
@@ -36,7 +36,7 @@ const BEATS: { m: SeqMessage; caption: string }[] = [
       'A fills the cache and shows its token L1. The cache checks that L1 is still valid and stores v2. If a writer had deleted k since the lease was issued, L1 would be void and this set would be refused. That also blocks the stale-set race from lesson 5.3.',
   },
   {
-    m: { from: 'Client B', to: 'Cache', label: 'GET k (retry)' },
+    m: { from: 'Client B', to: 'Cache', label: 'get k (retry)' },
     caption: 'B waited a few milliseconds and asks again.',
   },
   {

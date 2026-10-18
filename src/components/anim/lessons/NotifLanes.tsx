@@ -2,7 +2,7 @@ import { DesignCompare, type CompareVariant } from '../DesignBuild';
 
 const fifo: CompareVariant = {
   id: 'fifo',
-  label: 'Naive: one FIFO queue',
+  label: 'Naive: one first-in-first-out queue',
   nodes: [
     { id: 'camp', x: 85, y: 90, w: 130, h: 60, label: 'Campaign', sub: '3M messages' },
     { id: 'otp', x: 85, y: 250, w: 130, h: 60, label: 'Login code', sub: '1 message' },
@@ -59,7 +59,7 @@ export default function NotifLanes() {
       prompt="Queue design:"
       variants={[fifo, lanes]}
       height={340}
-      label="Two designs for sending a campaign and a login code. With one FIFO queue the code waits 600 seconds. With separate lanes and worker caps the code is sent at once."
+      label="Two designs for sending a campaign and a login code. With one first-in-first-out queue the code waits 600 seconds. With separate lanes and worker caps the code is sent at once."
     />
   );
 }

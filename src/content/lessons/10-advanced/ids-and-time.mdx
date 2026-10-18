@@ -20,19 +20,19 @@ On one machine both are easy. A counter gives IDs. The machine's clock gives ord
 
 ## Naive solution: auto-increment
 
-Each database counts 1, 2, 3. Lesson [4.7](/learn/04-data/sharding/) split a table over shards. Now shard 1 hands out ID 1, 2, 3 and shard 2 hands out ID 1, 2, 3. The same ID names two different rows.
+Each database counts 1, 2, 3 with an **auto-increment** column: the database adds 1 for every new row. Lesson [4.7](/learn/04-data/sharding/) split a table over shards. Now shard 1 hands out ID 1, 2, 3 and shard 2 hands out ID 1, 2, 3. The same ID names two different rows.
 
-You can give each shard its own range, or give each an offset. Flickr's old design used two "ticket servers" with a MySQL table: `REPLACE INTO` a stub row, then `LAST_INSERT_ID()` returns the next number. One server counts odd numbers and the other even. It works. The cost: every new ID is a round trip to a central database on the write path. That database is a point of failure.
+You can give each shard its own range, or give each an offset. Flickr's old design used two "ticket servers", each a MySQL database (a popular open-source database) with one small table: `REPLACE INTO` a stub row, then `LAST_INSERT_ID()` returns the next number. One server counts odd numbers and the other even. It works. The cost: every new ID is a round trip to a central database on the write path. That database is a point of failure.
 
 We want IDs that each machine can make **alone**, that are unique, and ideally sort by creation time.
 
 ## UUIDs
 
-A **UUID** is a 128-bit ID that machines generate on their own. Two versions matter.
+A **UUID** (universally unique identifier) is a 128-bit ID that machines generate on their own. It is usually written as 32 hex digits, such as `018bcfe5-6800-7...`. Two versions matter.
 
-**UUIDv4** is random. Of 128 bits, 6 are fixed (4 for the version, 2 for the variant), so **122 bits are random**. A collision is possible but absurdly unlikely. The birthday bound says a 50% chance of one collision needs about 1.18 × 2^61 = 2.7 × 10^18 IDs. At 1 billion IDs per second that takes about 86 years.
+**UUIDv4** is random. Of 128 bits, 6 are fixed (4 for the version, 2 for the variant), so **122 bits are random**. A collision is possible but absurdly unlikely. The **birthday bound** (the maths of how fast repeats appear among random picks) says a 50% chance of one collision needs about 1.18 × 2^61 = 2.7 × 10^18 IDs. At 1 billion IDs per second that takes about 86 years.
 
-**UUIDv7** (RFC 9562) puts time first. The layout is:
+**UUIDv7** puts time first. The layout is:
 
 | Field | Bits |
 |---|---|
@@ -48,7 +48,7 @@ Why does the order matter? Look at the index (lesson [4.3](/learn/04-data/indexi
 
 A **time-ordered** key lands on the **rightmost** leaf page every time. That one page stays hot in memory. One page, not 2.5 million candidates. This is the same pattern as an auto-increment key.
 
-The price of v7: it shows when the ID was made. UUIDs are 16 bytes against 8 for a counter. And its order is only as good as the machine's clock. The RFC warns that clock rollback, leap seconds, and counter overflow can break it, so implementations should check.
+The price of v7: it shows when the ID was made. UUIDs are 16 bytes against 8 for a counter. And its order is only as good as the machine's clock. The UUID rules warn that clock rollback, leap seconds, and counter overflow can break it, so implementations should check.
 
 ## Snowflake: 64 bits you can sort
 
@@ -57,7 +57,7 @@ Twitter's Snowflake packs an ID into 64 bits (read in the original source and RE
 | Field | Bits | What it gives |
 |---|---|---|
 | Sign | 1 | Always 0 |
-| Timestamp | 41 | Milliseconds since a custom epoch: 2^41 ms, about 69.7 years |
+| Timestamp | 41 | Milliseconds since a start date you pick (the **epoch**): 2^41 ms, about 69.7 years |
 | Machine ID | 10 | Up to 1,024 machines |
 | Sequence | 12 | 4,096 IDs per millisecond per machine |
 
@@ -69,14 +69,14 @@ The numbers: 4,096 IDs per millisecond is 4,096,000 per second **per machine**. 
 
 Snowflake has two hard parts.
 
-- **Assign machine IDs.** Two machines must never share one. A small coordination service such as ZooKeeper or etcd (lesson [8.8](/learn/08-technologies/zookeeper/)) can hand them out once at startup. After that, no coordination is needed per ID.
-- **Do not trust the clock to move forward.** If the clock steps back, the same millisecond comes again with the same sequence, and an ID repeats. The original code refuses to issue IDs until the clock passes the last timestamp used. Its README also advises running NTP so that it does not move the clock backwards.
+- **Assign machine IDs.** Two machines must never share one. A small coordination service (a few machines that agree on shared facts, such as ZooKeeper or etcd; lesson [8.8](/learn/08-technologies/zookeeper/)) can hand them out once at startup. After that, no coordination is needed per ID.
+- **Do not trust the clock to move forward.** If the clock steps back, the same millisecond comes again with the same sequence, and an ID repeats. The original code refuses to issue IDs until the clock passes the last timestamp used. Its README also advises running NTP (explained next) so that it does not move the clock backwards.
 
 The order is also only **roughly** by time. Two machines in the same millisecond order by machine ID, not by what really happened first.
 
 ## Clocks lie
 
-Wall clocks drift. **NTP** (Network Time Protocol) corrects them by asking time servers. Wikipedia's summary: accuracy is tens of milliseconds over the internet. On a LAN in ideal conditions, accuracy is better than 1 ms. In bad cases, accuracy is 100 ms or more.
+Wall clocks drift. **NTP** (Network Time Protocol) corrects them by asking time servers. Wikipedia's summary: accuracy is tens of milliseconds over the internet. On a LAN (a local network in one building) in ideal conditions, accuracy is better than 1 ms. In bad cases, accuracy is 100 ms or more.
 
 Now use the clock to order two writes to the same key, with "last write wins" (lesson [4.6](/learn/04-data/replication/), multi-leader). Machine A's clock is 30 ms ahead.
 
@@ -100,7 +100,7 @@ Leslie Lamport's insight: order matters only when one event could have **caused*
 
 If a happened before b, then L(a) < L(b). The reverse is false: L(a) < L(b) does **not** mean a came first. They may be unrelated.
 
-**Vector clock.** Each process keeps one counter **per process**, so [A, B, C]. A local event adds 1 to its own entry. A receive takes the larger entry in every slot, then adds 1 to its own. Compare two vectors slot by slot. If one is at most the other in every slot, that event happened first. If neither is, the events are **concurrent**: no causal link. This is what Dynamo-style stores use to find conflicting writes (lesson [4.9](/learn/04-data/cap-pacelc/)).
+**Vector clock.** Each process keeps one counter **per process**, so [A, B, C]. A local event adds 1 to its own entry. A receive takes the larger entry in every slot, then adds 1 to its own. Compare two vectors slot by slot. If one is at most the other in every slot, that event happened first. If neither is, the events are **concurrent**: no causal link. This is what Dynamo-style stores (databases with no single leader, as in lesson 4.9) use to find conflicting writes (lesson [4.9](/learn/04-data/cap-pacelc/)).
 
 <IdLamport client:visible />
 
@@ -108,14 +108,14 @@ The price of the vector is size: one entry per process.
 
 **Hybrid logical clock** (HLC, Kulkarni et al. 2014). A timestamp is a pair (l, c). The first value, l, follows the largest physical time the node has seen. The second value, c, breaks ties when l does not move. It stays close to real time, so you can still read it as a date, and it fits in 64 bits. Example: a node has (100, 0) and its clock reads 100. A message arrives stamped (105, 2) from a node whose clock runs ahead. The new l is max(100, 105, 100) = 105. It matches the message's l, so c = 2 + 1 = 3. The node now says (105, 3), later than the message, with no clock change.
 
-**TrueTime** (Google Spanner, 2012) takes the opposite route: fix the clock with GPS and atomic clocks and **admit the error**. `TT.now()` returns an interval [earliest, latest] that contains the true time. The paper reports the error bound ε as a sawtooth between about 1 and 7 ms. The bound is 4 ms most of the time. The sawtooth comes from a 30 s poll interval and a drift rate of 200 µs per second. The product is 30 × 200 µs = 6 ms. To commit, Spanner picks a timestamp and then does **commit wait**. Spanner holds the result until `TT.after(s)` says the time has surely passed. Two transactions then get timestamps in the true order.
+**TrueTime** (a clock service inside Google's Spanner database, 2012) takes the opposite route: fix the clock with GPS receivers and atomic clocks and **admit the error**. `TT.now()` returns an interval [earliest, latest] that contains the true time. The paper reports the error bound ε as a sawtooth between about 1 and 7 ms. The bound is 4 ms most of the time. The sawtooth comes from a 30 s poll interval and a drift rate of 200 µs per second. The product is 30 × 200 µs = 6 ms. To commit, Spanner picks a timestamp and then does **commit wait**. Spanner holds the result until `TT.after(s)` says the time has surely passed. Two transactions then get timestamps in the true order.
 
 ## Numbers
 
 | Fact | Value | Source |
 |---|---|---|
-| UUIDv4 random bits | 122 of 128 | RFC 9562 |
-| UUIDv7 | 48-bit ms timestamp, 4-bit ver, 12-bit rand_a, 2-bit var, 62-bit rand_b | RFC 9562 |
+| UUIDv4 random bits | 122 of 128 | UUID standard |
+| UUIDv7 | 48-bit ms timestamp, 4-bit ver, 12-bit rand_a, 2-bit var, 62-bit rand_b | UUID standard |
 | Snowflake fields | 41 / 10 / 12 bits | Twitter snowflake README |
 | Snowflake timestamp life | 2^41 ms = 2,199,023,255,552 ms ≈ 69.7 years | Derived |
 | Snowflake rate | 4,096,000 IDs per second per machine | Derived |
@@ -226,7 +226,7 @@ Suppose transaction T1 commits with timestamp s1. Transaction T2 starts after T1
 
 ## Further reading
 
-- [RFC 9562: Universally Unique IDentifiers](https://datatracker.ietf.org/doc/html/rfc9562) (UUIDv4 and UUIDv7 layouts, clock-rollback guidance)
+- [RFC 9562: Universally Unique IDentifiers](https://datatracker.ietf.org/doc/html/rfc9562) (UUIDv4 and UUIDv7 layouts, clock-rollback guidance). You do not need these links to follow the lesson. They are the sources.
 - [Twitter Snowflake (2010 source)](https://github.com/twitter-archive/snowflake/tree/snowflake-2010) (41/10/12 layout, custom epoch, clock-going-back guard)
 - [Flickr: Ticket servers](https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/) (central counters with odd and even offsets)
 - [Kulkarni et al., "Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases"](https://cse.buffalo.edu/tech-reports/2014-04.pdf) (hybrid logical clocks)

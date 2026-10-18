@@ -48,13 +48,13 @@ const steps: Step[] = [
     threadTone: 'bad',
   },
   {
-    caption: 'C finishes. D and E run quickly, one after the other. The slow command delayed everyone behind it. This is head-of-line blocking. One O(N) command on a big keyspace can stall every client.',
+    caption: 'C finishes. D and E run quickly, one after the other. The slow command delayed everyone behind it. This is called head-of-line blocking: one command at the front holds up everyone behind it. One command whose work grows with the data (O(N)) can stall every client.',
     chips: [chip('A', 'ZADD', 'done', 'ok'), chip('B', 'GET', 'done', 'ok'), chip('C', 'KEYS *', 'done', 'warn'), chip('D', 'GET', 'done', 'warn'), chip('E', 'ZADD', 'run', 'accent')],
     thread: 'running E',
     threadTone: 'accent',
   },
   {
-    caption: 'The fix is to never run a long command. SCAN walks the keys in small slices. Each call returns a cursor, and each call is short. Other clients get a turn between the slices. Pipelining solves a different cost: it sends many commands in one network round trip, so the thread spends less time on socket reads and writes.',
+    caption: 'The fix is to never run a long command. SCAN walks the keys in small slices. Each call returns a cursor, which is a bookmark for where to continue, and each call is short. Other clients get a turn between the slices. Pipelining solves a different cost: it sends many commands in one network round trip, so the thread spends less time reading from and writing to the network.',
     chips: [chip('A', 'ZADD', 'done', 'ok'), chip('B', 'GET', 'done', 'ok'), chip('C', 'SCAN 0', 'done', 'ok'), chip('D', 'GET', 'done', 'ok'), chip('E', 'ZADD', 'done', 'ok')],
     thread: 'idle',
     threadTone: 'muted',

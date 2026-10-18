@@ -5,16 +5,16 @@ export default function PageLayout() {
   const X = 190;
   const segs = [
     { label: 'header\n24 B', w: 78, fill: 'var(--accent-soft)', color: 'var(--accent)' },
-    { label: 'item ptrs\n4 B each', w: 110, fill: 'var(--accent-soft)', color: 'var(--accent)' },
+    { label: 'row pointers\n4 B each', w: 110, fill: 'var(--accent-soft)', color: 'var(--accent)' },
     { label: 'free\nspace', w: 112, fill: 'var(--surface)', color: 'var(--muted)' },
-    { label: 'rows\n(tuples)', w: 230, fill: 'color-mix(in srgb, var(--warn) 14%, var(--bg))', color: 'var(--warn)' },
+    { label: 'the rows\nthemselves', w: 230, fill: 'color-mix(in srgb, var(--warn) 14%, var(--bg))', color: 'var(--warn)' },
   ];
   let x = X;
   const bandY = 78;
   return (
     <SketchSvg width={720} height={350} label="Layout of one 8 kilobyte database page">
       <HandText x={4} y={16} size={17} weight={700} anchor="start">
-        Table = file = array of pages
+        Table = file = list of pages
       </HandText>
       {[0, 1, 2, 3].map((k) => (
         <g key={k}>
@@ -55,13 +55,13 @@ export default function PageLayout() {
         {'1) Each row gets a stable address: (page, slot).'}
       </HandText>
       <HandText x={X - 20} y={232} size={15.5} anchor="start">
-        {'2) Rows may move inside the page. Only the pointer changes.'}
+        {'2) Rows may move inside the page. Only the row pointer changes.'}
       </HandText>
       <HandText x={X - 20} y={258} size={15.5} anchor="start">
-        {'3) The header stores the log position (LSN) of the last change.'}
+        {'3) The header notes the latest change made to the page.'}
       </HandText>
       <HandText x={X - 20} y={296} size={16} anchor="start" color="var(--accent)" weight={700}>
-        {'The page is the unit of I/O.'}
+        {'The page is the unit of disk reads and writes.'}
       </HandText>
       <HandText x={X - 20} y={320} size={15.5} anchor="start" color="var(--accent)">
         {'To get one 200 B row you read a whole 8 KB page.'}

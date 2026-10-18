@@ -12,12 +12,12 @@ const date = new Date(SNOWFLAKE_EPOCH + ELAPSED).toISOString().replace('T', ' ')
 const idText = ID.toLocaleString('en-US');
 
 const steps = [
-  { caption: 'A Snowflake ID is one 64-bit integer cut into four fields: 1 sign bit, a 41-bit timestamp, a 10-bit machine ID, and a 12-bit sequence. Twitter\'s 2010 source splits the 10 machine bits into 5 for a datacenter and 5 for a worker. We will build one ID.', upTo: 0 },
-  { caption: 'Sign bit: always 0. It keeps the number positive when read as a signed 64-bit integer.', upTo: 1 },
-  { caption: `Timestamp: milliseconds since a custom epoch. Twitter's source uses 1288834974657, which is 2010-11-04 01:42:54.657 UTC. Our ID is made ${ELAPSED.toLocaleString('en-US')} ms later, at ${date}. In 41 bits that is the binary shown. 41 bits last 2^41 ms, about 69.7 years.`, upTo: 2 },
+  { caption: 'A Snowflake ID is one 64-bit integer cut into four fields: 1 sign bit, a 41-bit timestamp, a 10-bit machine ID, and a 12-bit sequence. Twitter\'s 2010 code splits the 10 machine bits into 5 for the building and 5 for the server in it. We will build one ID.', upTo: 0 },
+  { caption: 'Sign bit: always 0. It keeps the number positive, because many databases use the first bit to mean a minus sign.', upTo: 1 },
+  { caption: `Timestamp: milliseconds since a start date that you pick (the epoch). Twitter's source uses 1288834974657, which is 2010-11-04 01:42:54.657 UTC. Our ID is made ${ELAPSED.toLocaleString('en-US')} ms later, at ${date}. In 41 bits that is the binary shown. 41 bits last 2^41 ms, about 69.7 years.`, upTo: 2 },
   { caption: `Machine ID: this server is number ${MACHINE}. It is set by configuration, so two servers never share a number. Ten bits allow 1,024 servers.`, upTo: 3 },
   { caption: `Sequence: this is the 4th ID this machine made in this millisecond, so the counter reads ${SEQ}. The first ID in a millisecond uses 0. The counter resets to 0 in the next millisecond.`, upTo: 4 },
-  { caption: `Put together: ${ELAPSED.toLocaleString('en-US')} × 2^22 + ${MACHINE} × 2^12 + ${SEQ} = ${idText}. Read it back with shifts: shift right 22 gives ${BACK.elapsed.toLocaleString('en-US')}; (shift right 12) and 1023 gives ${BACK.machine}; and 4095 gives ${BACK.seq}. The timestamp sits in the high bits, so IDs sort by time.`, upTo: 5 },
+  { caption: `Put together: ${ELAPSED.toLocaleString('en-US')} × 2^22 + ${MACHINE} × 2^12 + ${SEQ} = ${idText}. Each field can be read back out of the number: ${BACK.elapsed.toLocaleString('en-US')} ms, machine ${BACK.machine}, sequence ${BACK.seq}. The timestamp sits in the high bits, so IDs sort by time.`, upTo: 5 },
   { caption: 'Limits. 12 bits allow 4,096 IDs per millisecond per machine, or 4,096,000 per second. The 4,097th ID in one millisecond must wait for the next one. If the clock moves backwards, the original code refuses to issue IDs until the clock passes the last timestamp. Without that guard, IDs could repeat.', upTo: 5, limits: true },
 ];
 

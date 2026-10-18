@@ -19,13 +19,13 @@ const steps: Step[] = [
     caption:
       'Two ways to remember a logged-in user. On the left, a session: the server keeps the state and the browser holds only a random id in a cookie. On the right, a JWT: the server signs the state into the token and keeps nothing.',
     packets: [],
-    left: 'cookie holds an opaque id',
+    left: 'cookie holds a meaningless id',
     right: 'token holds signed claims',
     active: [],
   },
   {
     caption:
-      'Login, same on both sides: the user proves who they are (password, lesson below). Left: the server makes a random id and stores {id: user 42} in a session store. Right: the server signs {sub: 42, exp: ...} with a key and hands it over. No store write.',
+      'Login, same on both sides: the user proves who they are (password check, covered above). Left: the server makes a random id and stores {id: user 42} in a session store. Right: the server signs {sub: 42, exp: ...} with a key and hands it over. No store write.',
     packets: [
       { from: 'cS', to: 'aS', label: 'login' },
       { from: 'aS', to: 'stS', label: 'save', delay: 0.9 },
@@ -52,7 +52,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Scale. Add 20 API servers. Left: every server needs the shared store, so the store must be fast and highly available. Right: every server needs only the key. Any server can verify any token. The JWT wins on reads here.',
+      'Scale. Add 20 API servers. Left: every server needs the shared store, so the store must be fast and always up. Right: every server needs only the key. Any server can verify any token. The JWT wins on reads here.',
     packets: [],
     left: 'shared store becomes a dependency',
     right: 'servers are fully stateless',
@@ -85,7 +85,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'The usual repair: make the JWT short-lived and pair it with a refresh token that the server does store and can revoke. Or keep a denylist of revoked token ids that the API checks. A denylist brings back a lookup, which is the cost of the session you left.',
+      'The usual repair: make the JWT short-lived and pair it with a refresh token that the server does store and can revoke. Or keep a denylist of revoked token ids (a blocklist) that the API checks. A denylist brings back a lookup, which is the cost of the session you left.',
     packets: [],
     left: 'sessions: state, easy to revoke',
     right: 'short exp + revocable refresh token',

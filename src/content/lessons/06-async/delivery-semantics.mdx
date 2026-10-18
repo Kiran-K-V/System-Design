@@ -11,11 +11,11 @@ import AsyncCrashMatrix from '../../../components/anim/lessons/AsyncCrashMatrix.
 
 ## The problem
 
-A payment system sends "credit $10" through a broker. Someone asks: "Is delivery exactly-once?" The honest answer is "it depends on which step you mean."
+A payment system sends "credit $10" through a **broker**. A broker is the server in the middle that stores messages and hands them to programs (the **consumers**) that act on them (lesson 6.1). Someone asks: "Is delivery exactly-once?" The honest answer is "it depends on which step you mean."
 
 A message travels through three steps. Each can fail alone.
 
-1. **Producer to broker.** The producer sends. The broker stores it and replies with an ack. The ack can be lost.
+1. **Producer to broker.** The producer sends. The broker stores it and replies with an **ack**. An ack (short for acknowledgement) is a small reply that means "I got it". The ack can be lost.
 2. **Broker to consumer.** The broker hands the message to a consumer. The consumer can crash.
 3. **Consumer to its effect.** The consumer changes a database, sends an email, or calls an API.
 
@@ -23,7 +23,7 @@ In every step, one side acts and the other side cannot see whether it worked. Th
 
 ## Three guarantees
 
-Kafka's docs define them in one line each.
+**Kafka** is a broker that keeps messages in an append-only log (lesson 6.2). Its docs define the three guarantees in one line each.
 
 | Guarantee | Meaning | Risk |
 |---|---|---|
@@ -31,7 +31,7 @@ Kafka's docs define them in one line each.
 | **At-least-once** | Messages are never lost but may be redelivered | Duplicates |
 | **Exactly-once** | Each message is processed once and only once | Hard. See below. |
 
-Kafka's default is at-least-once. SQS standard queues are at-least-once too (lesson 6.1).
+Kafka's default is at-least-once. SQS standard queues are at-least-once too. SQS is the Amazon queue service from lesson 6.1.
 
 Why can you not just have both? Because of one fact. When a sender gets no ack, it cannot tell **"the message was lost"** from the other case. The other case is **"the message arrived and the ack was lost"**. There are two choices. Send again, and risk a duplicate. Do not send again, and risk a loss. No third option exists inside one unreliable link.
 
@@ -41,17 +41,17 @@ Watch the second case happen. The consumer does everything right, and the money 
 
 ## The producer hop: idempotent producers
 
-A producer that resends after a lost ack creates a duplicate record in the log. Kafka fixes this inside the broker. Since Kafka 0.11, the broker assigns each producer an ID. The producer sends a **sequence number** with every message. The broker uses that number to drop a resend it has already stored.
+A producer that resends after a lost ack creates a duplicate record in the log. Kafka fixes this inside the broker. The broker gives each producer an ID. The producer sends a **sequence number** with every message. The broker uses that number to drop a resend it has already stored.
 
-This is on by default now: `enable.idempotence` defaults to `true`. It needs `acks=all`, `retries` above 0 (the default is 2,147,483,647), and `max.in.flight.requests.per.connection` of at most 5. The producer's `delivery.timeout.ms` bounds the retrying, with a default of 2 minutes.
+This is on by default now: `enable.idempotence` defaults to `true`. "Idempotent" means a repeat has the same result as one run. The setting needs `acks=all`. The `acks` setting says how many broker copies must hold a message before the broker sends the ack. With `all`, every in-sync copy (a replica, the copies that keep the data safe if one machine dies) must have it. The setting also needs `retries` above 0 (the default is 2,147,483,647). Retries is how many times the producer resends after a failure. It also needs `max.in.flight.requests.per.connection` of at most 5, which caps how many sends can wait for an ack at once. The producer's `delivery.timeout.ms` bounds the retrying, with a default of 2 minutes.
 
 The limit matters. The idempotent producer only removes duplicates from **its own internal retries**. The Kafka docs say an application that sends the same data again by hand cannot be de-duplicated. A new send has a new sequence number.
 
-RabbitMQ has a similar step on the producer side: publisher confirms. A persistent message in a durable queue is confirmed after it reaches disk. Without confirms, a crash before the disk write can lose the message. RabbitMQ also has transactions, but the docs say they reduce throughput by a factor of 250.
+**RabbitMQ** is a broker that you run yourself. It has a similar step on the producer side: publisher confirms. A confirm is RabbitMQ's name for the ack to the producer. A persistent message (saved to disk) in a durable queue (one that survives a restart) is confirmed after it reaches disk. Without confirms, a crash before the disk write can lose the message. RabbitMQ also has transactions (a group of steps that all happen or none do), but the docs say they reduce throughput by a factor of 250.
 
 ## The consumer hop: when do you ack?
 
-The consumer has two jobs after it receives a message: **process** it and **ack** it. The order matters. Pick a rule, pick a crash point, and read the result.
+The consumer has two jobs after it receives a message: **process** it and **ack** it. The order matters. Pick a rule, pick a crash point, and read the result. "Dedupe" in the diagram is short for de-duplicate: the consumer spots a message it has already handled and skips it. The next sections show how.
 
 <AsyncCrashMatrix client:visible />
 
@@ -67,7 +67,7 @@ For anything that must not be lost, pick work first and fix the duplicates.
 
 True exactly-once delivery over a network is not on offer. What you can get is **exactly-once effect**: the message may arrive twice, but the change happens once. The recipe is an **idempotent consumer**, from lesson 3.4.
 
-Give every message a unique id. The consumer keeps a table of processed ids. Before it acts, it checks the table. The check and the effect must be in **one database transaction** (lesson 4.4). Then a crash can never leave one without the other.
+Give every message a unique id. The consumer keeps a table of processed ids. Before it acts, it checks the table. The check and the effect must be in **one database transaction** (lesson 4.4). A transaction is a group of database changes that all succeed or all fail together, like a bank transfer that cannot take money out without putting it in. Then a crash can never leave one without the other.
 
 <AsyncAckWalk mode="dedupe" client:visible />
 
@@ -76,7 +76,7 @@ If the id is saved in a different system from the effect, you rebuild the gap. S
 A dedupe table grows. Keep each id at least as long as the longest time a redelivery can arrive. Then expire it.
 
 <Callout type="deep" title="What Kafka transactions give you">
-Kafka can make "read, process, write" exactly-once **inside Kafka**. A transactional producer writes the output records and the consumer's offsets in one transaction. The consumer reads with `isolation.level=read_committed`, so it sees only committed transactions, and it sets `enable.auto.commit=false`. A transaction that stays open too long is aborted by the coordinator: `transaction.timeout.ms` defaults to 1 minute. Kafka's own docs add the limit: for other destination systems, exactly-once "generally requires cooperation with such systems". If your consumer writes to Postgres or calls an API, Kafka transactions do not cover that write. Use a dedupe table or an idempotency key there.
+Kafka can make "read, process, write" exactly-once **inside Kafka**. A transactional producer writes the output records and the consumer's offsets in one transaction. An offset is the consumer's bookmark: the position of the last message it has read. The consumer reads with `isolation.level=read_committed`, so it sees only transactions that finished, and it sets `enable.auto.commit=false`, so Kafka does not save its bookmark on its own. A transaction that stays open too long is cancelled by the coordinator (a Kafka server that tracks transactions): `transaction.timeout.ms` defaults to 1 minute. Kafka's own docs add the limit: for other destination systems, exactly-once "generally requires cooperation with such systems". If your consumer writes to a database such as Postgres or calls an API, Kafka transactions do not cover that write. Use a dedupe table or an idempotency key there.
 </Callout>
 
 ## What the platforms offer
@@ -86,8 +86,8 @@ Kafka can make "read, process, write" exactly-once **inside Kafka**. A transacti
 | Kafka idempotent producer | No duplicates from producer retries | Not for resends by your own code |
 | Kafka transactions | Atomic read-process-write inside Kafka | Kafka to Kafka only |
 | SQS standard | At-least-once, high throughput | Duplicates, no order |
-| SQS FIFO | No duplicate sends inside a 5 minute deduplication interval. It uses a deduplication id, or a SHA-256 hash of the body with content-based deduplication. | A repeat after 5 minutes is a new message |
-| RabbitMQ | Publisher confirms. Quorum queues confirm after replicas accept. A delivery limit (20 by default since 4.0) stops endless redelivery. | Confirms add latency. Transactions are far slower. |
+| SQS FIFO (first in, first out queue) | No duplicate sends inside a 5 minute deduplication interval. It uses a deduplication id, or a fingerprint (a SHA-256 hash) of the message body with content-based deduplication. | A repeat after 5 minutes is a new message |
+| RabbitMQ | Publisher confirms. Quorum queues (queues copied across several servers) confirm after the copies accept. A delivery limit (20 by default since 4.0) stops endless redelivery. | Confirms add latency. Transactions are far slower. |
 
 ## Numbers
 
@@ -111,8 +111,8 @@ Kafka can make "read, process, write" exactly-once **inside Kafka**. A transacti
 | At-least-once, no dedupe | Nothing is lost | Duplicates reach the effect | The effect is naturally idempotent, like "set price to 9" |
 | At-least-once + idempotent consumer | Safe, correct effects | A dedupe table and a transaction per message | Payments, orders, ledgers |
 | Kafka transactions | Atomic inside Kafka | Latency and throughput | Stream processing from topic to topic |
-| `acks=all` | No loss from one broker failure | Slower writes | Almost always |
-| `acks=1` | Faster writes | A leader crash can lose data | Rarely. Only when loss is cheap. |
+| `acks=all` (wait for every in-sync copy) | No loss from one broker failure | Slower writes | Almost always |
+| `acks=1` (wait for the leader copy only) | Faster writes | A leader crash can lose data | Rarely. Only when loss is cheap. |
 
 ## Interview lens
 
@@ -143,7 +143,7 @@ Do not say "we use Kafka, so it is exactly-once". Say what is exactly-once and o
     },
     {
       q: 'You keep a "processed ids" table to drop duplicates. Where must the id be written so a crash never splits it from the effect?',
-      options: ['In the same database transaction as the effect', 'In an in-memory set in the consumer', 'In Redis, right after the database write', 'In the broker, before the consumer starts work'],
+      options: ['In the same database transaction as the effect', 'In an in-memory set in the consumer', 'In a separate cache, right after the database write', 'In the broker, before the consumer starts work'],
       answer: 0,
       explain: 'One transaction commits the id and the effect together, or neither. A separate store leaves a gap between the two writes, and a crash in the gap loses the work or repeats it. Memory is lost on restart.',
     },
@@ -175,7 +175,7 @@ Do not say "we use Kafka, so it is exactly-once". Say what is exactly-once and o
         'FIFO queues deliver every message at least twice',
         'Content-based deduplication needs a message id header to work',
         'A copy sent 8 minutes later is outside the 5 minute window',
-        'SHA-256 hashes of the order JSON collide often in practice',
+        'Fingerprints of the order JSON collide often in practice',
       ],
       answer: 2,
       explain: 'SQS FIFO only suppresses duplicate sends inside the 5 minute deduplication interval. After it, the same body is accepted again as new.',

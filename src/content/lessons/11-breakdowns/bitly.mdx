@@ -61,7 +61,7 @@ So the system is read-heavy by 1,000 to 1, and the database size is small. Every
 
 Two things are stored.
 
-- **Mapping:** `short_code` (primary key), `long_url`, `created_at`, `expires_at`, and a flag for custom alias.
+- **Mapping:** `short_code` (the primary key, the column that identifies each row and must be unique), `long_url`, `created_at`, `expires_at`, and a flag for custom alias.
 - **ID range:** a block of unused numbers that the counter hands to one server. It has no table of its own. It is one number in the counter service.
 
 A user table exists once login is in scope. It is below the line today.
@@ -85,7 +85,7 @@ Two choices in this design deserve a closer look.
 
 **Reads and writes are separate services.** The write path makes about 6 calls a second. The read path makes 58,000 at peak. They need different numbers of servers, so split them (lesson [9.1](/learn/09-patterns/scaling-reads/)).
 
-**The cache is cache-aside.** The redirect service asks the cache first. On a miss it reads the table, then fills the cache ([lesson 5.3](/learn/05-caching/cache-strategies/)). A code never changes once created. So a cached entry is never stale, except when a link expires or is deleted. Give each cache entry a TTL no longer than the time to expiry. Pick LRU eviction ([lesson 5.4](/learn/05-caching/eviction/)). Link traffic is skewed: a few links are very popular and most are rarely opened. Assume the hot 10 million links make up most traffic. At 500 B each that is 5 GB, which fits in one cache machine, with a replica for safety.
+**The cache is cache-aside.** The redirect service asks the cache first. On a miss it reads the table, then fills the cache ([lesson 5.3](/learn/05-caching/cache-strategies/)). A code never changes once created. So a cached entry is never stale, except when a link expires or is deleted. Give each cache entry a TTL (a timer after which the cache deletes it) no longer than the time to expiry. Pick LRU eviction (when the cache is full, drop the entry that was used longest ago) ([lesson 5.4](/learn/05-caching/eviction/)). Link traffic is skewed: a few links are very popular and most are rarely opened. Assume the hot 10 million links make up most traffic. At 500 B each that is 5 GB, which fits in one cache machine, with a replica for safety.
 
 ## Deep dive 1: making the short code
 
@@ -95,11 +95,11 @@ Now: where do the characters come from? Compare two designs. Switch between them
 
 <BitlyIds client:visible />
 
-**Hashing** is the first idea. Hash the long URL and keep the first 7 characters. It needs no shared state. But a cut hash is a random number in a space of 62^7 values. The chance of a clash is the birthday problem. With n = 1 billion codes and a space of S ≈ 3.5 × 10^12, the expected number of colliding pairs is about n² ÷ (2S) = 10^18 ÷ 7 × 10^12 ≈ 142,000. So collisions are not rare. Each write must read first, and retry on a clash. Hashing also gives the same code to the same URL. That is wrong if two users want separate links with separate expiry dates.
+**Hashing** is the first idea. Hash the long URL and keep the first 7 characters. It needs no shared state. But a cut hash is a random number in a space of 62^7 values. The chance of a clash is the birthday problem: in a room of 23 people, two likely share a birthday, because every pair is a chance to match. With n = 1 billion codes and a space of S ≈ 3.5 × 10^12, the expected number of colliding pairs is about n² ÷ (2S) = 10^18 ÷ 7 × 10^12 ≈ 142,000. So collisions are not rare. Each write must read first, and retry on a clash. Hashing also gives the same code to the same URL. That is wrong if two users want separate links with separate expiry dates.
 
 **A counter** is the second idea. A counter hands out 1, 2, 3, and so on. Base62 turns each number into a short string. ID 1,000,000 becomes `4c92`. No two numbers are equal, so no two codes are equal and nothing needs a check. The catch is that one shared counter, hit on every write, becomes a bottleneck and a single point of failure.
 
-**Range allocation** fixes the catch. Each server asks the counter for a block, say 1,000 IDs, and serves them from memory. The counter is called once per 1,000 writes. If a server dies, its unused IDs are lost. That is fine: a gap in codes costs nothing, since 1 billion is far below the space. With several regions, give each region a disjoint range, so regions never talk to each other to create a code. The counter itself can be a single row in a replicated database, or a key in a consensus store ([lesson 8.9](/learn/08-technologies/zookeeper/)), updated with `INCRBY 1000`.
+**Range allocation** fixes the catch. Each server asks the counter for a block, say 1,000 IDs, and serves them from memory. The counter is called once per 1,000 writes. If a server dies, its unused IDs are lost. That is fine: a gap in codes costs nothing, since 1 billion is far below the space. With several regions, give each region a disjoint range, so regions never talk to each other to create a code. The counter itself can be a single row in a replicated database, or a key in a consensus store ([lesson 8.9](/learn/08-technologies/zookeeper/)), updated with `INCRBY 1000` (a command that adds 1,000 to a stored number in one step).
 
 One cost remains. Counter codes come in order, so `4c93` follows `4c92`. A person can guess the next link. If links must be private, scramble the number with a reversible shuffle before encoding, or add a random suffix. Do not use random strings alone: they bring the collision problem back. Time-ordered IDs are a related topic in [lesson 10.5](/learn/10-advanced/ids-and-time/).
 
@@ -107,10 +107,10 @@ One cost remains. Counter codes come in order, so `4c93` follows `4c92`. A perso
 
 ## Deep dive 2: redirect status, 301 or 302
 
-Both codes redirect. They differ in what a client may remember. RFC 9110 defines them.
+Both codes redirect. They differ in what a client may remember. The HTTP rules define them.
 
-- **301 Moved Permanently** says the target now lives at a new URI. Responses with this code can be cached by default, so browsers and CDNs may skip your server on repeat visits.
-- **302 Found** says the target is temporary and the client should keep using the original URI for future requests.
+- **301 Moved Permanently** says the target now lives at a new address. Responses with this code can be cached by default, so browsers and CDNs may skip your server on repeat visits.
+- **302 Found** says the target is temporary and the client should keep using the original address for future requests.
 
 | Choice | You gain | You pay | Choose when |
 |---|---|---|---|
@@ -251,6 +251,6 @@ A system with one global counter is easy to reason about, but it must be strict.
 
 ## Further reading
 
-- [RFC 9110: 301 Moved Permanently and 302 Found](https://www.rfc-editor.org/rfc/rfc9110.html#name-301-moved-permanently) (what each code allows caches to do)
+- [RFC 9110: 301 Moved Permanently and 302 Found](https://www.rfc-editor.org/rfc/rfc9110.html#name-301-moved-permanently) (what each code allows caches to do). You do not need this spec to follow the lesson.
 - [Redis docs: INCRBY](https://redis.io/docs/latest/commands/incrby/) (an atomic counter that can hand out ranges)
 - [Birthday problem](https://en.wikipedia.org/wiki/Birthday_problem) (why a cut hash collides sooner than you expect)

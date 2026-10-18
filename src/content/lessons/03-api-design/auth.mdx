@@ -12,84 +12,162 @@ import PkceLab from '../../../components/anim/lessons/PkceLab.tsx';
 
 ## The problem
 
-HTTP is stateless (lessons 2.3 and 3.1). The server keeps no memory of the last request. So when Ada calls `GET /orders`, the server must learn from that one request who she is. The server must also learn whether she may see these orders.
+HTTP is stateless (lesson 2.3). The server keeps no memory of the last request. Each request arrives alone, like a letter with no earlier letters in the pile.
+
+So when Ada calls `GET /orders`, the server must learn from that one request who she is. The server must also learn whether she may see these orders.
 
 Two questions hide in that sentence, and people mix them up.
 
-- **Authentication** (authn) asks: who are you?
-- **Authorization** (authz) asks: what may you do?
+- **Authentication** (often shortened to authn) asks: who are you? Picture a guard at a door checking your ID card.
+- **Authorization** (authz) asks: what may you do? Picture the same guard reading the guest list to see which rooms your ID opens.
 
-Every design below answers the first one. The second one is yours to enforce, in every service, on every resource.
+Every design below answers the first question. The second one is yours to enforce, in every service, on every resource. A valid ID card does not open every room.
 
-## Naive solution: send the password every time
+## The naive way: send the password every time
 
-Send the username and password with each request (HTTP Basic does this). It is simple, and it fails in three ways.
+Send the username and password with each request. (HTTP Basic is the standard way to do this.) It is simple, and it fails in three ways.
 
-- **Exposure.** The most sensitive secret travels on every request. Each log, proxy or crash dump that sees a request sees the password. One leak ends the account for good, because the user cannot rotate a password per request.
-- **Cost.** A good password check is slow on purpose. OWASP's guide tells you to use a memory-hard hash such as Argon2id. The minimum is 19 MiB of memory and 2 iterations. Doing that on every request turns your API into a self-inflicted denial of service.
-- **Reach.** A third-party app that wants to read Ada's data would need her password. You do not want that, and neither does she.
+- **Exposure.** The most sensitive secret travels on every request. Each log file, proxy or crash dump that sees a request sees the password. One leak ends the account for good, because a user cannot change a password between two requests. Picture a hotel guest who must shout the safe code at the front desk every time they walk past.
+- **Cost.** A good password check is slow on purpose. (The next section explains why.) A safe setting uses at least 19 MiB of memory on each check. Doing that on every request turns your own API into a self-inflicted denial of service.
+- **Reach.** Suppose a third-party app wants to read Ada's data. With this design, she would have to give it her password. She does not want that. You do not want that.
 
-The fix has one idea. Check the password once, at login. Then hand the client a **credential** that is cheap to check and easy to cancel.
+The fix is one idea. Check the password once, at login. Then hand the client a **credential**: a small proof that is cheap to check and easy to cancel. Picture a hotel key card. The desk checks your passport once. After that, a card opens your door, and the desk can switch the card off without changing your passport.
 
 ### Storing passwords
 
-At login you compare a password with what you stored. Never store the password. Store a **hash**: a one-way function of it. Add a unique random **salt** per user. So two users with the same password get different hashes. Precomputed tables do not work. OWASP's order of preference is Argon2id, then scrypt, then bcrypt for legacy systems, then PBKDF2 where a standard such as FIPS-140 requires it. bcrypt has two gotchas: it reads at most 72 bytes of the password, and its work factor should be at least 10.
+At login you compare the password the user typed with something you stored. Never store the password itself. If your database leaks, every password leaks with it, and people reuse passwords on other sites.
 
-The cost is a feature. A stolen database is a stream of guesses for the attacker, and slow hashing makes every guess expensive.
+Store a **hash** instead. A hash is the output of a one-way function. You put text in and get a fixed-size scramble out. The same input always gives the same scramble. You cannot run the function backwards to get the input. Picture a meat grinder: beef goes in, mince comes out, and you cannot rebuild the steak. To check a login, you grind the typed password and compare the mince with the stored mince.
+
+A hash alone has a weakness. Two users with the password `hunter2` get the same hash. An attacker can also build a huge table of common passwords and their hashes in advance, then look up your stolen hashes in it. The fix is a **salt**: a random string, unique to each user, added to the password before hashing. Picture each user adding their own secret spice before grinding. Two users with the same password now get different hashes, and a table built in advance is useless because it does not know the spice. You store the salt next to the hash. It is not secret. It only forces the attacker to work on each user alone.
+
+One more step makes the attacker slower. You choose a hash function that is slow and memory-hungry on purpose. A general-purpose hash such as SHA-256 is built to be fast, so an attacker can try guesses at enormous speed. A password hash is not. One login check costs you a small, fixed amount of work, which is fine. A billion guesses cost the attacker a billion times that amount. The slowness is a feature.
+
+The OWASP password guide (OWASP is a security non-profit that publishes checklists) lists the choices in this order:
+
+1. **Argon2id** is the first choice. The minimum setting is 19 MiB of memory, 2 iterations and parallelism 1.
+2. **scrypt** is the second choice.
+3. **bcrypt** is for older systems. It reads at most 72 bytes of the password, so longer passwords are silently cut. Set its work factor (how many rounds of work it does) to at least 10.
+4. **PBKDF2** is for places where a standard such as FIPS-140 (a US government rule for approved cryptography) demands it.
+
+You now have a safe way to check a password once. Next question: what do you give the user after that?
 
 ## The mechanism
 
 ### Session: the server remembers
 
-After login the server makes a long random **session id**, stores `id -> user` in a **session store** (a database or Redis, Module 5), and sends the id in a cookie. Each later request carries the cookie. The server looks the id up.
+After a good login, the server makes a long random **session id**. It stores `id -> user` in a **session store**, which is any fast place to keep small records, such as a database or Redis (an in-memory key-value store that Module 5 covers). Then it sends the id to the browser in a **cookie** (a small named value the browser stores and sends back on each request to the same site, as lesson 2.3 showed). Each later request carries the cookie. The server looks the id up and finds the user.
 
-OWASP asks for at least 64 bits of entropy from a secure random generator, and for an id that means nothing by itself. A guessable id is a stolen account. The server must also issue a fresh id at login so an attacker cannot plant a known one.
+Picture a coat check. You hand in your coat and get a numbered ticket. The ticket means nothing by itself. The coat room holds the truth.
 
-The browser holds only the id, and the server holds the truth. So revoking is easy: delete the row.
+Two rules keep this safe.
+
+- The id must be random and long. OWASP asks for at least 64 bits of **entropy**, which means unpredictability: the id must come from a secure random generator, so an attacker has about 2^64 (roughly 1.8 x 10^19) possible ids to guess. A guessable id is a stolen account.
+- The server must issue a fresh id at login. Otherwise an attacker could plant a known id in the victim's browser before login, then use it afterwards.
+
+The browser holds only the id. The server holds the truth. So cancelling is easy: delete the row. The next request finds nothing and is refused.
+
+The price is one store lookup on every request. At 50,000 requests per second, that is 50,000 store reads per second (derived). A cache handles that well, but the store becomes a dependency that must stay up.
 
 ### JWT: the token remembers
 
-A **JWT** (JSON Web Token, RFC 7519) packs the claims into the credential and signs them. It is three base64url parts joined by dots: a **header** (the algorithm), **claims** (who, for whom, until when), and a **signature**. Standard claims include `sub` (the user), `iss` (who issued it), `aud` (who it is for), `iat` (issued at) and `exp` (expiry; the token must not be accepted on or after that time).
+A **token** is a credential the client carries and shows on each request. A session id is a token that means nothing. A **JWT** (JSON Web Token) is a token that carries its own facts and proves nobody changed them.
 
-The signature is the point. The server signs `header.claims` with a secret key (or a private key, in the public-key variants). Any service with the matching key can verify the token with no network call. Tamper with a claim and watch the check fail.
+A JWT is three parts joined by dots.
+
+1. A **header**: a small JSON note that says how the token is signed.
+2. The **claims**: JSON facts about the user. Standard claim names are `sub` (the subject, meaning the user), `iss` (the issuer, who made the token), `aud` (the audience, who the token is for), `iat` (issued-at time) and `exp` (expiry time; the API must refuse the token at or after it).
+3. A **signature**: a short value that proves the first two parts are untouched.
+
+Each of the first two parts is JSON turned into plain letters by **base64url**. Base64url is an *encoding*: a fixed, public way to write bytes using only URL-safe letters and digits. Anyone can reverse it. It hides nothing. It only makes the data safe to paste into a header.
+
+So how does the signature work? The server owns a secret **key**: a string of random bytes that only the server knows. It runs a function called **HMAC** over `header.claims` using that key. (HMAC mixes a secret key into a hash, so only a holder of the key can produce the right output.) The result is the signature. HS256 is the name for "HMAC with SHA-256", and it is what the header's signing-method field names.
+
+Picture a wax seal. Anyone can read the letter. Only the person with the signet ring can make a seal that matches. If someone changes one word in the letter, the old seal no longer fits the text.
+
+To check a token, any service that holds the same key repeats the HMAC and compares the result with the signature. If they match, nobody changed the header or the claims since the server signed them. No network call is needed. (Some JWT setups use a private key to sign and a public key to verify, so the verifying services never hold anything that can forge a token.)
+
+Try it below. Edit a claim, then see the signature check fail. Re-sign with the real key and it passes again. An attacker has no key, so the attacker cannot do that last step.
 
 <TokenAnatomy client:visible />
 
-Two warnings worth remembering. First, a JWT is **signed, not encrypted**. Anyone holding it can read the claims. Do not put secrets in it. Second, the application, not the token, decides which algorithms it accepts. RFC 7519 says to reject a token whose algorithm you do not accept. Pin the algorithm in your verifier.
+Two warnings are worth keeping.
+
+- A JWT is **signed, not encrypted**. The seal proves the letter is untouched. It does not hide the letter. Anyone who holds the token can read the claims. Never put secrets in it.
+- The application, not the token, must decide which signing methods it accepts. The header is part of the token, so an attacker can write anything there, including a note that says "no signature needed". Pin the method in your verifier and reject every token that names another one.
 
 ### The decision: look it up, or verify it?
 
+Walk through both designs side by side. The last steps show the key difference, which is cancelling a credential.
+
 <SessionVsJwt client:visible />
 
-The trade is simple to say. A session costs one store read per request and gives instant revocation. A JWT costs no lookup and cannot be revoked before it expires. At 50,000 requests per second, sessions mean 50,000 store reads per second (derived). That is easy for a cache and still a dependency that must stay up.
+The trade is easy to say. A session costs one store read per request and gives instant cancellation. A JWT costs no lookup and cannot be cancelled before it expires. The server holds no copy, so there is nothing to delete.
 
-Most real systems mix them. A short-lived **access token** (a JWT, valid minutes) goes to the API. A longer-lived **refresh token** is stored by the server and can be revoked. The refresh token gets a new access token when the old one expires. Revoke the refresh token and the user is out within one access-token lifetime. RFC 6749 makes refresh tokens optional for the server to issue. RFC 9700 says refresh tokens for public clients must be sender-constrained or rotated on each use.
+Most real systems mix the two.
+
+- A short-lived **access token** (a JWT that lasts minutes) goes to the API on each request.
+- A longer-lived **refresh token** is stored by the server and can be revoked. The client sends it only to the login server, to get a new access token when the old one expires.
+- Revoke the refresh token and the user is locked out within one access-token lifetime.
+
+Picture a day pass plus a membership card. The day pass is used at every door and expires tonight. The membership card stays at the front desk and buys a new day pass each morning. The desk can cancel the card.
+
+Refresh tokens are riskier for apps that cannot keep a secret, such as a phone app. Current security guidance says such a refresh token must be bound to the one device that holds it, or be swapped for a new one each time it is used (rotation). Then a stolen copy stops working as soon as the real app uses its own.
 
 ### Cookies: the flags that matter
 
-Where the credential lives in the browser decides how it can be stolen. For cookies, five attributes carry the weight (MDN and OWASP).
+Where the credential lives in the browser decides how it can be stolen. Two attacks matter here, so name them first.
+
+- **XSS** (cross-site scripting) happens when an attacker gets their own JavaScript to run inside your page, for example through an unescaped comment. That script can read anything the page can read.
+- **CSRF** (cross-site request forgery) happens when a different site makes the victim's browser send a request to your site. The browser attaches your cookie on its own, so the request looks real. Picture a letter that arrives on your desk, signed with your own stamp, which you never wrote.
+
+A cookie has **attributes**, which are switches set by the server when it creates the cookie. Five carry the weight.
 
 | Attribute | What it does | Guards against |
 |---|---|---|
 | `HttpOnly` | JavaScript cannot read the cookie | Theft by injected script (XSS) |
-| `Secure` | Sent only over HTTPS | Sniffing on plain HTTP |
-| `SameSite=Lax` or `Strict` | Not sent on most cross-site requests. `None` allows them and requires `Secure` | Forged requests from other sites (CSRF) |
-| `__Host-` name prefix | Needs `Secure`, no `Domain`, `Path=/` | Another subdomain overwriting the cookie |
-| `Max-Age` / `Expires` | Lifetime. Without them the cookie ends with the browser session | Long-lived stolen cookies |
+| `Secure` | Browser sends it only over HTTPS | Eavesdropping on plain HTTP |
+| `SameSite=Lax` or `Strict` | Browser does not send it on most requests started by another site. `None` allows them and requires `Secure` | Forged requests from other sites (CSRF) |
+| `__Host-` name prefix | Browser accepts it only with `Secure`, no `Domain` attribute, and `Path=/` | Another subdomain (for example `blog.example.com`) overwriting your cookie |
+| `Max-Age` / `Expires` | Sets the lifetime. Without them the cookie ends when the browser closes | Long-lived stolen cookies |
 
-A browser treats a cookie with no `SameSite` as `Lax`. OWASP's idle timeouts are 2 to 5 minutes for high-value apps and 15 to 30 for low risk ones. Its office-worker example has an absolute limit of 4 to 8 hours.
+Most modern browsers treat a cookie with no `SameSite` setting as `Lax`. Do not rely on it. Set it.
 
-The same logic says where a JWT should live. Put it in `localStorage` and any injected script can read it. An `HttpOnly` cookie hides it from scripts. It then needs `SameSite` protection.
+A session also needs time limits. An **idle timeout** ends the session after a pause. OWASP suggests 2 to 5 minutes for high-value apps and 15 to 30 minutes for low-risk ones. An **absolute timeout** ends it no matter what. OWASP's example for an office worker is 4 to 8 hours.
+
+The same reasoning says where to keep a JWT in a browser. `localStorage` is a small browser store that any script on the page can read. So an XSS attack steals a JWT kept there. An `HttpOnly` cookie hides it from scripts. A cookie then needs `SameSite` protection against CSRF.
 
 ### OAuth 2.0: letting an app act for a user
 
-Ada wants a calendar app to read her email. She will not give it her password. **OAuth 2.0** (RFC 6749) lets her grant it limited, revocable access. It names four roles: the **resource owner** (Ada), the **client** (the app), the **authorization server** (issues tokens) and the **resource server** (the API).
+Ada wants a calendar app to read her email. She will not give it her password. **OAuth 2.0** lets her grant the app limited, cancellable access instead. Picture a valet key. It starts the car and opens the door, but it does not open the glovebox or the trunk.
 
-Note what OAuth is. It is a way to get **authorization**: a token that says what the app may do. It does not by itself say who Ada is. A layer on top, OpenID Connect, adds a standard way to get a user's identity. "Login with Google" uses both.
+OAuth gives each party a name.
 
-The browser-based flow is the **authorization code grant**. The app sends Ada to the authorization server. Ada signs in and agrees. The server sends her back to the app with a short-lived, one-time **code**. The app then trades the code for tokens, in a direct call.
+- The **resource owner** is Ada, who owns the data.
+- The **client** is the calendar app.
+- The **authorization server** is the service where Ada logs in. It issues tokens.
+- The **resource server** is the API that holds her email and checks tokens.
 
-The code travels through the browser, in a URL. It can leak. For public clients, such as mobile apps and single-page apps with no safe place for a secret, an attacker can steal it and redeem it. **PKCE** (Proof Key for Code Exchange, RFC 7636) closes that hole. RFC 9700 says public clients must use it. Step through the flow.
+The limits come from a **scope**: a short label such as `read:email` that names one permission. The app asks for scopes. Ada approves them. The token carries only those.
+
+Note what OAuth is. It is a way to get *authorization*: a token that says what the app may do. It does not say who Ada is. A layer on top, called OpenID Connect, adds a standard way to learn the user's identity. A button that says "Log in with Google" uses both.
+
+The usual browser-based flow is the **authorization code grant**. It has these steps.
+
+1. The app sends Ada's browser to the authorization server. The request is a URL that holds the app's `client_id` (its public name), the scopes it wants, a **redirect URI** (the address where the server must send Ada back) and a random **state** value.
+2. Ada signs in at the authorization server and agrees. The app never sees her password.
+3. The server sends her browser back to the redirect URI with a short-lived, one-time **code**. The code is a claim ticket, not a key.
+4. The app trades the code for tokens in a direct call to the server's **token endpoint** (an endpoint is just a URL the server answers).
+
+The code travels through the browser, inside a URL. URLs end up in logs, browser history and, on a phone, in other apps. So the code can leak. If an attacker steals it before the app uses it, the attacker could trade it for tokens. That matters most for **public clients**: apps that cannot keep a secret, such as mobile apps and single-page web apps. Anyone can unpack such an app and read any secret inside.
+
+**PKCE** (Proof Key for Code Exchange, said "pixie") closes this hole. The idea needs one more word: a **hash**, which you already met in password storage. Here it is the same meat grinder.
+
+1. The app makes a random secret for this one login, the **code verifier**.
+2. The app hashes it with SHA-256 (a standard hash function) and sends only the hash, the **code challenge**, in step 1. The hash cannot be reversed, so showing it is safe. It is a sealed envelope.
+3. When the app trades the code, it also sends the verifier. The server hashes it and compares with the stored challenge.
+
+Only the app that made the verifier can pass. A thief who has the code has no verifier. The server then answers with an error called `invalid_grant`, which means "this code is not valid for you". Step through the flow.
 
 <PkceFlow client:visible />
 
@@ -97,45 +175,49 @@ The whole trick is one hash. Try to break it. The attacker has the code and may 
 
 <PkceLab client:visible />
 
-Three more rules from RFC 9700. Match redirect URIs by exact string, so a token cannot be sent to an attacker's URL. Avoid the implicit grant, which returns tokens in the URL, and use the code flow. Send a `state` value and check it on return. This ties the callback to the login that began it. RFC 6749 recommends this check against CSRF.
+Three more rules keep the flow safe.
+
+- **Match redirect URIs by exact string.** The server compares the redirect URI against the one the app registered. A near match could send the code to the attacker's address.
+- **Skip the implicit grant.** It is an older flow that puts tokens straight into the URL. Use the code flow instead.
+- **Send a `state` value and check it on return.** The app makes a random value, sends it out, and requires the same value back. It ties the callback to the login the app began. Without the check, an attacker can push a callback of their own into the victim's browser (a CSRF attack).
 
 ## Numbers
 
-| Item | Value | Source |
-|---|---|---|
-| Session id entropy | at least 64 bits (2^64 is about 1.8 x 10^19 guesses) | OWASP |
-| PKCE code verifier | 43 to 128 characters | RFC 7636 |
-| Authorization code lifetime | at most 10 minutes (recommended), single use | RFC 6749 |
-| Session idle timeout | 2 to 5 min (high value), 15 to 30 min (low risk) | OWASP |
-| Session absolute timeout | 4 to 8 h (office-worker example) | OWASP |
-| Argon2id minimum | 19 MiB memory, 2 iterations, parallelism 1 | OWASP |
-| bcrypt | 72 byte input limit, work factor at least 10 | OWASP |
-| Session check cost | 1 store round trip per request | derived |
-| JWT check cost | 1 local signature check, 0 round trips | derived |
+| Item | Value |
+|---|---|
+| Session id entropy | at least 64 bits (2^64 is about 1.8 x 10^19 guesses) |
+| PKCE code verifier length | 43 to 128 characters |
+| Authorization code lifetime | at most 10 minutes (recommended), single use |
+| Session idle timeout | 2 to 5 min (high value), 15 to 30 min (low risk) |
+| Session absolute timeout | 4 to 8 h (office-worker example) |
+| Argon2id minimum | 19 MiB memory, 2 iterations, parallelism 1 |
+| bcrypt | 72 byte input limit, work factor at least 10 |
+| Session check cost | 1 store round trip per request (derived) |
+| JWT check cost | 1 local signature check, 0 round trips (derived) |
 
-Access token lifetimes and refresh token lifetimes vary by vendor and risk. There is no standard number. Say what you would pick and why: short for high risk, because that is your revocation window.
+The sources for these numbers are OWASP's cheat sheets and the OAuth documents listed under Further reading. Access token and refresh token lifetimes vary by vendor and risk. There is no standard number. Say what you would pick and why. Choose short for high risk, because the access token lifetime is your revocation window.
 
 ## Trade-offs
 
 | Choice | You gain | You pay | Pick it when |
 |---|---|---|---|
-| Server session and cookie | Instant revoke, tiny cookie, state can change | Shared store on every request path | One web app, strong logout needs |
-| Stateless JWT | No lookup, any service verifies, good across services | Cannot revoke early, bigger header on every call | Service-to-service identity, short lifetimes |
-| JWT + refresh token | Short exposure plus revocation | Two tokens, a refresh flow, rotation logic | Mobile apps and APIs |
-| OAuth 2.0 + PKCE | Delegated access with no password sharing | Redirects, more moving parts | Third-party apps, "login with" flows |
+| Server session and cookie | Instant cancel, tiny cookie, state can change | Shared store read on every request | One web app, strong logout needs |
+| Stateless JWT | No lookup, any service can verify, good across services | Cannot cancel early, bigger header on every call | Service-to-service identity, short lifetimes |
+| JWT + refresh token | Short exposure plus cancellation | Two tokens, a refresh flow, rotation logic | Mobile apps and APIs |
+| OAuth 2.0 + PKCE | Delegated access with no password sharing | Redirects, more moving parts | Third-party apps, "log in with" flows |
 
 ## In practice
 
 <Callout type="tip">
-Show the authentication path in one breath: "Passwords stored with Argon2id. After login we issue a 15 minute access token and a revocable refresh token. The API gateway verifies the signature and passes the user id downstream. Each service still checks authorization on the resource." The gateway verifies the token once. The services own the permission checks (Module 8 covers the gateway).
+Say the authentication path in one breath: "Passwords stored with Argon2id. After login we issue a 15 minute access token and a revocable refresh token. The API gateway verifies the signature and passes the user id downstream. Each service still checks authorization on the resource." A **gateway** is one front door that every outside request enters first (Module 8 covers it). It verifies the token once. The services behind it own the permission checks.
 </Callout>
 
 <Callout type="mistake">
-Do not say "we log out a JWT by deleting it on the server". The server never held a copy. Say: short expiry, refresh token revocation, or a denylist by token id. Do not store a JWT in `localStorage` and call it secure. And do not say "OAuth is authentication". It grants access. Identity comes from OpenID Connect on top.
+Do not say "we log out a JWT by deleting it on the server". The server never held a copy. Say: short expiry, refresh token revocation, or a **denylist** (a list of revoked token ids that the API checks, which brings back one lookup). Do not store a JWT in `localStorage` and call it secure. And do not say "OAuth is authentication". It grants access. Identity comes from OpenID Connect on top.
 </Callout>
 
 <Callout type="deep" title="The confused deputy: authentication is not authorization">
-The most common real bug is a valid token used on someone else's data. `GET /orders/9812` passes authentication because Ada's token is fine. If the service never checks that order 9812 belongs to Ada, she can read every order by changing the number. Take the user id from the verified token (lesson 3.1 said the same). Also check ownership on every read and write.
+The most common real bug is a valid token used on someone else's data. `GET /orders/9812` passes authentication because Ada's token is fine. If the service never checks that order 9812 belongs to Ada, she can read every order by changing the number. Take the user id from the verified token, never from the URL or the request body. Then check ownership on every read and write.
 </Callout>
 
 ## Check yourself
@@ -188,7 +270,9 @@ The most common real bug is a valid token used on someone else's data. `GET /ord
 
 ## Further reading
 
+You do not need any of these to follow the lesson. They are the official sources behind the numbers and rules above.
+
 - [RFC 6749: OAuth 2.0 Authorization Framework](https://www.rfc-editor.org/rfc/rfc6749) (roles, authorization code grant, state) and [RFC 7636: PKCE](https://www.rfc-editor.org/rfc/rfc7636)
-- [RFC 9700: OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700) (PKCE for public clients, exact redirect matching, avoid implicit grant)
+- [RFC 9700: OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700) (PKCE for public clients, exact redirect matching, avoid implicit grant, refresh token rotation)
 - [RFC 7519: JSON Web Token](https://www.rfc-editor.org/rfc/rfc7519) (structure, claims, validation)
 - [OWASP: Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html) and [OWASP: Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)

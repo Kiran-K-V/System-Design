@@ -3,8 +3,7 @@ import SequenceDiagram, { type SeqMessage } from '../SequenceDiagram';
 
 /**
  * OAuth 2.0 authorization code flow with PKCE.
- * RFC 6749 section 4.1 (steps A to E), RFC 7636 (verifier and S256 challenge).
- * The example verifier and challenge are the RFC 7636 appendix B pair, recomputed with SHA-256 for this lesson.
+ * The example verifier and challenge are a real SHA-256 pair.
  */
 
 export const EX_VERIFIER = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
@@ -23,13 +22,13 @@ const ROWS: Row[] = [
     m: { from: 'App', to: 'App', label: 'make a random verifier', note: true, tone: 'accent' },
     mem: 'verifier',
     caption:
-      'The app (the client) wants to read a user\'s data from the API. Before it does anything, it makes a secret for this one login: the code_verifier. It is a random string of 43 to 128 characters. It stays in the app and is not sent yet.',
+      'The app (the client) wants to read a user\'s data from the API. Before it does anything, it makes a secret for this one login: the code_verifier. It is a random string, 43 to 128 characters long. It stays in the app and is not sent yet.',
   },
   {
     m: { from: 'App', to: 'App', label: 'make challenge = hash', note: true, tone: 'accent' },
     mem: 'challenge',
     caption:
-      'The app hashes the verifier with SHA-256 and base64url-encodes it. That is the code_challenge (S256 method). A hash cannot be reversed, so the challenge can travel openly. It is a sealed envelope: the verifier will open it later.',
+      'The app hashes the verifier with SHA-256 and base64url-encodes it. That is the code_challenge (the standard method for this). A hash cannot be reversed, so the challenge can travel openly. It is a sealed envelope: the verifier will open it later.',
   },
   {
     m: { from: 'App', to: 'Auth server', label: 'GET /authorize' },
@@ -47,13 +46,13 @@ const ROWS: Row[] = [
     m: { from: 'Auth server', to: 'App', label: 'redirect: code + state' },
     mem: 'challenge',
     caption:
-      'Step C. The server redirects the browser back to the app\'s redirect URI with a short-lived, one-time authorization code and the same state. RFC 6749 recommends a code lifetime of at most 10 minutes. The code is in a URL, so it can leak: logs, history, a malicious app on the same phone.',
+      'Step C. The server redirects the browser back to the app\'s redirect URI with a short-lived, one-time authorization code and the same state. A good server keeps the code valid for 10 minutes at most. The code is in a URL, so it can leak: logs, history, a malicious app on the same phone.',
   },
   {
     m: { from: 'App', to: 'App', label: 'state matches? yes', note: true, tone: 'ok' },
     mem: 'verifier',
     caption:
-      'The app checks that the returned state equals the one it sent. That blocks a forged callback (CSRF, a request forgery attack). A thief with the code still cannot use it yet.',
+      'The app checks that the returned state equals the one it sent. That blocks a forged callback (a forged-request attack, called CSRF). A thief with the code still cannot use it yet.',
   },
   {
     m: { from: 'App', to: 'Auth server', label: 'POST /token: code + verifier' },
@@ -71,12 +70,12 @@ const ROWS: Row[] = [
     m: { from: 'Auth server', to: 'App', label: 'access token (+ refresh)', tone: 'ok' },
     mem: 'verifier',
     caption:
-      'Step E. The server returns an access token. It may also return a refresh token, which is optional and the server\'s choice (RFC 6749). The code is now spent. Using it twice is not allowed.',
+      'Step E. The server returns an access token. It may also return a refresh token, which is optional and the server\'s choice. The code is now spent. Using it twice is not allowed.',
   },
   {
-    m: { from: 'App', to: 'API', label: 'GET /me  Bearer token' },
+    m: { from: 'App', to: 'API', label: 'GET /me + access token' },
     mem: 'verifier',
-    caption: 'The app calls the API with the access token in the Authorization header. The API is the resource server. It never saw the user\'s password.',
+    caption: 'The app calls the API with the access token in the Authorization header of the request. The API is the resource server. It never saw the user\'s password.',
   },
   {
     m: { from: 'API', to: 'App', label: '200 user data', tone: 'ok' },
@@ -87,7 +86,7 @@ const ROWS: Row[] = [
 
 export default function PkceFlow() {
   const steps = [
-    { caption: 'Three parties. The user also takes part, through the browser. OAuth 2.0 names the roles: resource owner (the user), client (the app), authorization server, and resource server (the API). We follow the authorization code flow with PKCE (pronounced "pixie").' },
+    { caption: 'Three parties. The user also takes part, through the browser. OAuth 2.0 gives each party a name: resource owner (the user), client (the app), authorization server, and resource server (the API). We follow the authorization code flow with PKCE (pronounced "pixie").' },
     ...ROWS.map((r) => ({ caption: r.caption })),
   ];
   const messages = ROWS.map((r) => r.m);

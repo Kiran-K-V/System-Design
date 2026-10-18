@@ -5,7 +5,7 @@ const nodes: BuildNode[] = [
   { id: 'api', x: 185, y: 200, w: 110, h: 56, label: 'Intake API', step: 0 },
   { id: 'queues', x: 345, y: 200, w: 130, h: 64, label: 'Queues', sub: 'per channel + lane', step: 0 },
   { id: 'push', x: 500, y: 120, w: 80, h: 56, label: 'Push', sub: 'worker', step: 0 },
-  { id: 'pprov', x: 650, y: 120, w: 108, h: 56, label: 'APNs / FCM', step: 0 },
+  { id: 'pprov', x: 650, y: 120, w: 108, h: 56, label: 'Apple / Google', step: 0 },
   { id: 'sms', x: 500, y: 200, w: 80, h: 56, label: 'SMS', sub: 'worker', step: 1 },
   { id: 'email', x: 500, y: 280, w: 80, h: 56, label: 'Email', sub: 'worker', step: 1 },
   { id: 'sprov', x: 650, y: 200, w: 108, h: 56, label: 'SMS vendor', step: 1 },
@@ -14,7 +14,7 @@ const nodes: BuildNode[] = [
   { id: 'prefs', x: 185, y: 80, w: 120, h: 70, label: 'Preferences', shape: 'db', step: 3 },
   { id: 'camp', x: 345, y: 330, w: 140, h: 60, label: 'Campaigns', sub: 'expand segment', step: 4 },
   { id: 'limit', x: 345, y: 80, w: 150, h: 56, label: 'Dedupe + limits', step: 6 },
-  { id: 'retry', x: 500, y: 365, w: 120, h: 56, label: 'Retry + DLQ', step: 7 },
+  { id: 'retry', x: 500, y: 365, w: 120, h: 56, label: 'Retry + dead letters', step: 7 },
 ];
 
 const edges: BuildEdge[] = [
@@ -38,7 +38,7 @@ const edges: BuildEdge[] = [
 const steps: BuildStep[] = [
   {
     req: 'FR1: notify one user',
-    caption: 'The smallest design. A sender service calls the intake API. The API puts the message on a queue (lesson 6.1). A push worker takes it and calls the push provider (APNs or FCM). The sender is not blocked while the provider is slow.',
+    caption: 'The smallest design. A sender service calls the intake API. The API puts the message on a queue (lesson 6.1). A push worker takes it and calls the push provider (APNs from Apple or FCM from Google, the phone makers delivery services). The sender is not blocked while the provider is slow.',
     packets: [{ from: 'sender', to: 'api', label: 'send' }, { from: 'api', to: 'queues', label: 'enqueue', delay: 0.9 }],
   },
   {
@@ -47,7 +47,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: an accepted message is never lost',
-    caption: 'The API writes the request to a durable log before it answers 202. If a queue loses data or a worker crashes, the log still has the request and can enqueue it again.',
+    caption: 'The API writes the request to a durable log before it answers "accepted" (HTTP 202). If a queue loses data or a worker crashes, the log still has the request and can enqueue it again.',
     packets: [{ from: 'api', to: 'log', label: 'write first' }],
   },
   {

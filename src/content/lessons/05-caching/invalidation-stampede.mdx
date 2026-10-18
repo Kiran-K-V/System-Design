@@ -56,13 +56,9 @@ Most of the time the database sees none of these reads. Then the TTL runs out. F
 
 This is a **cache stampede**, also called a **thundering herd**. A popular entry expires, and many requests try to rebuild it at the same time. It gets worse in a loop. The extra load slows the database. The rebuild now takes 2 seconds instead of 200 ms. That is 10,000 misses instead of 1,000, so the database slows more. A slow rebuild feeds the herd.
 
-### Three ways out, side by side
+### Three ways out
 
-Watch the same expiry under three rules. Step through all five steps. Compare the DB counter in each column.
-
-<StampedeCompare client:visible />
-
-All three are the same idea at different costs. The herd exists because *every reader does the rebuild*. Fix that, and you only choose what the *other* readers do while one rebuilds. Your options are **wait** (single-flight, lock, lease), or **take the old value** (stale-while-revalidate).
+Five fixes follow. They share one idea, at different costs. The herd exists because *every reader does the rebuild*. Fix that, and you only choose what the *other* readers do while one rebuilds. Your options are **wait** (single-flight, lock, lease), or **take the old value** (stale-while-revalidate).
 
 ### Fix 1: Single-flight, also called request coalescing
 
@@ -88,13 +84,13 @@ Facebook's memcache builds the lock into the cache. When a get misses, memcache 
 
 <LeaseHerd client:visible />
 
-The token does two jobs. It lets one client rebuild. And a delete by a writer voids the token, so a slow reader's late fill is refused. That is the stale-set race from lesson 5.3. The paper compares it to load-link/store-conditional in a CPU.
+The token does two jobs. It lets one client rebuild. And a delete by a writer voids the token, so a slow reader's late fill is refused. That is the stale-set race from lesson 5.3. 
 
 Facebook limits how fast tokens leave: by default a server returns a token once every 10 seconds per key. Any request in that window gets "wait a short time". The paper's own data covers keys prone to herds. That data shows a peak database query rate of 17K per second without leases. With leases, that peak is 1.3K per second.
 
 ### Fix 4: Serve stale while you refresh
 
-Waiting costs latency. Another choice: let readers have the **old** value while one request fetches the new one in the background. The web standard calls this **stale-while-revalidate**. RFC 5861 defines it as a `Cache-Control` extension. Caches may serve a response after it goes stale, for the number of seconds you state. An example from the RFC:
+Waiting costs latency. Another choice: let readers have the **old** value while one request fetches the new one in the background. The web standard calls this **stale-while-revalidate**. It is a setting in the `Cache-Control` header, the header where a server tells caches how long they may keep a response. Caches may serve a response after it goes stale, for the number of seconds you state. An example:
 
 ```text
 Cache-Control: max-age=600, stale-while-revalidate=30
@@ -119,6 +115,12 @@ if (no value) or  now - delta * beta * log(rand()) >= expiry:
 ```
 
 `rand()` is between 0 and 1, so `log(rand())` is negative, and the term adds a random gap to `now`. A key that is slow to build has a large `delta`, so it refreshes earlier. A larger `beta` favors earlier refresh. You pay with some extra recomputes, and gain safety without coordination.
+
+### The fixes side by side
+
+Watch the same expiry under three rules: no protection, a lease (a single-flight lock works the same way here), and serving stale. Step through all five steps. Compare the DB counter in each column.
+
+<StampedeCompare client:visible />
 
 ### Which one?
 
@@ -178,7 +180,7 @@ Some books also use "breakdown" for a single hot key expiring. That is the stamp
 | Facebook herd result | Peak DB query rate 17K/s without leases, 1.3K/s with leases |
 | Redis lock command | `SET key token NX PX 5000` (the 5,000 ms is the Redis team's example) |
 | XFetch `beta` | 1.0 by default |
-| RFC 5861 example | `max-age=600, stale-while-revalidate=30` |
+| Header example | `max-age=600, stale-while-revalidate=30` |
 
 ## Trade-offs
 
@@ -284,6 +286,7 @@ Do not say "TTL solves it". A TTL is what *causes* the stampede on a hot key. Do
 
 - [Scaling Memcache at Facebook (NSDI 2013)](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala). Section 3.2.1 covers leases, stale sets, thundering herds, and stale values.
 - [MIT 6.824 memcache FAQ](https://pdos.csail.mit.edu/6.824/papers/memcache-faq.txt). A short Q&A on the same paper, including the stale set example.
+You do not need the RFC below to follow the lesson. It is the source for the header.
 - [RFC 5861: HTTP Cache-Control extensions for stale content](https://www.rfc-editor.org/rfc/rfc5861). The standard for `stale-while-revalidate` and `stale-if-error`.
 - [Redis: cache stampede prevention](https://redis.antirez.com/fundamental/cache-stampede-prevention.html). Lock with `SET NX PX`, and the XFetch formula.
 - [Optimal Probabilistic Cache Stampede Prevention (PVLDB 2015)](https://cseweb.ucsd.edu/~avattani/papers/cache_stampede.pdf). The XFetch paper and its pseudo-code.

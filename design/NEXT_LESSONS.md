@@ -48,10 +48,18 @@ Imports use relative paths: `../../../components/lesson/Callout.astro`, `../../.
 7. **Check yourself.** `Quiz` (3 to 5 questions). Add one `Diagnose` (a short incident puzzle) or one `Ballpark` (estimation practice) where it fits.
 8. **Further reading.** 2 to 4 links you fetched yourself and confirmed load.
 
-Length: 900 to 1800 words of prose plus visuals.
+Length: set by the number of ideas, not a word limit. A lesson with about 10 ideas needs about 3,000 words. If a lesson needs much more than 4,000 words, split it into two lessons.
 
 ### Writing style
-- Plain, direct English. One idea per sentence. Short sentences. Active voice. Define every term at first use. No filler, no hype.
+- Plain, direct English. One idea per sentence. Short sentences. Active voice. No filler, no hype.
+- **Audience: the reader can code and has shipped a web service, but knows nothing about networks, databases, or infrastructure.** Never write for someone who already knows the topic. A term that feels obvious to you is the term that loses the reader.
+- **Teach every term inside the text, before you use it, at the moment the reader needs it.** Never put a glossary or word list at the top of a lesson. Do not assume a reader has met a term in another lesson unless that lesson taught it. When you are unsure, define it again in one clause.
+- **Give every idea four parts:** what it is, an everyday picture (an analogy), why it exists, and one number or example. Three short sentences is too little for an idea.
+- A question-first structure is allowed but not required. Use whatever form teaches each idea best: a story, a worked example, a before and after, a table, a step-by-step walk. Use plain descriptive headings, not a chain of question headings.
+- **Specs and RFC numbers go only in "Further reading"**, with one line that says the reader does not need them. Never put them in lesson text, tables, quiz text, or diagram captions.
+- **Diagrams follow the same rule.** Every acronym or term in a diagram label or caption must be explained in the lesson text before the diagram appears. Place the diagram after the section that defines its terms.
+- Reference lesson for this style: `src/content/lessons/02-networking/ip-tcp-udp.mdx`.
+- Teach why, then how, then numbers. Show a failing naive design before the fix.
 - Teach why, then how, then numbers. Show a failing naive design before the fix.
 - Concrete numbers. Mark rough ones with `~`. Use only numbers you verified from a source or derived and showed.
 - Original text. Hello Interview and other sites are for checking topic coverage only. Never copy their sentences, structure, or diagrams.

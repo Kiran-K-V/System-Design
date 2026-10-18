@@ -22,31 +22,31 @@ const edges: BuildEdge[] = [
 
 const steps: BuildStep[] = [
   {
-    req: 'FR1: shorten a URL',
-    caption: 'The smallest design that works. The client sends a long URL. The service picks a code and stores the code and the long URL in a table. The code is the primary key.',
+    req: 'Goal: shorten a URL',
+    caption: 'The smallest design that works. The client sends a long URL. The service picks a code and stores the code and the long URL in a table. Each code is unique in the table, so it identifies one row.',
     packets: [{ from: 'client', to: 'shorten' }],
   },
   {
-    req: 'NFR: one code, one URL',
+    req: 'Quality: one code, one URL',
     caption: 'Codes must never repeat. A separate generator hands out unique numbers, and the service turns each number into a short code. The deep dive below shows why this beats hashing.',
   },
   {
-    req: 'FR2 and FR3: alias and expiry',
-    caption: 'No new box. A custom alias is just a code the user picks. The primary key rejects it if taken. Expiry is a column, expires_at, that the read path checks.',
+    req: 'Goals: alias and expiry',
+    caption: 'No new box. A custom alias is just a code the user picks. The table rejects it if taken. Expiry is a column, expires_at, that the read path checks.',
     active: ['db'],
   },
   {
-    req: 'FR4: redirect',
+    req: 'Goal: redirect',
     caption: 'Reads go to their own service. It looks up the code and answers with a redirect. Reads outnumber writes about 1,000 to 1 in our assumptions, so they must scale on their own.',
     packets: [{ from: 'client', to: 'redir' }],
   },
   {
-    req: 'NFR: redirect in about 100 ms',
-    caption: 'A cache sits in front of the table (cache-aside, lesson 5.3). Hot codes answer from memory. Only a miss reads the table.',
+    req: 'Quality: redirect in about 100 ms',
+    caption: 'A cache sits in front of the table (lesson 5.3). Hot codes answer from memory. Only a miss reads the table.',
     packets: [{ from: 'redir', to: 'cache' }],
   },
   {
-    req: 'NFR: highly available',
+    req: 'Quality: highly available',
     caption: 'Copy the table to replicas. Redirects read from a replica, so a lost primary does not stop them. A stale read is fine here, because a code never changes after it is created.',
   },
 ];

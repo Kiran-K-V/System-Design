@@ -48,7 +48,7 @@ export default function IsolationMatrix() {
           );
         })}
         <HandText x={350} y={346} size={14} color="var(--muted)">
-          {'PostgreSQL treats Read uncommitted as Read committed. Other engines differ.\nRead committed lost update: the app reads, computes, then writes the value.'}
+          {'PostgreSQL has no level weaker than Read committed. Other engines do.\nRead committed lost update: the app reads, computes, then writes the value.'}
         </HandText>
       </SketchSvg>
       </div>

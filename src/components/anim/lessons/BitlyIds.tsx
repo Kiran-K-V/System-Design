@@ -18,7 +18,7 @@ const hash: CompareVariant = {
     { caption: 'The service hashes each long URL and keeps the first 7 base62 characters as the code. No counter is needed.', active: ['svc'] },
     { caption: 'URL A hashes to the code "k3Fq9Zd". The service writes it. So far so good.', packets: [{ from: 'a', to: 'svc' }, { from: 'svc', to: 'db' }], tones: { db: 'ok' } },
     { caption: 'URL B, a different URL, also hashes to "k3Fq9Zd". Cutting a hash to 7 characters throws bits away, so two URLs can land on one code. The insert fails.', packets: [{ from: 'b', to: 'svc' }, { from: 'svc', to: 'db', tone: 'bad' }], tones: { b: 'bad', db: 'bad' } },
-    { caption: 'The fix is to check the table, add a salt, and hash again. Every write now needs a read first, and a retry loop. At 1B codes in 62^7 space, we expect about 142,000 colliding pairs.', active: ['svc'], tones: { svc: 'warn' } },
+    { caption: 'The fix is to check the table, add some extra characters to the URL, and hash again. Every write now needs a read first, and a retry loop. At 1B codes in 62^7 space, we expect about 142,000 colliding pairs.', active: ['svc'], tones: { svc: 'warn' } },
   ],
 };
 

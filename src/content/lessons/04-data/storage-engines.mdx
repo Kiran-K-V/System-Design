@@ -41,6 +41,8 @@ The database keeps recently used pages in a RAM cache, the **buffer pool**. Post
 
 The **write-ahead log** (WAL) is a file where the database appends a record for every change. It does this before it changes any data page. The PostgreSQL manual states the rule plainly. Data file changes must be written only after WAL records describing them are flushed to permanent storage.
 
+"Flushed" has a precise meaning. When a program writes to a file, the operating system usually keeps the bytes in RAM first. A call named **fsync** forces them onto the disk and returns only when the disk confirms. It is like posting a letter versus getting a signed receipt. One fsync costs roughly 0.1 to 1 ms on an SSD.
+
 Step through one commit, then a crash.
 
 <WalCrash client:visible />
@@ -58,7 +60,7 @@ Why is this faster, not just safer? Look at the cost of one commit.
 | Write every changed page | One 8 KB write per changed page | Random, scattered |
 | Write-ahead log | One small record, one fsync | Sequential append |
 
-The log is written in order, so an HDD does not seek. An SSD sees the friendliest pattern it has. PostgreSQL also batches: when many small transactions commit at once, one fsync of the log may commit all of them. This is **group commit**.
+The log is written in order, so an HDD (a spinning disk) does not need to move its read head between spots, which is called a seek. An SSD sees the friendliest pattern it has. PostgreSQL also batches: when many small transactions commit at once, one fsync of the log may commit all of them. This is **group commit**.
 
 <Callout type="deep" title="Why the first change to a page after a checkpoint logs the whole page">
 A crash in the middle of an 8 KB page write can leave half old, half new bytes. This is a **torn page**. A log record that says "change bytes 40–48" cannot fix a torn page. So PostgreSQL's `full_page_writes` setting (on by default) writes the whole page into the log. This happens on the first change to a page after each checkpoint. Recovery restores the page from the log, then applies the later small records. This is also why a checkpoint is followed by a burst of larger log writes.
@@ -66,9 +68,9 @@ A crash in the middle of an 8 KB page write can leave half old, half new bytes. 
 
 ## Two families of storage engines
 
-Everything above is **update in place**: the page stays at one location and is overwritten. PostgreSQL, MySQL's InnoDB, and SQLite work this way. Their indexes are **B-trees** (lesson 4.3). The WAL is a safety net.
+Everything above is **update in place**: the page stays at one location and is overwritten. PostgreSQL, MySQL's InnoDB, and SQLite work this way. Their indexes are **B-trees**. A B-tree is a sorted lookup structure shaped like a tree. Think of a book index: the top level says which range of keys to open, the next level narrows it, and a few steps reach the page that holds your row. Even a huge table needs only a handful of steps this way. Lesson 4.3 builds it in full. The WAL is a safety net.
 
-The other family makes the log the data. It never overwrites. It only appends, and merges old data later. These are **log-structured** engines, such as RocksDB, Cassandra, and LevelDB. Their indexes are **LSM trees** (lesson 4.3). The idea comes from the 1996 LSM-tree paper by O'Neil and others.
+The other family makes the log the data. It never overwrites. It only appends, and merges old data later. These are **log-structured** engines, such as RocksDB, Cassandra, and LevelDB. Their indexes are **LSM trees** (log-structured merge trees). New writes go into a small sorted table in RAM. When it fills, it is written to disk as one sorted file that is never edited. Background work later merges the files. Think of piling up sorted stacks of cards and merging two stacks when there are too many. Writes are fast because they only append. Reads may check several files. Lesson 4.3 builds it in full. The idea comes from the 1996 LSM-tree paper by O'Neil and others.
 
 To feel why this works, build the smallest database there is: two shell functions.
 
@@ -77,7 +79,7 @@ db_set() { echo "$1,$2" >> database; }          # write: append one line
 db_get() { grep "^$1," database | tail -n 1; }  # read: scan, take the last
 ```
 
-Writes are as fast as a disk can go: one sequential append. Reads scan the whole file: slow, and slower with every write. This is the example Martin Kleppmann builds in *Designing Data-Intensive Applications* (chapter 3). Every storage engine is this log plus a way to find things without scanning. That "way to find things" is an **index**. It is the next lesson.
+Writes are as fast as a disk can go: one sequential append. Reads scan the whole file: slow, and slower with every write. An **index** is a small extra structure that tells the database where a row is, so it need not scan. This is the example Martin Kleppmann builds in *Designing Data-Intensive Applications* (chapter 3). Every storage engine is this log plus a way to find things without scanning. That "way to find things" is the index. It is the next lesson.
 
 ## Numbers
 

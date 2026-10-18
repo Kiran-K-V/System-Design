@@ -13,7 +13,7 @@ import VecHnsw from '../../../components/anim/lessons/VecHnsw.tsx';
 
 A user types "cheap flights to somewhere warm". No document holds those exact words. A keyword index (lesson [8.5](/learn/08-technologies/elasticsearch/)) finds documents that contain the words. It does not find documents that **mean** the same thing.
 
-An **embedding** model fixes the input side. It turns a text, an image, or a song into a **vector**. A vector is a list of d numbers, for example d = 768. The model is trained so that items with similar meaning get vectors that are close together. Now "find similar" becomes "find the stored vectors nearest to this query vector". That is a **nearest-neighbor search**, and asking for the top k is **k-nearest-neighbors**, or kNN.
+An **embedding** model fixes the input side. It turns a text, an image, or a song into a **vector**. A vector is a list of d numbers, for example d = 768. Each position in the list is a **dimension**. The model is trained so that items with similar meaning get vectors that are close together. Now "find similar" becomes "find the stored vectors nearest to this query vector". That is a **nearest-neighbor search**, and asking for the top k is **k-nearest-neighbors**, or kNN.
 
 A B-tree (lesson [4.3](/learn/04-data/indexing/)) cannot help. It sorts one number. A vector has hundreds of dimensions, and "nearest" is not "next in sort order".
 
@@ -31,7 +31,7 @@ Cosine looks only at **direction**. Dot product mixes direction and length. L2 l
 
 At A = (1, 0) and B = (1, 1), C wins on cosine (it points the same way). C also wins on dot product (it is longer). But **B** wins on L2 (distance 1 against 2). If every vector is scaled to length 1, dot product and cosine give the same ranking. Check what your model outputs and pick the measure it was trained for.
 
-In pgvector, the operators are `<->` for L2 distance, `<#>` for negative inner product, `<=>` for cosine distance, and `<+>` for L1 distance.
+**pgvector** is a free add-on for the PostgreSQL database that stores vectors and searches them. We use it as our real example, and the last sections say more. In its queries you pick the measure with an operator. These are `<->` for L2 distance, `<#>` for negative inner product (the dot product with its sign flipped, so that smaller still means closer), `<=>` for cosine distance, and `<+>` for L1 distance (add up the gaps on each dimension).
 
 ## Naive solution: compare to everything
 
@@ -39,8 +39,10 @@ Exact kNN computes the distance from the query to **every** stored vector, then 
 
 For 1 million vectors of 768 float32 numbers:
 
+A **float32** is a decimal number stored in 4 bytes.
+
 - Memory: 1,000,000 × 768 × 4 bytes = **3.07 GB**.
-- Work: 1,000,000 × 768 = **768 million** multiply-adds per query.
+- Work: 1,000,000 × 768 = **768 million** multiplications and additions per query.
 - Time floor: reading 3.07 GB at the 10 to 50 GB/s of RAM (lesson [1.2](/learn/01-one-machine/latency-numbers/)) takes 61 to 307 ms, and that is before any math.
 
 That is fine for 10,000 vectors, and too slow for 100 queries per second over a million. The result is **perfect**: its recall is 100%. **Recall** is the share of the true top k that you return. pgvector does exact search by default and gets perfect recall.
@@ -49,7 +51,7 @@ To go faster we accept an **approximate** nearest neighbor (ANN) search: it may 
 
 ## IVF: look only in the nearest buckets
 
-**IVF** (inverted file) groups vectors into clusters. A clustering step (k-means) picks **lists** centers. Each vector joins the list of its nearest center. A query finds its nearest `probes` centers and scans only those lists.
+**IVF** (inverted file) groups vectors into clusters. A clustering step (k-means, which repeatedly moves center points toward the middle of the vectors nearest to them) picks a number of centers. That number is called **lists**. Each vector joins the list of its nearest center. A query finds its nearest `probes` centers and scans only those lists.
 
 In pgvector this is the IVFFlat index. The README suggests `lists` = rows / 1,000 up to 1 million rows, and √rows above that. The default `ivfflat.probes` is 1.
 
@@ -62,7 +64,7 @@ The miss: a query near a cluster border has its true neighbor in the **next** cl
 
 ## HNSW: a graph with express lanes
 
-**HNSW** (hierarchical navigable small world) is a graph. Each vector is a node linked to some near neighbors. A search starts somewhere and walks to nodes closer to the query. A single graph walks slowly across a big space. HNSW stacks layers, like the express and local lanes of a metro.
+**HNSW** (hierarchical navigable small world) is a graph. Each vector is a node linked to some near neighbors. A search starts somewhere and keeps stepping to whichever linked node is closer to the query. This is a **greedy** walk. A single graph walks slowly across a big space. HNSW stacks layers, like the express and local lanes of a metro.
 
 - Every vector is in layer 0. A vector is also placed in layer 1 with probability 1/M, in layer 2 with probability 1/M², and so on. The paper's choice is mL = 1/ln M.
 - For 1 million vectors and M = 16, the layers hold about 1,000,000 / 16^l. Layer 1 holds **62,500**, layer 2 holds **3,906**, and layer 3 holds **244**. Layer 4 holds **15**, and layer 5 holds **1**. This number is derived from the rule, not measured.
@@ -95,14 +97,14 @@ Real queries add a condition: "the 10 nearest products **in category 7**". An ap
 pgvector offers three fixes.
 
 - **Iterative index scans**: the index keeps scanning until enough rows pass the filter.
-- **A B-tree on the filter column**, when the filter matches a small share of rows. Postgres then finds those rows by index and sorts them by distance exactly.
-- **Partial indexes or partitions** when the filter has few distinct values, or per tenant.
+- **A B-tree index on the filter column**, when the filter matches a small share of rows. Postgres then finds those rows by index and sorts them by distance exactly.
+- **Partial indexes or partitions** when the filter has few distinct values, or one per tenant (one per customer of your product).
 
 The same trap shows up in every vector store. Ask how it combines the filter with the index.
 
 ## Where vectors live
 
-**pgvector** adds a `vector` type and these indexes to PostgreSQL (lesson [8.1](/learn/08-technologies/postgresql/)). Your vectors sit next to your rows, in the same transaction and the same backup. The `vector` type holds up to 2,000 dimensions in an HNSW index, and `halfvec` up to 4,000. Dedicated vector databases exist too. They add scale-out features around the same index ideas.
+As said above, pgvector adds a `vector` type and these indexes to PostgreSQL (lesson [8.1](/learn/08-technologies/postgresql/)). Your vectors sit next to your rows, in the same transaction (a group of changes that succeed or fail together) and the same backup. The `vector` type holds up to 2,000 dimensions in an HNSW index, and `halfvec` up to 4,000. Dedicated vector databases exist too. They add features for spreading data over many machines around the same index ideas.
 
 ## Numbers
 
@@ -209,6 +211,7 @@ A k-d tree splits space one axis at a time, like a quadtree (lesson [10.1](/lear
 
 ## Further reading
 
+- You do not need these links to follow the lesson. They are the sources.
 - [Malkov and Yashunin, "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs"](https://arxiv.org/abs/1603.09320). The paper covers layers, M, efConstruction, and the memory estimate.
 - [pgvector README](https://github.com/pgvector/pgvector) (operators, HNSW and IVFFlat options, filtering, iterative scans)
 - [Wikipedia: Cosine similarity](https://en.wikipedia.org/wiki/Cosine_similarity) (the formula and its range)

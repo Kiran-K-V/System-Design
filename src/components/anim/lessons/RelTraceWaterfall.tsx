@@ -20,7 +20,7 @@ const SPANS: Span[] = [
   { id: 'root', parent: null, name: 'GET /checkout', service: 'gateway', start: 0, end: 250, depth: 0 },
   { id: 'auth', parent: 'root', name: 'check token', service: 'auth', start: 5, end: 30, depth: 1 },
   { id: 'cart', parent: 'root', name: 'load cart', service: 'cart', start: 35, end: 110, depth: 1 },
-  { id: 'sql', parent: 'cart', name: 'SELECT items', service: 'cart db', start: 45, end: 100, depth: 2 },
+  { id: 'sql', parent: 'cart', name: 'read items', service: 'cart db', start: 45, end: 100, depth: 2 },
   { id: 'pay', parent: 'root', name: 'charge card', service: 'payments', start: 115, end: 235, depth: 1 },
   { id: 'bank', parent: 'pay', name: 'bank API call', service: 'external', start: 125, end: 225, depth: 2 },
   { id: 'order', parent: 'root', name: 'write order', service: 'orders', start: 238, end: 248, depth: 1 },
@@ -33,7 +33,7 @@ interface Step {
 }
 
 const steps: Step[] = [
-  { caption: 'A user taps Pay. The gateway starts a trace and makes up a trace ID. Every span made for this request will carry that ID. A span is one timed unit of work. Here is the empty canvas: time runs left to right, 0 to 250 ms.', shown: 0, focus: null },
+  { caption: 'A user taps Pay. The gateway (the front door that receives every request) starts a trace and makes up a trace ID. Every span made for this request will carry that ID. A span is one timed unit of work. Here is the empty canvas: time runs left to right, 0 to 250 ms.', shown: 0, focus: null },
   { caption: 'The gateway opens the first span, the root: GET /checkout. It has no parent. It starts at 0 ms. Its bar will end when the response is sent, so it is the length of the whole request.', shown: 1, focus: 'root' },
   { caption: 'The gateway calls the auth service. The call carries the trace ID and the root span\'s ID in a header. Auth opens a child span with parent = root. It takes 25 ms.', shown: 2, focus: 'auth' },
   { caption: 'Next the gateway calls the cart service. Another child of the root. It runs from 35 ms to 110 ms.', shown: 3, focus: 'cart' },

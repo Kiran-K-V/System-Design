@@ -19,21 +19,21 @@ Discord's 2017 post gives the starting point. Around November 2015 the service r
 
 ## Before: MongoDB, then Cassandra
 
-**What Discord says (2017).** Messages sat in one MongoDB collection with one compound index on channel and creation time. Once the index left RAM, reads went to disk. The post gives an example: returning 50 messages can cause "many random seeks on disk causing disk cache evictions". The team listed its needs and states that "Cassandra was the only database that fulfilled all of our requirements."
+**What Discord says (2017).** Messages sat in one MongoDB collection with one compound index on channel and creation time. An index is a sorted lookup table kept beside the data, like the index at the back of a book. A compound index sorts by two fields, here channel first and then time. Once the index left RAM, reads went to disk. The post gives an example: returning 50 messages can cause "many random seeks on disk causing disk cache evictions". The team listed its needs and states that "Cassandra was the only database that fulfilled all of our requirements."
 
-The new key followed the read pattern (lesson [4.7](/learn/04-data/sharding/) on choosing a shard key). The channel became the partition key, "since all queries operate on a channel". Message IDs are Snowflakes, which sort by time, so they became the clustering key. Cassandra's storage model is in lesson [8.3](/learn/08-technologies/cassandra/).
+The new key followed the read pattern (lesson [4.7](/learn/04-data/sharding/) on choosing a shard key). The channel became the partition key, "since all queries operate on a channel". Message IDs are Snowflakes, which are numbers that grow with time. So they sort by time, and they became the clustering key. The clustering key sets the order of rows inside one partition. Cassandra's storage model is in lesson [8.3](/learn/08-technologies/cassandra/).
 
 Pure channel partitions can grow without limit. So Discord added a time bucket to the partition key. The post says about 10 days of messages fit in a bucket the team "could comfortably stay under 100MB". Play with the idea below. The message sizes are our assumption, not Discord's data.
 
 <DiscordBucket client:visible />
 
-The 2017 numbers describe a cluster of 12 nodes with a replica factor of 3. Each node holds nearly 1 TB of compressed data. Writes take under a millisecond, and reads take under 5 ms.
+The 2017 numbers describe a cluster of 12 nodes with a replica factor of 3. That means each row is stored on 3 nodes, so one node can fail and no data is lost. Each node holds nearly 1 TB of compressed data. Writes take under a millisecond, and reads take under 5 ms.
 
 **What Discord says (2023).** By the start of 2022 the cluster had 177 nodes and trillions of messages. The post calls it "a high-toil system". The on-call team was "frequently paged", and latency was unpredictable. Three causes are named:
 
 - **Hot partitions.** "Lots of concurrent reads" on one channel could hotspot a partition. The post says a hot partition "frequently affected latency across our entire database cluster".
-- **Garbage collection pauses.** Cassandra runs on the JVM. "GC pauses would cause significant latency spikes."
-- **Compaction debt.** Operators did the "gossip dance": take a node out of rotation so it can compact without taking traffic.
+- **Garbage collection pauses.** Cassandra runs on the JVM, the Java Virtual Machine. This is the program that runs Java code. Java frees unused memory in the background with a garbage collector. Think of a cleaner who stops all work in the room to tidy up. While the collector runs, the program can pause for a short time and answer nothing. The post says "GC pauses would cause significant latency spikes." GC is short for garbage collection.
+- **Compaction debt.** Cassandra writes new data to many small files on disk. Compaction is the background job that merges those files into fewer, larger ones, like tidying loose pages into a binder. If a node falls behind, reads get slower because they must check many files. That backlog is the debt. Operators did the "gossip dance": take a node out of rotation so it can compact without taking traffic. The name comes from gossip, the way Cassandra nodes tell each other which nodes are up.
 
 ## After: ScyllaDB and data services
 
@@ -42,9 +42,9 @@ The 2017 numbers describe a cluster of 12 nodes with a replica factor of 3. Each
 **What Discord says.** Two changes happened together.
 
 1. The database became ScyllaDB, "a Cassandra-compatible database written in C++". It has no garbage collector. The post reports 72 ScyllaDB nodes instead of 177 Cassandra nodes. Each node has 9 TB of disk, up from an average of 4 TB.
-2. A new layer of **data services**, written in Rust, sits between the API monolith and the database. "The big feature our data services provide is request coalescing." If many users ask for the same row at the same moment, "we'll only query the database once." Requests are routed by consistent hashing (lesson [4.8](/learn/04-data/consistent-hashing/)). As a result, all requests for one channel reach one instance. That makes coalescing work.
+2. A new layer of **data services**, written in Rust, sits between the API monolith and the database. The monolith is the one large program that holds all of Discord's API code. "The big feature our data services provide is request coalescing." If many users ask for the same row at the same moment, "we'll only query the database once." Requests are routed by consistent hashing (lesson [4.8](/learn/04-data/consistent-hashing/)). This means a hash of the channel ID picks the service instance. As a result, all requests for one channel reach one instance. That makes coalescing work.
 
-Reported results: fetching historical messages went from a p99 of 40 to 125 ms to 15 ms. Message inserts went from 5 to 70 ms p99 to a steady 5 ms. The cutover was in May 2022. Moving the data ran at up to 3.2 million messages per second. A first estimate of three months dropped to nine days after the team rewrote its migration tool in Rust.
+Reported results: fetching historical messages went from a p99 of 40 to 125 ms to 15 ms. The p99 is the time that 99 out of 100 requests beat, so it shows the slow tail and not the average. Message inserts went from 5 to 70 ms p99 to a steady 5 ms. The cutover, the day traffic switched to the new system, was in May 2022. Moving the data ran at up to 3.2 million messages per second. A first estimate of three months dropped to nine days after the team rewrote its migration tool in Rust.
 
 <Callout type="deep" title="Our reading">
 Coalescing is the same idea as the request collapsing that protects a cache from a stampede (lesson [5.5](/learn/05-caching/invalidation-stampede/)). Here it protects the database itself.

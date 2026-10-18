@@ -27,7 +27,7 @@ const naive: CompareVariant = {
       active: ['f'],
     },
     {
-      caption: 'The site slows down, blocks the crawler, or answers 429 (too many requests). Meanwhile b.example and c.example sit idle, and a ban hurts the whole crawl.',
+      caption: 'The site slows down, blocks the crawler, or answers 429 (too many requests, a status code that tells you to slow down). Meanwhile b.example and c.example sit idle, and a ban hurts the whole crawl.',
       tones: { ha: 'bad', hb: 'muted', hc: 'muted' },
       active: ['ha'],
     },

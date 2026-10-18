@@ -33,9 +33,9 @@ This case study is about three parts the algorithm lesson skipped. Part one is w
 **Scale.** These are interview assumptions, not company data.
 
 - Peak of 1 million requests a second across all clients. Every request needs one check.
-- One Redis instance sustains about 50,000 limiter calls a second. Lesson [8.2](/learn/08-technologies/redis/) warns that no single ops-per-second number is universal, and a script costs more than a plain `GET`. So this is a planning number. Benchmark your own hardware.
+- One Redis instance (a fast in-memory store that many servers can share) sustains about 50,000 limiter calls a second. Lesson [8.2](/learn/08-technologies/redis/) warns that no single ops-per-second number is universal, and a script costs more than a plain `GET`. So this is a planning number. Benchmark your own hardware.
 
-Derive the shard count. At 1M checks a second and 50K per shard, you need enough shards just to carry the load. The math is 1,000,000 ÷ 50,000 = 20 shards. Redis near 100% busy has no room for a burst. Many designs aim for about half load. That gives 40 shards. Say "20 at the minimum, about 40 for headroom". The exact number matters less than showing the division.
+Derive the shard count. A shard is one Redis instance that holds a slice of the clients' buckets. At 1M checks a second and 50K per shard, you need enough shards just to carry the load. The math is 1,000,000 ÷ 50,000 = 20 shards. Redis near 100% busy has no room for a burst. Many designs aim for about half load. That gives 40 shards. Say "20 at the minimum, about 40 for headroom". The exact number matters less than showing the division.
 
 <Ballpark
   client:visible
@@ -69,15 +69,15 @@ Step through it. Each step adds one box for one requirement.
 
 <RateLimiterBuild client:visible />
 
-**Where does the check run?** You can place it in the client, in each service, or at the gateway. Never rely on the client, since callers can lie or skip it. Per-service checks repeat the same code and drift. The usual answer is the API gateway ([lesson 8.10](/learn/08-technologies/api-gateway/)), or a sidecar next to each service. The gateway already knows the caller, so it can pick the key. Keep a coarse per-IP limit before login and a per-user limit after it.
+**Where does the check run?** You can place it in the client, in each service, or at the gateway. Never rely on the client, since callers can lie or skip it. Per-service checks repeat the same code and drift. The usual answer is the API gateway ([lesson 8.10](/learn/08-technologies/api-gateway/)), or a sidecar (a small helper process that runs beside each service and handles its traffic). The gateway already knows the caller, so it can pick the key. Keep a coarse per-IP limit before login and a per-user limit after it.
 
 ## Deep dive 1: the check must be atomic
 
-Each check does three things: refill the bucket for the time that passed, test for a token, and take one. If these are separate Redis calls, two gateways can interleave them. Watch the race, then the fix.
+Each check does three things: refill the bucket for the time that passed, test for a token, and take one. If these are separate Redis calls, two gateways can interleave them. Redis has simple commands for this. `GET` reads a stored value. `SET` writes one. A **race** is a bug where the result depends on which of two overlapping actions happens first. An **atomic** step is one that nothing can interrupt, like a turnstile that lets exactly one person through at a time. Watch the race, then the fix.
 
 <RateLimiterAtomic client:visible />
 
-The cure is one **Lua script**. Redis guarantees that a script runs atomically. In the words of the Redis docs, all of a script's effects "either have yet to happen or had already happened". No other command runs in the middle.
+The cure is one **Lua script**. Lua is a small programming language. Redis can run a short Lua program inside itself, next to the data. Think of handing the cashier a written note with all your steps, instead of shouting them one at a time while other customers cut in. The sketch below is about ten lines. Redis guarantees that a script runs atomically. In the words of the Redis docs, all of a script's effects "either have yet to happen or had already happened". No other command runs in the middle.
 
 A sketch of the script:
 
@@ -101,19 +101,19 @@ Read it in order. It reads the stored state. It adds `elapsed × rate` tokens, c
 
 Details that matter:
 
-- **The script reads the clock inside Redis**, with `TIME`. All gateways then share one clock, so skew between gateway servers cannot give one client extra tokens. The Redis docs say that since version 5, scripts replicate by their effects, so calling `TIME` is allowed.
+- **The script reads the clock inside Redis**, with `TIME`. All gateways then share one clock, so clock skew (two servers disagreeing about the time) between gateway servers cannot give one client extra tokens. The Redis docs say that since version 5, scripts replicate by their effects, so calling `TIME` is allowed.
 - **The key expires after twice the refill time.** An idle bucket refills to full after `cap ÷ rate` seconds. A full bucket is the same as a missing key. So deleting it after that is lossless, and idle keys do not pile up. With capacity 100 and rate 10 a second, the expiry is 2 × 10 = 20 seconds.
 - **Pass only the key in `KEYS`.** The Redis docs require every key a script touches to be given as a key argument. That is what lets Redis Cluster route the call.
-- **Load the script once** with `SCRIPT LOAD` and call it by hash with `EVALSHA`. The script cache is lost on restart and failover, so the client must reload on a `NOSCRIPT` error. Most clients do this for you.
+- **Load the script once** with `SCRIPT LOAD` and call it by its fingerprint (a hash of its text) with `EVALSHA`, so the full text is not sent each time. The script cache is lost on restart and failover, so the client must reload on a `NOSCRIPT` error. Most clients do this for you.
 - **Keep the script short.** A script blocks the whole instance while it runs. This one does a few hash operations.
 
 ## Deep dive 2: scale and keys
 
-Twenty to forty shards need a rule that sends every call for one client to one shard. Redis Cluster does this with 16,384 hash slots. The slot is `CRC16(key) mod 16384`. Each primary owns a range of slots ([lesson 8.2](/learn/08-technologies/redis/)). Because each script touches one key, it never spans two shards. Resizing moves whole slots, in the spirit of [lesson 4.8](/learn/04-data/consistent-hashing/).
+Twenty to forty shards need a rule that sends every call for one client to one shard. Redis Cluster does this with 16,384 hash slots, which are numbered buckets that keys fall into. The slot is `CRC16(key) mod 16384`, where CRC16 is a fixed function that turns any key into a number. Each primary owns a range of slots ([lesson 8.2](/learn/08-technologies/redis/)). Because each script touches one key, it never spans two shards. Resizing moves whole slots, in the spirit of [lesson 4.8](/learn/04-data/consistent-hashing/).
 
-Latency has two parts. The gateway keeps a pool of open connections to Redis, so no call pays for a new TCP handshake. The shard sits in the same region as the gateway, so one round trip is short. Our 10 ms budget covers the round trip and a script that does a few hash operations.
+Latency has two parts. The gateway keeps a pool of open connections to Redis, so no call pays for a new connection setup (the TCP handshake from module 2). The shard sits in the same region as the gateway, so one round trip is short. Our 10 ms budget covers the round trip and a script that does a few hash operations.
 
-**Hot keys.** One abusive client sending 200,000 calls a second would saturate its shard and hurt the other clients on it. Options: block it at the edge once it is far over limit, so most of its traffic never reaches Redis; let each gateway take a batch of 10 tokens at a time and spend them locally; or give heavy customers their own shards. Each option trades some accuracy for less load.
+**Hot keys.** A hot key is one key that gets far more traffic than the rest. One abusive client sending 200,000 calls a second would saturate its shard and hurt the other clients on it. Options: block it at the edge once it is far over limit, so most of its traffic never reaches Redis; let each gateway take a batch of 10 tokens at a time and spend them locally; or give heavy customers their own shards. Each option trades some accuracy for less load.
 
 **Many regions.** A global bucket needs a slow round trip across oceans on every request. Most designs give each region its own limit, such as a share of the total. These designs accept that a client can reach the sum of the regional limits. That is the eventual-consistency trade we accepted in the requirements.
 

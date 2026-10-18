@@ -36,7 +36,7 @@ const steps: CStep[] = [
   },
   {
     caption:
-      'The TTL runs out. Columns 1 and 2 delete the value: the key is gone. Column 3 keeps the old value but marks it stale, as the Cache-Control directive stale-while-revalidate allows.',
+      'The TTL runs out. Columns 1 and 2 delete the value: the key is gone. Column 3 keeps the old value but marks it stale, a trick called stale-while-revalidate.',
     cols: [
       { req: 'readers', cache: 'EMPTY (TTL up)', cacheTone: 'bad', db: 0, dbTone: 'muted', out: 'next read will miss', outTone: 'warn' },
       { req: 'readers', cache: 'EMPTY (TTL up)', cacheTone: 'bad', db: 0, dbTone: 'muted', out: 'next read will miss', outTone: 'warn' },

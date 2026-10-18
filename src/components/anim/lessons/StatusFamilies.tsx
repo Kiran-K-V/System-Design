@@ -30,7 +30,7 @@ const FAMILIES: Family[] = [
     codes: [
       ['301', 'moved for good'],
       ['302', 'moved for now'],
-      ['304', 'use your cached copy'],
+      ['304', 'use your saved copy'],
     ],
   },
   {
@@ -44,7 +44,7 @@ const FAMILIES: Family[] = [
       ['403', 'not allowed'],
       ['404', 'no such resource'],
       ['409', 'clashes with state'],
-      ['422', 'fails validation'],
+      ['422', 'fails the rules'],
       ['429', 'slow down'],
     ],
   },
@@ -55,9 +55,9 @@ const FAMILIES: Family[] = [
     color: 'var(--bad)',
     codes: [
       ['500', 'server bug'],
-      ['502', 'bad upstream reply'],
+      ['502', 'bad reply from behind'],
       ['503', 'overloaded or down'],
-      ['504', 'upstream too slow'],
+      ['504', 'server behind too slow'],
     ],
   },
 ];

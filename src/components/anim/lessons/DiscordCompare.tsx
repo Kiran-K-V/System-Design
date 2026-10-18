@@ -22,10 +22,10 @@ const before: CompareVariant = {
       notes: [{ x: 560, y: 250, text: 'hot partition slows every query', anchor: 'middle', tone: 'bad' }],
     },
     {
-      caption: 'The Java garbage collector adds latency spikes. To compact a lagging node, operators took it out of rotation. The team called this the gossip dance.',
+      caption: 'The Java memory cleaner (garbage collector) pauses the node and adds latency spikes. To let a lagging node tidy its disk files, operators took it out of rotation. The team called this the gossip dance.',
       active: ['cass'],
       tones: { cass: 'bad' },
-      notes: [{ x: 560, y: 250, text: 'GC pauses and compaction debt', anchor: 'middle', tone: 'bad' }],
+      notes: [{ x: 560, y: 250, text: 'memory pauses and disk-tidying backlog', anchor: 'middle', tone: 'bad' }],
     },
   ],
 };
@@ -46,7 +46,7 @@ const after: CompareVariant = {
   ],
   steps: [
     { caption: 'The same busy channel. Five users ask for the same recent messages.', packets: [{ from: 'users', to: 'api', label: '5 reads' }] },
-    { caption: 'The monolith calls a data service. Consistent hash routing sends every request for one channel to the same service instance.', packets: [{ from: 'api', to: 'ds', label: '5 reads' }], active: ['ds'] },
+    { caption: 'The monolith calls a data service. Hash-based routing on the channel ID sends every request for one channel to the same service instance.', packets: [{ from: 'api', to: 'ds', label: '5 reads' }], active: ['ds'] },
     {
       caption: 'The service keeps one query in flight per row. Four of the five requests wait on the first one. This is request coalescing.',
       active: ['ds'],

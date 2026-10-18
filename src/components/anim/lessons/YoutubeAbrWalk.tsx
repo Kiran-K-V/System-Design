@@ -20,7 +20,7 @@ interface Step {
 const steps: Step[] = [
   {
     caption:
-      'The player has the manifest: one video, four rungs, many 6-second segments per rung. It has no speed measurement yet, so it plays safe and asks for segment 1 from the lowest rung. A low-rung segment is small, so the picture starts fast.',
+      'The player has the manifest: one video, four rungs, many 6-second segments per rung. It has not measured the connection speed yet, so it plays safe and asks for segment 1 from the lowest rung. A low-rung segment is small, so the picture starts fast.',
     chosen: [3],
     line: 'No measurement yet: start low',
     tone: 'accent',

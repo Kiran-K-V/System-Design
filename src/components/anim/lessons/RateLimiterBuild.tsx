@@ -26,32 +26,32 @@ const edges: BuildEdge[] = [
 
 const steps: BuildStep[] = [
   {
-    req: 'FR1 and FR2: limit each client',
+    req: 'Goal: limit each client',
     caption: 'Start with one gateway. It finds the caller (API key, user, or IP) and keeps a token bucket per caller in its own memory. A request with a token goes on to the backend.',
     packets: [{ from: 'client', to: 'gw1' }],
   },
   {
-    req: 'NFR: the limit holds across servers',
+    req: 'Quality: the limit holds across servers',
     caption: 'A second gateway breaks it. Each keeps its own buckets, so a client gets twice the limit. Move the buckets into a shared Redis, one key per caller.',
   },
   {
-    req: 'NFR: no two servers pass the same token',
-    caption: 'No new box. The refill, the check, and the take run as one Lua script inside Redis, so two gateways can never both take the last token. The deep dive shows the race.',
+    req: 'Quality: no two servers pass the same token',
+    caption: 'No new box. The refill, the check, and the take run as one small script inside Redis, in a single uninterruptible step, so two gateways can never both take the last token. The deep dive shows the race.',
     active: ['redis'],
   },
   {
-    req: 'FR3: reject with 429',
+    req: 'Goal: reject with 429',
     caption: 'When the script says no, the gateway answers 429 Too Many Requests with a Retry-After header. The backend never sees the request.',
     packets: [{ from: 'gw1', to: 'client', tone: 'bad' }],
     active: ['gw1'],
   },
   {
-    req: 'NFR: 1M checks per second',
-    caption: 'One Redis cannot take that load under our assumption. Split callers over shards by key (lesson 4.8). Each caller always lands on the same shard, so its bucket stays in one place.',
+    req: 'Quality: 1M checks per second',
+    caption: 'One Redis cannot take that load under our assumption. Split callers over shards (separate Redis servers, each holding some callers) by key (lesson 4.8). Each caller always lands on the same shard, so its bucket stays in one place.',
     packets: [{ from: 'gw1', to: 'shard2' }],
   },
   {
-    req: 'NFR: highly available',
+    req: 'Quality: highly available',
     caption: 'Each shard gets a replica for failover. If Redis is unreachable, the gateway must pick: let requests through (fail open) or block them (fail closed).',
   },
   {

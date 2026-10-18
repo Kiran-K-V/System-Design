@@ -3,7 +3,7 @@ import { WidgetFrame } from '../data-kit';
 import { b64uToText, hmacSha256B64u, textToB64u } from './b64';
 
 /**
- * Widget: a real HS256 JWT (RFC 7519 structure: header.claims.signature, each base64url).
+ * Widget: a real HS256 JWT (header.claims.signature, each base64url).
  * The sample token was signed with the key "demo-secret".
  * Tamper with a claim and the old signature no longer matches. Re-sign with the key and it does.
  */
@@ -70,11 +70,11 @@ export default function TokenAnatomy() {
 
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
         <div>
-          <div className="text-xs font-semibold" style={{ color: 'var(--accent)' }}>HEADER (decoded)</div>
+          <div className="text-xs font-semibold" style={{ color: 'var(--accent)' }}>HEADER (decoded: which signing method)</div>
           <pre className="mt-1 overflow-x-auto rounded bg-surface px-3 py-2 font-mono text-xs">{JSON.stringify(JSON.parse(b64uToText(HEAD)), null, 2)}</pre>
         </div>
         <div>
-          <div className="text-xs font-semibold" style={{ color: 'var(--warn)' }}>CLAIMS (decoded)</div>
+          <div className="text-xs font-semibold" style={{ color: 'var(--warn)' }}>CLAIMS (decoded: who, for whom, until when)</div>
           <pre className="mt-1 overflow-x-auto rounded bg-surface px-3 py-2 font-mono text-xs" data-testid="claims">{JSON.stringify(claims, null, 2)}</pre>
           <div className="mt-1 text-xs text-muted">
             iat = {iso(iat)}, exp = {iso(exp)}
@@ -109,8 +109,8 @@ export default function TokenAnatomy() {
       >
         {verdict === 'checking' && 'Checking signature...'}
         {verdict === 'valid' && 'Signature valid: the API accepts these claims.'}
-        {verdict === 'invalid' && 'Signature invalid: HMAC(key, header.claims) does not match. The API rejects the token.'}
-        {verdict === 'unsupported' && 'This browser has no WebCrypto, so the signature cannot be checked here.'}
+        {verdict === 'invalid' && 'Signature invalid: the signature does not match the header, the claims and the key. The API rejects the token.'}
+        {verdict === 'unsupported' && 'This browser cannot do the signature math here.'}
       </div>
     </WidgetFrame>
   );

@@ -18,7 +18,7 @@ const variants: CompareVariant[] = [
         notes: [{ x: 24, y: 250, text: '4 rungs, one at a time = 4 × the work in one queue', tone: 'warn' }],
       },
       {
-        caption: 'The worker is 90% through the first rung when the machine is reclaimed. Nothing was saved in the middle. The job restarts from frame zero.',
+        caption: 'The worker is 90% through the first rung when the machine is taken away. Nothing was saved in the middle. The job restarts from frame zero.',
         active: ['w'],
         tones: { w: 'bad' },
         notes: [{ x: 24, y: 250, text: 'Crash at 90%: all of that work is lost', tone: 'bad' }],
@@ -33,7 +33,7 @@ const variants: CompareVariant[] = [
   },
   {
     id: 'dag',
-    label: 'Better: DAG of small jobs',
+    label: 'Better: a graph of small jobs',
     nodes: [
       { id: 'raw', x: 70, y: 150, w: 100, h: 44, label: 'Raw file' },
       { id: 'split', x: 205, y: 150, w: 100, h: 44, label: 'Split' },
@@ -55,7 +55,7 @@ const variants: CompareVariant[] = [
     ],
     steps: [
       {
-        caption: 'The pipeline is a directed graph with no cycles. A job may run when all its inputs are done. First job: split the raw file into segments a few seconds long, each starting at a frame that decodes on its own.',
+        caption: 'The pipeline is a graph of jobs with no loops. A job may run when all its inputs are done. First job: split the raw file into segments a few seconds long, each starting at a keyframe that decodes on its own.',
         active: ['split'],
         packets: [{ from: 'raw', to: 'split' }],
         notes: [{ x: 24, y: 320, text: '10 min / 6 s = 100 segments. 4 rungs: 400 encode jobs', tone: 'accent' }],
@@ -68,7 +68,7 @@ const variants: CompareVariant[] = [
         notes: [{ x: 24, y: 320, text: 'Jobs run in parallel on many workers', tone: 'accent' }],
       },
       {
-        caption: 'Job “seg 2” fails: its worker was reclaimed. The orchestrator retries that one job. The other two outputs are safe in storage. The job writes to a key made from video, rung, and segment, so a retry overwrites instead of duplicating.',
+        caption: 'Job “seg 2” fails: its machine was taken away by the cloud provider. The orchestrator retries that one job. The other two outputs are safe in storage. The job writes to a key made from video, rung, and segment, so a retry overwrites instead of duplicating.',
         active: ['j2'],
         tones: { j1: 'ok', j2: 'bad', j3: 'ok' },
         notes: [{ x: 24, y: 320, text: 'Retry 1 job of 400, not the whole video', tone: 'bad' }],

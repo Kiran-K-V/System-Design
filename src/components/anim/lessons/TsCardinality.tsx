@@ -26,8 +26,8 @@ export default function TsCardinality() {
         <div className="grid gap-2 sm:grid-cols-2">
           <Card title="Series" value={fmt(c.series)} note={`${hosts} × ${endpoints} × ${status} × ${users}`} tone={huge ? 'bad' : 'ok'} />
           <Card title="Samples per day" value={fmt(c.samplesPerDay)} note="One sample per series every 15 s: 5,760 per series." />
-          <Card title="Disk per day" value={bytesFmt(c.bytesPerDay)} note="Assumes 1.5 bytes per sample. Prometheus quotes 1 to 2." />
-          <Card title="Disk for 15 days" value={bytesFmt(c.totalBytes)} note="15 days is the Prometheus default retention." tone={huge ? 'bad' : undefined} />
+          <Card title="Disk per day" value={bytesFmt(c.bytesPerDay)} note="Assumes 1.5 bytes per sample. Real stores quote 1 to 2." />
+          <Card title="Disk for 15 days" value={bytesFmt(c.totalBytes)} note="Retention is how long data is kept. 15 days is a common default." tone={huge ? 'bad' : undefined} />
         </div>
       </div>
     </CacheWidgetFrame>

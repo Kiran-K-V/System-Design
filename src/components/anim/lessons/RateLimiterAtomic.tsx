@@ -26,14 +26,14 @@ const naive: CompareVariant = {
 
 const lua: CompareVariant = {
   id: 'lua',
-  label: 'Better: one Lua script',
+  label: 'Better: one script in Redis',
   ...common,
   edges: [
     { from: 'a', to: 'redis' },
     { from: 'b', to: 'redis' },
   ],
   steps: [
-    { caption: 'Same start: one token left, two requests at two gateways. This time each gateway sends one EVAL call. The script does refill, check, and take.', notes: [{ x: 470, y: 250, text: 'tokens = 1', anchor: 'middle', tone: 'accent' }] },
+    { caption: 'Same start: one token left, two requests at two gateways. This time each gateway sends one call that runs a small script inside Redis. The script does refill, check, and take.', notes: [{ x: 470, y: 250, text: 'tokens = 1', anchor: 'middle', tone: 'accent' }] },
     { caption: 'Both calls reach Redis. Redis runs one script at a time. It starts A first. B waits its turn.', packets: [{ from: 'a', to: 'redis' }, { from: 'b', to: 'redis', delay: 0.3 }], tones: { redis: 'accent' }, notes: [{ x: 470, y: 250, text: 'running: A', anchor: 'middle', tone: 'accent' }] },
     { caption: 'A\'s script sees 1 token, takes it, and returns allowed. The script ends. Only then does B\'s script start.', packets: [{ from: 'redis', to: 'a', tone: 'ok' }], tones: { a: 'ok' }, notes: [{ x: 470, y: 250, text: 'tokens = 0', anchor: 'middle', tone: 'ok' }] },
     { caption: 'B\'s script sees 0 tokens, changes nothing, and returns rejected. One token, one pass. Gateway B answers 429.', packets: [{ from: 'redis', to: 'b', tone: 'bad' }], tones: { a: 'ok', b: 'warn' }, notes: [{ x: 470, y: 250, text: 'tokens = 0, 1 passed', anchor: 'middle', tone: 'ok' }] },
@@ -47,7 +47,7 @@ export default function RateLimiterAtomic() {
       prompt="Check method:"
       variants={[naive, lua]}
       height={330}
-      label="Two gateways race for the last token. A GET then SET lets both through. A single Lua script lets only one through."
+      label="Two gateways race for the last token. A GET then SET lets both through. A single script run inside Redis lets only one through."
     />
   );
 }

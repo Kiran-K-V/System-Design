@@ -12,13 +12,13 @@ const ROWS_AT_STEP = [0, 1, 3, 4, 5, 6, 7, 7];
 const KIND_COLOR = { header: 'var(--muted)', time: 'var(--accent)', value: 'var(--ok)' } as const;
 
 const steps = [
-  { caption: `Three samples as plain data: a 64-bit timestamp and a 64-bit double each, so ${RAW} bits (${RAW / 8} bytes). Gorilla stores them in a block that begins at 02:00:00. We compress field by field.` },
+  { caption: `Three samples as plain data: a 64-bit timestamp and a 64-bit decimal number each, so ${RAW} bits (${RAW / 8} bytes). Gorilla stores them in a block that begins at 02:00:00. We compress field by field.` },
   { caption: 'The block header holds the start time once: 64 bits. Every timestamp in the block is stored relative to it.' },
   { caption: 'Sample 1 time: 02:01:02 is 62 s after the header. The paper stores this first delta in 14 bits. Sample 1 value: stored raw, 64 bits.' },
   { caption: 'Sample 2 time: the delta is 60 s. Last delta was 62 s. The delta of delta is 60 − 62 = −2. A value in [−63, 64] costs the control bits "10" plus 7 bits: 9 bits.' },
   { caption: 'Sample 2 value is 12.0 again. XOR with the previous value is all zeros. One "0" bit says "same as before": 1 bit.' },
   { caption: 'Sample 3 time: the delta is 60 s again. The delta of delta is 0, so one "0" bit. A steady 60 s scrape costs 1 bit per timestamp.' },
-  { caption: 'Sample 3 value 24.0 XOR 12.0 = 0x0010000000000000. It has 11 leading zeros and one meaningful bit. Store control "11", 5 bits for 11, 6 bits for length 1, then the bit itself: 2 + 5 + 6 + 1 = 14 bits.' },
+  { caption: 'Sample 3 value: 24.0 XOR 12.0 gives a 64-bit result with 11 zeros at the front and one 1 bit (the meaningful bit). Store control "11", 5 bits for 11, 6 bits for length 1, then the bit itself: 2 + 5 + 6 + 1 = 14 bits.' },
   { caption: `Total: 64 + 14 + 64 + 9 + 1 + 1 + 14 = ${TOTAL} bits, under 21 bytes, from ${RAW} bits. The header and the first value are the big costs. In a long block they are spread over thousands of points. The paper reports 1.37 bytes per point on average, against 16.` },
 ];
 

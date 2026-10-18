@@ -5,7 +5,7 @@ import { EX_CHALLENGE, EX_VERIFIER } from './PkceFlow';
 
 /**
  * Widget: the authorization server stores code_challenge = BASE64URL(SHA256(verifier)) at /authorize.
- * At /token it hashes the verifier it receives and compares (RFC 7636 section 4.6).
+ * At /token it hashes the verifier it receives and compares.
  * The first verifier is the legitimate app. The second is what an attacker who stole the code might try.
  */
 
@@ -63,7 +63,7 @@ export default function PkceLab() {
       title="PKCE lab: why a stolen code is useless"
       caption={
         err
-          ? 'This browser has no WebCrypto, so the hash cannot be computed here.'
+          ? 'This browser cannot compute the hash here.'
           : 'The server stored the challenge from the real app. It hashes whatever verifier arrives at /token and compares. Edit the attacker\'s guess: only the exact secret passes. Edit the app\'s verifier to see the challenge change with it.'
       }
     >

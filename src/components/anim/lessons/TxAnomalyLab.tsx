@@ -39,7 +39,7 @@ const SCENARIOS: Scenario[] = [
     id: 'dirty',
     tab: 'Dirty read',
     bad: {
-      level: 'Read uncommitted (the SQL standard allows this)',
+      level: 'Read uncommitted (the weakest level: no protection)',
       levelTone: 'bad',
       intro: 'Alice has a balance of 100. T1 will change it and then cancel. T2 will read it in between. A dirty read means reading data that another transaction wrote but has not committed.',
       events: [

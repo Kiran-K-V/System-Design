@@ -23,22 +23,22 @@ This is a queue (lesson [6.1](/learn/06-async/queues/)). A queue only protects y
 
 The outage began with database contention. Jobs ran slowly, so they piled up, "which caused Redis to reach its maximum configured memory limit". New jobs could not be enqueued. Then came the nasty part. The post says "our system actually required a bit of free Redis memory in order to dequeue a job". The queue stayed locked after the database recovered.
 
-The post lists more limits. Redis had little operational headroom, "particularly with respect to memory". Connections formed "a complete bipartite graph", since every client talks to every Redis host. Workers "couldn't scale independently of Redis". And "dequeuing a job requires work proportional to the length of the queue".
+The post lists more limits. Redis had little operational headroom, "particularly with respect to memory". Connections formed "a complete bipartite graph". This means every web and worker client holds a link to every Redis host, so the link count multiplies as either side grows. Workers "couldn't scale independently of Redis". And "dequeuing a job requires work proportional to the length of the queue".
 
 ## After: Kafka in front of Redis
 
-<SlackCompare client:visible />
-
 **What Slack says.** Kafka sits ahead of Redis. Replacing Redis outright would have meant changes to scheduling, execution, and deduplication logic. So the team put Kafka in front, "leaving the existing application enqueue and dequeue interfaces in place".
 
-Two stateless Go services connect the pieces.
+Two stateless Go services connect the pieces. Stateless means a service keeps no data of its own, so you can restart or copy it freely. Go is a programming language.
 
-- **Kafkagate** takes an HTTP POST with a topic, partition, and content, and writes to Kafka with the Sarama driver. It waits only for the partition leader. The post says "we only wait for the leader to acknowledge the request, and not for replication". The post says this carries a small risk of losing a job if a broker dies first.
-- **JQRelay** moves jobs from Kafka to Redis. At startup it tries to take a Consul lock on a key for the topic. The winner relays all partitions of that topic. It "only advances the offset if the job is successfully written to Redis". For a Redis outage it retries without end. For a job-specific error it re-enqueues the job to Kafka. Rate limits live in Consul.
+- **Kafkagate** takes an HTTP POST with a topic, partition, and content, and writes to Kafka with Sarama, a Go library for talking to Kafka. It waits only for the partition leader, the broker that owns that partition. The post says "we only wait for the leader to acknowledge the request, and not for replication". The post says this carries a small risk of losing a job if a broker dies first.
+- **JQRelay** moves jobs from Kafka to Redis. At startup it tries to take a Consul lock on a key for the topic. Consul is a small shared service that many programs can ask, "who holds this lock?" Think of one key to a meeting room. Only one program can hold the key at a time. This choice of one owner is called leader election. Several relay copies run so that one can take over if another dies. The relay that wins the lock is the leader for that topic, and it relays all partitions of that topic. The others wait. If the leader dies, Consul frees the lock and a waiting relay takes it. It "only advances the offset if the job is successfully written to Redis". For a Redis outage it retries without end. For a job-specific error it re-enqueues the job to Kafka. Rate limits live in Consul too. A rate limit caps how many jobs per second JQRelay may write.
 
 When enqueues outpace dequeues, Kafka holds the backlog. Operators can lower JQRelay's rate limit or pause writes to Redis.
 
-The cluster, per the post, runs Kafka 0.10.1.2 on 16 brokers on i3.2xlarge machines. Every topic has 32 partitions, replication factor 3, and 2 days of retention. The rollout canaries covered 50 Redis clusters and 1600 Kafka partitions (50 topics times 32 partitions).
+The cluster, per the post, runs Kafka 0.10.1.2 on 16 brokers on i3.2xlarge machines. Every topic has 32 partitions, replication factor 3, and 2 days of retention. Retention is how long Kafka keeps a job before it deletes it. The i3.2xlarge is an Amazon cloud machine type. The rollout canaries, small test groups that get the change first, covered 50 Redis clusters and 1600 Kafka partitions (50 topics times 32 partitions).
+
+<SlackCompare client:visible />
 
 Watch the failover case below. The "duplicate" step is our reading.
 

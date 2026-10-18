@@ -13,7 +13,7 @@ interface WalStep {
 
 const edges: FlowEdge[] = [
   { from: 'client', to: 'wbuf', head: 'both' },
-  { from: 'wbuf', to: 'wal', label: 'append, fsync', labelAt: [0, -16] },
+  { from: 'wbuf', to: 'wal', label: 'append + flush', labelAt: [0, -16] },
   { from: 'pool', to: 'data', label: 'checkpoint', dashed: true, labelAt: [0, -16] },
   { from: 'wal', to: 'pool', label: 'replay', dashed: true, bend: -26, labelAt: [-6, 0] },
 ];
@@ -32,16 +32,16 @@ const steps: WalStep[] = [
     packets: [],
   },
   {
-    caption: 'The client sends BEGIN, two UPDATEs, COMMIT. The database does not touch the data file yet. It first writes one record to the log buffer in RAM: "txn 41: A=70, B=80, commit".',
+    caption: 'The client sends three commands: start a transaction, change two rows, commit. The database does not touch the data file yet. It first writes one record to the log buffer in RAM: "txn 41: A=70, B=80, commit".',
     ram: { wbuf: 'txn 41 record', pool: 'A=100  B=50' },
     disk: { wal: 'empty', data: 'A=100  B=50' },
     active: ['wbuf'],
     packets: [{ from: 'client', to: 'wbuf', label: 'txn 41' }],
   },
   {
-    caption: 'The record is appended to the log file and flushed (fsync). One sequential write. Now the commit is durable: the change survives a power cut. The data file is still old, and that is fine.',
+    caption: 'The record is appended to the log file and forced onto the disk (the flush). One sequential write. Now the commit is durable: the change survives a power cut. The data file is still old, and that is fine.',
     ram: { wbuf: 'txn 41 record', pool: 'A=100  B=50' },
-    disk: { wal: 'txn 41 ✓ (fsynced)', data: 'A=100  B=50' },
+    disk: { wal: 'txn 41 ✓ (on disk)', data: 'A=100  B=50' },
     active: ['wal'],
     packets: [{ from: 'wbuf', to: 'wal', label: 'append', tone: 'ok' }],
     note: 'durable here',
@@ -50,21 +50,21 @@ const steps: WalStep[] = [
   {
     caption: 'Only now does the client get "OK". The rule: log first, acknowledge second. Everything after this point is housekeeping.',
     ram: { wbuf: 'txn 41 record', pool: 'A=100  B=50' },
-    disk: { wal: 'txn 41 ✓ (fsynced)', data: 'A=100  B=50' },
+    disk: { wal: 'txn 41 ✓ (on disk)', data: 'A=100  B=50' },
     active: ['client'],
     packets: [{ from: 'wbuf', to: 'client', label: 'OK', tone: 'ok' }],
   },
   {
     caption: 'The database applies the change to the cached page in RAM. The page is now dirty: it differs from the copy on disk. It will be written out later, in a batch, at a convenient time.',
     ram: { wbuf: 'txn 41 record', pool: 'A=70  B=80  (dirty)' },
-    disk: { wal: 'txn 41 ✓ (fsynced)', data: 'A=100  B=50  (stale)', dataTone: 'warn' },
+    disk: { wal: 'txn 41 ✓ (on disk)', data: 'A=100  B=50  (stale)', dataTone: 'warn' },
     active: ['pool'],
     packets: [],
   },
   {
     caption: 'CRASH. Power fails. RAM is wiped, and the dirty page with it. The data file shows A=100, B=50, which is wrong. But the client was told "OK", so the system owes it A=70, B=80. The truth survives only in the log.',
     ram: { wbuf: 'lost', pool: 'lost', tone: 'bad' },
-    disk: { wal: 'txn 41 ✓ (fsynced)', data: 'A=100  B=50  (stale)', dataTone: 'warn' },
+    disk: { wal: 'txn 41 ✓ (on disk)', data: 'A=100  B=50  (stale)', dataTone: 'warn' },
     active: [],
     packets: [],
     note: 'POWER CUT',
@@ -73,7 +73,7 @@ const steps: WalStep[] = [
   {
     caption: 'Restart. Recovery reads the log from the last checkpoint and replays every committed record against the page. This is called redo. The page in RAM is rebuilt: A=70, B=80. No acknowledged write is lost.',
     ram: { wbuf: 'empty', pool: 'A=70  B=80  (redone)' },
-    disk: { wal: 'txn 41 ✓ (fsynced)', data: 'A=100  B=50  (stale)', dataTone: 'warn' },
+    disk: { wal: 'txn 41 ✓ (on disk)', data: 'A=100  B=50  (stale)', dataTone: 'warn' },
     active: ['pool'],
     packets: [{ from: 'wal', to: 'pool', label: 'redo', tone: 'ok' }],
   },
