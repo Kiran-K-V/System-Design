@@ -28,6 +28,8 @@ Both fixes show the real tension. Who decides the shape of the response: the ser
 
 ## Three answers
 
+The animation compares three ways to design an API: REST, GraphQL and RPC. Each is explained below the animation. For now, watch how many round trips each one needs.
+
 <FetchRace client:visible />
 
 Watch the REST lane. Two words describe what went wrong.
@@ -58,27 +60,27 @@ The server returns JSON with exactly that shape. Key facts from graphql.org:
 
 - **One endpoint**, usually `/graphql`. Queries go in a `POST` body (`GET` is allowed for queries only).
 - **Three operation types**: `query` reads, `mutation` writes, `subscription` pushes live updates.
-**Strong types and introspection**: clients can ask the server what the schema is. Tools can validate queries before they run.
-- **Evolution without versions**: you add fields freely and mark old ones deprecated.
+- **Strong types and introspection**: clients can ask the server what the schema is. That is called **introspection**. Tools can validate queries before they run.
+- **Evolution without versions**: you add fields freely and mark old ones **deprecated**. Deprecated means "still works, but do not use it in new code". Old clients keep working while new clients move on.
 
-The server works through each field with a **resolver**: a small function that loads the data for that field. That design hides a trap.
+The server works through each field with a **resolver**: a small function that loads the data for that field. Think of a waiter who fetches each dish on your order one at a time. That design hides a trap.
 
 ### The N+1 problem
 
-Say the query asks for 20 posts with their authors. A naive resolver does this:
+Say the query asks for 20 posts with their authors. A naive resolver does this. ("Naive" means the first, simple version, written without thinking about cost.)
 
 1. One query loads the 20 posts.
 2. For each post, the `author` resolver runs its own query. That is 20 more.
 
-That is **N+1 queries**: one for the list, N for the children. At ~1 ms per database query (assumption), the server spends ~21 ms in sequence. The fix is **batching**. A tool such as DataLoader collects all author ids requested in the same tick. It asks for them together: `WHERE id IN (...)`. That is 2 queries, ~2 ms.
+That is **N+1 queries**: one for the list, N for the children. At ~1 ms per database query (assumption), the server spends ~21 ms in sequence. The fix is **batching**: gather many small lookups and send them as one. Think of one trip to the shop with a full list, not 20 trips for one item each. A tool such as DataLoader waits for a tiny moment (one "tick" of the program, well under a millisecond), collects all author ids requested in that time, and asks for them together. The database query for that is `WHERE id IN (...)`, which means "give me every row whose id is in this list". That is 2 queries, ~2 ms.
 
 GraphQL did not remove the fan-out. It moved it from the phone to your data center, where round trips cost microseconds instead of 80 ms. That is a good trade. It still needs care.
 
 ### RPC: call a procedure
 
-**RPC** (remote procedure call) makes a network call look like a function call: `GetProfileScreen(7)`. The unit of design is the **action**, not the resource. In gRPC, which you met in lesson 2.6, services are defined in `.proto` files with Protocol Buffers. Also, gRPC generates client and server code in many languages. It runs on HTTP/2.
+**RPC** (remote procedure call) makes a network call look like a function call: `GetProfileScreen(7)`. The unit of design is the **action**, not the resource. In gRPC, which you met in lesson 2.6, services are defined in `.proto` files with Protocol Buffers. A **Protocol Buffer** (protobuf) is a compact binary message format with a fixed layout. Also, gRPC generates client and server code in many languages. It runs on HTTP/2.
 
-RPC fits **service-to-service** calls. Both sides are your code. Types are generated, so mistakes show up at compile time. Messages are binary and small, so calls are fast. The downsides are tight coupling (change a method and every caller must update) and weaker support in browsers.
+RPC fits **service-to-service** calls. Both sides are your code. Types are generated, so mistakes show up at **compile time**: when you build the code, before it runs, not in production. Messages are binary and small, so calls are fast. The downsides are tight coupling (change a method and every caller must update) and weaker support in browsers.
 
 <ApiStylePanels />
 
@@ -86,8 +88,8 @@ RPC fits **service-to-service** calls. Both sides are your code. Types are gener
 
 GraphQL is not free. Four costs come up again and again.
 
-- **HTTP caching.** Every query goes to the same URL by `POST`. CDNs and browsers cannot cache by URL. You must cache at the field level, or use persisted queries (the client sends a stored query id).
-- **Query cost.** A client can ask for a deeply nested query that loads millions of rows. Limit query depth, score complexity, or allow only pre-approved queries.
+- **HTTP caching.** Every query goes to the same URL by `POST`. CDNs and browsers cannot cache by URL. You must cache at the field level, or use **persisted queries**. With those, the server keeps a list of approved queries. The client sends only a short id such as `q42`, so the request can be a `GET` with a cacheable URL.
+- **Query cost.** A client can ask for a deeply nested query that loads millions of rows. For example: users, their posts, each post's comments, each comment's author, and so on. Limit query depth, give each field a cost score and reject queries over a budget, or allow only pre-approved queries.
 - **Authorization per field.** In REST, you guard a route. In GraphQL, one query reaches many types. Each resolver must check access.
 - **Errors.** A response can hold data and errors together. The GraphQL-over-HTTP rules say to answer `2xx` when `data` is present, because HTTP has no status for "partial success". Monitoring that counts only 4xx and 5xx will miss failures.
 
@@ -103,12 +105,14 @@ At 5,000 profile loads per second, REST makes 25,000 requests per second. GraphQ
 
 ## Trade-offs
 
+One row below needs a picture first. A **BFF** (backend for frontend) is a small server that sits between one kind of client, such as the iOS app, and your internal services. It calls them and shapes one response for that client. Each client team gets its own BFF, so no one waits on a shared API.
+
 | Style | Gain | Pay | Choose it when |
 |---|---|---|---|
 | REST | Simple, cacheable by URL, works everywhere | Over-fetch, many round trips | Public APIs, simple resources, CDN-friendly reads |
 | GraphQL | Client picks fields, one round trip, typed schema | N+1, hard HTTP caching, query cost, auth per field | Many clients with different data needs, nested data |
 | RPC / gRPC | Fast, small, generated typed clients | Tight coupling, browser limits | Internal service-to-service calls |
-| BFF (backend for frontend) | One tailored API per client, REST inside | Another service to build and run | A few clients, each needing very different shapes |
+| BFF (backend for frontend: a small server built for one client) | One tailored API per client, REST inside | Another service to build and run | A few clients, each needing very different shapes |
 
 ## In practice
 
@@ -121,7 +125,7 @@ Do not say "GraphQL is faster". One request is faster than five. But the query s
 </Callout>
 
 <Callout type="deep" title="Why not GraphQL everywhere?">
-GraphQL puts a general query engine in front of your data. That gives clients power, and gives attackers power too. Most teams that adopt it also adopt a gateway, query depth limits, persisted queries and per-field auth. If you have two clients and stable screens, REST plus a few purpose-built endpoints is simpler.
+GraphQL puts a general query engine in front of your data. That gives clients power, and gives attackers power too. Most teams that adopt it also adopt a gateway (one front-door server that all calls pass through), query depth limits, persisted queries and per-field auth. If you have two clients and stable screens, REST plus a few purpose-built endpoints is simpler.
 </Callout>
 
 ## Check yourself

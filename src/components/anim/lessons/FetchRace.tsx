@@ -74,7 +74,7 @@ const steps = [
   },
   {
     caption:
-      'Same screen, same data: 3 round trips against 1. The cost did not vanish. GraphQL moves the fan-out into the server, where it can turn into many database queries. RPC moves it into a per-screen method that a team must keep writing.',
+      'Same screen, same data: 3 round trips against 1. The cost did not vanish. GraphQL moves the extra calls into the server, where they can turn into many database queries. RPC moves them into a per-screen method that a team must keep writing.',
   },
 ];
 

@@ -58,7 +58,7 @@ function steps(scn: Scenario, fix: boolean): Step[] {
       fix
         ? {
             caption:
-              'Fix: you just wrote, so the router sends your read to the leader. (Another way: your write returned a log position, and a follower answers only after it passes that position.) You see "Anna".',
+              'Fix: you just wrote, so the router sends your read to the leader. (Another way: your write returned a position number in the leader\'s list of changes, and a follower answers only after it has applied changes up to that number.) You see "Anna".',
             a: { sub: 'name = Anna', tone: 'ok' },
             b: { sub: 'name = Ann' },
             active: ['c', 'a'],

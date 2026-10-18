@@ -69,9 +69,9 @@ const steps: KStep[] = [
   },
   {
     caption:
-      'Keys cannot live forever. Stripe may remove keys that are at least 24 hours old. After that, K1 is new again and the request runs as a fresh one. Pick a time-to-live longer than any retry window you allow.',
+      'Keys cannot live forever. Stripe may delete keys that are at least 24 hours old. After that, K1 is new again and the request runs as a fresh one. Pick a time-to-live longer than any retry window you allow.',
     req: { lines: ['POST /charges', 'Idempotency-Key: K1', 'body hash: h1'] },
-    decision: '25 h later. K1 pruned: absent',
+    decision: '25 h later. K1 expired: absent',
     res: { line: '201 (new charge)', tone: 'warn' },
     rows: [{ key: 'K1', hash: 'h1', status: 'in progress', saved: '-' }],
   },

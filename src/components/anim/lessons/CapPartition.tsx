@@ -81,7 +81,7 @@ function stepsFor(mode: Mode): Step[] {
         },
     cp
       ? {
-          caption: 'Bob tries to write x = 7. B refuses again. In a real CP system with three or more replicas, the side that still has a majority keeps working. Only the side with no majority refuses.',
+          caption: 'Bob tries to write x = 7. B refuses again. With three or more replicas, the side that still has more than half of them keeps working. Only the side with less than half refuses.',
           xa: '2', xb: '2', cut: true, active: ['bob', 'b'],
           packets: [
             { from: 'bob', to: 'b', label: 'x=7' },
@@ -110,7 +110,7 @@ function stepsFor(mode: Mode): Step[] {
           tone: { a: 'ok', b: 'ok' },
         }
       : {
-          caption: 'The partition heals. The replicas compare notes and find a conflict: 5 versus 7. The system needs a rule to merge them. "Last write wins" silently drops one write. Vector clocks or CRDTs keep both for the app to resolve.',
+          caption: 'The partition heals. The replicas compare notes and find a conflict: 5 versus 7. The system needs a rule to merge them. A simple rule, "last write wins", silently drops one write. Smarter rules keep both versions for the app to merge.',
           xa: '5 / 7?', xb: '7 / 5?', cut: false, active: ['a', 'b'],
           packets: [{ from: 'a', to: 'b', label: 'conflict', tone: 'bad' }],
           noteA: 'must reconcile',

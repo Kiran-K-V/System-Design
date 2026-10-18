@@ -24,13 +24,13 @@ We want two things a queue lacks: **fan-out** (many readers get every message) a
 
 In **publish/subscribe** (pub/sub), a producer publishes to a named **topic**. It does not know who listens. Each consumer **subscribes** to the topic and gets its own copy of every message. The producer stays the same when a fourth team joins.
 
-A common cloud pattern: publish once to a topic (SNS on AWS), and give each subscriber its own queue. SQS fits one subscriber per queue, and SNS fans out to many. Each team then reads its queue at its own speed. This solves fan-out. It does not solve replay, because each queue still deletes what it hands out.
+A common cloud pattern: publish once to a topic (SNS, Amazon's notification service), and give each subscriber its own queue (SQS, Amazon's queue service). SQS fits one subscriber per queue, and SNS fans out to many. Each team then reads its queue at its own speed. This solves fan-out. It does not solve replay, because each queue still deletes what it hands out.
 
 ## The log: records that stay
 
 A **log** is an ordered, append-only list of records. Writers add at the end. Readers read from any position. Reading does not remove anything. A record leaves only when **retention** removes it, by age or size.
 
-Each record has an **offset**, its position in the log, counted from 0. A reader needs to remember one thing: the offset of the next record to read. The Kafka docs say it plainly: the position of a consumer in each partition "is just a single integer."
+Each record has an **offset**, its position in the log, counted from 0. A reader needs to remember one thing: the offset of the next record to read. This is why a log is cheap to read from. The Kafka docs say it plainly: the position of a consumer in each partition "is just a single integer."
 
 Compare the two designs.
 
@@ -38,7 +38,7 @@ Compare the two designs.
 
 Because reading is non-destructive, the log gives you replay and fan-out together. RabbitMQ streams describe themselves the same way: they are non-destructive, and consumers can read the same messages repeatedly. A new service starts at offset 0 and catches up. A fixed bug is re-run by moving the offset back.
 
-What you pay is disk. Kafka's broker defaults keep records for 168 hours (7 days) and set no size limit. Also, a log file segment is 1 GiB. You choose how long to keep data.
+What you pay is disk. Kafka is a widely used log system. A **broker** is one Kafka server. Kafka's broker defaults keep records for 168 hours (7 days) and set no size limit. A log file segment, which is one file on disk that holds a slice of the log, is 1 GiB by default. You choose how long to keep data.
 
 ## Partitions: splitting the log
 
@@ -46,11 +46,13 @@ One log has one writer path and, for each reader, one position. It lives on one 
 
 The producer picks a partition by **hashing the record key**. Records with the same key land in the same partition. Kafka's docs describe the idea as letting the user "specify a key to partition by and using this to hash to a partition". So all events for one user stay in order. The price: **order exists only inside a partition**. Across partitions there is none.
 
-Each partition has one leader and some followers (lesson 4.6). Kafka says a committed message is not lost as long as at least one in-sync replica is alive.
+Each partition has one leader and some followers (lesson 4.6). The leader takes the writes and the followers copy them. An in-sync replica is a copy that is fully caught up. Kafka says a committed message is not lost as long as at least one in-sync replica is alive.
 
 ## Consumer groups: sharing the reading
 
 Many consumers can read one topic. A **consumer group** is a set of consumers that share one subscription. The rule: **each partition goes to exactly one consumer in the group** at a time. Together the members read every record once. A second group reads everything again, with its own offsets. That is how billing and analytics each get all orders.
+
+Four words help before you step through. In the picture, P0 to P3 are partitions and C1 and C2 are consumers. A consumer **commits** an offset when it tells Kafka "I finished everything before this position". Kafka keeps that number as the group's bookmark. A consumer sends a **heartbeat**, a small "I am alive" message, every few seconds. If the heartbeats stop, the group decides the consumer is dead and does a **rebalance**: it hands that consumer's partitions to the others. **Lag** is how many records sit in a partition that the group has not yet read.
 
 Step through a run. Watch the keys, the offsets, a crash, and the handover.
 
@@ -59,10 +61,10 @@ Step through a run. Watch the keys, the offsets, a crash, and the handover.
 Three things happened in that run.
 
 1. **Same key, same partition.** The second A landed behind the first A on P0, so one key stays in order.
-2. **Commit.** A consumer saves the offset it finished. The saved offset is the group's bookmark. Kafka stores it in an internal topic.
-3. **Rebalance.** The group moved partitions when a member died and when it came back. The new owner started at the **committed** offset. Records read but not committed are read again. That is at-least-once delivery, the same as the visibility timeout in lesson 6.1. Lesson 6.3 shows how to live with it.
+2. **Commit.** A consumer saves the offset it finished. The saved offset is the group's bookmark. Kafka stores it in an internal topic (a topic Kafka keeps for its own use).
+3. **Rebalance.** The group moved partitions when a member died and when it came back. The new owner started at the **committed** offset. Records read but not committed are read again. That is at-least-once delivery, the same as the visibility timeout in lesson 6.1 (the hide time after which a received but undeleted message returns to the queue). Lesson 6.3 shows how to live with it.
 
-How fast does the group notice a dead member? In the current Kafka consumer settings, the default session timeout is 45 seconds. Members send a heartbeat every 3 seconds. A consumer that goes too long between calls to `poll` is also dropped. That limit, `max.poll.interval.ms`, is 5 minutes by default. Kafka 4.0 made a new rebalance protocol generally available. The broker assigns partitions, and the docs say it no longer relies on a global synchronization barrier. Consumers opt in with `group.protocol=consumer`.
+How fast does the group notice a dead member? In the current Kafka consumer settings, the default session timeout is 45 seconds. Members send a heartbeat every 3 seconds. A consumer that goes too long between calls to `poll` (the call that fetches the next batch of records) is also dropped. That limit, `max.poll.interval.ms`, is 5 minutes by default. Kafka 4.0 made a new rebalance protocol generally available. In the old one, every member stopped reading until all agreed on the new split, like a meeting where nobody works until everyone has voted. In the new one, the broker assigns partitions and members keep reading while the split changes. Consumers opt in with `group.protocol=consumer`.
 
 ## The ceiling: partitions
 
@@ -86,7 +88,7 @@ Plan the partition count for your **peak** consumer count, with headroom. More p
 | Throughput of one broker | ~100s of MB/s (lesson 1.5) | Lesson 1.5 |
 | RabbitMQ stream segment size, default | 500,000,000 bytes | RabbitMQ streams docs |
 
-A compacted topic keeps the latest record per key and drops older ones. A tombstone is a record with a key and no value, which marks a delete. Compaction suits "current state" topics, where you want the last value and not the whole history.
+Compaction is a cleanup mode for a topic. A compacted topic keeps the latest record per key and drops older ones. A tombstone is a record with a key and no value, which marks a delete. Compaction suits "current state" topics, where you want the last value and not the whole history.
 
 ## Trade-offs
 

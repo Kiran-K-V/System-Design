@@ -35,7 +35,7 @@ export default function PacelcTree() {
       <Box id="el" cx={455} cy={272} w={165} h={74} text={'L: answer from the\nnearest replica.\nMay be stale.'} size={14} />
       <Box id="ec" cx={625} cy={272} w={165} h={74} text={'C: wait for replicas\nto confirm. Slower.'} size={14} />
       <HandText x={360} y={336} size={14} color="var(--muted)">
-        name = P then A or C, E then L or C. Example: Cassandra default is PA/EL.
+        Label: partition choice, then normal-run choice. PA/EL = Available, then Latency.
       </HandText>
     </SketchSvg>
   );

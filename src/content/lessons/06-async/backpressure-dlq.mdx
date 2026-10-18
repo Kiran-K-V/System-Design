@@ -26,13 +26,13 @@ This lesson covers both topics. It covers what to do when the queue grows, and w
 
 You have five levers. Each moves the pain to a different place.
 
-1. **Add consumers.** This works if you have spare partitions or workers, and the downstream system can take the load. It costs money and has a limit (lesson 6.2: partitions cap a group).
-2. **Slow the producers.** This is **backpressure**: the slow stage pushes the slowness back toward the source. An API can return `429 Too Many Requests`. Lesson 7.4 covers rate limiting.
+1. **Add consumers.** This works if you have spare partitions or workers, and the downstream system can take the load. It costs money and has a limit (lesson 6.2: a partition is one lane of a log, and only one worker in a group reads a lane, so the lane count caps the group).
+2. **Slow the producers.** This is **backpressure**: the slow stage pushes the slowness back toward the source. Think of a sink with a slow drain. If you keep pouring, it overflows. If the sink could tell the tap to ease off, it would not. The queue plays the sink, and the producers are the tap. Without it, a slow stage fills every buffer behind it until something runs out of memory or the wait becomes huge. In practice, an API can return `429 Too Many Requests`, which is the standard HTTP answer for "too many calls, slow down". The caller then waits and tries later. Lesson 7.4 covers rate limiting.
 3. **Bound the queue and block.** The queue has a size limit. When it is full, producers are held back or rejected. Nothing is lost, but callers wait or see errors.
 4. **Bound the queue and drop.** When the queue is full, throw something away: the newest message or the oldest. Nothing blocks. Data is lost.
-5. **Limit what a worker holds.** This is **prefetch**. A RabbitMQ consumer may hold only a set number of unacknowledged messages. The docs say values of 100 to 300 "usually offer good throughput". A value of 1 is the most conservative. Zero means no limit. A high prefetch leaves one worker with many messages while another sits idle.
+5. **Limit what a worker holds.** This is **prefetch**. RabbitMQ is a popular queue server. Its consumer may hold only a set number of unacknowledged messages. A message is unacknowledged while the worker has received it but has not yet told the queue that it finished. The docs say values of 100 to 300 "usually offer good throughput". A value of 1 is the most conservative. Zero means no limit. A high prefetch leaves one worker with many messages while another sits idle.
 
-RabbitMQ offers both bounded modes. A queue with a length limit has an `overflow` setting. With `drop-head`, the default, it removes messages from the front. With `reject-publish`, it refuses new ones. When publisher confirms are on, the publisher gets a `basic.nack` for a refused message and can react.
+RabbitMQ offers both bounded modes. A queue with a length limit has an `overflow` setting. With `drop-head`, the default, it removes messages from the front. With `reject-publish`, it refuses new ones. When publisher confirms are on (a setting where the queue answers each publish with "got it" or "refused"), the publisher gets a `basic.nack`, which means "negative acknowledgement", for a refused message and can react.
 
 Try the three policies on the same burst. The queue limit is 200 messages. Workers do 50 per second. Producers send 30 per second, then 300 per second for 20 seconds.
 
@@ -48,7 +48,7 @@ Compare the three runs:
 
 The numbers in the first row are derived by hand and match the widget. In the block run, the producers hold the extra 4,800 or so messages. The 5,000 in the queue and at the producers together drain at 20 per second. So everything is done at about 275 s. Choose by asking what the work is worth. Dropping a "like" event is fine. Dropping a payment is not. Blocking protects the data and moves the wait upstream. That only helps if the upstream can wait or can tell its own callers "try later".
 
-Also watch the right signal. **Queue age** (how old the oldest message is) tells you the user wait. Queue size alone does not. SQS reports `ApproximateAgeOfOldestMessage` for this. Autoscale workers and alert on age.
+Also watch the right signal. **Queue age** (how old the oldest message is) tells you the user wait. Queue size alone does not. SQS is Amazon's managed queue service. It reports `ApproximateAgeOfOldestMessage` for this. Autoscale workers and alert on age.
 
 ## The message that never succeeds
 
@@ -58,20 +58,22 @@ The naive design retries forever. It fails in two ways. The poison message burns
 
 The standard fix is a **dead-letter queue** (DLQ): a second queue for messages that failed too many times. The main queue counts how often a message was received. At a limit, it moves the message to the DLQ. SQS calls the limit `maxReceiveCount`.
 
+One more word helps for the diagram below: the **visibility timeout**. When a worker receives a message, the queue hides it from other workers for a set time. If the worker deletes the message in that time, the work is done. If not, the message becomes visible again and a worker receives it a second time. Each receive adds one to the count.
+
 <AsyncPoisonWalk client:visible />
 
 Rules from the SQS docs worth remembering:
 
-- A DLQ must live in the same account and Region as the source queue. Create it first.
-- **Set DLQ retention longer than source retention.** For a standard queue, the enqueue time does not change when a message moves. A message that waited 1 day in the source queue, with a 4 day DLQ retention, is deleted from the DLQ after 3 more days, not 4.
+- A DLQ must live in the same AWS account and the same Region (a Region is one geographic AWS location, such as Frankfurt) as the source queue. Create it first.
+- **Set DLQ retention longer than source retention.** For a standard queue (the default SQS type, which does not promise strict order), the enqueue time (the moment the message first entered a queue) does not change when a message moves. A message that waited 1 day in the source queue, with a 4 day DLQ retention, is deleted from the DLQ after 3 more days, not 4.
 - A low `maxReceiveCount` such as 1 means a single failure sends the message to the DLQ. Set it high enough to allow for real retries.
 - With a standard queue and `maxReceiveCount` above 3, a message received 3 or more times without a delete moves to the back of the queue.
-- Do not use a DLQ with a FIFO queue if you need exact order. The message leaves the sequence.
+- Do not use a DLQ with a FIFO queue (a queue type that keeps strict first-in, first-out order) if you need exact order. The message leaves the sequence.
 - **Redrive** moves messages from the DLQ back to a source queue, after you fix the cause.
 
-RabbitMQ has the same idea. A `basic.nack` or `basic.reject` with `requeue=false` sends the message to a dead-letter exchange, or discards it if none is set. Requeueing in a tight loop wastes resources. Quorum queues have a delivery limit, 20 by default since RabbitMQ 4.0, after which the message is dropped or dead-lettered.
+RabbitMQ has the same idea. A `basic.nack` or `basic.reject` with `requeue=false` sends the message to a dead-letter exchange (RabbitMQ's name for the routing point that decides which queue gets the message), or discards it if none is set. Requeueing in a tight loop wastes resources. Quorum queues (a RabbitMQ queue type that copies its data to several servers) have a delivery limit, 20 by default since RabbitMQ 4.0, after which the message is dropped or dead-lettered.
 
-A log does not count receives for you. RabbitMQ streams have no dead-letter exchange. In a log, your consumer code must set the bad record aside, for example by writing it to another topic, so the offset can move on.
+A log does not count receives for you. RabbitMQ streams have no dead-letter exchange. In a log, your consumer code must set the bad record aside, for example by writing it to another topic, so the offset (the reader's bookmark position in the log) can move on.
 
 A DLQ is **not** the fix. It keeps a bad message safe and out of the way. A person still has to read it, find the cause, and fix it. So put an **alarm** on the DLQ. A DLQ that fills in silence is a bug that nobody sees.
 

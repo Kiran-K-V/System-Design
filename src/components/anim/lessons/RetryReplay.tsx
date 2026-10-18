@@ -12,21 +12,21 @@ type Mode = 'naive' | 'key';
 const NAIVE_ACTORS = ['Client', 'API', 'Payments DB'];
 const NAIVE: { m: SeqMessage; caption: string }[] = [
   { m: { from: 'Client', to: 'API', label: 'POST /charges $50' }, caption: 'The client asks to charge the customer $50.' },
-  { m: { from: 'API', to: 'Payments DB', label: 'INSERT charge $50' }, caption: 'The API writes the charge. The money moves.' },
+  { m: { from: 'API', to: 'Payments DB', label: 'save charge $50' }, caption: 'The API writes the charge. The money moves.' },
   { m: { from: 'Payments DB', to: 'API', label: 'ok', tone: 'ok' }, caption: 'The database confirms.' },
   { m: { from: 'API', to: 'Client', label: '201 Created', lost: true, tone: 'bad' }, caption: 'The success response is lost on the network. The server did its job. The client has no way to know.' },
   { m: { from: 'Client', to: 'Client', label: 'timeout. Did it work?', note: true, tone: 'warn' }, caption: 'The client times out. It faces a choice: give up and maybe lose the sale, or retry and maybe charge twice.' },
   { m: { from: 'Client', to: 'API', label: 'POST /charges $50 (retry)' }, caption: 'It retries. To the server, this request looks exactly like a new purchase of $50.' },
-  { m: { from: 'API', to: 'Payments DB', label: 'INSERT charge $50', tone: 'bad' }, caption: 'The API writes a second charge. Nothing links it to the first.' },
+  { m: { from: 'API', to: 'Payments DB', label: 'save charge $50', tone: 'bad' }, caption: 'The API writes a second charge. Nothing links it to the first.' },
   { m: { from: 'API', to: 'Client', label: '201 Created', tone: 'ok' }, caption: 'This time the response arrives. The client thinks one charge happened. The customer paid $100.' },
 ];
 
 const KEY_ACTORS = ['Client', 'API', 'Key store', 'Payments DB'];
 const KEYED: { m: SeqMessage; caption: string }[] = [
-  { m: { from: 'Client', to: 'Client', label: 'make key K1 (a UUID)', note: true, tone: 'accent' }, caption: 'Before the first try, the client makes one random key for this purchase. The key names the operation, not the request.' },
+  { m: { from: 'Client', to: 'Client', label: 'make key K1 (random id)', note: true, tone: 'accent' }, caption: 'Before the first try, the client makes one random key for this purchase. The key names the operation, not the request.' },
   { m: { from: 'Client', to: 'API', label: 'POST $50, key K1' }, caption: 'The client sends the charge with the key in the Idempotency-Key header.' },
   { m: { from: 'API', to: 'Key store', label: 'K1 absent: claim it' }, caption: 'The API claims K1 with an atomic "insert if absent". K1 is new, so the claim succeeds. Status: in progress.' },
-  { m: { from: 'API', to: 'Payments DB', label: 'INSERT charge $50' }, caption: 'The API writes the charge. The money moves once.' },
+  { m: { from: 'API', to: 'Payments DB', label: 'save charge $50' }, caption: 'The API writes the charge. The money moves once.' },
   { m: { from: 'API', to: 'Key store', label: 'K1 = done + 201 body' }, caption: 'The API saves the final answer (status and body) under K1.' },
   { m: { from: 'API', to: 'Client', label: '201 Created', lost: true, tone: 'bad' }, caption: 'The same network fault: the response is lost.' },
   { m: { from: 'Client', to: 'Client', label: 'timeout. Retry, same K1', note: true, tone: 'warn' }, caption: 'The client times out and retries. It reuses K1, because this is the same purchase.' },

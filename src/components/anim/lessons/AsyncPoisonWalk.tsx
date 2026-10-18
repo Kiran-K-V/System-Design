@@ -24,7 +24,7 @@ const meter = (lag: number, tries: number | null, tone: QMeter['tone']): QMeter 
 const steps: Step[] = [
   {
     caption:
-      'A producer sends a message M and then good messages a to d. M is a poison message: its payload is broken, so every attempt to process it fails. One worker reads in order. The queue allows 3 receives per message (SQS calls this maxReceiveCount).',
+      'A producer sends a message M and then good messages a to d. M is a poison message: its payload is broken, so every attempt to process it fails. One worker reads in order. The queue allows 3 receives per message (Amazon SQS, a managed queue service, calls this limit maxReceiveCount).',
     buffer: [M(), g('a'), g('b'), g('c'), g('d')],
     worker: { label: 'Worker', state: 'idle' },
     meter: meter(5, 0, 'ok'),
@@ -32,7 +32,7 @@ const steps: Step[] = [
     activeProducer: true,
   },
   {
-    caption: 'The worker receives M for the first time. Processing throws an error. The worker does not delete M, so M will come back when its visibility timeout ends.',
+    caption: 'The worker receives M for the first time. Processing throws an error. The worker does not delete M, so M will come back when its hide time ends. The queue hides a received message for a while, and shows it again if it is not deleted.',
     buffer: [M({ hidden: true }), g('a'), g('b'), g('c'), g('d')],
     worker: { label: 'Worker', state: 'busy', msg: M() },
     meter: meter(5, 1, 'warn'),
@@ -67,7 +67,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'An engineer reads M in the DLQ, finds the bug in the parser, and ships a fix. Then the engineer redrives: the queue moves M from the DLQ back to the source queue. The DLQ did not fix anything. It kept M safe until a fix existed.',
+      'An engineer reads M in the DLQ, finds the bug in the parser, and ships a fix. Then the engineer redrives: the queue moves M from the DLQ back to the source queue. This move is called a redrive. The DLQ did not fix anything. It kept M safe until a fix existed.',
     buffer: [M({ tone: 'ok' }), g('e'), g('f'), g('g')],
     worker: { label: 'Worker', state: 'idle' },
     meter: meter(4, null, 'ok'),

@@ -11,33 +11,33 @@ import ModelLadder from '../../../components/anim/lessons/ModelLadder.tsx';
 
 ## The problem
 
-You replicated your database (lesson 4.6). Reads go to followers. Now a user changes their display name from "Ann" to "Anna" and keeps refreshing the page. They see "Anna", then "Ann", then "Anna".
+You replicated your database (lesson 4.6). Reads go to followers. A follower is a copy that receives every change from the main copy, the leader. Now a user changes their display name from "Ann" to "Anna" and keeps refreshing the page. They see "Anna", then "Ann", then "Anna".
 
 Each follower answered correctly for its own state. No bug exists. But the user sees time run backward, and support gets a ticket.
 
-Replication lag turns "what is the value of x?" into a question with several honest answers. PostgreSQL's manual puts asynchronous lag at typically under one second. It can grow under load. During that window, replicas disagree.
+Replication lag is the delay between a change on the leader and the same change on a follower. It turns "what is the value of x?" into a question with several honest answers. **Asynchronous** replication means the leader does not wait for followers before it confirms a write. PostgreSQL's manual puts this lag at typically under one second. It can grow under load. During that window, replicas disagree.
 
 So you need a precise way to say **which answers are acceptable**. That is a **consistency model**. It is a contract that says which values a read may return, given the writes that came before.
 
-One warning about words. "Consistent" means different things in different places. In ACID it means "the data obeys the schema's rules". In CAP (lesson 4.9) it means linearizability, defined below. In this lesson it only means: **what can a read see?**
+One warning about words. "Consistent" means different things in different places. In ACID (the four safety promises of a database transaction) it means "the data obeys the schema's rules". In CAP (lesson 4.9) it means linearizability, defined below. In this lesson it only means: **what can a read see?**
 
 ## Naive: pick "strong" or "eventual"
 
 Most people know two words.
 
-**Eventual consistency** says: if writes stop, all replicas end up the same. That is all it says. While writes continue it promises nothing. Azure Cosmos DB's documentation is blunt. With eventual consistency, a client "might read values older than those values it read in the past". The animation below shows exactly that.
+**Eventual consistency** says: if writes stop, all replicas end up the same. That is all it says. While writes continue it promises nothing. Azure Cosmos DB is Microsoft's cloud database that spreads copies over many regions. Its documentation is blunt. With eventual consistency, a client "might read values older than those values it read in the past". The animation below shows exactly that.
 
-**Strong consistency** says: every read returns the latest write, as if there were one copy. It is easy to reason about. It is not cheap. Cosmos DB documents the write latency for a multi-region account with strong consistency. It is about two round trips between the two farthest regions, plus 10 ms at the 99th percentile. With a 70 ms round trip (the coast-to-coast figure from lesson 4.9) that is about 2 × 70 + 10 = 150 ms per write. Cosmos blocks strong consistency by default when regions are more than 5,000 miles apart. The reason is that the write latency is so high.
+**Strong consistency** says: every read returns the latest write, as if there were one copy. It is easy to reason about. It is not cheap. Cosmos DB documents the write latency for a multi-region account with strong consistency. It is about two round trips between the two farthest regions, plus 10 ms at the 99th percentile. That means 99 writes out of 100 are at least this fast. With a 70 ms round trip (the coast-to-coast figure from lesson 4.9) that is about 2 × 70 + 10 = 150 ms per write. Cosmos blocks strong consistency by default when regions are more than 5,000 miles apart. The reason is that the write latency is so high.
 
 Two words are not enough. Between them sits a ladder of cheaper contracts, and most features need only one of the lower rungs.
 
 ## The cheap guarantees: what one user needs
 
-Three small guarantees fix the most common complaints. Each is a promise to **one client**, not to the whole world. They are called session guarantees.
+Three small guarantees fix the most common complaints. Each is a promise to **one client**, not to the whole world. A **session** is one user's run of requests against the system, such as one browser logged in. So these are called session guarantees.
 
 - **Read your writes.** After I write, my later reads show my write (or something newer).
 - **Monotonic reads.** Once I read a value, I never read an older value.
-- **Consistent prefix.** I never see an effect without its cause. If write A happened before write B, then I never see B without A.
+- **Consistent prefix.** I never see an effect without its cause. If write A happened before write B, then I never see B without A. (A reply must never show up without the question it answers.)
 
 Pick an anomaly. Step through it with the guarantee off. Then flip the guarantee on and compare.
 
@@ -47,11 +47,11 @@ How systems provide each guarantee is usually plain routing or bookkeeping, not 
 
 | Guarantee | Typical implementation | Cost |
 |---|---|---|
-| Read your writes | Read from the leader after you write, or send a position token with the read and let a follower answer only if it has reached it | Extra leader load, or a retry |
+| Read your writes | Read from the leader after you write, or send a position token with the read and let a follower answer only if it has reached it. A position token is a number that marks how far in the leader's list of changes your write sits | Extra leader load, or a retry |
 | Monotonic reads | Route each user to the same follower | A failed follower breaks the pin once |
-| Consistent prefix | Keep causally related writes in order, for example on one shard, or tag writes with what they depend on | Extra metadata, or limits on sharding |
+| Consistent prefix | Keep causally related writes in order, for example on one shard (one slice of the data, lesson 4.7), or tag writes with what they depend on | Extra metadata, or limits on sharding |
 
-Real products package these. Cosmos DB's **session** level uses a session token. The client sends the token on reads. A replica answers only if it holds data at least as new as the token. If not, the client tries another replica. Cosmos calls session consistency the most widely used level and says its latency and availability are comparable to eventual consistency. MongoDB's causally consistent sessions guarantee read your writes, monotonic reads, monotonic writes, and writes follow reads. They apply only when reads use the `majority` read concern and writes use the `majority` write concern.
+Real products package these. Cosmos DB's **session** level uses a session token, which works like the position token above. The client sends the token on reads. A replica answers only if it holds data at least as new as the token. If not, the client tries another replica. Cosmos calls session consistency the most widely used level and says its latency and availability are comparable to eventual consistency. MongoDB's causally consistent sessions guarantee read your writes, monotonic reads, monotonic writes (my writes are applied in the order I made them), and writes follow reads (a write I make after a read is ordered after what I read). They apply only when reads use the `majority` read concern and writes use the `majority` write concern. A **concern** is a setting that says how many replicas must confirm. `majority` means more than half of them.
 
 ## The strong end: linearizability
 
@@ -59,7 +59,7 @@ Now the top of the ladder. **Linearizability** says every operation appears to t
 
 In plain words, the system behaves as if there is **one copy** of the data. Operations touch that copy one at a time.
 
-The word "clock" is the key. Compare with a weaker model, **sequential consistency**. It also requires one order that every client agrees on, and it keeps each client's own order. But it ignores real time. A client may read arbitrarily stale state. Jepsen's definition notes this.
+The word "clock" is the key. Compare with a weaker model, **sequential consistency**. It also requires one order that every client agrees on, and it keeps each client's own order. But it ignores real time. A client may read arbitrarily stale state. Jepsen's definition notes this. Jepsen is a well-known testing project that checks real databases for these promises. Its pages are the best public reference for the models in this lesson.
 
 Use the lab. Client A writes `x = 1`, then `x = 2`. Client B reads twice. Click a preset, then change times and returned values. The verdicts are computed by a small checker that tries every order of the four operations.
 
@@ -73,28 +73,28 @@ Try these:
 
 That third case is the subtle one. While a write is running, linearizability allows a read to return either the old or the new value, but not both in the wrong order. Once any read has shown the new value, every later read must show it too.
 
-The cost of linearizability is availability. Jepsen states that a linearizable system "cannot be totally or sticky available". Jepsen also states that during a partition "some or all nodes will be unable to make progress". This is the C in CAP, so lesson 4.9 predicted it.
+The cost of linearizability is availability. Jepsen states that a linearizable system "cannot be totally or sticky available". **Totally available** means every working server answers every request, even during a partition. **Sticky available** means a client gets answers during a partition, but only if it keeps talking to the same server. This lesson shows both words on the ladder below. Jepsen also states that during a partition "some or all nodes will be unable to make progress". This is the C in CAP, so lesson 4.9 predicted it.
 
 ## The whole ladder
 
-Jepsen lays the models in a hierarchy. A stronger model implies the weaker ones. Strict serializable implies linearizable, which implies sequential, then causal, then PRAM. PRAM implies read your writes, monotonic reads, and monotonic writes. The picture also shows what each rung costs in availability.
+Jepsen lays the models in a hierarchy. Think of a ladder: a stronger rung gives every promise of the rungs below it. Strict serializable implies linearizable, which implies sequential, then causal, then PRAM. PRAM is a weak model that only keeps each client's own reads and writes in order. It implies read your writes, monotonic reads, and monotonic writes. The picture also shows what each rung costs in availability.
+
+- **Causal consistency** keeps causes before effects across all clients. It is the strongest model Jepsen lists as sticky available. The model keeps working through a partition as long as each client keeps using the same server.
+- **Serializable** is a different axis. It is about **transactions** (groups of reads and writes treated as one unit) and says concurrent transactions behave as if run one after another (lesson 4.4). It has no real-time rule. **Strict serializable** adds the real-time rule of linearizability, across many objects.
 
 <ModelLadder />
 
-- **Causal consistency** keeps causes before effects across all clients. It is the strongest model Jepsen lists as sticky available. The model keeps working through a partition as long as each client keeps using the same server.
-- **Serializable** is a different axis. It is about **transactions** and says concurrent transactions behave as if run one after another (lesson 4.4). It has no real-time rule. **Strict serializable** adds the real-time rule of linearizability, across many objects.
-
 ## Strong consistency in real systems
 
-Every major store lets you pick a point on the ladder, often per request.
+Every major store lets you pick a point on the ladder, often per request. The table names real products. You do not need to know them. Read it to see the pattern.
 
 | Store | Default | Stronger option | Notes |
 |---|---|---|---|
-| DynamoDB | Eventually consistent reads | `ConsistentRead` per read | Eventual reads cost half as much. Strong reads are not supported on global secondary indexes. Global tables replicate "typically within a second" by default. |
-| Cosmos DB | Chosen per account | Five levels: strong, bounded staleness, session, consistent prefix, eventual | Strong and bounded staleness read from two replicas, so read throughput per request unit is half. |
-| Spanner | External consistency | n/a | Stronger than linearizability: it also orders multi-object transactions. Uses TrueTime, a distributed clock service. |
+| DynamoDB | Eventually consistent reads | `ConsistentRead` per read | Eventual reads cost half as much. Strong reads are not supported on global secondary indexes (extra copies of a table sorted by another field, lesson 4.5). Global tables replicate "typically within a second" by default. |
+| Cosmos DB | Chosen per account | Five levels: strong, bounded staleness, session, consistent prefix, eventual | Strong and bounded staleness read from two replicas, so read throughput per request unit (Cosmos's billing and capacity measure) is half. |
+| Spanner | External consistency | n/a | Stronger than linearizability: it also orders multi-object transactions. Uses TrueTime, Google's clock service whose readings come with a known error margin, so servers can order events across the world. |
 | MongoDB | `local` read concern is described as able to read data later rolled back | `majority`, `linearizable` | `linearizable` reads with `majority` writes act as if one thread did the operations in real time. |
-| Cassandra | You choose per request | `QUORUM` for reads and writes | Overlapping reads and writes (`W + R > RF`) make acknowledged writes visible to later reads. |
+| Cassandra | You choose per request | `QUORUM` for reads and writes | `RF` is the replication factor, the number of copies. A write waits for `W` copies and a read asks `R` copies. When `W + R > RF`, every read set overlaps every finished write set, so acknowledged writes are visible to later reads. |
 
 ## Numbers
 
@@ -130,7 +130,7 @@ Do not say "eventual consistency means the data may be wrong". It means replicas
 </Callout>
 
 <Callout type="deep" title="A quorum read is not automatically linearizable">
-Take `N = 3`, write quorum `W = 2`, read quorum `R = 2`, so `R + W > N`. A write of the new value is still in flight: only one replica has it so far. Read 1 happens to ask that replica and one other, and sees the new value. Read 2 starts later, asks the two replicas that do not have it yet, and sees the old value. The overlap rule held for finished writes. But this read pair is exactly the "new, then old" case in the lab above. Real systems add repair or a leader-confirmed read to close the gap. Sloppy quorums (lesson 4.6, hinted handoff) and clock-based last-write-wins break it further.
+Take `N = 3` copies, write quorum `W = 2` (a write needs 2 confirmations), read quorum `R = 2` (a read asks 2 replicas), so `R + W > N`. A write of the new value is still in flight: only one replica has it so far. Read 1 happens to ask that replica and one other, and sees the new value. Read 2 starts later, asks the two replicas that do not have it yet, and sees the old value. The overlap rule held for finished writes. But this read pair is exactly the "new, then old" case in the lab above. Real systems add repair or a leader-confirmed read to close the gap. Sloppy quorums (lesson 4.6, hinted handoff) and clock-based last-write-wins (keep the write with the later clock time) break it further.
 </Callout>
 
 ## Check yourself

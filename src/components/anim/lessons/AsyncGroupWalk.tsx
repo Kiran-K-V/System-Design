@@ -41,7 +41,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'C2 crashes. It stops sending heartbeats. The group coordinator does not know yet. It waits for the session timeout, 45 seconds by default in the current consumer settings. P2 and P3 have no live reader. New records keep arriving, so lag grows on P2 and P3.',
+      'C2 crashes. It stops sending heartbeats (its "I am alive" messages). The broker that manages the group does not know yet. It waits for the session timeout, 45 seconds by default in the current consumer settings. P2 and P3 have no live reader. New records keep arriving, so lag (the records nobody has read yet) grows on P2 and P3.',
     logs: [[done('A'), done('A')], [done('B')], [done('C'), nxt('C'), k('C')], [done('D'), k('D')]],
     members: [{ name: 'C1', owns: [0, 1] }, { name: 'C2', owns: [2, 3], state: 'down' }],
     incoming: [2, 3],

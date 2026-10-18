@@ -57,7 +57,7 @@ export default function AsyncFlowLab({ policies = false, initial = {}, title = '
 
   const wait = cur.depth / cp;
   const buffer: QMsg[] = Array.from({ length: Math.min(TRAY_CELLS, Math.ceil(cur.depth)) }, () => ({ label: '' }));
-  const note = policy === 'block' && cur.held > 0 ? `${fmt(cur.held)} held` : `${fmt(rateAt(p, cur.t))} msg/s`;
+  const note = policy === 'block' && cur.held > 0 ? `${fmt(cur.held)} held` : `${fmt(rateAt(p, cur.t))} messages/s`;
 
   return (
     <WidgetFrame
@@ -81,12 +81,12 @@ export default function AsyncFlowLab({ policies = false, initial = {}, title = '
       <DepthChart ticks={ticks} t={cur.t} cap={policy === 'unbounded' ? null : cap} />
 
       <div className="mt-4 grid gap-x-6 gap-y-3 text-sm sm:grid-cols-2">
-        <Slider label="Burst rate" unit="msg/s" value={burst} min={100} max={600} step={50} onChange={setBurst} />
+        <Slider label="Burst rate" unit="messages/s" value={burst} min={100} max={600} step={50} onChange={setBurst} />
         <Slider label="Burst length" unit="s" value={burstLen} min={5} max={30} step={5} onChange={setBurstLen} />
         <Slider label="Workers" unit="" value={workers} min={2} max={30} step={1} onChange={setWorkers} />
         {policies && (
           <>
-            <Slider label="Queue limit" unit="msgs" value={cap} min={50} max={1000} step={50} onChange={setCap} disabled={policy === 'unbounded'} />
+            <Slider label="Queue limit" unit="messages" value={cap} min={50} max={1000} step={50} onChange={setCap} disabled={policy === 'unbounded'} />
             <label className="block sm:col-span-2">
               <span className="text-muted">When the queue is full</span>
               <select
@@ -131,13 +131,13 @@ export default function AsyncFlowLab({ policies = false, initial = {}, title = '
 
       <dl className="mt-4 grid grid-cols-2 gap-y-1 text-xs sm:grid-cols-4 sm:gap-x-4">
         <dt className="text-muted">Peak queue</dt>
-        <dd className="font-mono">{fmt(sum.peakDepth)} msgs</dd>
+        <dd className="font-mono">{fmt(sum.peakDepth)} messages</dd>
         <dt className="text-muted">Worst wait</dt>
         <dd className="font-mono">{Number.isFinite(sum.peakWait) ? `${fmt(sum.peakWait)} s` : 'never'}</dd>
         <dt className="text-muted">Queue empty at</dt>
         <dd className="font-mono">{sum.drainedAt === null ? (sum.keepsUp ? 'after 300 s' : 'never') : `${sum.drainedAt} s`}</dd>
         <dt className="text-muted">Dropped</dt>
-        <dd className="font-mono" style={{ color: sum.dropped > 0 ? 'var(--bad)' : undefined }}>{fmt(sum.dropped)} msgs</dd>
+        <dd className="font-mono" style={{ color: sum.dropped > 0 ? 'var(--bad)' : undefined }}>{fmt(sum.dropped)} messages</dd>
       </dl>
     </WidgetFrame>
   );

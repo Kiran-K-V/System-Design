@@ -48,7 +48,7 @@ const steps: Step[] = [
   },
   {
     caption: 'S2 asks every other server for its vote in term 2. A server votes for at most one candidate per term, first come first served.',
-    msg: 'S2 to all: RequestVote (term 2)',
+    msg: 'S2 to all: RequestVote (please vote for me, term 2)',
     nodes: [f(1), { role: 'candidate', term: 2, log: '', badge: 'voted for self', badgeTone: 'warn' }, f(1), f(1), f(1)],
     arrows: [{ from: 1, to: [0, 2, 3, 4] }],
   },
@@ -61,8 +61,8 @@ const steps: Step[] = [
   },
   {
     caption:
-      'S2 becomes leader of term 2 and sends a heartbeat at once. A heartbeat is an AppendEntries message with no entries. Followers reset their timers, so nobody else starts an election. Two leaders in one term are impossible: two majorities share a server, and that server votes once per term.',
-    msg: 'S2 to all: AppendEntries (heartbeat, term 2)',
+      'S2 becomes leader of term 2 and sends a heartbeat at once. A heartbeat is an AppendEntries message that carries no new entries. Followers reset their timers, so nobody else starts an election. Two leaders in one term are impossible: two majorities share a server, and that server votes once per term.',
+    msg: 'S2 to all: AppendEntries (heartbeat: I am the leader, term 2)',
     nodes: [f(2), { role: 'leader', term: 2, log: '', badge: 'leader', badgeTone: 'ok' }, f(2), f(2), f(2)],
     arrows: [{ from: 1, to: [0, 2, 3, 4] }],
   },
@@ -87,8 +87,8 @@ const steps: Step[] = [
     arrows: [{ from: 0, to: [1], tone: 'ok' }, { from: 2, to: [1], tone: 'ok' }],
   },
   {
-    caption: 'The next heartbeat carries the leader’s commit index. Followers mark entry 1 committed and apply it. All live servers now hold the same committed log.',
-    msg: 'S2 to all: heartbeat (commit index 1)',
+    caption: 'The next heartbeat tells followers the number of the last committed entry. Followers mark entry 1 committed and apply it. All live servers now hold the same committed log.',
+    msg: 'S2 to all: heartbeat (entry 1 is committed)',
     nodes: [f(2, '2*'), { role: 'leader', term: 2, log: '2*', badge: 'leader', badgeTone: 'ok' }, f(2, '2*'), f(2, '2*'), down(2)],
     arrows: [{ from: 1, to: [0, 2, 3] }],
   },
@@ -100,8 +100,8 @@ const steps: Step[] = [
   },
   {
     caption:
-      'S4’s timer is shortest. It becomes a candidate in term 3 and asks for votes. The request also states its last log entry: index 1, term 2. A voter refuses a candidate whose log is less up to date than its own. That rule is what keeps committed entries safe.',
-    msg: 'S4 to all: RequestVote (term 3, last entry: index 1, term 2)',
+      'S4’s timer is shortest. It becomes a candidate in term 3 and asks for votes. The request also states its last log entry: entry number 1, from term 2. A voter refuses a candidate whose log is less up to date than its own. That rule is what keeps committed entries safe.',
+    msg: 'S4 to all: RequestVote (term 3, my last entry: number 1, term 2)',
     nodes: [f(2, '2*'), down(2, '2*'), f(2, '2*'), { role: 'candidate', term: 3, log: '2*', badge: 'voted for self', badgeTone: 'warn' }, down(2)],
     arrows: [{ from: 3, to: [0, 2] }],
   },
@@ -115,7 +115,7 @@ const steps: Step[] = [
   {
     caption:
       'S2 and S5 restart. S2 still believes term 2, but the first message from S4 carries term 3, so S2 steps down and follows. S5 has an empty log, so S4 sends it entry 1. A follower’s log always ends up matching the leader’s.',
-    msg: 'S4 to S2 and S5: AppendEntries (term 3, catch up)',
+    msg: 'S4 to S2 and S5: AppendEntries (term 3, copy the log)',
     nodes: [f(3, '2*'), f(3, '2*', 'stepped down', 'warn'), f(3, '2*'), { role: 'leader', term: 3, log: '2*', badge: 'leader', badgeTone: 'ok' }, f(3, '2*', 'log copied', 'ok')],
     arrows: [{ from: 3, to: [1, 4] }],
   },
