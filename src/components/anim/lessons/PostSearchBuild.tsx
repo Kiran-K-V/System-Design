@@ -6,12 +6,12 @@ const nodes: BuildNode[] = [
   { id: 'user', x: 90, y: 80, w: 120, label: 'User', step: 0 },
   { id: 'api', x: 250, y: 80, w: 130, label: 'Post API', step: 0 },
   { id: 'posts', x: 410, y: 80, w: 130, label: 'Posts DB', sub: 'source of truth', h: 80, shape: 'db', step: 0 },
-  { id: 'cdc', x: 590, y: 80, w: 130, label: 'Kafka', sub: 'change feed', h: 80, shape: 'db', step: 2 },
+  { id: 'cdc', x: 590, y: 80, w: 130, label: 'Change log', sub: 'change feed', h: 80, shape: 'db', step: 2 },
   { id: 'likes', x: 250, y: 210, w: 130, label: 'Likes store', sub: 'counters', h: 80, shape: 'db', step: 1 },
   { id: 'indexer', x: 590, y: 210, w: 130, label: 'Indexer', step: 3 },
   { id: 'index', x: 590, y: 350, w: 130, label: 'Search index', sub: 'shards', h: 80, shape: 'db', step: 3 },
   { id: 'query', x: 410, y: 350, w: 130, label: 'Query service', step: 4 },
-  { id: 'cache', x: 250, y: 350, w: 130, label: 'Result cache', sub: 'short TTL', step: 6 },
+  { id: 'cache', x: 250, y: 350, w: 130, label: 'Result cache', sub: 'short life', step: 6 },
   { id: 'searcher', x: 90, y: 350, w: 120, label: 'Searcher', step: 4 },
 ];
 
@@ -32,7 +32,7 @@ const edges: BuildEdge[] = [
 const steps: BuildStep[] = [
   { req: 'FR1: create posts', caption: 'A user creates a post. The Post API writes it to the posts database. This is the source of truth. Everything else can be rebuilt from it.', packets: [{ from: 'user', to: 'api', label: 'post' }, { from: 'api', to: 'posts', label: 'insert', delay: 0.9 }] },
   { req: 'FR1: like posts', caption: 'A like is not a row in the posts table. At 100,000 likes a second it goes to a counter store, sharded by post id. This keeps the hot write path away from the posts database.', packets: [{ from: 'api', to: 'likes', label: '+1' }] },
-  { req: 'NFR: searchable in about a minute', caption: 'Change data capture reads the posts database log and publishes each new post to Kafka (lesson 6.5). The application does not write to the index itself, so the two can never disagree after a partial failure.', packets: [{ from: 'posts', to: 'cdc', label: 'new post' }] },
+  { req: 'NFR: searchable in about a minute', caption: 'Change data capture reads the posts database log and publishes each new post to a change log, an ordered list that readers consume at their own pace (lesson 6.5). The application does not write to the index itself, so the two can never disagree after a partial failure.', packets: [{ from: 'posts', to: 'cdc', label: 'new post' }] },
   { req: 'FR2: search by keyword', caption: 'The indexer reads the feed, splits each post into terms, and writes it into an inverted index split over shards (lessons 4.3 and 8.5). Each term points to the posts that contain it.', packets: [{ from: 'cdc', to: 'indexer', label: 'post' }, { from: 'indexer', to: 'index', label: 'terms', delay: 0.9 }] },
   { req: 'FR2: search by keyword', caption: 'A search goes to the query service. It asks every shard for its best matches, then merges the lists and returns one page.', packets: [{ from: 'searcher', to: 'query', label: 'q' }, { from: 'query', to: 'index', label: 'terms', delay: 0.9 }] },
   { req: 'FR3: sort by likes or recency', caption: 'Recency is cheap: post ids grow with time. Likes change too often to index each one. The like store sends the index a message only at milestones, and the query service re-reads exact counts for its top results.', packets: [{ from: 'likes', to: 'indexer', label: 'milestone' }, { from: 'query', to: 'likes', label: 'exact', delay: 0.9 }] },

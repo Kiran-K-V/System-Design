@@ -10,7 +10,7 @@ import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import MetricsBuild from '../../../components/anim/lessons/MetricsBuild.tsx';
 import MetricsRollup from '../../../components/anim/lessons/MetricsRollup.tsx';
 
-Every large company runs a system that answers one question: is everything healthy right now? Lesson [7.5](/learn/07-reliability/observability/) explained what to measure and how to alert on it. This lesson builds the system that stores the measurements. The new ideas are four: a very high write rate, pull versus push, rollups with retention, and a limit on label cardinality.
+Every large company runs a system that answers one question: is everything healthy right now? Lesson [7.5](/learn/07-reliability/observability/) explained what to measure and how to alert on it. This lesson builds the system that stores the measurements. The new ideas are four: a very high write rate, pull versus push, rollups with retention, and a limit on label cardinality. A label is a tag such as `region="eu"` on a measurement. Cardinality is the count of distinct values a label can take. The last deep dive shows why that count matters.
 
 ## Requirements
 
@@ -18,8 +18,8 @@ Every large company runs a system that answers one question: is everything healt
 
 1. Ingest metrics (CPU, memory, latency, custom counters) from services.
 2. Let people query and graph metrics with filters, aggregation, and time ranges.
-3. Evaluate alert rules, such as "p99 latency above 500 ms for 5 minutes".
-4. Send alerts to email, Slack, or a pager.
+3. Evaluate alert rules, such as "p99 latency above 500 ms for 5 minutes". The p99 is the value that 99 out of 100 requests beat, so it shows how slow the slowest 1 in 100 feels.
+4. Send alerts to email, Slack, or a pager. A pager is a service that rings the on-call engineer's phone, day or night.
 
 **Below the line.** Log search, distributed tracing, and anomaly detection by machine learning. They are different systems with different storage. Say so and move on.
 
@@ -32,15 +32,15 @@ Every large company runs a system that answers one question: is everything healt
 
 ## Core entities
 
-- **Series.** One metric name plus one set of labels, for example `cpu_seconds{host="a1", region="eu"}`.
+- **Series.** One measured thing over time, such as the CPU of one machine. It is one metric name plus one set of labels, for example `cpu_seconds{host="a1", region="eu"}`.
 - **Sample.** A timestamp and a number, belonging to one series.
-- **Rollup.** Min, max, sum, and count of one series over one time window.
+- **Rollup.** Min, max, sum, and count of one series over one time window. It is a short summary that stands in for many raw points, like a daily sales total in place of every receipt.
 - **Alert rule.** An expression, a `for` duration, a severity, and a route.
 - **Alert instance.** One rule firing for one label set, in state inactive, pending, or firing.
 
 ## API
 
-- `GET /metrics` on every service. The collector calls it. This is the pull path.
+- `GET /metrics` on every service. The collector calls it. A call like this is a scrape: the collector reads the service's current numbers. This is the pull path.
 - `POST /v1/write` on a push gateway, for jobs too short to be scraped.
 - `GET /v1/query?expr=...&start=...&end=...&step=...` for dashboards.
 - `POST /v1/rules` and `GET /v1/alerts` for alert rules and their state.
@@ -57,7 +57,7 @@ The collector in step 1 pulls. Prometheus works this way: its overview says time
 
 The strongest gain is the down signal. A scrape that fails is data. With push, silence is ambiguous: the service may be dead, or the network may be cut. The service may instead have nothing to say.
 
-Push still has a place. A batch job may live for only 5 seconds, so no scrape will catch it. Prometheus offers the Pushgateway for the outcome of such jobs, and its own docs warn about three costs. The gateway becomes a single point of failure. You lose the automatic `up` health signal. And it keeps old series forever, until someone deletes them.
+Push still has a place. A batch job may live for only 5 seconds, so no scrape will catch it. Prometheus is a popular open-source metrics system. It offers the Pushgateway, a small service that holds the results that short jobs push to it until the collector scrapes them, and its own docs warn about three costs. The gateway becomes a single point of failure. You lose the automatic `up` health signal. And it keeps old series forever, until someone deletes them.
 
 ## Deep dives
 
@@ -67,7 +67,7 @@ A dashboard panel asks for average CPU of 1,000 servers over 30 days, one dot pe
 
 <MetricsRollup client:visible />
 
-The fix is the one that lesson [10.2](/learn/10-advanced/time-series/) described for time series: write coarser copies of old data. The query service picks the coarsest resolution that still gives the step the user asked for. Prometheus has a related tool, recording rules. They "precompute frequently needed or computationally expensive expressions" and save the result as new series. That is the same trade: do the work once, at write time.
+The fix is the one that lesson [10.2](/learn/10-advanced/time-series/) described for time series: write coarser copies of old data. The query service picks the coarsest resolution that still gives the step the user asked for. Prometheus has a related tool, recording rules, which are saved queries that run on a timer. They "precompute frequently needed or computationally expensive expressions" and save the result as new series. That is the same trade: do the work once, at write time.
 
 Keep min, max, sum, and count in each rollup, not only the average. The average hides a 30-second spike. Sum and count let you combine windows correctly.
 
@@ -94,13 +94,13 @@ The 1-minute target in our requirements is the delay before the evaluator sees t
 Two failures matter here.
 
 - **One evaluator dies.** Its alerts go quiet, and nobody notices. Run evaluators as a pair that both evaluate every rule, and let the alert manager remove duplicates. A silent monitoring system is worse than a loud one.
-- **Rules are expensive.** Evaluating every rule against raw history every few seconds does not scale. Have rules read recent data only, from the store's hot tier or straight off the buffer. Pre-aggregate expensive expressions with recording rules.
+- **Rules are expensive.** Evaluating every rule against raw history every few seconds does not scale. Have rules read recent data only, from the store's hot tier (the fast storage that holds the newest data) or straight off the buffer. Pre-aggregate expensive expressions with recording rules.
 
 ### Cardinality
 
 The number of series is the cost driver. It is the product of the label values. A counter has 20 routes, 4 status codes, and 100 hosts. That gives up to 20 x 4 x 100 = 8,000 series. Add a `customer_id` label with 50,000 values, and the bound becomes 8,000 x 50,000 = 400 million.
 
-Each series costs memory in the ingester and an entry in the index. A single careless label can double the bill or crash the store. The Prometheus instrumentation guide advises keeping metric cardinality below 10 for most metrics. The guide also advises treating anything over 100 as a reason to rethink.
+Each series costs memory in the ingester (the part of the store that accepts incoming writes) and an entry in the index. A single careless label can double the bill or crash the store. The Prometheus instrumentation guide advises keeping metric cardinality below 10 for most metrics. The guide also advises treating anything over 100 as a reason to rethink.
 
 The control belongs at ingest. The collector counts the series each service owns, and drops new ones past a limit. It reports the drop as a metric of its own. The owning team gets paged about its own label, not the whole company about the store.
 

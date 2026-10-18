@@ -70,7 +70,7 @@ Pagination (lesson [3.3](/learn/03-api-design/pagination/)) is not needed. K is 
 
 This problem has a clear pipeline, so write it down first.
 
-1. A view event enters a durable log.
+1. A view event enters a durable log. A log is a list that only grows at the end, and it is saved to disk so no event is lost. Kafka is one.
 2. A stream job sums events per video over short buckets.
 3. The sums go to a count store.
 4. A job ranks the counts and writes a list per window to a cache.
@@ -92,9 +92,11 @@ The naive design runs `UPDATE counts SET views = views + 1` for every view. At 8
 
 The stream job fixes this. It groups events by video id for one minute and writes one partial count per video. If 5 million different videos get a view in a minute (assumption), the store sees 5,000,000 / 60 = about **83,000 writes per second**. That needs 83,000 / 10,000, so about **9 instances**. Batching cut the write rate by about 10 times.
 
-The job keeps its sums in Flink state (lesson [8.7](/learn/08-technologies/flink/)). Checkpoints protect that state. If the job crashes, it restarts from the last checkpoint and replays from the Kafka offset stored with it. A late event is handled by the watermark rule in the same lesson. An example is a view sent by a phone that was offline. Choose a delay of a few seconds. Longer delay means better counts and a slower list.
+The job keeps its sums in memory, in what Flink calls state (lesson [8.7](/learn/08-technologies/flink/)). A **checkpoint** is a saved copy of that state, taken every so often, like a save point in a game. A Kafka **offset** is the position of the last event the job has read in the log. The checkpoint stores the offset too. If the job crashes, it reloads the last checkpoint and reads the log again from that offset, so no view is lost or counted twice.
 
-Shard the count store by video id (lesson [4.7](/learn/04-data/sharding/)). One video belongs to one shard, so its count never needs a cross-shard sum. One very hot video is still one hot key. A viral video may get far more writes than 10,000 per second. The stream job already merges its views into one write per minute. That is why batching also solves the hot key here.
+Some events arrive late. An example is a view sent by a phone that was offline. A **watermark** is the job's rule for how long to wait for stragglers before it closes a minute. Choose a delay of a few seconds. A longer delay means better counts and a slower list.
+
+Shard the count store by video id (lesson [4.7](/learn/04-data/sharding/)). One video belongs to one shard, so its count never needs a cross-shard sum. One very hot video is still one **hot key**: a single key that gets far more traffic than the others, so its shard becomes the bottleneck. A viral video may get far more writes than 10,000 per second. The stream job already merges its views into one write per minute. That is why batching also solves the hot key here.
 
 ### Reading the top K
 
@@ -121,7 +123,7 @@ The cheap method uses buckets.
 You pay for subtraction: you must keep the old buckets until they expire. For one hour that is 60 minute-buckets, or about 60 x 5,000,000 x 16 bytes = 4.8 GB in our model.
 
 <Callout type="mistake" title="One sorted set for every window">
-A single sorted set of counts has no way to forget old views. Give each window its own key and let old buckets expire. Otherwise the last-hour list slowly turns into the all-time list.
+A single sorted set (a Redis structure that keeps items ordered by a score, here the count; lesson [8.2](/learn/08-technologies/redis/)) of counts has no way to forget old views. Give each window its own key and let old buckets expire. Otherwise the last-hour list slowly turns into the all-time list.
 </Callout>
 
 ### Approximate counts: heavy hitters

@@ -45,7 +45,7 @@ const steps: Step[] = [
     arrows: [],
   },
   {
-    caption: 'The write arrives: key 7, value Ana. First it is appended to the commit log. An append is sequential, which disks do fast. The commit log exists only for crash recovery.',
+    caption: 'The write arrives: key 7, value Ana. First it is appended to the commit log. An append only adds to the end of the file, which disks do fast. The commit log exists only for crash recovery.',
     write: 'write 7 = Ana',
     log: [e(7, 'Ana')],
     mem: [],
@@ -72,7 +72,7 @@ const steps: Step[] = [
     arrows: [],
   },
   {
-    caption: 'Flush. The memtable is written to disk as one SSTable, in one sequential write. SSTables are immutable: never written to again after the flush. The memtable starts empty. The commit log is not needed any more for these writes, because they now sit in an SSTable.',
+    caption: 'Flush. The memtable is written to disk as one SSTable, in one write that runs straight through the file. SSTables are immutable: never written to again after the flush. The memtable starts empty. The commit log is not needed any more for these writes, because they now sit in an SSTable.',
     log: [],
     mem: [],
     sst1: SST1,
@@ -87,7 +87,7 @@ const steps: Step[] = [
     arrows: [{ id: 'flush2', points: [[280, 174], [322, 214]], tone: 'accent', label: 'flush', at: [330, 186] }],
   },
   {
-    caption: 'Compaction. A background job combines several SSTables into one. For key 7 it keeps the newest value, Ana2. Cassandra then removes the old SSTables once the new one is written. Reads touch fewer files. The cost is that the data is rewritten (write amplification).',
+    caption: 'Compaction. A background job combines several SSTables into one. For key 7 it keeps the newest value, Ana2. Cassandra then removes the old SSTables once the new one is written. Reads touch fewer files. The cost is that the same data is written to disk again.',
     log: [],
     mem: [],
     sst1: { ...SST1, old: true },
@@ -135,7 +135,7 @@ export default function CassWritePath() {
             <HandText x={45} y={222} size={TEXT_SIZES.note} mono color={s.write === 'ok' ? 'var(--ok)' : 'var(--accent)'}>{s.write === 'ok' ? 'OK' : s.write.replace('write ', 'put ')}</HandText>
           )}
 
-          <EntryBox cx={215} cy={106} title="Memtable (RAM)" entries={s.mem} seed="cassmem" stroke={s.mem.length === 3 ? 'var(--warn)' : 'var(--fg)'} />
+          <EntryBox cx={215} cy={106} title="Memtable (memory)" entries={s.mem} seed="cassmem" stroke={s.mem.length === 3 ? 'var(--warn)' : 'var(--fg)'} />
           <EntryBox cx={215} cy={250} title="Commit log (disk)" entries={s.log} seed="casslog" />
           {s.sst1 && (
             <Fade step={i} born={5}>

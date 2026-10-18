@@ -16,7 +16,7 @@ Two people open the same document. Alice types a word at the start. Bob deletes 
 
 Both must see both changes within a fraction of a second. The two screens must end with identical text. Nobody's edit may vanish.
 
-Real-time delivery is solved (lesson [9.3](/learn/09-patterns/real-time-updates/)). The new problem is **merging**: edits made at the same time, on copies that have not yet seen each other. This case study covers two ways to merge, **operational transform** (OT) and **CRDTs**, and the server design around them. We keep to plain text. Rich formatting and permissions are below the line.
+Real-time delivery is solved (lesson [9.3](/learn/09-patterns/real-time-updates/)). The new problem is **merging**: edits made at the same time, on copies that have not yet seen each other. This case study covers two ways to merge, **operational transform** (OT) and **CRDTs** (conflict-free replicated data types, explained below), and the server design around them. We keep to plain text. Rich formatting and permissions are below the line.
 
 ## Requirements
 
@@ -64,6 +64,7 @@ Two choices carry the design.
 
 - **One collaboration server owns each active document.** All its editors connect to that server. It gives every operation a **sequence number**, so there is one agreed order. How a document finds its server is routing by a hash of the document id (lesson [4.8](/learn/04-data/consistent-hashing/)).
 - **Edits are operations, not whole documents.** An operation is a small change: "insert X at position 1", "delete the character at position 2". Small changes can be merged. Whole texts cannot.
+- **Every accepted operation goes into an operation log.** The log is an ordered list, only ever added to at the end, like the line items on a bank statement. The current text is whatever you get by replaying the log from the start. If the server crashes, the log is what it recovers from. A **snapshot** is a saved copy of the full text at one version, so you do not have to replay from the very start.
 
 ## Numbers
 
@@ -152,13 +153,13 @@ The cost is metadata. Each character carries an id, and tombstones stay until a 
 | Hard part | Transform rules for every pair of operation types | Memory growth and cleanup |
 | Offline editing | Harder | Natural |
 
-Neither one removes the need for a server. You still need storage, authentication, permissions, and fan-out. Do not say "CRDTs need no server". Figma's engineers wrote that they chose not to use OT. They called OT the standard multiplayer algorithm popularized by apps like Google Docs. That is their claim and their reasons for their own problem. We cover their approach in the In the Wild module. In an interview, pick one, say why, and state its price.
+Neither one removes the need for a server. You still need storage, authentication, permissions, and fan-out, which means sending each edit to every other editor of the document. Do not say "CRDTs need no server". Figma's engineers wrote that they chose not to use OT. They called OT the standard multiplayer algorithm popularized by apps like Google Docs. That is their claim and their reasons for their own problem. We cover their approach in the In the Wild module. In an interview, pick one, say why, and state its price.
 
 ## Deep dive: one owner per document
 
 If two servers both accept operations for the same document, each makes its own order. The copies diverge. So one server must own a document at a time.
 
-Route by hash of document id (lesson [4.8](/learn/04-data/consistent-hashing/)). Record the owner with a lease in a coordination service such as ZooKeeper or etcd (lesson [8.8](/learn/08-technologies/zookeeper/)). When the owner dies, the lease expires and another server takes over. The new owner loads the latest snapshot, replays the log after it, and clients reconnect. A client reports the last sequence number it saw and resends operations that were never acknowledged. The server drops repeats by client id and operation number.
+Route by hash of document id (lesson [4.8](/learn/04-data/consistent-hashing/)). Record the owner with a lease, a claim that runs out unless the owner keeps renewing it, in a coordination service such as ZooKeeper or etcd (lesson [8.8](/learn/08-technologies/zookeeper/)). When the owner dies, the lease expires and another server takes over. The new owner loads the latest snapshot, replays the log after it, and clients reconnect. A client reports the last sequence number it saw and resends operations that were never acknowledged. The server drops repeats by client id and operation number.
 
 The operation log is written before the server confirms. A server that confirms first and writes later loses confirmed edits when it crashes. The Diagnose below shows this.
 
@@ -167,9 +168,9 @@ The operation log is written before the server confirms. A server that confirms 
 Cursors change many times a second and nobody needs them after a restart. So:
 
 - Keep them in memory on the owning server. Do not write them to a database.
-- Throttle: a client sends a cursor update at most every 50 to 100 ms (our assumption).
+- Throttle (limit the rate): a client sends a cursor update at most every 50 to 100 ms (our assumption).
 - Send them only to other sessions on that document.
-- Expire them. If no heartbeat arrives for about 30 seconds (assumption), drop the user.
+- Expire them. If no heartbeat, a small "still here" message, arrives for about 30 seconds (assumption), drop the user.
 
 A cursor is a position, so it has the same problem as an edit. If Alice's cursor is at position 5 and Bob inserts 2 characters at position 1, Alice's cursor moves to 7. Transform cursors with the same rule as operations.
 

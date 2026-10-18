@@ -30,17 +30,17 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: first token fast',
-    caption: 'A worker writes each token to a buffer as it is made. The stream gateway reads the buffer and sends each token to the client as a server-sent event. If the connection drops, the client reconnects and the gateway replays from the last event id.',
+    caption: 'A worker writes each token to a buffer as it is made. The stream gateway reads the buffer and sends each token to the client as it arrives, as one event in an open HTTP response. Each event has a number. If the connection drops, the client reconnects and says the last number it saw, and the gateway replays from there.',
     packets: [{ from: 'gpu', to: 'buf' }, { from: 'buf', to: 'gate', delay: 0.5 }, { from: 'gate', to: 'client', delay: 1 }],
   },
   {
     req: 'FR2: resume old chats',
-    caption: 'Every message is appended to a conversation store, keyed by conversation. Before a new run, the API reads the recent messages that fit the model window and puts them in front of the prompt.',
+    caption: 'Every message is appended to a conversation store, keyed by conversation. Before a new run, the API reads the recent messages that fit the model input limit and puts them in front of the prompt.',
     packets: [{ from: 'api', to: 'conv' }],
   },
   {
     req: 'NFR: fair use per tier',
-    caption: 'A rate limiter sits in front of the queue. It keeps two budgets per user: requests per minute and tokens per minute. Paid tiers get larger budgets. An empty budget gets a 429 with a retry time.',
+    caption: 'A rate limiter sits in front of the queue. It keeps two budgets per user: requests per minute and tokens per minute. Paid tiers get larger budgets. An empty budget gets a "too many requests" reply (HTTP status 429) with a retry time.',
     packets: [{ from: 'api', to: 'lim' }],
   },
   {

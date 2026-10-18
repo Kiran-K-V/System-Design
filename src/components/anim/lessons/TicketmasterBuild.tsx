@@ -16,7 +16,7 @@ const edges: BuildEdge[] = [
   { from: 'client', to: 'evsvc', step: 0 },
   { from: 'evsvc', to: 'evdb', step: 0 },
   { from: 'evsvc', to: 'index', step: 1 },
-  { from: 'evdb', to: 'index', step: 1, dashed: true, label: 'CDC', labelAt: [30, 0] },
+  { from: 'evdb', to: 'index', step: 1, dashed: true, label: 'copies changes', labelAt: [30, 0] },
   { from: 'evsvc', to: 'cache', step: 2 },
   { from: 'client', to: 'bsvc', step: 3 },
   { from: 'bsvc', to: 'seats', step: 3 },
@@ -33,7 +33,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR2: search events',
-    caption: 'Search by name, city, or date needs a search index (lesson 8.5). Change data capture copies each event change into it (lesson 6.5). The index can lag, because a new event can wait a moment.',
+    caption: 'Search by name, city, or date needs a search index, a store built to find text fast (lesson 8.5). A feed of database changes copies each event change into it (lesson 6.5). The index can lag, because a new event can wait a moment.',
   },
   {
     req: 'NFR: reads outnumber writes',
@@ -56,7 +56,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: a live seat map',
-    caption: 'Seat changes stream to every viewer (SSE, lesson 2.5), so a fan does not click a seat that is already gone. The seat map is a hint. The hold step decides.',
+    caption: 'Seat changes are pushed to every viewer over a one-way live connection (lesson 2.5), so a fan does not click a seat that is already gone. The seat map is a hint. The hold step decides.',
     packets: [{ from: 'seats', to: 'feed' }],
   },
 ];

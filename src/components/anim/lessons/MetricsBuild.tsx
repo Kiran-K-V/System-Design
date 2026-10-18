@@ -27,7 +27,7 @@ const edges: BuildEdge[] = [
 const steps: BuildStep[] = [
   {
     req: 'FR1: ingest metrics',
-    caption: 'The collector pulls. Every 10 seconds it calls each service for its current values. This is the Prometheus model. A service that does not answer is a service that is down, and the collector knows it at once.',
+    caption: 'The collector pulls. Every 10 seconds it calls each service for its current values. This is called pull. A service that does not answer is a service that is down, and the collector knows it at once.',
     packets: [{ from: 'col', to: 'svc' }],
   },
   {
@@ -46,7 +46,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR3: alert rules',
-    caption: 'A rule evaluator runs every rule on a fixed timer. It reads the store, compares the result with the threshold, and keeps a pending state until the condition has held for the whole window.',
+    caption: 'A rule evaluator runs every rule on a fixed timer. It reads the store, compares the result with the threshold, and waits, and only fires once the condition has held for the whole window.',
     packets: [{ from: 'store', to: 'eval' }],
   },
   {

@@ -32,9 +32,9 @@ const decr: CompareVariant = {
   edges,
   steps: [
     { caption: 'Same start: one unit left, two buyers at the same moment.', active: ['a', 'b'] },
-    { caption: 'The API sends DECR stock. Redis runs commands one at a time, so the two decrements are ordered. A is first.', packets: [{ from: 'a', to: 'api' }, { from: 'api', to: 'redis', delay: 0.5 }], active: ['redis'] },
+    { caption: 'The API sends DECR stock, which means subtract 1 and return the new value. Redis runs commands one at a time, so the two decrements are ordered. A is first.', packets: [{ from: 'a', to: 'api' }, { from: 'api', to: 'redis', delay: 0.5 }], active: ['redis'] },
     { caption: 'A gets 0 back. The result is not below zero, so A holds a unit. The API writes the reservation.', tones: { a: 'ok', redis: 'ok' }, notes: [{ x: 610, y: 240, text: 'A: result 0, win', size: 14, tone: 'ok' }] },
-    { caption: 'B gets -1 back. A negative result means there was nothing to take. The API sends INCR to put the 1 back, and tells B the item is sold out. No second reservation exists.', tones: { b: 'bad', a: 'ok', redis: 'ok' }, packets: [{ from: 'b', to: 'api', tone: 'bad' }], notes: [{ x: 610, y: 240, text: 'B: result -1, INCR back', size: 14, tone: 'warn' }] },
+    { caption: 'B gets -1 back. A negative result means there was nothing to take. The API sends INCR (add 1) to put the 1 back, and tells B the item is sold out. No second reservation exists.', tones: { b: 'bad', a: 'ok', redis: 'ok' }, packets: [{ from: 'b', to: 'api', tone: 'bad' }], notes: [{ x: 610, y: 240, text: 'B: result -1, INCR back', size: 14, tone: 'warn' }] },
   ],
 };
 

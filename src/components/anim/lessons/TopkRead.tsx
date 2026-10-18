@@ -18,7 +18,7 @@ const naive: CompareVariant = {
   steps: [
     { caption: 'A reader asks for the top 1,000 videos in the last hour.', packets: [{ from: 'reader', to: 'api', label: 'top K' }], active: ['reader'] },
     {
-      caption: 'The API runs ORDER BY views DESC LIMIT 1000. The database must visit every row, or keep an index that changes on every single view.',
+      caption: 'The API asks the database to sort every row by views and keep the top 1,000 (ORDER BY views DESC LIMIT 1000). The database must visit every row, or keep an index that changes on every single view.',
       packets: [{ from: 'api', to: 'counts', label: 'sort' }],
       tones: { counts: 'warn' },
       active: ['counts'],
@@ -56,7 +56,7 @@ const better: CompareVariant = {
       active: ['cache'],
     },
     {
-      caption: 'Meanwhile, every 30 seconds (our assumption), the job scans the counts once. It keeps a min-heap of size K, so memory is K entries, not 4B.',
+      caption: 'Meanwhile, every 30 seconds (our assumption), the job scans the counts once. It keeps only the K biggest counts seen so far (a min-heap), so memory is K entries, not 4B.',
       packets: [{ from: 'counts', to: 'job', label: 'scan' }],
       active: ['job'],
     },

@@ -74,7 +74,7 @@ const steps: Step[] = [
     active: ['s0', 's1', 's2'],
   },
   {
-    caption: 'A hot partition. One key, say a live match counter, takes 60% of all writes. Hashing sends every write for that key to the same shard. That shard saturates while the other two idle. Adding shards does not help, because the key still maps to one.',
+    caption: 'A hot key. One key, say a live match counter, takes 60% of all writes. Hashing sends every write for that key to the same shard. That shard saturates while the other two idle. Adding shards does not help, because the key still maps to one.',
     note: 'one key, one shard: 60% of writes',
     noteTone: 'bad',
     nodes: [clients, api, queue, worker, shard(0, 'bad', '60% of writes'), shard(1, undefined, '20%'), shard(2, undefined, '20%')],

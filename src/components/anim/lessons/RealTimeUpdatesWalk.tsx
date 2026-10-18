@@ -89,7 +89,7 @@ const steps: Step[] = [
     active: ['g2'],
   },
   {
-    caption: 'Cy\'s client waits a random delay (lesson 7.2 explains why jitter matters), reconnects through the load balancer to server 1, and says "my last sequence number was 42". The server asks the log for everything after 42 and replays 43. Then it joins the live path. SSE has the same idea built in: the `id` field sets the last event ID the browser sends back on reconnect.',
+    caption: 'Cy\'s client waits a random delay (a different random wait for each client, so they do not all return at once), reconnects through the load balancer to server 1, and says "my last sequence number was 42". The server asks the log for everything after 42 and replays 43. Then it joins the live path. SSE has the same idea built in: the `id` field sets the last event ID the browser sends back on reconnect.',
     note: 'resume from 42: replay 43, then live',
     noteTone: 'ok',
     tones: { g2: 'bad', u3: 'ok' },

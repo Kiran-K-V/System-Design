@@ -15,7 +15,7 @@ export default function ProxNeighbors() {
   return (
     <figure className="not-prose my-8 overflow-hidden rounded-xl border border-line bg-bg px-2 py-4 sm:px-4">
       <div>
-        <SketchSvg width={720} height={400} label="A 3 by 3 block of geohash cells around a query point near the right edge of the middle cell. Two nearby points on the Greenwich line have no common prefix.">
+        <SketchSvg width={720} height={400} label="A 3 by 3 block of geohash cells around a query point near the right edge of the middle cell. Two nearby points on either side of longitude 0 have no common prefix.">
           <HandText x={x0 + 1.5 * cs} y={22} size={TEXT_SIZES.heading}>
             {`Query near the east edge of cell ${WEST}`}
           </HandText>
@@ -55,7 +55,7 @@ export default function ProxNeighbors() {
             {`east  ${EAST}`}
           </HandText>
           <HandText x={400} y={222} size={TEXT_SIZES.label} anchor="start">
-            {'About 140 m apart, yet no shared\nfirst character. The Greenwich line\nis a top-level split.'}
+            {'About 140 m apart, yet no shared\nfirst character. The line at\nlongitude 0 is the first split.'}
           </HandText>
           <HandText x={400} y={312} size={TEXT_SIZES.label} anchor="start" color="var(--muted)">
             {'The circle crosses the right edge.\nSo the query reads the middle cell\nand its 8 neighbors, then filters\nby true distance.'}

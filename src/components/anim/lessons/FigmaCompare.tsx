@@ -6,7 +6,7 @@ const before: CompareVariant = {
   nodes: [
     { id: 'clients', x: 80, y: 150, w: 110, h: 56, label: 'Clients' },
     { id: 'server', x: 320, y: 150, w: 150, h: 64, label: 'Multiplayer', sub: 'file in memory' },
-    { id: 'ckpt', x: 600, y: 150, w: 150, h: 80, shape: 'db', label: 'Checkpoint', sub: 'in S3' },
+    { id: 'ckpt', x: 600, y: 150, w: 150, h: 80, shape: 'db', label: 'Checkpoint', sub: 'in S3 file store' },
   ],
   edges: [
     { from: 'clients', to: 'server', label: 'edits' },

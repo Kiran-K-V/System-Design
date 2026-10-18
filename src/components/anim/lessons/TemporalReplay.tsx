@@ -28,7 +28,7 @@ interface Step {
 const steps: Step[] = [
   {
     caption:
-      'A workflow is ordinary code with three steps. Each step is an activity: a call to the outside world, like a payment API. The server keeps an event history for this workflow. The history is the source of truth. Worker A runs the code. Worker A keeps nothing that the history does not also hold.',
+      'A workflow is ordinary code with three steps. Each step is an activity: a call to the outside world, like a payment API. The server keeps an event history for this workflow. The history is the one record that is always right. Worker A runs the code. Worker A keeps nothing that the history does not also hold.',
     msg: 'Worker A starts the workflow. History has 1 event.',
     worker: 'Worker A: running',
     workerTone: 'accent',
@@ -77,7 +77,7 @@ const steps: Step[] = [
     lines: ['muted', 'muted', 'muted'],
   },
   {
-    caption: 'Worker B gets a workflow task with the full history. It runs the code from the top. Step 1 emits "schedule charge". The SDK compares it with events 2 and 3. They match, so it returns the saved result and does not call the payment API again.',
+    caption: 'Worker B gets the job of continuing this workflow, along with the full history. It runs the code from the top. Step 1 emits "schedule charge". The Temporal library compares it with events 2 and 3. They match, so it returns the saved result and does not call the payment API again.',
     msg: 'Worker B replays step 1 from the history.',
     worker: 'Worker B: replaying',
     workerTone: 'accent',
@@ -106,7 +106,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Now suppose someone deploys code that reserves stock before it charges. Replay emits "schedule reserve" first. The history says event 2 is "charge scheduled". They differ, so the SDK raises a non-determinism error and the workflow stops. A stopped workflow is safer than one that charges twice or skips a step. This is why workflow code must be deterministic, and why changes need versioning.',
+      'Now suppose someone deploys code that reserves stock before it charges. Replay emits "schedule reserve" first. The history says event 2 is "charge scheduled". They differ, so the Temporal library raises an error and the workflow stops, because the code no longer repeats the same steps. A stopped workflow is safer than one that charges twice or skips a step. This is why workflow code must be deterministic, and why changes need versioning.',
     msg: 'Changed code does not match the history.',
     worker: 'Worker B: mismatch',
     workerTone: 'bad',

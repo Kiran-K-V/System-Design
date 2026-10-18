@@ -18,7 +18,7 @@ const edges: BuildEdge[] = [
   { from: 'client', to: 'api', step: 0 },
   { from: 'api', to: 'search', step: 0 },
   { from: 'search', to: 'index', step: 0 },
-  { from: 'bizdb', to: 'index', label: 'CDC', labelAt: [30, 0], step: 1 },
+  { from: 'bizdb', to: 'index', label: 'copies changes', labelAt: [30, 0], step: 1 },
   { from: 'api', to: 'biz', step: 2 },
   { from: 'biz', to: 'bizdb', step: 2 },
   { from: 'biz', to: 'revdb', step: 2 },

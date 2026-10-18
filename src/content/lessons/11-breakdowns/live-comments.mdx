@@ -45,7 +45,7 @@ This is the opposite of the previous case study. In the WhatsApp lesson ([11.6](
 
 - `POST /videos/{id}/comments` with `{text}`. Returns `{comment_id}`.
 - `GET /videos/{id}/comments?before=<seq>&limit=10`. A page of history (lesson [3.3](/learn/03-api-design/pagination/) on cursors).
-- `GET /videos/{id}/stream`. An SSE stream. After a drop, the browser reconnects with `Last-Event-ID` and the server resumes from there.
+- `GET /videos/{id}/stream`. An SSE stream. SSE (server-sent events) is one long HTTP response that the server keeps open and writes new items into, like a tap that keeps dripping. After a drop, the browser reconnects with `Last-Event-ID` and the server resumes from there.
 
 No data-flow section is needed. This is request-response plus one long-lived stream.
 
@@ -75,7 +75,7 @@ A simple first idea is one topic for all comments, with every stream server subs
 
 <LiveCommentsFanout client:visible />
 
-The fix is the pub/sub rule from lesson [6.2](/learn/06-async/pubsub-logs/): a **channel per video**. A stream server joins a channel only while it has a viewer of that video. This is a routing problem, so lesson [4.8](/learn/04-data/consistent-hashing/) applies in one place. If one pub/sub node cannot carry all the channels, spread channels over nodes by `hash(video_id)`. Redis can run this layer (lesson [8.2](/learn/08-technologies/redis/)). Its pub/sub is at-most-once. That is acceptable here, because the comment is already saved and a missed comment costs the viewer only a moment.
+The fix is the pub/sub rule from lesson [6.2](/learn/06-async/pubsub-logs/): a **channel per video**. A stream server joins a channel only while it has a viewer of that video. This is a routing problem, so lesson [4.8](/learn/04-data/consistent-hashing/) applies in one place. If one pub/sub node cannot carry all the channels, spread channels over nodes by `hash(video_id)`. Redis can run this layer (lesson [8.2](/learn/08-technologies/redis/)). Its pub/sub is at-most-once. That means a message is delivered zero or one times and is never retried, so a subscriber that is briefly disconnected misses it. That is acceptable here, because the comment is already saved and a missed comment costs the viewer only a moment.
 
 ### The hot video
 
@@ -89,15 +89,15 @@ How do you cut 2,000 to 5? **Sample**. A small aggregator keeps about 1 in 400 c
 
 When even the sample is too costly, drop push and use the CDN. A job writes the latest 100 to 200 comments as a small snapshot object once a second. Viewers poll the CDN edge (lesson [2.7](/learn/02-networking/cdn-proxies/)). Say there are 50 edge locations: the origin handles about 50 requests per second. By contrast, the edge absorbs 500,000 per second from 1M viewers polling every 2 s. The price is delay: up to 1 s for the snapshot plus 2 s for the poll. So the total is about 3 s.
 
-The write side can be hot too. Partition the store by `video_id` and one popular video makes one hot partition (lesson [4.7](/learn/04-data/sharding/)). Use a composite key such as `(video_id, minute)`. Order inside a video comes from time-sortable ids, not from a single counter (lesson [10.5](/learn/10-advanced/ids-and-time/)).
+The write side can be hot too. A partition is one slice of the store, kept on one machine. If you assign slices by `video_id`, every comment of a popular video lands on the same machine, so that machine gets all 2,000 writes per second while the others sit idle (lesson [4.7](/learn/04-data/sharding/)). The fix is a composite key, which joins two fields into one key, such as `(video_id, minute)`. Now each minute of a video can live on a different machine, and a read of recent comments touches only one or two slices. Order inside a video comes from time-sortable ids, not from a single counter (lesson [10.5](/learn/10-advanced/ids-and-time/)).
 
 ### Disconnects and late joins
 
 Phones drop connections. SSE gives you the resume: each event carries an `id` equal to the comment `seq`. The browser sends `Last-Event-ID` on reconnect. The server needs a short buffer of recent events to answer from. A time window is fine for a normal video. For the hot video it would be huge: 5 minutes × 2,000 per second = 600,000 comments. So bound the buffer by count (say the last 200). If the viewer is further behind than that, skip ahead and reload the latest page. That is a graceful gap, and it is acceptable by the requirements.
 
-If a stream server dies, all its viewers reconnect at once. Backoff and jitter prevent a storm (lesson [2.5](/learn/02-networking/real-time-transport/)).
+If a stream server dies, all its viewers reconnect at once. Backoff (wait longer after each failed try) and jitter (add a random delay so clients do not retry in step) prevent a storm (lesson [2.5](/learn/02-networking/real-time-transport/)).
 
-Late joiners read the recent-comment cache (lesson [9.1](/learn/09-patterns/scaling-reads/) for the read pattern), then subscribe. Subscribe first, then read history, and drop duplicates by `seq`, so nothing falls in the gap between the two.
+Late joiners read the recent-comment cache (lesson [9.1](/learn/09-patterns/scaling-reads/) for the read pattern), then subscribe. Order matters here. Picture a viewer who reads history first and subscribes second. A comment posted between those two steps is in neither place, so the viewer never sees it. So subscribe first, then read history, and drop duplicates by `seq`. Now the worst case is that one comment arrives twice, and the `seq` number lets the client ignore the second copy.
 
 ## Numbers
 

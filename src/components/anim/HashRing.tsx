@@ -274,7 +274,7 @@ export default function HashRing({ initialServers = 4, initialKeys = 120, initia
           </div>
 
           <div>
-            <div className="mb-1 text-xs text-muted">Virtual nodes per server</div>
+            <div className="mb-1 text-xs text-muted">Virtual nodes per server (points each server takes on the ring)</div>
             <div className="inline-flex overflow-hidden rounded-md border border-line text-xs" role="group" aria-label="Virtual nodes per server">
               {VNODE_CHOICES.map((v) => (
                 <button
@@ -325,7 +325,7 @@ export default function HashRing({ initialServers = 4, initialKeys = 120, initia
 
           <div className="rounded-lg border border-line bg-surface p-3" aria-live="polite">
             {change === null ? (
-              <p className="text-muted">Add or remove a server. The ring counts the keys that move. Then it counts how many <code>hash % N</code> would move.</p>
+              <p className="text-muted">Add or remove a server. The ring counts the keys that move. Then it counts how many would move with the simple method, <code>hash % N</code> (the key's hash number divided by the server count, keeping the remainder).</p>
             ) : change.moved === undefined ? (
               <p>{change.text}.</p>
             ) : (

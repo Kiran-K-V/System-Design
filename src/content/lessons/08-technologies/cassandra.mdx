@@ -12,7 +12,7 @@ import QuorumCalc from '../../../components/anim/lessons/QuorumCalc.tsx';
 
 ## What it is
 
-Apache Cassandra is a wide-column, distributed, peer-to-peer database. It is built for a high write rate and horizontal scale. "Peer-to-peer" means no node is special. There is no leader and no single master. Any node can take any request.
+Apache Cassandra is a wide-column, distributed, peer-to-peer database. **Wide-column** means a row can hold a very large number of columns, and different rows can use different columns. You can think of each row as a sorted map. **Distributed** means the data lives on many machines, called **nodes**. It is built for a high write rate and horizontal scale: to handle more load you add more nodes, not a bigger machine. "Peer-to-peer" means no node is special. There is no leader and no single master. Any node can take any request.
 
 It is the working example of ideas you have already seen. Its storage is the log-structured design from [lesson 4.2](/learn/04-data/storage-engines). Its placement is [consistent hashing](/learn/04-data/consistent-hashing). Its consistency is the quorum rule from [lesson 4.11](/learn/04-data/consensus), which you set per request ([lesson 4.10](/learn/04-data/consistency-models)).
 
@@ -20,9 +20,9 @@ It is the working example of ideas you have already seen. Its storage is the log
 
 ### The ring: who owns which key
 
-Cassandra hashes the **partition key** of each row into a token. The tokens form a ring. Each node owns ranges of the ring. A row belongs to the node that owns its token. The row also belongs to the next nodes around the ring, up to the replication factor. **Replication factor** (RF) is how many copies of each row exist. Cassandra's dynamo design page says nodes use **virtual nodes**, so each machine owns many small ranges and the load spreads evenly. Replication settings are set per keyspace, and the docs advise NetworkTopologyStrategy for production.
+Cassandra runs the **partition key** of each row through a hash function. The result is a number called a **token**. All possible tokens, laid end to end and joined into a circle, form the ring. Picture a clock face where each node owns some of the hours. Each node owns ranges of the ring. A row belongs to the node that owns its token. The row also belongs to the next nodes around the ring, up to the replication factor. **Replication factor** (RF) is how many copies of each row exist. Cassandra's dynamo design page says nodes use **virtual nodes**, so each machine owns many small ranges and the load spreads evenly. Replication settings are set per **keyspace** (a group of tables, like a database in other systems). The docs advise a rule called NetworkTopologyStrategy for production. It places copies in different racks and data centers, so one failure does not take out all copies.
 
-There is no central place that holds the ring map. Every node runs the **gossip** task by itself, on a timer. Gossip passes membership, token ownership, and schema versions between nodes. The docs show a gossip round about once per second. One detail worth knowing: whether a peer is UP or DOWN is a local decision of each node. It is not passed around by gossip.
+There is no central place that holds the ring map. Every node runs the **gossip** task by itself, on a timer. Like office rumor, each node tells a few peers what it knows, and the news spreads to all. Gossip passes membership (who is in the cluster), token ownership, and schema versions (the table definitions) between nodes. The docs show a gossip round about once per second. One detail worth knowing: whether a peer is UP or DOWN is a local decision of each node. It is not passed around by gossip.
 
 ### The data model: partition key and clustering columns
 
@@ -30,6 +30,8 @@ A table's primary key has two parts.
 
 - The **partition key** picks the node and groups rows into a partition. The docs say only an equality is allowed on a partition key.
 - The **clustering columns** order rows inside a partition. Range queries on them must ask for a contiguous set of rows.
+
+The example below is CQL, Cassandra's query language. It looks like SQL.
 
 ```sql
 CREATE TABLE readings_by_sensor (
@@ -50,17 +52,17 @@ A write needs only a sequential disk append and a memory insert. Step through on
 
 The three parts, from the Cassandra storage docs:
 
-1. The **commit log** gets every write first. It is only for crash recovery.
+1. The **commit log** gets every write first. It is a file on disk where new entries are only added at the end. It is only for crash recovery.
 2. The **memtable** is an in-memory structure that "stores writes in sorted order until reaching a configurable limit".
-3. A **flush** writes the memtable to an **SSTable**. "SSTables are immutable, and never written to again after the memtable is flushed."
+3. A **flush** writes the memtable to an **SSTable** (a sorted table file). "SSTables are immutable, and never written to again after the memtable is flushed."
 
-Then **compaction**: "Cassandra triggers compactions which combine multiple SSTables into one." It costs I/O because it rewrites data. The reward is fewer files per read. A delete is also a write, a marker called a tombstone, since files cannot be edited.
+Then **compaction**: "Cassandra triggers compactions which combine multiple SSTables into one." It costs disk reads and writes (I/O) because it rewrites data. The reward is fewer files per read. A delete is also a write, a marker called a tombstone, since files cannot be edited. The marker tells reads to ignore the older value, and compaction removes both later.
 
 Reads may touch the memtable and several SSTables. That is why reads are costlier than writes here, and why compaction matters.
 
 ### Tunable consistency
 
-With RF = 3, each write goes to three replicas. How many must answer before the coordinator replies? The Cassandra docs list the consistency levels. Three of them:
+With RF = 3, each write goes to three replicas. How many must answer before the coordinator (the node that took the client's request) replies? The Cassandra docs list the consistency levels. Three of them:
 
 | Level | Meaning |
 |---|---|
@@ -68,15 +70,15 @@ With RF = 3, each write goes to three replicas. How many must answer before the 
 | `QUORUM` | "A majority (n/2 + 1) of the replicas must respond." |
 | `ALL` | "All of the replicas must respond." |
 
-`LOCAL_QUORUM` is a majority of the replicas in the coordinator's own data center. The docs give the overlap rule as `W + R > RF`. Here W and R are the write and read levels. That is the quorum rule of lesson 4.11. Watch what happens at `ONE`, then at `QUORUM`.
+`LOCAL_QUORUM` is a majority of the replicas in the coordinator's own data center (the building or site that holds a group of nodes). The docs give the overlap rule as `W + R > RF`. Here W and R are the write and read levels. That is the quorum rule of lesson 4.11. Watch what happens at `ONE`, then at `QUORUM`.
 
 <CassConsistency client:visible />
 
-At `ONE`/`ONE`, W + R = 2 is not more than 3, so a read can miss a write. At `QUORUM`/`QUORUM`, W + R = 4 is more than 3. So a read always meets a replica that took the latest completed write. Cassandra is, in the docs' words, an "eventually consistent storage system". You buy stronger reads with latency and with availability. Try the calculator. Pick the Cassandra presets.
+At `ONE`/`ONE`, W + R = 2 is not more than 3, so a read can miss a write. At `QUORUM`/`QUORUM`, W + R = 4 is more than 3. So a read always meets a replica that took the latest completed write. Cassandra is, in the docs' words, an "eventually consistent storage system": replicas may differ for a short time, and they converge if no new writes arrive. You buy stronger reads with latency and with availability. Try the calculator. Pick the Cassandra presets.
 
 <QuorumCalc client:visible />
 
-Cassandra also has **lightweight transactions** for compare-and-set, built on Paxos. They need more round trips. So use them for rare cases, not for every write. An example is "create this username only if it does not exist".
+Cassandra also has **lightweight transactions** for compare-and-set: change a value only if it still has the value you expect. They are built on Paxos, a protocol in which the replicas vote to agree on one outcome. A vote takes several message round trips, so these writes are slower. Use them for rare cases, not for every write. An example is "create this username only if it does not exist".
 
 ## When to use it
 
@@ -118,7 +120,7 @@ Do not say Cassandra is strongly consistent by default. It is eventually consist
 </Callout>
 
 <Callout type="deep" title="Why QUORUM tolerates one down node but ALL does not">
-With RF = 3, QUORUM needs 2 acks, so one replica can be down and writes still pass. ALL needs 3, so one dead replica blocks every request for the partitions it holds. You trade availability for the strongest single-request view. The same pattern appears in [CAP and PACELC](/learn/04-data/cap-pacelc): when a replica is unreachable, you pick between answering and being sure.
+With RF = 3, QUORUM needs 2 replies, so one replica can be down and writes still pass. ALL needs 3 replies, so one dead replica blocks every request for the partitions it holds. You trade availability for the strongest single-request view. The same pattern appears in [CAP and PACELC](/learn/04-data/cap-pacelc): when a replica is unreachable, you pick between answering and being sure.
 </Callout>
 
 ## Check yourself

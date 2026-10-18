@@ -13,12 +13,12 @@ interface Step {
 const steps: Step[] = [
   {
     caption:
-      'A client sends GET /orders/42 with a bearer token over HTTPS. The request lands on the API gateway, the one entry point for outside traffic. The gateway ends TLS here, so every check below reads plain HTTP. It runs a fixed chain of steps in order.',
+      'A client sends GET /orders/42 with a token over HTTPS. The request lands on the API gateway, the one entry point for outside traffic. The gateway ends TLS here, so every check below reads plain HTTP. It runs a fixed chain of steps in order.',
     active: 'client',
     packets: [{ from: 'client', to: 'auth' }],
   },
   {
-    caption: 'Step 1, authentication. The gateway checks the token: signature, expiry, and audience (lesson 3.5). The token is valid, so the request carries the caller’s identity forward. The gateway can reject a bad request here without touching any backend.',
+    caption: 'Step 1, authentication. The gateway checks the token: its signature, its expiry time, and who it was issued for (lesson 3.5). The token is valid, so the request carries the caller’s identity forward. The gateway can reject a bad request here without touching any backend.',
     tones: { auth: 'ok' },
     subs: { auth: 'token valid' },
     active: 'auth',
@@ -53,7 +53,7 @@ const steps: Step[] = [
     notes: [{ x: 90, y: 232, text: 'client gets 401', tone: 'bad', anchor: 'middle' }],
   },
   {
-    caption: 'Failure 2: the bucket is empty. The gateway answers 429 Too Many Requests, usually with a Retry-After header. The token was valid, but this caller has used its share. The backend load stays flat.',
+    caption: 'Failure 2: the bucket is empty. The gateway answers 429 Too Many Requests, usually with a header that says how long to wait. The token was valid, but this caller has used its share. The backend load stays flat.',
     tones: { auth: 'ok', limit: 'bad', route: 'muted', orders: 'muted' },
     subs: { auth: 'token valid', limit: 'bucket empty' },
     active: 'limit',

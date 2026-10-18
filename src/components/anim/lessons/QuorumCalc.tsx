@@ -2,11 +2,11 @@ import { useState } from 'react';
 import CacheWidgetFrame from './CacheWidgetFrame';
 import { majority, report } from './quorum';
 
-/** Round trip from the coordinator to each replica, nearest first. Same data center, same region, another coast, across an ocean. */
+/** Round trip from the coordinator to each replica, nearest first. Same building, same region, another coast, across an ocean. */
 const RTTS = [0.5, 1, 70, 70, 150, 150, 150, 150, 150];
 
 const PRESETS: { label: string; n: number; w: (n: number) => number; r: (n: number) => number }[] = [
-  { label: 'Majority / majority (Raft, etcd)', n: 5, w: majority, r: majority },
+  { label: 'Majority / majority (5 replicas)', n: 5, w: majority, r: majority },
   { label: 'ONE / ONE (Cassandra)', n: 3, w: () => 1, r: () => 1 },
   { label: 'QUORUM / QUORUM (Cassandra)', n: 3, w: majority, r: majority },
   { label: 'Write ALL, read ONE', n: 3, w: (n) => n, r: () => 1 },
@@ -110,18 +110,18 @@ export default function QuorumCalc() {
 
           <div className="grid gap-2 sm:grid-cols-2">
             <Card
-              title="Does every read see the latest finished write? (R + W > N)"
+              title="Does every read see the latest finished write? (read count + write count > N)"
               value={rep.overlap ? `Yes, ${rep.minShared} shared` : `No (${w} + ${r} ≤ ${n})`}
               ok={rep.overlap}
               note={rep.overlap ? `Any read set shares at least ${rep.minShared} node${rep.minShared === 1 ? '' : 's'} with any write set.` : 'A read can miss every node that has the write.'}
             />
             <Card
-              title="Can two writes both succeed on opposite sides of a split? (2W ≤ N)"
+              title="Can two writes both succeed when the network splits into two groups? (2W ≤ N)"
               value={rep.writesIntersect ? 'No' : 'Yes'}
               ok={rep.writesIntersect}
               note={rep.writesIntersect ? 'Two write sets always share a node.' : 'Two disjoint groups could each reach W.'}
             />
-            <Card title="Failures tolerated" value={`writes ${rep.writeTolerates}, reads ${rep.readTolerates}`} note="Nodes that can be down while the operation still works." />
+            <Card title="Failures tolerated" value={`writes ${rep.writeTolerates}, reads ${rep.readTolerates}`} note="How many nodes can be down while the operation still works." />
             <Card title="Latency (W-th and R-th fastest reply)" value={`write ${ms(rep.writeMs)}, read ${ms(rep.readMs)}`} note="You wait for the slowest node you need." />
           </div>
         </div>

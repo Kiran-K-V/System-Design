@@ -4,7 +4,7 @@ const nodes: BuildNode[] = [
   { id: 'feed', x: 70, y: 70, w: 100, h: 60, label: 'Market\nfeed', step: 0 },
   { id: 'cons', x: 210, y: 70, w: 100, h: 60, label: 'Feed\nreader', step: 0 },
   { id: 'cache', x: 210, y: 190, w: 100, h: 70, label: 'Quote\ncache', shape: 'db', step: 0 },
-  { id: 'topics', x: 360, y: 70, w: 100, h: 60, label: 'Symbol\ntopics', step: 1 },
+  { id: 'topics', x: 360, y: 70, w: 100, h: 60, label: 'Channel\nper stock', step: 1 },
   { id: 'gate', x: 505, y: 70, w: 100, h: 60, label: 'Push\ngateway', step: 1 },
   { id: 'app', x: 650, y: 70, w: 80, h: 56, label: 'App', step: 1 },
   { id: 'order', x: 505, y: 250, w: 100, h: 60, label: 'Order\nservice', step: 2 },
@@ -38,7 +38,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR1: push, do not poll',
-    caption: 'Each symbol is a topic. A push gateway holds the app sessions and sends a symbol only to sessions that watch it, at most once per second. This is the pattern of lesson 9.3, applied to prices.',
+    caption: 'Each stock symbol gets its own channel. A push gateway holds the app sessions and sends a symbol only to sessions that watch it, at most once per second. This is the pattern of lesson 9.3, applied to prices.',
     packets: [{ from: 'cons', to: 'topics' }, { from: 'topics', to: 'gate', delay: 0.5 }, { from: 'gate', to: 'app', delay: 1 }],
   },
   {

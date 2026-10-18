@@ -28,13 +28,13 @@ const steps: BuildStep[] = [
   {
     req: 'FR1: send and receive a message',
     caption:
-      'Start with one chat server. Alice and Bob each hold a WebSocket to it. The server keeps a map from user to socket in memory. Alice sends a frame, the server looks up Bob, and it writes the frame to Bob’s socket. This works until one machine cannot hold every socket.',
+      'Start with one chat server. Alice and Bob each hold a WebSocket to it, which is one long-lived two-way connection (lesson 2.5). The server keeps a map from user to socket in memory. Alice sends a frame, the server looks up Bob, and it writes the frame to Bob’s socket. This works until one machine cannot hold every socket.',
     packets: [{ from: 'alice', to: 'gw1' }, { from: 'gw1', to: 'bob', delay: 0.9 }],
   },
   {
     req: 'FR1: reach users on other servers',
     caption:
-      'A second server holds Cara’s socket. Server A cannot see it. So every server writes “user X is on server Y” into a shared session map, and refreshes it with each heartbeat. Server A looks Cara up, then forwards the message to server B, which writes it to her socket.',
+      'A second server holds Cara’s socket. Server A cannot see it. So every server writes “user X is on server Y” into a shared session map, and refreshes it with each heartbeat, a small ping that phones send on a timer to show they are still there. Server A looks Cara up, then forwards the message to server B, which writes it to her socket.',
     packets: [{ from: 'gw1', to: 'reg' }, { from: 'gw1', to: 'gw2', delay: 0.9 }, { from: 'gw2', to: 'cara', delay: 1.8 }],
   },
   {
@@ -52,7 +52,7 @@ const steps: BuildStep[] = [
   {
     req: 'FR3: deliver to offline users',
     caption:
-      'If the session map has no entry for the recipient, nothing is pushed. The server leaves the message in that device’s inbox instead. When the phone reconnects, it says which sequence number it saw last, and the server replays everything after it. The inbox entry is deleted after the ack.',
+      'If the session map has no entry for the recipient, nothing is pushed. The server leaves the message in that device’s inbox instead. When the phone reconnects, it says the number of the last message it saw (the sequence number), and the server replays everything after it. The inbox entry is deleted after the ack.',
     packets: [{ from: 'gw1', to: 'inbox' }],
   },
   {

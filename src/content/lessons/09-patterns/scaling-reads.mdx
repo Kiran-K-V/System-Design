@@ -44,9 +44,9 @@ Each rung takes a share of reads away from the rung behind it. Step through all 
 
 **Rung 1: read replicas.** The primary keeps all writes. Followers copy its log (lesson [4.6](/learn/04-data/replication/)) and answer reads. Read capacity grows about linearly with the number of replicas. Writes do not grow at all. This is the simplest rung because the app still speaks SQL.
 
-**Rung 2: a cache.** A cache holds the answers to the most common reads in memory (lessons [5.1](/learn/05-caching/why-cache/) to [5.3](/learn/05-caching/cache-strategies/)). With a hit ratio `h`, only a share `1 - h` of reads reaches the database. At 90% the database sees one read in ten. That is the largest single gain in the ladder, and it costs staleness (lesson [5.5](/learn/05-caching/invalidation-stampede/)).
+**Rung 2: a cache.** A cache holds the answers to the most common reads in memory (lessons [5.1](/learn/05-caching/why-cache/) to [5.3](/learn/05-caching/cache-strategies/)). The hit ratio is the share of reads the cache answers without help. Picture a librarian who keeps the 100 most asked books on the desk: each time someone asks for one of them, no trip to the shelves is needed. With a hit ratio `h`, only a share `1 - h` of reads reaches the database. At 90% the database sees one read in ten. That is the largest single gain in the ladder, and it costs staleness (lesson [5.5](/learn/05-caching/invalidation-stampede/)).
 
-**Rung 3: a CDN.** A CDN answers requests for content that is the same for every user. The answer comes from a server close to the user (lesson [2.7](/learn/02-networking/cdn-proxies/)). Those requests never reach your data center. It only helps for shared, cacheable responses: images, scripts, public pages, and API responses that are identical for everyone.
+**Rung 3: a CDN.** A CDN (content delivery network) is a set of servers spread around the world that keep copies of your public content. The "edge" is that outer ring of servers, close to users. Picture a local shop that stocks the popular items so people do not travel to the factory. A CDN answers requests for content that is the same for every user (lesson [2.7](/learn/02-networking/cdn-proxies/)). Those requests never reach your data center. If the CDN answers half of all reads, everything behind it sees half the demand. It only helps for shared, cacheable responses: images, scripts, public pages, and API responses that are identical for everyone.
 
 Order matters. You add the rungs in this order because each one is cheaper to run per request than the one behind it, and each one hides load from it.
 
@@ -72,21 +72,21 @@ Three fixes, from simple to exact:
 - **A position token.** The write returns a log position. A replica may answer only once it has applied that position. Otherwise the read goes to the primary.
 - **Pin by data, not by user.** Read the primary only for the rows this user just changed.
 
-The cost is load on the primary, so keep the window short. Caches have the same problem. If a write only deletes the cached key, a read can refill the cache with the old value. The refill can happen when a read arrives before the replica has caught up. Facebook's memcache paper describes this for replicas in other regions. Its fix is a remote marker: a key that says "this data was just written, read it from the primary region". The paper says the marker trades extra latency on a miss for a lower chance of reading stale data. Your system may not need a marker. The idea still applies: after a write, remember that the replica is not trusted yet.
+The cost is load on the primary, so keep the window short. Caches have the same problem. If a write only deletes the cached key, a read can refill the cache with the old value. The refill can happen when a read arrives before the replica has caught up. Facebook's memcache paper describes this for replicas in other regions (a region is a data center site in one part of the world). Its fix is a remote marker: a key that says "this data was just written, read it from the primary region". The paper says the marker trades extra latency on a miss for a lower chance of reading stale data. Your system may not need a marker. The idea still applies: after a write, remember that the replica is not trusted yet.
 
 ## Hot keys
 
-A cache spreads keys over nodes by hash (lesson [4.8](/learn/04-data/consistent-hashing/)). One key still lives on one node. When a post goes viral, the node that holds it takes most of the traffic while the others idle. Adding nodes does not help, because the key does not move.
+A cache spreads keys over nodes by hash (a hash turns a key into a number that picks the node; lesson [4.8](/learn/04-data/consistent-hashing/)). One key still lives on one node. When a post goes viral, the node that holds it takes most of the traffic while the others idle. Adding nodes does not help, because the key does not move.
 
 Options, cheapest first:
 
-- **A small in-process cache** in every app server for the hottest keys, with a TTL of a few seconds. The cache node sees one read per app server per TTL, not one per user.
+- **A small in-process cache** in every app server for the hottest keys, with a TTL (time to live: the number of seconds a copy is kept before it is thrown away) of a few seconds. "In-process" means the copy lives in the app server's own memory, so reading it costs no network trip. The cache node sees one read per app server per TTL, not one per user.
 - **Copy the key to several cache nodes** and read from any copy. The memcache paper does this for keys that are fetched in large groups and fit on one or two servers. Its example: a server holds 100 items and answers 500K requests per second, and each request asks for all 100. To serve 1M requests per second, splitting the items across two servers sends every request to both. So each of the two servers still handles 1M. Replicating all 100 items on two servers lets each request go to either one, so each handles 500K. The price is that every write must invalidate every copy.
-- **Coalesce misses.** When many requests miss on the same key at once, let one go to the database. The other requests wait (lesson [5.5](/learn/05-caching/invalidation-stampede/)). The memcache paper's lease does this: the server hands out one token per key. Each key gets at most one token every 10 seconds by default. The server tells other clients to wait briefly.
+- **Coalesce misses.** To coalesce is to merge many identical requests into one. When many requests miss on the same key at once, let one go to the database. The other requests wait (lesson [5.5](/learn/05-caching/invalidation-stampede/)). Memcache is the in-memory cache server that Facebook runs. The paper's lease does this: the server hands out one token per key. Each key gets at most one token every 10 seconds by default. The server tells other clients to wait briefly.
 
 ## Denormalize so a read is one read
 
-A normalized schema is good for writes and awkward for reads. Say a feed page shows 20 posts, each with the author's name and a like count. Normalized, that is 1 query for the post ids, 20 for authors, and 20 for counts: 41 queries. Denormalized, each post row stores `author_name` and `like_count`, and the page is 1 query.
+A normalized schema stores each fact once and links rows by id, like a phone book that lists each person once. That is good for writes and awkward for reads. Denormalizing means copying a fact into the rows that need it, so a read does not have to join several tables. Say a feed page shows 20 posts, each with the author's name and a like count. Normalized, that is 1 query for the post ids, 20 for authors, and 20 for counts: 41 queries. Denormalized, each post row stores `author_name` and `like_count`, and the page is 1 query.
 
 You pay on the write side. A like now updates two places. A rename updates every post by that author. And the copies can drift, so you need a way to repair them. Lesson [4.1](/learn/04-data/data-modeling/) gives the rule: copy a fact only when reads far outnumber writes and the copy is stable. Counters are the common case. Keep `like_count` as a column or in a cache instead of counting rows on every view.
 
@@ -122,7 +122,7 @@ Do not add a cache to cure a slow query. You hide the problem and add a stalenes
 </Callout>
 
 <Callout type="deep" title="Why a cache can make an outage worse">
-A cache that runs at 95% hit ratio protects a database that could not serve all reads on its own. If the cache is flushed, or a node dies, the database suddenly sees more reads. The read load can reach up to 20 times its normal level. It fails, and the cache cannot refill because the database is down. Plan for this. Warm the cache before sending traffic, rate-limit misses, and keep replicas sized for some miss traffic, not for zero. Lesson 5.5 covers the stampede in detail.
+A cache that runs at 95% hit ratio protects a database that could not serve all reads on its own. If the cache is flushed, or a node dies, the database suddenly sees more reads. The read load can reach up to 20 times its normal level. It fails, and the cache cannot refill because the database is down. Plan for this. Warm the cache (fill it with popular answers) before sending traffic, rate-limit misses, and keep replicas sized for some miss traffic, not for zero. Lesson 5.5 covers the stampede in detail.
 </Callout>
 
 ## Check yourself

@@ -22,14 +22,14 @@ const variants: CompareVariant[] = [
         packets: [{ from: 'alice', to: 'srv' }, { from: 'srv', to: 'cara', delay: 0.9 }],
       },
       {
-        caption: 'The socket write returned without an error. The kernel accepted the bytes into a send buffer. The server takes that as delivered and tells Alice two ticks.',
+        caption: 'The socket write returned without an error. The operating system accepted the bytes into a waiting area called a send buffer. The server takes that as delivered and tells Alice two ticks.',
         active: ['srv'],
         tones: { srv: 'warn' },
-        notes: [{ x: 300, y: 190, text: 'write() returned: mark delivered', anchor: 'middle', tone: 'warn' }],
+        notes: [{ x: 300, y: 190, text: 'send worked: mark delivered', anchor: 'middle', tone: 'warn' }],
         packets: [{ from: 'srv', to: 'alice' }],
       },
       {
-        caption: 'Cara’s phone had just entered a tunnel. No close frame ever arrived, so the server still thinks the socket is open. The bytes sit in a buffer and never reach her.',
+        caption: 'Cara’s phone had just entered a tunnel. No goodbye message ever arrived, so the server still thinks the socket is open. The bytes sit in a buffer and never reach her.',
         active: ['cara'],
         tones: { cara: 'bad', srv: 'warn' },
         notes: [{ x: 560, y: 190, text: 'no signal, socket looks open', anchor: 'middle', tone: 'bad' }],
@@ -66,7 +66,7 @@ const variants: CompareVariant[] = [
         packets: [{ from: 'srv', to: 'cara' }],
       },
       {
-        caption: 'Same tunnel, same silence. But now the heartbeat pings go unanswered, and the ack timer runs out. The server closes the socket and clears her entry in the session map. The inbox entry is still there.',
+        caption: 'Same tunnel, same silence. But now the heartbeat pings (small checks on a timer) go unanswered, and the ack timer runs out. The server closes the socket and clears her entry in the session map. The inbox entry is still there.',
         active: ['cara'],
         tones: { cara: 'bad', inbox: 'warn' },
         notes: [{ x: 560, y: 190, text: 'heartbeat missed: socket dead', anchor: 'middle', tone: 'bad' }],

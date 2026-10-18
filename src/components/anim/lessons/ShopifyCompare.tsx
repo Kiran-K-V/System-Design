@@ -47,7 +47,7 @@ const after: CompareVariant = {
       tones: { pool: 'warn' },
     },
     {
-      caption: 'Reserve and ledger live in one database, so one ACID transaction covers both. The cap keeps the pool small: 50,000 units over 10 locations would otherwise be 500,000 rows.',
+      caption: 'Reserve and ledger live in one database, so one ACID transaction (all-or-nothing, saved for good) covers both. The cap keeps the pool small: 50,000 units over 10 locations would otherwise be 500,000 rows.',
       tones: { pool: 'ok', ledger: 'ok' },
       active: ['pool', 'ledger'],
     },

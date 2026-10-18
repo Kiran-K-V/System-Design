@@ -12,7 +12,7 @@ import ReplicationCommit from '../../../components/anim/lessons/ReplicationCommi
 
 ## What it is
 
-PostgreSQL is an open-source relational database. You describe data as tables with typed columns, and you ask questions in SQL. It gives you transactions with ACID guarantees, joins, constraints, and many index types.
+PostgreSQL is an open-source relational database. You describe data as tables with typed columns, and you ask questions in SQL. It gives you transactions with ACID guarantees, joins, constraints, and many index types. A **transaction** is a group of changes that succeed or fail together. **ACID** is the name for the safety promises a transaction makes: all of it happens or none of it, the data stays valid, transactions do not trip over each other, and a committed change survives a crash. A **join** combines rows from two tables. A **constraint** is a rule the database enforces, such as "this column is never empty".
 
 In an interview, PostgreSQL is the safe default. If the data is relational and one primary machine can carry the writes, say "PostgreSQL" and move on. This lesson shows why it is a good default and where the default stops. Everything here builds on three earlier lessons: [how a database stores data](/learn/04-data/storage-engines), [indexing](/learn/04-data/indexing), and [transactions and isolation](/learn/04-data/transactions).
 
@@ -20,13 +20,13 @@ In an interview, PostgreSQL is the safe default. If the data is relational and o
 
 ### Rows live in pages, and an update makes a new row version
 
-PostgreSQL stores a table in a **heap**: a set of 8 KB pages ([lesson 4.2](/learn/04-data/storage-engines)). A **row version**, also called a tuple, is one stored state of a row. Every `UPDATE` creates a new row version for the same logical row. The old version stays in the page for now.
+PostgreSQL stores a table in a **heap**: a pile of fixed-size 8 KB blocks called pages, with rows in no special order ([lesson 4.2](/learn/04-data/storage-engines)). A **row version**, also called a tuple, is one stored state of a row. Every `UPDATE` creates a new row version for the same logical row. The old version stays in the page for now.
 
 Each row version carries two hidden columns. According to the PostgreSQL docs, `xmin` is the ID of the inserting transaction. `xmax` is the ID of the deleting transaction, or zero for a row version that nobody has deleted. A row version where `xmax` is not zero may still be visible. That usually means the deleting transaction has not committed yet, or it rolled back.
 
 ### MVCC: readers never wait for writers
 
-This is **multi-version concurrency control** (MVCC): keep several versions of a row, and let each query see a consistent one. The PostgreSQL docs say each statement sees a snapshot of the data "as it was some time ago, regardless of the current state of the underlying data". They also say the locks for reading "do not conflict with locks acquired for writing data, and so reading never blocks writing and writing never blocks reading". Lesson 4.4 compared this with locking. Now watch the row versions themselves.
+This is **multi-version concurrency control** (MVCC): keep several versions of a row, and let each query see a consistent one. The PostgreSQL docs say each statement sees a snapshot of the data "as it was some time ago, regardless of the current state of the underlying data". They also say the locks for reading "do not conflict with locks acquired for writing data, and so reading never blocks writing and writing never blocks reading". Lesson 4.4 compared this with locking. A **lock** is a flag that makes other users wait. A **snapshot** is a note of which transactions had committed when a query started. The query uses the note to decide which row versions it may see. The diagram also shows VACUUM, the cleanup job covered in the next section. Now watch the row versions themselves.
 
 <PgMvcc client:visible />
 
@@ -36,15 +36,15 @@ The cost of MVCC is **dead row versions**. A version becomes dead when no transa
 
 ### VACUUM cleans up dead versions
 
-The docs give four jobs for vacuuming: recover or reuse space used by updated or deleted rows, update planner statistics, update the visibility map (which speeds up index-only scans), and protect against transaction ID wraparound. The standard `VACUUM` "removes dead row versions in tables and indexes and marks the space available for future reuse". It does not return the space to the operating system, except when pages at the end of the table become completely free. `VACUUM FULL` compacts the table and does return space. But it takes an `ACCESS EXCLUSIVE` lock, so nobody can read or write the table meanwhile.
+**VACUUM** is the cleanup job. The docs give four reasons for it. It recovers or reuses space used by updated or deleted rows. It refreshes the row-count statistics that the query planner uses to pick a fast plan. It updates a small map of pages that have no dead rows, which lets some queries skip reading the table. And it protects against transaction ID wraparound, explained below. The standard `VACUUM` "removes dead row versions in tables and indexes and marks the space available for future reuse". It does not return the space to the operating system, except when pages at the end of the table become completely free. `VACUUM FULL` compacts the table and does return space. But it takes the strictest lock (`ACCESS EXCLUSIVE`), so nobody can read or write the table meanwhile.
 
 You rarely run VACUUM by hand. **Autovacuum** runs it in the background. Your job is to keep it able to finish. The usual blocker is a transaction that stays open for hours. The reason is that VACUUM cannot remove a version that an open snapshot may still read.
 
-Transaction IDs are a fixed-size counter. The docs say every table must be vacuumed "at least once every two billion transactions" to avoid wraparound. The setting `autovacuum_freeze_max_age` defaults to 200 million.
+Transaction IDs are a fixed-size counter, like a car odometer. When it runs out of numbers it wraps around, and old rows would look like they are from the future. That is **wraparound**, and it makes data invisible. VACUUM prevents it by marking old rows as safe. The docs say every table must be vacuumed "at least once every two billion transactions" to avoid wraparound. The setting `autovacuum_freeze_max_age` defaults to 200 million.
 
 ### The write-ahead log
 
-PostgreSQL follows the rule from lesson 4.2: write the log before the page. Changes go to the **write-ahead log** (WAL) first. The docs say that "only the WAL file needs to be flushed to disk to guarantee that a transaction is committed". Data pages can be written later. After a crash, PostgreSQL replays the WAL (REDO) to rebuild the pages. The same log supports point-in-time recovery and replication.
+PostgreSQL follows the rule from lesson 4.2: write the log before the page. Changes go to the **write-ahead log** (WAL) first. The WAL is an append-only file on disk, like a ship's logbook: you write the entry before you do the work. The docs say that "only the WAL file needs to be flushed to disk to guarantee that a transaction is committed". Data pages can be written later. After a crash, PostgreSQL replays the WAL from the last safe point to rebuild the pages. The same log supports point-in-time recovery (restore a backup, then replay the log up to a chosen minute) and replication.
 
 ### Indexes
 
@@ -54,13 +54,13 @@ The default is B-tree: `CREATE INDEX` makes one unless you ask for another. The 
 |---|---|
 | B-tree | Equality and range queries, sorting. The default. |
 | Hash | Equality only |
-| GIN | Values that hold many items, such as arrays |
-| GiST, SP-GiST | Geometric and other custom search types |
-| BRIN | Huge tables where values correlate with physical order. Stores a min and max per block range. |
+| GIN | Values that hold many items, such as arrays or words in a text. Maps each item to the rows that hold it. |
+| GiST, SP-GiST | Shapes, map points, and other custom search types such as "nearest to here" |
+| BRIN | Huge tables where values grow in step with the order rows were written, such as a timestamp. Stores only a min and max per group of pages, so it is tiny. |
 
 ### Replication
 
-A **standby** is a second PostgreSQL server that replays the primary's WAL. This is streaming replication. It is asynchronous by default. With synchronous settings, a commit waits until the standby confirms. The docs say the minimum wait time is "the round-trip time between primary and standby". That is the trade-off from [lesson 4.6](/learn/04-data/replication), now with PostgreSQL labels. Step through it again and watch the crash.
+A **standby** is a second PostgreSQL server that replays the primary's WAL. The **primary** is the server that takes the writes. The primary streams its log to the standby as it goes. This is streaming replication. It is asynchronous by default: the primary answers the client without waiting for the standby. With synchronous settings, a commit waits until the standby confirms. The docs say the minimum wait time is "the round-trip time between primary and standby". That is the trade-off from [lesson 4.6](/learn/04-data/replication), now with PostgreSQL labels. Step through it again and watch the crash.
 
 <ReplicationCommit client:visible />
 
@@ -72,14 +72,14 @@ The fix is a **connection pooler** such as PgBouncer. Many clients talk to the p
 
 <PgPooler />
 
-PgBouncer has three modes: session, transaction, and statement. In transaction mode a server connection is lent out only for the length of one transaction. That gives the best sharing. The cost: per the PgBouncer docs, transaction mode "breaks a few session-based features". Examples are `LISTEN`, `PREPARE`, and session-level advisory locks.
+PgBouncer has three modes: session, transaction, and statement. In transaction mode a server connection is lent out only for the length of one transaction. That gives the best sharing. The cost: per the PgBouncer docs, transaction mode "breaks a few session-based features". These are features that expect the same server connection to stay yours. Examples are `LISTEN` (get a message when another session sends one), `PREPARE` (save a parsed query on your connection for reuse), and session-level advisory locks (locks your code takes by name).
 
 ## When to use it
 
 - You have relational data with relationships between entities, and you need joins, constraints, and multi-row transactions.
 - One primary can carry the write rate. Add read replicas for read-heavy load ([lesson 4.6](/learn/04-data/replication)).
 - You do not know all the queries up front. SQL and secondary indexes handle new questions without a redesign.
-- You want strong guarantees by default. The default isolation level is Read Committed. Repeatable Read prevents phantoms in PostgreSQL. Serializable prevents all the listed anomalies. Read Uncommitted is accepted but behaves as Read Committed.
+- You want strong guarantees by default. An **isolation level** says how much one transaction can see of another one's work. The default is Read Committed: each statement sees only committed data. Repeatable Read keeps one fixed view for the whole transaction, and in PostgreSQL it also prevents phantoms (new rows that appear in a repeated query). Serializable prevents all the listed anomalies. Read Uncommitted is accepted but behaves as Read Committed.
 
 ## When not to
 
@@ -102,7 +102,7 @@ PgBouncer has three modes: session, transaction, and statement. In transaction m
 | Vacuum every table at least once per | 2 billion transactions | PostgreSQL docs, routine vacuuming |
 | `autovacuum_freeze_max_age` default | 200 million | PostgreSQL docs, routine vacuuming |
 
-A row version must fit in one 8 KB heap page. Large values are moved out of the page and stored separately (TOAST). The docs do not give one single "maximum row size" number, so do not quote one.
+A row version must fit in one 8 KB heap page. Large values are moved out of the page and stored in a side table (the feature is called TOAST). The docs do not give one single "maximum row size" number, so do not quote one.
 
 ## Interview lens
 

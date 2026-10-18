@@ -40,7 +40,7 @@ const better: CompareVariant = {
   nodes: [
     { id: 'a', x: 80, y: 80, w: W, h: H, label: 'Matcher A' },
     { id: 'b', x: 80, y: 220, w: W, h: H, label: 'Matcher B' },
-    { id: 'lock', x: 330, y: 150, w: 140, h: 90, shape: 'db', label: 'Lock', sub: 'driver:17, TTL 10 s' },
+    { id: 'lock', x: 330, y: 150, w: 140, h: 90, shape: 'db', label: 'Lock', sub: 'driver:17, expires 10 s' },
     { id: 'app', x: 590, y: 80, w: W, h: H, label: 'Driver app' },
     { id: 'next', x: 590, y: 220, w: W, h: H, label: 'Next driver' },
   ],
@@ -51,7 +51,7 @@ const better: CompareVariant = {
     { from: 'b', to: 'next' },
   ],
   steps: [
-    { caption: 'The same two matchers pick the same driver. Each now tries to create one key, only if it does not exist (SET with NX and a 10 second expiry).', packets: [{ from: 'a', to: 'lock', label: 'SET NX' }, { from: 'b', to: 'lock', label: 'SET NX' }], active: ['lock'] },
+    { caption: 'The same two matchers pick the same driver. Each now tries to create one key, only if it does not exist (the Redis command SET with the NX option and a 10 second expiry).', packets: [{ from: 'a', to: 'lock', label: 'lock if free' }, { from: 'b', to: 'lock', label: 'lock if free' }], active: ['lock'] },
     {
       caption: 'Redis runs one command at a time (lesson 8.2). One SET wins. The other fails right away. There is no gap between check and write.',
       tones: { a: 'ok', b: 'warn', lock: 'ok' },

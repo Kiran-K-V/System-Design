@@ -42,7 +42,7 @@ const cdc = build(
   'cdc',
   'Better: content-defined chunks',
   [0],
-  'The same insert. This time the cut points depend on the bytes near them, found with a rolling hash. The cuts after the edit land on the same bytes as before. Chunks c2 to c7 are unchanged.',
+  'The same insert. This time the cut points depend on the bytes near them, found by sliding a small window over the bytes. The cuts after the edit land on the same bytes as before. Chunks c2 to c7 are unchanged.',
   'Only c1 is marked changed. The server already has the six reused hashes. The client uploads one chunk.',
 );
 

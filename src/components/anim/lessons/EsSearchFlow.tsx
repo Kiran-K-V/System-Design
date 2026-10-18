@@ -18,7 +18,7 @@ const S3 = 'g 6.0 · h 5.5 · i 1.0';
 
 const steps: Step[] = [
   {
-    caption: 'An index called products has three primary shards. Each shard is a self-contained Lucene index with its own inverted index (lesson 4.3). Every document belongs to exactly one primary shard. Replica copies, not drawn, hold the same data and serve reads. A search request arrives at any node. That node becomes the coordinating node.',
+    caption: 'An index called products has three primary shards. Each shard is a self-contained search index (built with the Lucene library) with its own inverted index (lesson 4.3). Every document belongs to exactly one primary shard. Replica copies, not drawn, hold the same data and serve reads. A search request arrives at any node. That node becomes the coordinating node.',
     coord: {},
     shards: [undefined, undefined, undefined],
     active: ['coord'],
@@ -60,7 +60,7 @@ const steps: Step[] = [
     noteTone: 'ok',
   },
   {
-    caption: 'Fetch phase: the coordinator asks only the shards that hold a winner for the document bodies (the _source field). Shard 1 is asked for a. Shard 2 is asked for d and e. Shard 3 is not contacted again.',
+    caption: 'Fetch phase: the coordinator asks only the shards that hold a winner for the full document text. Shard 1 is asked for a. Shard 2 is asked for d and e. Shard 3 is not contacted again.',
     coord: { sub: 'top 3: a · d · e' },
     shards: [S1, S2, S3],
     shardTone: [undefined, undefined, 'muted'],
@@ -82,7 +82,7 @@ const steps: Step[] = [
     noteTone: 'ok',
   },
   {
-    caption: 'One catch. Each shard scored its documents with its own local statistics, such as how rare a word is inside that shard. Scores from different shards are then compared. The search type query_then_fetch does exactly this, and is usually faster but less accurate. dfs_query_then_fetch first collects global statistics, which is usually slower but more accurate.',
+    caption: 'One catch. Each shard scored its documents using only its own data, such as how rare a word is inside that shard. Scores from different shards are then compared. The default search type, named query_then_fetch, does exactly this. It is usually faster but less accurate. A second type, dfs_query_then_fetch, first collects counts from all shards. It is usually slower but more accurate.',
     coord: {},
     shards: [S1, S2, S3],
     active: [],

@@ -46,12 +46,12 @@ Most of the system is easy. One part is hard: many writers race to update **one 
 
 | Call | Purpose |
 |---|---|
-| `POST /v1/auctions` | Item, start price, end time. Returns 201. |
-| `POST /v1/auctions/{id}/bids` | Amount and an idempotency key. Returns 201, or 409 if outbid. |
+| `POST /v1/auctions` | Item, start price, end time. Returns 201 (the HTTP status code for "created"). |
+| `POST /v1/auctions/{id}/bids` | Amount and an idempotency key. Returns 201, or 409 (the status code for "conflict") if outbid. |
 | `GET /v1/auctions/{id}` | Status and current highest bid. |
-| `WS /v1/auctions/{id}/stream` | Server pushes each new highest bid. |
+| `WS /v1/auctions/{id}/stream` | A WebSocket: one connection that stays open, so the server can push each new highest bid. |
 
-The bid call needs an idempotency key (lesson [3.4](/learn/03-api-design/idempotency/)). A phone that retries after a timeout must not place two bids.
+The bid call needs an idempotency key (lesson [3.4](/learn/03-api-design/idempotency/)). That is a unique token the client attaches to one bid, so the server can spot a repeat of the same request and ignore it. A phone that retries after a timeout must not place two bids.
 
 ## High-level design
 
@@ -61,7 +61,8 @@ Step through the build.
 
 Three details are worth saying aloud.
 
-- The **auction row** holds the current highest bid. It is the only value that bids compete for. The **bid log** is append-only, so all bids are kept.
+- The **auction row** holds the current highest bid. It is the only value that bids compete for. The **bid log** is append-only: rows are only added, never changed, so all bids are kept.
+- A **pub/sub channel** (a named mailbox that many listeners can subscribe to) will carry each new price to viewers, and a **delay queue** (a queue that releases an item only at a set time) will end each auction. Both are explained in the deep dives below.
 - **Reads** and **writes** have different shapes. A viewer reads again and again. A bidder writes once in a while. Keep the two paths apart so viewers cannot slow bids down.
 - **Sharding** (lesson [4.7](/learn/04-data/sharding/)) is by auction id. All bids for one auction go to one shard. Different auctions spread over many shards.
 
@@ -124,7 +125,7 @@ SET highest_bid = :amount, highest_bidder = :user, version = version + 1
 WHERE id = :id AND highest_bid < :amount AND status = 'open' AND end_at > now();
 ```
 
-The database locks the row for the length of the statement. So two bids on one auction run one after the other. In PostgreSQL at the default READ COMMITTED level, the second one re-checks the row after the first commits. If it affects 0 rows, the bid was too low, the auction was closed, or time ran out. The service returns 409 with the current high bid. The bid log insert goes in the same transaction.
+The database locks the row for the length of the statement. So two bids on one auction run one after the other. In PostgreSQL at the default isolation level (READ COMMITTED, which means each statement sees only data that other transactions have already committed), the second one re-checks the row after the first commits. If it affects 0 rows, the bid was too low, the auction was closed, or time ran out. The service returns 409 with the current high bid. The bid log insert goes in the same transaction.
 
 This is **optimistic concurrency**: assume no conflict, and detect one at write time. It holds no lock while the client thinks. It works well when conflicts are rare for most auctions and bounded for one auction. The `version` column is for cases where the rule is more than "higher than". If a bid must be at least 5 above the current high, the service reads the row. The service then computes and writes with `WHERE version = :seen`. A 0-row result means "retry with fresh data".
 
@@ -134,7 +135,7 @@ What are the other options?
 |---|---|---|
 | Row lock first | `SELECT ... FOR UPDATE`, then update | Holds a lock across two statements. Bids queue behind each other |
 | Single writer per auction | Route all bids of one auction to one partition and one thread | Needs routing, and failover for the owner. No lock fights at all |
-| Redis script | A Lua script does the compare and set in memory (lesson [8.2](/learn/08-technologies/redis/)) | Fast, but a failover can lose the latest bids. Say this out loud |
+| Redis script | A Lua script (a small program that Redis runs as one uninterrupted step) does the compare and set in memory (lesson [8.2](/learn/08-technologies/redis/)) | Fast, but a failover can lose the latest bids. Say this out loud |
 
 Do not lock the whole table. That makes every auction wait for every other auction.
 
@@ -148,7 +149,7 @@ Two details matter. A gateway that restarts loses its connections. Clients recon
 
 ## Deep dive: when the auction ends
 
-A cron job that scans all auctions every minute is late by up to a minute. It scans millions of rows. Use a timer per auction instead. When an auction is created, schedule a close event at its end time in a delay queue or scheduler. One example is in lesson [11.15](/learn/11-breakdowns/job-scheduler/).
+A cron job (a task that runs on a fixed schedule) that scans all auctions every minute is late by up to a minute. It scans millions of rows. Use a timer per auction instead. When an auction is created, schedule a close event at its end time in a delay queue or scheduler. One example is in lesson [11.15](/learn/11-breakdowns/job-scheduler/).
 
 Two rules protect the end.
 

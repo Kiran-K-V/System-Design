@@ -12,13 +12,13 @@ import ProxQuadtree from '../../../components/anim/lessons/ProxQuadtree.tsx';
 
 ## The problem
 
-A ride app has 1 billion places and drivers on the map. A user opens the app. You must show everything within 1 km, in under 100 ms.
+A ride app has 1 billion places and drivers on the map. Each one has two numbers: **latitude** (how far north or south, from −90 at the south pole to 90 at the north pole) and **longitude** (how far east or west, from −180 to 180, with 0 at a line through Greenwich in London). Together they are a **coordinate**, like a street and house number for the whole planet. A user opens the app. You must show everything within 1 km, in under 100 ms.
 
-The query reads like this: `WHERE lat BETWEEN a AND b AND lng BETWEEN c AND d`. It has two range conditions. Lesson [4.3](/learn/04-data/indexing/) showed what a B-tree does with that. A B-tree sorts in **one** dimension.
+The query reads like this: `WHERE lat BETWEEN a AND b AND lng BETWEEN c AND d`. It has two range conditions. Lesson [4.3](/learn/04-data/indexing/) showed what a B-tree does with that. A B-tree sorts in **one** dimension, like names in a phone book. A map has two, so one sorted list cannot keep both neighbors close.
 
-You can build a composite index on `(lat, lng)`. The first range condition narrows the search. The second one can only filter what the first one already read. That is rule 2 in lesson 4.3.
+You can build a composite index on `(lat, lng)`, one index that sorts by lat first and then by lng. The first range condition narrows the search. The second one can only filter what the first one already read. That is rule 2 in lesson 4.3.
 
-Do the numbers. Assume the 1 billion places are spread evenly over the Earth. That is false, but it keeps the arithmetic honest.
+Do the numbers. Assume the 1 billion places are spread evenly over the Earth. That is false, but it keeps the arithmetic honest. A degree (°) of latitude is about 111 km. A km² is a square 1 km on each side.
 
 - The search box is 2 km by 2 km, at latitude 51.5. That is 0.018° of latitude and 0.029° of longitude.
 - It holds about 4 km² / 510 million km² × 1 billion = **~8 places**.
@@ -28,21 +28,21 @@ The database reads about 100,000 rows to return 8. It reads about 12,000 times t
 
 ## Naive solution: two indexes
 
-Put one B-tree on `lat` and one on `lng`. The planner may read both and intersect the row lists. Each index still returns a full band: one around the planet by latitude, one pole to pole by longitude. The intersection is small, but the work to find it is not.
+Put one B-tree on `lat` and one on `lng`. The query planner (the database part that picks how to run a query) may read both and intersect the row lists, which means keep only the rows that appear in both. Each index still returns a full band: one around the planet by latitude, one pole to pole by longitude. The intersection is small, but the work to find it is not.
 
 Both bands are huge. The work is proportional to the bands, not to the answer. We need **one** key where places that are close in space are close in the sort order.
 
 ## The mechanism: geohash
 
-A **geohash** turns a latitude and a longitude into one string. Places that share a long prefix lie in the same small rectangle. A B-tree can then range-scan a prefix. That is one dimension again, and B-trees are good at it.
+A **geohash** turns a latitude and a longitude into one string. Places that share a long prefix lie in the same small rectangle. A prefix is the first characters of a string, such as `gcp` in `gcpuz`. A B-tree can range-scan a prefix, which means it reads all keys that start with it in one sweep. That is one dimension again, and B-trees are good at it.
 
 The encoder is a repeated halving.
 
 1. Start with longitude in [−180, 180] and latitude in [−90, 90].
-2. Take the middle of longitude. If the point is at or above it, write bit 1 and keep the upper half. If not, write 0 and keep the lower half.
+2. Take the middle of longitude. A bit is a single 0 or 1. If the point is at or above it, write bit 1 and keep the upper half. If not, write 0 and keep the lower half.
 3. Do the same for latitude.
 4. Alternate, longitude first.
-5. Cut the bits into groups of 5. Each group is a number from 0 to 31. Map it to the **base32** alphabet `0123456789bcdefghjkmnpqrstuvwxyz` (it leaves out a, i, l, and o).
+5. Cut the bits into groups of 5. Each group is a number from 0 to 31. Map it to the **base32** alphabet, a set of 32 letters and digits so each group becomes one readable character: `0123456789bcdefghjkmnpqrstuvwxyz` (it leaves out a, i, l, and o).
 
 Step through the point at latitude 10, longitude 20.
 
@@ -65,7 +65,7 @@ Lesson [4.3](/learn/04-data/indexing/) rule 1 now works for us. Store the hash i
 
 ### The edge problem
 
-A circle rarely fits inside one cell. If your point sits near the edge of its cell, places just across the edge are in a different cell. They may also have a different prefix. Two points 0.002° of longitude apart, about 140 m, can share **no** first character. The reason is that the Greenwich line is a top-level split.
+A circle rarely fits inside one cell. If your point sits near the edge of its cell, places just across the edge are in a different cell. They may also have a different prefix. Two points 0.002° of longitude apart, about 140 m, can share **no** first character. The reason is that the line at longitude 0 (through Greenwich) is the very first split the encoder makes. One side starts with a 0 bit and the other with a 1 bit.
 
 The fix is simple. Pick a cell at least as large as the search radius. Then query the point's cell **and its 8 neighbors**: 9 prefix scans. Then filter by the true distance, because the 3 × 3 block is larger than the circle.
 
@@ -79,20 +79,20 @@ Wrong choice of cell size breaks the guarantee. With length 6 cells, each cell i
 
 A geohash grid has fixed cells. Midtown Manhattan and the Sahara get the same size. Midtown has thousands of places per cell. The Sahara has none.
 
-A **quadtree** adapts. It starts as one cell. When a cell holds more than a set **capacity** of points, it splits into four equal quadrants. Dense areas split again and again. Sparse areas stay as one big cell.
+A **quadtree** adapts. "Quad" means four. It starts as one cell, like one square of paper. When a cell holds more than a set **capacity** of points, it splits into four equal quadrants. Dense areas split again and again. Sparse areas stay as one big cell.
 
 <ProxQuadtree client:visible />
 
-Notice step 4. Five points fall in the same quarter of a quarter. The split repeats until the points separate. That is the cost of a quadtree: it is a tree that changes. Inserts can split cells, deletes can merge them, and in a sharded database the tree itself needs a home (lesson [4.7](/learn/04-data/sharding/)). Many systems keep the quadtree in memory and rebuild it from the table.
+Notice step 4. Five points fall in the same quarter of a quarter. The split repeats until the points separate. That is the cost of a quadtree: it is a tree that changes. Inserts can split cells, deletes can merge them, and in a sharded database (one split across several machines) the tree itself needs a home (lesson [4.7](/learn/04-data/sharding/)). Many systems keep the quadtree in memory and rebuild it from the table.
 
 A geohash is a table column and a B-tree. A quadtree is a structure you maintain. In practice you pick by the data's shape: even spread favors geohash, and strong clusters favor a quadtree.
 
 ## What real systems use
 
-- **Redis GEO.** `GEOADD` stores each member in a sorted set. The score is a 52-bit interleaved geohash. Redis accepts longitude −180 to 180 and latitude ±85.05112878, and its docs state a worst-case distance error of about 0.5%. `GEOSEARCH` finds members in a radius or box. It is a good fit for a "drivers near me" set that fits in RAM (lesson [8.2](/learn/08-technologies/redis/)).
-- **PostGIS.** A PostgreSQL extension (lesson [8.1](/learn/08-technologies/postgresql/)). It builds a spatial index with GiST. `ST_DWithin` uses the index for a bounding-box check and then tests exact distance. The `geography` type works in meters on a spheroid.
-- **S2** (Google). It projects the sphere onto the six faces of a cube. Then a quadtree splits each face to level 30. Cell IDs follow a **Hilbert curve**, a path that visits nearby cells close together. So near IDs are usually near on the map. The S2 statistics page gives level 12 an average area of about 5 km².
-- **H3** (Uber). It tiles the sphere with hexagons. Each cell has 7 children. At every resolution, 12 cells are pentagons, because hexagons cannot cover a sphere.
+- **Redis GEO.** Redis is a fast in-memory data store. `GEOADD` stores each place in a sorted set, a list kept in order by a number called its score. The score is a 52-bit geohash, built by interleaving (alternating) the longitude and latitude bits. Redis accepts longitude −180 to 180 and latitude ±85.05112878, and its docs state a worst-case distance error of about 0.5%. `GEOSEARCH` finds members in a radius or box. It is a good fit for a "drivers near me" set that fits in RAM (the machine's fast working memory) (lesson [8.2](/learn/08-technologies/redis/)).
+- **PostGIS.** A PostgreSQL extension, which is an add-on that gives the database new abilities (lesson [8.1](/learn/08-technologies/postgresql/)). It builds a spatial index with GiST, a tree index that can sort shapes and boxes, not only numbers. `ST_DWithin` uses the index for a bounding-box check (is the place inside a rectangle around the circle?) and then tests exact distance. The `geography` type works in meters on a spheroid, which is a slightly squashed ball that models the Earth.
+- **S2** (Google). It projects the sphere onto the six faces of a cube, as if the Earth were wrapped in a box. Then a quadtree splits each face, down to level 30 (each level splits cells into four smaller ones). Cell IDs follow a **Hilbert curve**, a path that visits nearby cells close together. So near IDs are usually near on the map. The S2 statistics page gives level 12 an average area of about 5 km².
+- **H3** (Uber). It tiles the sphere with hexagons (six-sided cells, like a honeycomb). Each cell has 7 children, the smaller cells inside it. At every resolution, 12 cells are pentagons (five-sided), because hexagons alone cannot cover a sphere.
 
 All of these are the same idea. Turn two dimensions into a cell ID, then use an ordinary index or sorted set on the ID.
 

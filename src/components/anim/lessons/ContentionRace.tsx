@@ -20,10 +20,10 @@ const LINES: Record<Strategy, Line[]> = {
     { caption: 'A reads the seat row: 1 left.', arrow: 'read' },
     { caption: 'B reads the same row before A has written anything. B also sees 1 left.', arrow: 'read' },
     { caption: 'A writes "seats = 1 - 1 = 0" and gets "booked".', arrow: 'seats = 0' },
-    { caption: 'B writes "seats = 1 - 1 = 0" too, from its stale read, and also gets "booked". Two tickets for one seat. This is a lost update: B\'s write ignored A\'s.', arrow: 'seats = 0' },
+    { caption: 'B writes "seats = 1 - 1 = 0" too, from its out-of-date read, and also gets "booked". Two tickets for one seat. This is a lost update: B\'s write ignored A\'s.', arrow: 'seats = 0' },
   ],
   lock: [
-    { caption: 'A runs SELECT ... FOR UPDATE on the seat row. The database locks it and returns seats = 1.', arrow: 'FOR UPDATE' },
+    { caption: 'A runs SELECT ... FOR UPDATE, which locks the seat row and reads it. The database locks it and returns seats = 1.', arrow: 'FOR UPDATE' },
     { caption: 'B runs the same statement. The row is locked, so B waits. The PostgreSQL docs say other transactions that try to lock or change those rows wait until the first one ends.', arrow: 'FOR UPDATE' },
     { caption: 'A, still holding the lock, sets seats = 0 and records the booking.', arrow: 'seats = 0' },
     { caption: 'A commits. The lock is released. B\'s statement now completes and returns the committed row: seats = 0.', arrow: 'commit' },
@@ -39,7 +39,7 @@ const LINES: Record<Strategy, Line[]> = {
   hold: [
     { caption: 'A picks seat 12A. The server writes a hold on it with an expiry time, say 5 minutes. The hold is a write that only one buyer can win.', arrow: 'hold 5 min' },
     { caption: 'B picks the same seat and is refused: "someone is holding this seat". B can choose another seat or wait. Nobody is stuck behind a lock.', arrow: 'hold' },
-    { caption: 'A leaves checkout without paying. When the hold expires (a TTL, or an expiry check on read) the seat is free again. Something must do this, or abandoned holds would hide seats forever.', arrow: 'TTL ends' },
+    { caption: 'A leaves checkout without paying. When the hold expires (a TTL, which is a time to live, or an expiry check on read) the seat is free again. Something must do this, or abandoned holds would hide seats forever.', arrow: 'TTL ends' },
     { caption: 'B tries again and wins the hold.', arrow: 'hold 5 min' },
     { caption: 'B pays inside the window and confirms. The hold becomes a booking. If B had paid after the hold expired, the confirm would fail unless it re-checks the seat.', arrow: 'confirm' },
   ],

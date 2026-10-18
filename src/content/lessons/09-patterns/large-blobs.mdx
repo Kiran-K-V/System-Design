@@ -17,7 +17,7 @@ Count what that costs. Take a 2 GB video and a user on a 20 Mbit/s home uplink. 
 
 Three more problems follow.
 
-- **Gateways cap the body.** Amazon API Gateway rejects a body over 10 MB ([lesson 8.10](/learn/08-technologies/api-gateway/)).
+- **Gateways cap the body.** Amazon API Gateway, a managed front door for APIs, rejects a body over 10 MB ([lesson 8.10](/learn/08-technologies/api-gateway/)).
 - **A failure restarts everything.** If the connection drops at 99%, the user starts at byte zero.
 - **The app tier scales with bytes.** You add servers because of file size, not because of logic.
 
@@ -42,6 +42,8 @@ The rule is simple. **Bytes never pass through your app servers.** The server de
 
 The store does not know your users, so the server hands the client a **pre-signed URL**. The URL carries a signature made with the server's credentials. It allows one action on one key for a short time. The client needs no credentials of its own.
 
+Two more words appear in the diagram. A **multipart upload** cuts one big file into numbered parts that are sent separately, and the store joins them at the end. A **checksum** is a short fingerprint of the bytes, used to spot damage. Both are explained further below.
+
 <LargeBlobsDirect client:visible />
 
 The flow, in order:
@@ -61,7 +63,7 @@ Keep facts in the database and bytes in the store. The row holds the owner, name
 
 A single PUT to S3 can carry at most 5 GB, per the S3 documentation. Beyond that you must use multipart upload, and AWS suggests it from about 100 MB. Lesson 8.11 gives the part limits. What matters for this pattern is what multipart buys you. Parts go in parallel. A failed part is sent again alone.
 
-**Resume** follows from that. The store knows which parts it holds. After a crash or an app restart, the client asks for the list of uploaded parts. Then it sends only the missing ones. The client does not need to keep perfect memory, because the store is the record. Abandoned multipart uploads keep costing money until you complete or abort them. So add a lifecycle rule that aborts old ones.
+**Resume** follows from that. The store knows which parts it holds. After a crash or an app restart, the client asks for the list of uploaded parts. Then it sends only the missing ones. The client does not need to keep perfect memory, because the store is the record. Abandoned multipart uploads keep costing money until you complete or abort them. So add a lifecycle rule, a setting on the store that acts on objects by age, and tell it to abort unfinished uploads after a few days.
 
 ### Checksums: trust but verify
 
@@ -72,16 +74,16 @@ Networks and disks can corrupt bytes. A **checksum** is a short fingerprint comp
 How does the API learn the upload finished? There are two choices.
 
 - **The client says so.** The client calls `POST /videos/7/done`. This is easy, but a buggy or hostile client can claim success, or it can crash before it sends the call.
-- **The store says so.** Store event notifications go to a queue, a function, or an event bus. This is the proof that the bytes exist.
+- **The store says so.** Store event notifications go to a queue, a function, or an event bus (a shared channel that many listeners can subscribe to). This is the proof that the bytes exist.
 
-Prefer the event, with the client call as a hint. S3 notifications are designed to be delivered at least once, typically within seconds but sometimes a minute or longer. So the handler must be idempotent: `UPDATE ... SET status='READY' WHERE id=7 AND status='PENDING'` does nothing the second time ([lesson 3.4](/learn/03-api-design/idempotency/)). Also add a cleanup job. A row that stays `PENDING` past a deadline means the user never finished. Delete the row and abort the upload.
+Prefer the event, with the client call as a hint. S3 notifications are designed to be delivered at least once, typically within seconds but sometimes a minute or longer. At least once means a repeat is possible. So the handler must be idempotent, which means that running it twice has the same effect as running it once: `UPDATE ... SET status='READY' WHERE id=7 AND status='PENDING'` does nothing the second time ([lesson 3.4](/learn/03-api-design/idempotency/)). Also add a cleanup job. A row that stays `PENDING` past a deadline means the user never finished. Delete the row and abort the upload.
 
 ### Downloads: signed URLs and a CDN
 
 Reads need the same care. Do not stream a video through the API. There are two options.
 
 - **A signed GET URL** straight from the store. Good for private files and small read volume.
-- **A CDN with signed URLs** ([lesson 2.7](/learn/02-networking/cdn-proxies/)). CloudFront signs a URL with an expiry. It uses a canned policy for expiry only, or a custom policy for more rules. Edge caches then serve the bytes close to the user. If anyone changes the query string after signing, the CDN returns 403.
+- **A CDN with signed URLs** ([lesson 2.7](/learn/02-networking/cdn-proxies/)). CloudFront signs a URL with an expiry. It uses a canned policy, a fixed rule that sets only the expiry time, or a custom policy, which can add more rules such as an allowed IP range. Edge caches then serve the bytes close to the user. If anyone changes the query string after signing, the CDN returns 403, the HTTP code for "forbidden".
 
 The pattern is the same as for uploads. The API makes the decision, a signature carries it, and the data path skips the API.
 
@@ -118,7 +120,7 @@ Do not route large uploads through your servers "to validate them". You cannot h
 </Callout>
 
 <Callout type="deep" title="Two writes that cannot be one transaction">
-The database row and the object live in two systems, so no transaction covers both. That is the same problem as in [lesson 9.5](/learn/09-patterns/multi-step/). The status column is the answer. It turns a two-system write into a small state machine: PENDING, then READY, with cleanup for the failure paths. The upload is a tiny saga where the compensation is "delete the row and abort the parts".
+The database row and the object live in two systems, so no transaction covers both. That is the same problem as in [lesson 9.5](/learn/09-patterns/multi-step/). The status column is the answer. It turns a two-system write into a small state machine, which is a thing that is always in one named state and moves between states by fixed rules: PENDING, then READY, with cleanup for the failure paths. The upload is a tiny saga, a chain of steps where each step has an undo, and here the compensation is "delete the row and abort the parts".
 </Callout>
 
 ## Check yourself

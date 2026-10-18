@@ -29,7 +29,7 @@ export default function GatewayLayers() {
           { x: 225, y: 215, text: 'North-south: outside to inside', anchor: 'middle', tone: 'accent' },
           { x: 225, y: 240, text: 'API gateway: auth, limits, routes', anchor: 'middle' },
           { x: 600, y: 245, text: 'East-west: service to service', anchor: 'middle', tone: 'purple' },
-          { x: 600, y: 265, text: 'Mesh sidecars: retries, mTLS', anchor: 'middle' },
+          { x: 600, y: 265, text: 'Mesh sidecars: retries, encryption', anchor: 'middle' },
         ]}
       />
     </figure>

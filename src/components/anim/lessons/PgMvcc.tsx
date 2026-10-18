@@ -44,7 +44,7 @@ const steps: Step[] = [
     actors: [],
   },
   {
-    caption: 'Reader R starts a transaction at Repeatable Read. It takes a snapshot: "I see everything committed up to transaction 10." Under Read Committed, the default, a new snapshot is taken for each statement. Repeatable Read keeps one snapshot for the whole transaction, and that makes the next steps easy to see.',
+    caption: 'Reader R starts a transaction and asks for one fixed view of the data for its whole length (the Repeatable Read setting). It takes a snapshot, a note that says: "I see everything committed up to transaction 10." By default (Read Committed) a new snapshot is taken for each statement instead. One fixed snapshot makes the next steps easy to see.',
     vers: [V1()],
     actors: [{ id: 'r', label: 'Reader R', sub: 'snapshot: up to 10', tone: 'accent' }],
   },
@@ -53,7 +53,7 @@ const steps: Step[] = [
     vers: [V1({ xmax: 20, tag: 'old, xmax set', tone: 'warn' }), V2()],
     actors: [
       { id: 'r', label: 'Reader R', sub: 'snapshot: up to 10', tone: 'muted' },
-      { id: 'w', label: 'Writer W', sub: 'txid 20, open', tone: 'accent', at: 1 },
+      { id: 'w', label: 'Writer W', sub: 'transaction 20, open', tone: 'accent', at: 1 },
     ],
   },
   {
@@ -61,7 +61,7 @@ const steps: Step[] = [
     vers: [V1({ xmax: 20, tag: 'R sees this', tone: 'ok' }), V2({ tag: 'invisible to R', tone: 'muted' })],
     actors: [
       { id: 'r', label: 'Reader R', sub: 'reads 100', tone: 'ok', at: 0 },
-      { id: 'w', label: 'Writer W', sub: 'txid 20, open', tone: 'muted' },
+      { id: 'w', label: 'Writer W', sub: 'transaction 20, open', tone: 'muted' },
     ],
   },
   {
@@ -69,11 +69,11 @@ const steps: Step[] = [
     vers: [V1({ xmax: 20, tag: 'dead for N, live for R', tone: 'warn' }), V2({ tag: 'N sees this', tone: 'ok', dashed: false })],
     actors: [
       { id: 'r', label: 'Reader R', sub: 'still reads 100', tone: 'muted', at: 0 },
-      { id: 'n', label: 'Reader N', sub: 'txid 30, reads 150', tone: 'ok', at: 1 },
+      { id: 'n', label: 'Reader N', sub: 'transaction 30, reads 150', tone: 'ok', at: 1 },
     ],
   },
   {
-    caption: 'VACUUM runs. It may remove a dead version only when no open snapshot can still see it. R is still open and still needs v1, so v1 stays. A long-running transaction holds back cleanup for the whole table. This is the main way bloat starts.',
+    caption: 'VACUUM, the cleanup job, runs. It may remove a dead version only when no open snapshot can still see it. R is still open and still needs v1, so v1 stays. A long-running transaction holds back cleanup for the whole table. This is the main way bloat starts.',
     vers: [V1({ xmax: 20, tag: 'kept: R needs it', tone: 'warn' }), V2({ tag: 'live', tone: 'default', dashed: false })],
     actors: [
       { id: 'r', label: 'Reader R', sub: 'still open', tone: 'warn', at: 0 },
@@ -82,7 +82,7 @@ const steps: Step[] = [
     noteTone: 'warn',
   },
   {
-    caption: 'R commits, so no snapshot can see v1 any more. The next VACUUM removes the dead version and marks its slot free for reuse. A plain VACUUM does not shrink the file and give space back to the operating system. VACUUM FULL does, but it takes an ACCESS EXCLUSIVE lock on the table.',
+    caption: 'R commits, so no snapshot can see v1 any more. The next VACUUM removes the dead version and marks its slot free for reuse. A plain VACUUM does not shrink the file and give space back to the operating system. VACUUM FULL does, but it locks the whole table so nobody can read or write it.',
     vers: [V2({ slot: 1, tag: 'live', tone: 'default', dashed: false })],
     actors: [],
     note: 'VACUUM: v1 removed, slot reusable',
@@ -122,7 +122,7 @@ export default function PgMvcc() {
         return (
           <SketchSvg width={680} height={318} label="A heap page holding row versions with xmin and xmax, and the readers and writer that see them">
             <SketchBox cx={PAGE_CX} cy={166} w={ROW_W + 36} h={222} r={14} dashed stroke="var(--muted)" seed={seedOf('pgpage')} />
-            <HandText x={left - 8} y={34} size={TEXT_SIZES.heading} anchor="start">Heap page of table accounts</HandText>
+            <HandText x={left - 8} y={34} size={TEXT_SIZES.heading} anchor="start">Page of table accounts (8 KB block)</HandText>
             <HandText x={PAGE_CX + ROW_W / 2 + 12} y={34} size={TEXT_SIZES.note} anchor="end" color="var(--muted)">3 slots shown</HandText>
 
             {[0, 1, 2].filter((k) => !used.has(k as 0 | 1 | 2)).map((k) => (

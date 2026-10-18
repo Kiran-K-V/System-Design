@@ -5,10 +5,10 @@ const H = 56;
 
 const nodes: BuildNode[] = [
   { id: 'rider', x: 80, y: 70, w: W, h: H, label: 'Rider app', step: 0 },
-  { id: 'gw', x: 240, y: 70, w: W, h: H, label: 'Gateway', step: 0 },
+  { id: 'gw', x: 240, y: 70, w: W, h: H, label: 'Entry gateway', step: 0 },
   { id: 'fare', x: 400, y: 70, w: W, h: H, label: 'Fare service', step: 0 },
   { id: 'route', x: 560, y: 70, w: W, h: H, label: 'Routing API', shape: 'dashed', step: 0 },
-  { id: 'lock', x: 80, y: 190, w: W, h: H, label: 'Driver lock', sub: 'TTL 10 s', step: 5 },
+  { id: 'lock', x: 80, y: 190, w: W, h: H, label: 'Driver lock', sub: 'expires in 10 s', step: 5 },
   { id: 'match', x: 240, y: 190, w: W, h: H, label: 'Matching', step: 3 },
   { id: 'ride', x: 400, y: 190, w: W, h: H, label: 'Ride service', step: 1 },
   { id: 'ridedb', x: 560, y: 190, w: 110, h: 88, shape: 'db', label: 'Ride DB', step: 1 },
@@ -60,7 +60,7 @@ const steps: BuildStep[] = [
   {
     req: 'NFR: never double-assign a driver',
     caption: 'Before an offer, matching takes a lock on the driver with a time limit. Two matchers cannot both hold it. If one crashes, the lock expires and the driver is free again.',
-    packets: [{ from: 'match', to: 'lock', label: 'SET NX' }],
+    packets: [{ from: 'match', to: 'lock', label: 'lock if free' }],
   },
 ];
 

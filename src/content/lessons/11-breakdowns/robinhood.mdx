@@ -31,24 +31,26 @@ A stock trading app looks like one system. It is two. The price side moves a hug
 
 ## Core entities
 
-- **Account.** Cash and buying power.
+- **Account.** Cash and buying power. Buying power is the money the user may still spend on new orders: cash minus what open orders have already set aside.
 - **Order.** Symbol, side, type, quantity, limit price, state, an idempotency key, and the exchange's order id.
 - **Hold.** Money set aside for one open order.
 - **Position.** How many shares of a symbol an account owns.
-- **Execution.** One fill: quantity, price, time. An order can have several.
-- **Quote.** The latest price of a symbol. Kept in a cache, not stored per tick.
+- **Execution.** One fill: quantity, price, time. A fill is a report from the exchange that some or all of your order has traded. An order can have several, such as 30 shares now and 70 later.
+- **Quote.** The latest price of a symbol. A symbol is the short code of a stock, such as AAPL for Apple. Kept in a cache, not stored per tick.
 
 ## API
 
 - `GET /v1/quotes/{symbol}` for a snapshot.
-- `WS /v1/market/stream` to subscribe to symbols and receive ticks.
-- `POST /v1/orders` with an `Idempotency-Key` header. Returns `201` with the order in state `new`.
-- `DELETE /v1/orders/{id}` asks for a cancel. Returns `202`, because the exchange has not agreed yet.
+- `WS /v1/market/stream` opens a WebSocket, a connection that stays open so the server can push data at any time. Use it to subscribe to symbols and receive ticks.
+- `POST /v1/orders` with an `Idempotency-Key` header. Returns `201` (the HTTP status code for "created") with the order in state `new`.
+- `DELETE /v1/orders/{id}` asks for a cancel. Returns `202` (the status code for "accepted for processing, not done yet"), because the exchange has not agreed yet.
 - `GET /v1/orders/{id}` returns the state and the fills.
 
 The key header comes from lesson [3.4](/learn/03-api-design/idempotency/). A phone on a weak signal will retry a `POST`. Without a key, a retry is a second purchase.
 
 ## High-level design
+
+The diagram uses a few words that the sections below explain in full. The exchange is the market that matches buyers and sellers. It is run by someone else, such as a stock exchange. A tick is one small price update. A fill is the exchange telling us that an order traded. The order side of the diagram handles money, so it is built for correctness. The price side is built for speed.
 
 <RobinhoodBuild client:visible />
 
@@ -86,13 +88,19 @@ A cancel follows the same path. It is a request, and the order is `cancelled` on
 
 ## Deep dives
 
+### The audit log
+
+The non-functional list says every change to an order is recorded. The audit log does this job. It is an append-only table: rows are added and never edited or deleted. Think of a bank's paper ledger written in pen. Each row says what changed, the old state, the new state, the time, and which message caused it (for example, the exchange's fill id). Write the row in the same transaction as the state change, so no change exists without its record.
+
+It exists for three reasons. Support can answer "what happened to my order?" Regulators can ask for a full history, and a broker must be able to give it. And engineers can replay the log to find a bug in the state machine. The size is small. At the peak of about 600 orders a second, each order makes a handful of rows, so a few thousand small rows a second is easy for one database.
+
 ### Keeping buying power correct
 
 A user has $1,000 of buying power and sends two orders of $800 at the same time. Only one may pass.
 
 <RobinhoodHold client:visible />
 
-The conditional update is one case of the idea in lesson [9.4](/learn/09-patterns/contention/). This idea turns check-then-act into one atomic step. That step works on the row that is the source of truth. In SQL it reads `UPDATE accounts SET power = power - 800 WHERE id = ? AND power >= 800`, and the service reads the number of changed rows. In PostgreSQL's default isolation level, a second update waits for the first. That second update re-checks its `WHERE` clause against the new row, so the second order sees $200. The hold row and the order row are inserted in the same transaction. Either both exist, or neither does.
+The conditional update is one case of the idea in lesson [9.4](/learn/09-patterns/contention/). This idea turns check-then-act into one atomic step. That step works on the row that is the source of truth. In SQL it reads `UPDATE accounts SET power = power - 800 WHERE id = ? AND power >= 800`, and the service reads the number of changed rows. In PostgreSQL's default isolation level (READ COMMITTED, where a statement sees only data that other transactions have already committed), a second update waits for the first. That second update re-checks its `WHERE` clause against the new row, so the second order sees $200. The hold row and the order row are inserted in the same transaction. Either both exist, or neither does.
 
 The hold has a life cycle:
 
@@ -138,7 +146,7 @@ Do not send every tick to every client. Do not treat the first HTTP response as 
 </Callout>
 
 <Callout type="deep" title="Why a timeout is the worst case">
-A reply that says `rejected` is clear. A reply that never arrives is not. The order may have reached the exchange, been filled, and lost its acknowledgement on the way back. If you release the hold and let the user retry, they can buy twice. The safe state for an unknown order is "pending, hold kept". A reconciliation job later asks the exchange for its record, and moves the order to a final state.
+A reply that says `rejected` is clear. A reply that never arrives is not. The order may have reached the exchange, been filled, and lost its acknowledgement on the way back. If you release the hold and let the user retry, they can buy twice. The safe state for an unknown order is "pending, hold kept". A reconciliation job (a periodic check that compares our records with the exchange's and fixes any difference) later asks the exchange for its record, and moves the order to a final state.
 </Callout>
 
 ## Check yourself
@@ -233,5 +241,5 @@ A reply that says `rejected` is clear. A reply that never arrives is not. The or
 
 ## Further reading
 
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html): in Read Committed, a second `UPDATE` waits for the first. Then the second update re-checks its `WHERE` clause on the new row. This is why the conditional hold works.
+- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html): in the default isolation level, a second `UPDATE` waits for the first. Then the second update re-checks its `WHERE` clause on the new row. This is why the conditional hold works.
 - [Server-sent events (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events): the one-way push used for prices.

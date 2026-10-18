@@ -34,7 +34,7 @@ Here the cache is the product, not a helper. You are asked to design the cache i
 - Replicas. With one copy of each range, that is 20 x 2 = 40 nodes.
 - Load per node. 100,000 / 20 = 5,000 requests per second per node, if keys spread evenly. That is small. Capacity is set by memory here, not by request rate.
 - Keys. At 1 KB per entry (assumption), 1 TB is 1 billion keys, about 50 million per node.
-- LRU overhead. A linked list adds two pointers per entry, 16 bytes. On 1 KB entries that is 1.6%. On 100-byte entries it is 16%. Small values make exact LRU costly.
+- LRU overhead. A linked list is a chain of entries in which each one points to the one before and the one after. Those two pointers cost 16 bytes per entry. On 1 KB entries that is 1.6%. On 100-byte entries it is 16%. Small values make exact LRU costly.
 - Latency. A round trip inside one data center costs about 0.5 ms (lesson [1.2](/learn/01-one-machine/latency-numbers/)). One round trip from the client to the owning node leaves most of the 10 ms budget unused. A proxy in the middle adds a second hop. A client library that knows the ring avoids it.
 
 ## Core entities
@@ -51,7 +51,7 @@ PUT    /cache/{key}   { value, ttl }
 DELETE /cache/{key}
 ```
 
-In practice the client library speaks a binary protocol. The HTTP shape above is only to show the contract.
+In practice the client library speaks a compact binary format instead of text over HTTP, to save bytes and time. The HTTP shape above is only to show the contract.
 
 ## High-level design
 
@@ -61,7 +61,7 @@ Step through the build.
 
 ### One node first
 
-Start with the hot path of one machine. A hash map gives constant-time access. A doubly linked list orders entries by last use. A get moves the entry to the front. When memory is full, the node removes the entry at the back. Lesson [5.4](/learn/05-caching/eviction/) walks through it.
+Start with the hot path of one machine. A hash map gives constant-time access: it finds a value from its key in one step, however many entries there are. A doubly linked list orders entries by last use, like a stack of papers where the one you touched last goes on top. A get moves the entry to the front. When memory is full, the node removes the entry at the back. Lesson [5.4](/learn/05-caching/eviction/) walks through it.
 
 Exact LRU must update the list on every read, which means a lock on a shared structure. Real caches avoid that cost. Redis samples a few keys and evicts the least recently used of them. The default sample size is 5, and its docs report almost no loss on skewed access. Say you would take the approximation.
 
@@ -71,11 +71,11 @@ Exact LRU must update the list on every read, which means a lock on a shared str
 
 ### Placing keys: the ring
 
-With 20 nodes, `hash(key) % 20` sends each key to a node. Going to 21 nodes changes `hash % N` for nearly everyone. A share of N/(N+1) of the keys move, here 20/21 or about 95%. Each moved key is a miss, so the database behind the cache takes almost all the traffic at once. The ring of lesson [4.8](/learn/04-data/consistent-hashing/) moves only about 1/21, near 5%.
+With 20 nodes, `hash(key) % 20` sends each key to a node. Going to 21 nodes changes `hash % N` for nearly everyone. A share of N/(N+1) of the keys move, here 20/21 or about 95%. Each moved key is a miss, so the database behind the cache takes almost all the traffic at once. The ring of lesson [4.8](/learn/04-data/consistent-hashing/) moves only about 1/21, near 5%. The ring is a circle of positions. Each node sits at a point on the circle, and a key belongs to the first node you meet walking around from the key's own point. A new node takes over only the stretch just before it, so only the keys in that stretch move.
 
 Use **virtual nodes**: each physical node owns many points on the ring, such as 128 (assumption). Many points per node smooth out the load, so no node gets a much larger arc than the rest. They also spread the load of a failed node over many survivors, not just its single neighbor. With 40 nodes and 128 points, the ring has 5,120 points. A binary search finds the owner in about 13 steps.
 
-Where does the ring live? In the **client library**, loaded from a small config or consensus service (lesson [8.8](/learn/08-technologies/zookeeper/)). Clients refresh it when membership changes. A stale ring only sends a request to a node that no longer owns the key. That is a miss, not an error, which a cache can tolerate. Redis Cluster takes a related approach: 16,384 fixed hash slots assigned to nodes (lesson [8.2](/learn/08-technologies/redis/)).
+Where does the ring live? In the **client library**, loaded from a small config service that all nodes agree on (lesson [8.8](/learn/08-technologies/zookeeper/)). Clients refresh it when membership changes. A stale ring only sends a request to a node that no longer owns the key. That is a miss, not an error, which a cache can tolerate. Redis Cluster takes a related approach: 16,384 fixed numbered buckets, called hash slots, each key going to slot `hash(key) % 16,384` and each slot assigned to a node (lesson [8.2](/learn/08-technologies/redis/)).
 
 ### Replication for availability
 

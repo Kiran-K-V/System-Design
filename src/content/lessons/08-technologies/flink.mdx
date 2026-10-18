@@ -13,7 +13,7 @@ import FlinkCheckpoint from '../../../components/anim/lessons/FlinkCheckpoint.ts
 
 Flink is an engine that runs computations over **streams** of events that never end. You write a **job**. A job is a graph with a **source** that reads events (often a Kafka topic, lesson [8.6](/learn/08-technologies/kafka/)). The job also has **operators** that transform them, and a **sink** that writes results.
 
-What makes it special is **state**. An operator can remember things between events. Examples are a running total per user, the last 10 minutes of clicks, and a half-finished join. Flink keeps that state next to the code, on the machine that runs the operator. Reading it costs a local lookup, not a network call to a database.
+What makes it special is **state**. An operator can remember things between events. Examples are a running total per user, the last 10 minutes of clicks, and a half-finished join (matching events from two streams, such as an order and its payment). Flink keeps that state next to the code, on the machine that runs the operator. Reading it costs a local lookup, not a network call to a database.
 
 Flink runs as a small cluster. A **JobManager** schedules tasks, coordinates checkpoints, and coordinates recovery after failures. **TaskManagers** are the workers that run the tasks and move data between them. Each TaskManager offers a fixed number of **task slots**, its smallest unit of scheduling.
 
@@ -23,7 +23,7 @@ Compare with a plain consumer service. A consumer reads one record at a time and
 
 ### Event time and watermarks
 
-There are two clocks. **Processing time** is the wall clock of the machine running the operator. **Event time** is when the event happened at its source, stamped inside the event. Flink's docs say event time gives results that depend on the data, not on machine speed. A job replayed tomorrow gives the same answer. A job on processing time does not.
+There are two clocks. **Processing time** is the plain clock time of the machine running the operator. **Event time** is when the event happened at its source, stamped inside the event. Flink's docs say event time gives results that depend on the data, not on machine speed. A job replayed tomorrow gives the same answer. A job on processing time does not.
 
 Events arrive late and out of order. A phone that was offline sends a click minutes after it happened. So how does the job know that a window is complete? It cannot know. It uses a **watermark**. A `Watermark(t)` declares that event time has reached `t`: no more events with timestamp `t` or lower should arrive. It is a promise the job trusts. Events that break it are **late**.
 
@@ -50,27 +50,27 @@ Notice the trade-off in step 7. A watermark that waits longer catches more late 
 
 ### Checkpoints make state safe
 
-State on one machine is lost when the machine dies. Flink saves it with **checkpoints**. The method is inspired by the Chandy-Lamport algorithm for distributed snapshots. The checkpoint coordinator tells the sources to start checkpoint *n*. Each source records its position and puts a numbered **barrier** into its stream. The barrier flows with the data. When an operator sees the barrier, it saves its state. Checkpoint *n* then holds the effects of every event before barrier *n* and none after it. An operator with two inputs waits for the barrier on both, which is called **barrier alignment**.
+State on one machine is lost when the machine dies. Flink saves it with **checkpoints**. A checkpoint is a saved copy of the whole job at one moment, like a save point in a video game. The checkpoint coordinator tells the sources to start checkpoint *n*. Each source records its position and puts a numbered **barrier** into its stream. The barrier flows with the data. When an operator sees the barrier, it saves its state. Checkpoint *n* then holds the effects of every event before barrier *n* and none after it. An operator with two inputs waits for the barrier on both, which is called **barrier alignment**.
 
 <FlinkCheckpoint client:visible />
 
 On a failure, Flink restores every operator from the last complete checkpoint. Flink then **rewinds and replays** the source from the saved position. This needs a **replayable source**. Kafka qualifies, because it keeps the log (lesson [6.2](/learn/06-async/pubsub-logs/)).
 
-Flink's docs define exactly-once carefully. It does not mean each event is processed once. It means each event affects the **state** Flink manages exactly once. Events 121 to 135 in the animation are processed twice, but the restored state counts them once. For results that leave Flink, the docs list two conditions for end-to-end exactly-once. The conditions are replayable sources, and sinks that are **transactional or idempotent**. Otherwise the output has duplicates. That is the same problem as lesson [6.3](/learn/06-async/delivery-semantics/).
+Flink's docs define exactly-once carefully. It does not mean each event is processed once. It means each event affects the **state** Flink manages exactly once. Events 121 to 135 in the animation are processed twice, but the restored state counts them once. For results that leave Flink, the docs list two conditions for end-to-end exactly-once. The conditions are replayable sources, and sinks that are **transactional or idempotent**. A transactional sink writes a batch of results all at once or not at all. An idempotent sink gives the same result when the same write arrives twice. Otherwise the output has duplicates. That is the same problem as lesson [6.3](/learn/06-async/delivery-semantics/).
 
 ## When to use it
 
-- **Windowed aggregates** over events: counts, sums, and rates per minute.
+- **Windowed aggregates** over events: counts, sums, and rates per minute. An aggregate is one number computed from many events.
 - **Stateful rules** on a live stream, such as a fraud check that needs the last N events of a card.
-- **Stream joins and enrichment**, where two streams meet in state.
+- **Stream joins and enrichment**, where two streams meet in state. Enrichment means adding data to each event, such as a user's country.
 - **Anything that needs correct time handling** when data is late or replayed.
 
 ## When not to use it
 
 - **A stateless transform.** A plain consumer does it with less to run.
 - **Small jobs in Kafka only.** The Kafka Streams library may be enough. It is part of your app, with no separate cluster.
-- **Ad hoc analysis.** A warehouse answers one-off queries. Flink is for continuous ones.
-- **Request and response.** Flink is not an RPC server.
+- **Ad hoc analysis.** A data warehouse (a database built for big one-off analysis queries) answers one-off queries. Flink is for continuous ones.
+- **Request and response.** Flink does not answer calls from other services.
 - **A team that cannot run a cluster.** State, checkpoints, and upgrades are real operational work.
 
 ## Numbers
@@ -98,7 +98,7 @@ Size the checkpoint interval from the recovery cost you accept. The interval is 
 | Keyed windows | Scale over keys | Hot keys are slow | Many keys, even load |
 
 <Callout type="tip">
-Name the clock, the window, and the recovery in one pass: "I use event time with a watermark of 5 seconds, tumbling 1-minute windows keyed by merchant, and allowed lateness of 1 minute. State is checkpointed to durable storage. Source is Kafka, so it can replay. The sink writes with a transaction, or an idempotent upsert, for end-to-end exactly-once."
+Name the clock, the window, and the recovery in one pass: "I use event time with a watermark of 5 seconds, tumbling 1-minute windows keyed by merchant, and allowed lateness of 1 minute. State is checkpointed to durable storage (disks or cloud storage that survive a crash). Source is Kafka, so it can replay. The sink writes with a transaction, or an idempotent upsert (a write that inserts the row if it is new and replaces it if it exists), for end-to-end exactly-once."
 </Callout>
 
 <Callout type="mistake">

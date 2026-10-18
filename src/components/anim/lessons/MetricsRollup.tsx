@@ -26,7 +26,7 @@ const rollup: CompareVariant = {
     { id: 'dash', x: 90, y: 150, w: 120, h: 56, label: 'Dashboard' },
     { id: 'query', x: 320, y: 150, w: 130, h: 56, label: 'Query service' },
     { id: 'raw', x: 600, y: 60, w: 130, h: 80, label: 'Raw samples', shape: 'db', sub: 'last 15 days' },
-    { id: 'hour', x: 600, y: 250, w: 130, h: 80, label: 'Hour rollup', shape: 'db', sub: 'min, max, avg, count' },
+    { id: 'hour', x: 600, y: 250, w: 130, h: 80, label: 'Hour rollup', shape: 'db', sub: 'min, max, sum, count' },
   ],
   edges: [
     { from: 'dash', to: 'query' },

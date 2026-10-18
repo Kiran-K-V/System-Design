@@ -10,12 +10,12 @@ const DOCS = [
 
 const steps = [
   { caption: 'Three documents. Question: which documents contain the word "fast"? Scanning every document works for 3. For 3 billion it takes hours. We need an index: a structure built ahead of time that answers by lookup.' },
-  { caption: 'Step 1: analyze each document. Split the text into words (tokens) and lowercase them. Real engines also remove stop words ("the") and stem words ("writes" to "write"). We skip those to keep it small.' },
-  { caption: 'Step 2: index document 1. For each token, add the document id to that token’s posting list. The table is the inverted index: it maps word to documents. The "inverse" is that a normal index maps document to words.' },
-  { caption: 'Step 3: index document 2. "fast" already exists, so its list grows to [1, 2]. "indexes", "make", "reads" are new rows. The term dictionary stays sorted, so finding a term is a binary search or a B-tree lookup.' },
-  { caption: 'Step 4: index document 3. "writes" now lists documents 1 and 3. The index is built. Each posting list is sorted by document id, which makes the next step cheap.' },
-  { caption: 'Query: fast AND writes. Look up each term (two cheap lookups). Intersect the sorted lists by walking them together: fast = [1, 2], writes = [1, 3]. Only 1 is in both. No document was scanned.' },
-  { caption: 'Cost model: a query touches only the posting lists of its terms, not the corpus. The price is paid at write time: indexing one document updates one list per distinct word. Search engines such as Lucene (inside Elasticsearch) build on exactly this structure.' },
+  { caption: 'Step 1: analyze each document. Split the text into words (tokens) and lowercase them. Real engines also drop filler words such as "the" and cut words down to their root ("writes" becomes "write"). We skip those to keep it small.' },
+  { caption: 'Step 2: index document 1. For each token, add the document id to that token’s list of documents. The table is the inverted index: it maps word to documents. The "inverse" is that a normal index maps document to words.' },
+  { caption: 'Step 3: index document 2. "fast" already exists, so its list grows to [1, 2]. "indexes", "make", "reads" are new rows. The word column stays sorted, so finding a word is fast, like finding a name in a phone book.' },
+  { caption: 'Step 4: index document 3. "writes" now lists documents 1 and 3. The index is built. Each list of document ids is sorted, which makes the next step cheap.' },
+  { caption: 'Query: fast AND writes. Look up each word (two cheap lookups). Intersect the sorted lists by walking them together: fast = [1, 2], writes = [1, 3]. Only 1 is in both. No document was scanned.' },
+  { caption: 'Cost model: a query touches only the lists for its words, not all the documents. The price is paid at write time: indexing one document updates one list per distinct word. Search engines such as Lucene, the library inside Elasticsearch, build on exactly this structure.' },
 ];
 
 function termsFor(step: number) {
@@ -67,10 +67,10 @@ export default function InvertedIndexBuild() {
               Inverted index
             </HandText>
             <HandText x={340} y={40} size={14} anchor="start" color="var(--muted)">
-              term (sorted)
+              word (sorted)
             </HandText>
             <HandText x={470} y={40} size={14} anchor="start" color="var(--muted)">
-              posting list: doc ids
+              documents that contain it
             </HandText>
             <line x1={336} x2={636} y1={50} y2={50} stroke="var(--border)" />
             {rows.length === 0 && (

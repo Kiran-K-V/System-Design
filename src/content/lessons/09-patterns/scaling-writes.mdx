@@ -47,38 +47,36 @@ This lesson puts four earlier ideas in the right order.
 
 ## The mechanism
 
-Work through the walk below. It follows one burst through the four moves, in the order you should try them.
-
-<ScalingWritesWalk client:visible />
+There are four moves, in the order you should try them. Read each one. After the fourth, a step-through walk follows one burst through all of them.
 
 ### Move 1: less work per write
 
-**Batch.** Every commit has a fixed part, the flush of the log to disk, and a per-row part. If a worker commits 100 rows together, it pays the fixed part once. The PostgreSQL manual says this directly for bulk loads: do one commit at the end. The reason is that letting each row commit separately makes the database do much work per row. It also says `COPY` is optimized for loading many rows with much less overhead than separate `INSERT` statements.
+**Batch.** A commit is the moment the database promises that a change is saved for good. Every commit has a fixed part, the flush of the log to disk, and a per-row part. Picture a delivery van: the trip costs the same for 1 parcel or 100, so you wait and send them together. If a worker commits 100 rows together in one transaction (a group of changes that succeed or fail as one unit), it pays the fixed part once. The PostgreSQL manual says this directly for bulk loads: do one commit at the end. The reason is that letting each row commit separately makes the database do much work per row. It also says `COPY` is optimized for loading many rows with much less overhead than separate `INSERT` statements.
 
 Batching has a cost. A batch is acknowledged together, so each row waits for the batch to fill. A bad row can fail the whole transaction. And a bigger batch gives smaller gains each time, because the fixed part shrinks next to the per-row part. The lab below shows the curve.
 
-**Use a store built for writes.** A B-tree updates pages in place (lesson [4.2](/learn/04-data/storage-engines/)). A **log-structured merge tree** (LSM tree) appends. Cassandra's write path is the standard example (lesson [8.3](/learn/08-technologies/cassandra/)). A write goes to the commit log, a sequential append, and to the memtable, a sorted structure in memory. When the memtable is full it is flushed to an immutable SSTable file. A write is never an in-place edit. The cost moves to reads, which may check several files, and to compaction, which merges files in the background. Pick this kind of store when writes dominate and reads are by key or by a known range.
+**Use a store built for writes.** A B-tree updates pages in place (lesson [4.2](/learn/04-data/storage-engines/)). A **log-structured merge tree** (LSM tree) appends. Cassandra's write path is the standard example (lesson [8.3](/learn/08-technologies/cassandra/)). A write goes to the commit log, a sequential append, and to the memtable, a sorted structure in memory. When the memtable is full it is flushed to an immutable SSTable file (a sorted file on disk that is never changed after it is written). A write is never an in-place edit. The cost moves to reads, which may check several files, and to compaction, which merges those files in the background, like tidying a pile of sorted notes into one pile. Pick this kind of store when writes dominate and reads are by key or by a known range.
 
 ### Move 2: absorb bursts with a queue
 
-Put a durable queue (lesson [6.1](/learn/06-async/queues/)) between the API and the database. The API appends the write and answers. A worker drains the queue at the speed the database allows. A burst becomes a backlog. The database sees a steady load.
+Put a durable queue (lesson [6.1](/learn/06-async/queues/)) between the API and the database. The API appends the write and answers with an ack (an acknowledgement: "I got it"). A worker drains the queue at the speed the database allows. A burst becomes a backlog. The database sees a steady load.
 
 This is **write-behind**: the write is acknowledged before it lands in its final home. Know what you gave up:
 
 - The ack means "accepted", not "readable". A reader who checks at once may see nothing. That is the read-your-writes problem again (lesson [4.10](/learn/04-data/consistency-models/)). Return the new value from the write path, or read through the queue's state.
 - The queue must be durable, such as a replicated log. A write-behind cache in volatile memory loses acknowledged writes on a crash.
-- Delivery is at-least-once (lesson [6.3](/learn/06-async/delivery-semantics/)), so the worker may apply a write twice. Make writes idempotent (lesson [3.4](/learn/03-api-design/idempotency/)).
+- Delivery is at-least-once (lesson [6.3](/learn/06-async/delivery-semantics/)), so the worker may apply a write twice. Make writes idempotent (lesson [3.4](/learn/03-api-design/idempotency/)): applying the same write twice must give the same result as applying it once.
 - The queue must drain. If the average write rate is above the drain rate, the backlog grows without end. In that case, you need backpressure (lesson [6.4](/learn/06-async/backpressure-dlq/)).
 
 ### Move 3: shard
 
 When the sustained rate is above one node's ceiling, split the data (lesson [4.7](/learn/04-data/sharding/)). A hash of the shard key picks the node. With an even spread, N shards take about N times the writes. That is the only way to raise the write ceiling for good.
 
-The shard key decides everything. It sets how well writes spread, and which queries stay on one shard. Choose a key with many values and even traffic, such as a user id. Do not choose a key such as the date, because all of today's writes share one value.
+The shard key decides everything. It sets how well writes spread, and which queries stay on one shard. Choose a key with many different values (high cardinality) and even traffic, such as a user id. Do not choose a key such as the date, because all of today's writes share one value.
 
 ### Move 4: break up hot keys
 
-Sharding spreads keys, not one key. If a single key takes a large share of writes, the shard that holds it saturates while the others idle. DynamoDB documents each partition as designed for 1,000 write units per second (lesson [8.4](/learn/08-technologies/dynamodb/)). A hot key hits that limit no matter how many partitions the table has.
+Sharding spreads keys, not one key. If a single key takes a large share of writes, the shard that holds it saturates while the others idle. DynamoDB documents each partition (one slice of a table, held on its own machines) as designed for 1,000 write units per second (one write unit is one write per second of an item up to 1 KB) (lesson [8.4](/learn/08-technologies/dynamodb/)). A hot key hits that limit no matter how many partitions the table has.
 
 The fix is **key salting**. Add a suffix to the key: `hot#0`, `hot#1`, up to `hot#k`. The writes for one logical key now go to `k` physical keys, which usually live on different shards. DynamoDB's guide describes two ways to pick the suffix:
 
@@ -86,6 +84,10 @@ The fix is **key salting**. Add a suffix to the key: `hot#0`, `hot#1`, up to `ho
 - **Calculated suffix.** Derive the suffix from another field, such as a hash of the order id. Writes still spread, and you can find one item because you can recompute its suffix. Reading the whole day still needs every suffix.
 
 So salting trades a cheap write for an expensive read: `k` lookups. For counters, keep `k` partial counters and add them when you read.
+
+Step through the walk. It follows one burst through the four moves.
+
+<ScalingWritesWalk client:visible />
 
 ## The lab: before and after
 
@@ -198,8 +200,8 @@ A like counter for a viral post is a hot key by design. One row updated thousand
   title="One shard at 100%"
   scenario="A game stores match events in a 6-shard cluster, sharded by match id. During a final, one match gets most of the writes."
   facts={[
-    'shard 1: CPU 98%, write latency p99 900 ms',
-    'shards 2 to 6: CPU 12%, write latency p99 8 ms',
+    'shard 1: CPU 98%, the slowest 1% of writes take 900 ms',
+    'shards 2 to 6: CPU 12%, the slowest 1% of writes take 8 ms',
     'match 4471: ~70% of all writes',
   ]}
   steps={[

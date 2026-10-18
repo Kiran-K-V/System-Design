@@ -27,8 +27,8 @@ const steps: Step[] = [
     consumerTone: 'fg',
   },
   {
-    caption: 'The consumer polls. It gets offsets 3 and 4. Its position in memory moves to 5. The committed offset in Kafka is still 3, because nothing told Kafka that 3 and 4 are done.',
-    msg: 'poll() returns offsets 3 and 4.',
+    caption: 'The consumer asks for new records. It gets offsets 3 and 4. Its position in memory moves to 5. The committed offset in Kafka is still 3, because nothing told Kafka that 3 and 4 are done.',
+    msg: 'The read returns offsets 3 and 4.',
     committed: 3,
     position: 5,
     consumer: 'Consumer: holds 3 and 4',

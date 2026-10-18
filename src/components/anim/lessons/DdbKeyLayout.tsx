@@ -51,7 +51,7 @@ const steps: Step[] = [
     parts: [P1, ORDER_U1, P3],
   },
   {
-    caption: 'Query: userId = u1 AND orderDate >= 02-01. DynamoDB hashes u1, goes to one partition, and reads one contiguous slice. It never looks at the other partitions. A query always names the partition key. Without it you would need a Scan, which reads everything.',
+    caption: 'Query: userId = u1 AND orderDate >= 02-01. DynamoDB hashes u1, goes to one partition, and reads one contiguous slice. It never looks at the other partitions. A query always names the partition key. Without it you would need a Scan, which reads every item in the table.',
     parts: [P1, [ORDER_U1[0], { ...ORDER_U1[1], tone: 'accent' }, { ...ORDER_U1[2], tone: 'accent' }], P3],
     mutedParts: [0, 2],
     note: 'one partition, one slice',
@@ -65,14 +65,14 @@ const steps: Step[] = [
     noteTone: 'accent',
   },
   {
-    caption: 'A client writes a new item: u3, 03-15, pending. The base table write succeeds and the client gets its answer. The copy in the index is updated afterwards. For a short time a query on the GSI does not show the new item. All reads from a GSI are eventually consistent.',
+    caption: 'A client writes a new item: u3, 03-15, pending. The base table write succeeds and the client gets its answer. The copy in the index is updated afterwards. For a short time a query on the GSI does not show the new item. Reads from a GSI can be briefly out of date. This is called eventually consistent.',
     parts: [P1, ORDER_U1, [...P3, { ...NEW_ROW, tone: 'ok' }]],
     gsi: GSI_BEFORE,
     note: 'base table updated, GSI not yet',
     noteTone: 'warn',
   },
   {
-    caption: 'The index catches up. Now the pending query finds u3, 03-15. The price of the GSI: every write to the base table also writes to the index, so a table with several GSIs spends more write capacity per item. You cannot ask a GSI for attributes it does not project.',
+    caption: 'The index catches up. Now the pending query finds u3, 03-15. The price of the GSI: every write to the base table also writes to the index, so a table with several GSIs spends more write capacity per item. A GSI only returns the fields you chose to copy into it.',
     parts: [P1, ORDER_U1, [...P3, { ...NEW_ROW, tone: 'ok' }]],
     gsi: { pending: [GSI_BEFORE.pending[0], GSI_BEFORE.pending[1], { ...NEW_ROW, tone: 'ok' }], shipped: GSI_BEFORE.shipped },
     note: 'index caught up',

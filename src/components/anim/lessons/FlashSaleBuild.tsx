@@ -7,11 +7,11 @@ const nodes: BuildNode[] = [
   { id: 'redis', x: 520, y: 80, w: 110, h: 70, label: 'Stock\ncounter', shape: 'db', step: 1 },
   { id: 'resv', x: 520, y: 200, w: 130, h: 70, label: 'Reservations', shape: 'db', step: 1 },
   { id: 'pay', x: 350, y: 335, w: 100, h: 56, label: 'Payment', step: 2 },
-  { id: 'psp', x: 200, y: 335, w: 90, h: 60, label: 'Card\nnetwork', step: 2 },
+  { id: 'psp', x: 200, y: 335, w: 90, h: 60, label: 'Card\nbank', step: 2 },
   { id: 'orders', x: 520, y: 335, w: 110, h: 70, label: 'Orders', shape: 'db', step: 2 },
   { id: 'sweep', x: 350, y: 70, w: 100, h: 60, label: 'Expiry\nsweeper', step: 3 },
   { id: 'wait', x: 200, y: 70, w: 100, h: 60, label: 'Waiting\nroom', step: 4 },
-  { id: 'recon', x: 660, y: 140, w: 80, h: 60, label: 'Recon\njob', step: 5 },
+  { id: 'recon', x: 660, y: 140, w: 96, h: 60, label: 'Counter\nchecker', step: 5 },
 ];
 
 const edges: BuildEdge[] = [
@@ -38,7 +38,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR2: reserve one unit',
-    caption: 'The stock lives in one counter in Redis, set to 10,000 before the sale. A reserve call decrements it. If the result is zero or more, the user wins a unit and a reservation row is written with an expiry time. The deep dive shows why this must be one atomic step.',
+    caption: 'The stock lives in one counter in Redis, set to 10,000 before the sale. A reserve call subtracts 1 from it in one atomic step, which nothing can interrupt. If the result is zero or more, the user wins a unit and a reservation row is written with an expiry time. The deep dive shows why this must be one atomic step.',
     packets: [{ from: 'cdn', to: 'api' }, { from: 'api', to: 'redis', delay: 0.5 }, { from: 'api', to: 'resv', delay: 1 }],
   },
   {
@@ -58,7 +58,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: zero oversell',
-    caption: 'Redis can lose its last writes after a failover. A reconciler counts paid orders and live reservations in the database, and sets the counter to stock minus that sum. The database is the record. The counter is a fast copy.',
+    caption: 'Redis can lose its last writes after a failover. A checker job (a reconciler) counts paid orders and live reservations in the database, and sets the counter to stock minus that sum. The database is the record. The counter is a fast copy.',
     packets: [{ from: 'orders', to: 'recon' }, { from: 'recon', to: 'redis', delay: 0.5 }],
   },
 ];

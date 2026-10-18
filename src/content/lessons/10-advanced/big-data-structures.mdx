@@ -13,9 +13,9 @@ import BigBloomLab from '../../../components/anim/lessons/BigBloomLab.tsx';
 
 Three questions come up again and again at scale.
 
-1. **Is this key in this file?** An LSM tree (lesson [4.3](/learn/04-data/indexing/)) holds many files. A read for a missing key would open each one. Each check is a disk read of about 100 µs.
-2. **How many unique visitors did we have today?** A set of 1 billion 64-bit IDs takes at least 8 GB. You want that number per page, per day.
-3. **Which items are most frequent?** A table of counters for every search query grows with the number of distinct queries.
+1. **Is this key in this file?** An LSM tree (lesson [4.3](/learn/04-data/indexing/)) is a database layout that stores data in many sorted files on disk. A read for a key that is not there would have to open each file to be sure. Each check is a disk read of about 100 µs (microseconds, millionths of a second).
+2. **How many unique visitors did we have today?** A set of 1 billion IDs, each stored in 64 bits (8 bytes), takes at least 8 GB. You want that number per page, per day.
+3. **Which items are most frequent?** A table of counters, one per search query, grows with the number of distinct queries. Think of a tally sheet with one row for every different thing anyone ever typed.
 
 An exact answer costs memory that grows with the number of items. Give up a little accuracy and memory becomes **small and fixed**. These structures are called **probabilistic**. Each one trades a known, tunable error for a very small size.
 
@@ -28,7 +28,7 @@ A **Bloom filter** answers "is X in the set?" with one of two replies.
 
 It has no **false negatives**.
 
-It is an array of **m** bits, all 0, and **k** hash functions. A hash function turns an item into a number. Take it modulo m and you get a bit position.
+It is an array of **m** bits, all 0, and **k** hash functions. A hash function turns any item into a number that looks random. The same item always gives the same number. Take that number modulo m (the remainder after dividing by m) and you get a bit position from 0 to m - 1.
 
 - **Add** an item: compute its k positions and set those bits to 1.
 - **Query** an item: compute its k positions. If any bit is 0, the item is **definitely not** there. If all are 1, it is **possibly** there.
@@ -41,7 +41,7 @@ A bit is never reset to 0, so an item that was added always finds its bits set. 
 
 ### The formula
 
-After n items, the false-positive rate is about
+These formulas use `e` (about 2.718) and `ln` (the natural logarithm, a button on a calculator). You can use the results without the proofs. The false-positive rate ε (the share of "possibly yes" answers that are wrong) after n items is about
 
 **ε ≈ (1 − e^(−kn/m))^k**
 
@@ -71,15 +71,15 @@ Two warnings.
 - **It cannot delete.** Clearing a bit might also clear it for other items, and then those items would get a false negative. (There are variants with counters that allow deletes.)
 - **It must be sized for n.** If you plan for 1 million items and add 2 million to the same filter, the rate changes. With k = 7, the rate is about 16%, not 1%.
 
-Lesson 4.3 showed the main use. Each SSTable file keeps a Bloom filter in memory. A read checks it first and skips files that say "definitely not". Cassandra and PostgreSQL also use Bloom filters to skip disk reads for rows that are not there, as the [Wikipedia article](https://en.wikipedia.org/wiki/Bloom_filter) lists.
+Lesson 4.3 showed the main use. Each SSTable file keeps a Bloom filter in memory. A read checks it first and skips files that say "definitely not". Cassandra (a database built on an LSM tree) and PostgreSQL also use Bloom filters to skip disk reads for rows that are not there, as the [Wikipedia article](https://en.wikipedia.org/wiki/Bloom_filter) lists.
 
 ## HyperLogLog: how many unique items?
 
-**HyperLogLog** (HLL) estimates the number of **distinct** items in a stream. It uses a fixed memory, and it never stores the items.
+**HyperLogLog** (HLL) estimates the number of **distinct** items in a stream, which is a flow of items that you see once and cannot replay. It uses a fixed memory, and it never stores the items.
 
 The idea is a coin game. Hash each item to a random bit string. A random string starts with 0 half the time. The string starts with 00 a quarter of the time. With k zeros at the start, that happens 1 time in 2^k. If you saw a hash with 10 leading zeros, you probably looked at around 2^10 = 1,000 distinct items.
 
-One lucky hash makes a noisy guess. So HLL keeps **m registers** and splits the items among them.
+One lucky hash makes a noisy guess. So HLL keeps **m registers** and splits the items among them. A register is just a small slot that holds one number. Averaging many guesses is steadier than trusting one, like asking thousands of people to guess the height of a tree instead of one.
 
 1. Hash the item.
 2. The first p bits pick a register (m = 2^p registers).
@@ -96,9 +96,9 @@ Do it by hand with p = 2, so 4 registers, and 8-bit hashes.
 | d | `00 001000` | 0 | `001000` has 2 | 3 |
 | a again | `01 000101` | 1 | same as before | 4, nothing changes |
 
-The registers end as **[3, 4, 1, 0]**. Adding "a" a second time changed nothing. A repeat gives the same hash and the same rank, so it never counts twice. The estimate combines all registers with a harmonic mean, which stops one lucky register from dominating (Flajolet et al., 2007).
+The registers end as **[3, 4, 1, 0]**. Adding "a" a second time changed nothing. A repeat gives the same hash and the same rank, so it never counts twice. The estimate combines all registers with a harmonic mean, a kind of average that is not pulled up by a few very large values. This stops one lucky register from dominating.
 
-The error depends only on the number of registers. The standard error is **1.04 / √m**.
+The error depends only on the number of registers. The standard error is **1.04 / √m**. Standard error is the typical size of the miss. A 1% standard error means that for a true count of 1,000,000, the estimate usually lands within about 10,000 of it.
 
 | Registers m | Standard error |
 |---|---|
@@ -111,7 +111,7 @@ Four times the registers halves the error. The Redis implementation uses 16,384 
 
 Compare: exact counting of 1 billion IDs takes at least 8 GB. HLL takes 12 KB. That is about 650,000 times smaller (8 GB / 12 KB).
 
-Two more facts. Two HLLs merge by taking the **maximum** of each register pair. The result counts the union, with no loss of accuracy. Redis exposes this as `PFADD`, `PFCOUNT`, and `PFMERGE`. And HLL **cannot answer "did user X visit?"**. It keeps no items, only the maxima.
+Two more facts. Two HLLs merge by taking the **maximum** of each register pair. The result counts the union (everything seen by either one), with no loss of accuracy. This lets you count each server separately and then merge. Redis (a fast in-memory data store) exposes this as `PFADD`, `PFCOUNT`, and `PFMERGE`. And HLL **cannot answer "did user X visit?"**. It keeps no items, only the maxima.
 
 ## Count-Min Sketch: how often?
 

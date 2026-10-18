@@ -85,7 +85,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'B2 crashes and leaves the ISR. The ISR is {B1}: size 1, below min.insync.replicas of 2. The leader now rejects writes from acks=all producers (a NotEnoughReplicas error). The system picks "no write" over "a write held by one machine".',
+      'B2 crashes and leaves the ISR. The ISR is {B1}: size 1, below min.insync.replicas of 2. The leader now rejects writes from acks=all producers (it returns an error). The system picks "no write" over "a write held by one machine".',
     msg: 'Producer sends m4. B1 rejects it.',
     brokers: [b('B1 leader', 'in ISR', '0* 1* 2* 3*', 'accent'), dead('B2', '0* 1* 2* 3*'), b('B3', 'out of ISR', '0* 1* 2*', 'warn')],
     producer: 'write failed',
@@ -95,7 +95,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'B1 crashes too. B3 is alive but not in the ISR and misses m3. By default (unclean.leader.election.enable=false) the controller will not make B3 the leader. The partition is offline until B1 or B2 returns. No acknowledged message is lost. If you turned unclean election on, B3 would lead and m3 would be gone.',
+      'B1 crashes too. B3 is alive but not in the ISR and misses m3. By default (unclean.leader.election.enable=false) the cluster will not make B3 the leader. The partition is offline until B1 or B2 returns. No acknowledged message is lost. If you turned unclean election on, B3 would lead and m3 would be gone.',
     msg: 'No ISR member is alive. Partition offline.',
     brokers: [dead('B1', '0* 1* 2* 3*'), dead('B2', '0* 1* 2* 3*'), b('B3', 'out of ISR', '0* 1* 2*', 'warn')],
     producer: 'no leader',

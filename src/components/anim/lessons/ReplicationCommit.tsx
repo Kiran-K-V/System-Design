@@ -25,7 +25,7 @@ interface Step {
 
 const START: Step = {
   caption:
-    'One row, x, stored on three machines. The leader accepts writes. Two followers replay the leader’s log (the write-ahead log from lesson 4.2). All three hold x = 4 at log position 41.',
+    'One row, x, stored on three machines. The leader accepts writes. Two followers copy the leader’s log, the file where it records every change before applying it (lesson 4.2). All three hold x = 4 at log position 41.',
   leader: { sub: 'log 41 · x=4' },
   f1: { sub: 'log 41 · x=4' },
   f2: { sub: 'log 41 · x=4' },
@@ -44,13 +44,13 @@ const SEND: Step = {
 
 const APPEND: Step = {
   caption:
-    'The leader appends record 42 to its own log and fsyncs it. This is the same commit point as on one machine. The write is now durable on one machine only.',
+    'The leader adds record 42 to its own log and forces it onto its disk, so a power cut cannot erase it. This is the same commit point as on one machine. The write is now safe on one machine only.',
   leader: { sub: 'log 42 · x=5', tone: 'ok' },
   f1: { sub: 'log 41 · x=4' },
   f2: { sub: 'log 41 · x=4' },
   active: ['leader'],
   packets: [],
-  note: 'durable on 1 of 3',
+  note: 'saved on 1 of 3',
   noteTone: 'warn',
 };
 
@@ -62,7 +62,7 @@ function stepsFor(mode: Mode): Step[] {
       APPEND,
       {
         caption:
-          'Asynchronous: the leader answers OK right away. The client waited for one local fsync (~0.1–1 ms on an SSD). The leader plans to ship record 42 to the followers in the background.',
+          'Asynchronous: the leader answers OK right away. The client waited only for that one disk write (~0.1–1 ms on a fast solid-state disk). The leader plans to send record 42 to the followers in the background.',
         leader: { sub: 'log 42 · x=5', tone: 'ok' },
         f1: { sub: 'log 41 · x=4' },
         f2: { sub: 'log 41 · x=4' },
@@ -73,7 +73,7 @@ function stepsFor(mode: Mode): Step[] {
       },
       {
         caption:
-          'CRASH. The leader’s machine dies before it ships record 42. Both followers are healthy. Neither has seen the write. The client already holds an OK.',
+          'CRASH. The leader’s machine dies before it sends record 42. Both followers are healthy. Neither has seen the write. The client already holds an OK.',
         leader: { sub: 'crashed', tone: 'bad' },
         f1: { sub: 'log 41 · x=4' },
         f2: { sub: 'log 41 · x=4' },
@@ -84,7 +84,7 @@ function stepsFor(mode: Mode): Step[] {
       },
       {
         caption:
-          'Failover promotes follower 1. The cluster is up again, and x = 4. The write the client was told succeeded is gone. This is the price of asynchronous replication: fast commits, and a window where an acknowledged write can be lost.',
+          'Failover, the switch to a backup machine, makes follower 1 the new leader. The cluster is up again, and x = 4. The write the client was told succeeded is gone. This is the price of asynchronous replication: fast commits, and a window where an acknowledged write can be lost.',
         leader: { sub: 'crashed', tone: 'bad' },
         f1: { sub: 'new leader · x=4', tone: 'warn' },
         f2: { sub: 'log 41 · x=4' },
@@ -101,28 +101,28 @@ function stepsFor(mode: Mode): Step[] {
     APPEND,
     {
       caption:
-        'Semi-synchronous: the leader ships record 42 to both followers and waits. It will not answer the client yet.',
+        'Semi-synchronous: the leader sends record 42 to both followers and waits. It will not answer the client yet.',
       leader: { sub: 'log 42 · x=5', tone: 'ok' },
       f1: { sub: 'log 41 · x=4' },
       f2: { sub: 'log 41 · x=4' },
       active: ['leader'],
       packets: [
-        { from: 'leader', to: 'f1', label: 'rec 42' },
-        { from: 'leader', to: 'f2', label: 'rec 42', delay: 0.15 },
+        { from: 'leader', to: 'f1', label: 'log 42' },
+        { from: 'leader', to: 'f2', label: 'log 42', delay: 0.15 },
       ],
-      note: 'waiting for 1 ack',
+      note: 'waiting for 1 confirmation',
       noteTone: 'warn',
     },
     {
       caption:
-        'Follower 1 writes record 42 to its own log and sends an ack. Follower 2 is slower. The leader needs only one ack (MySQL’s default is one). A follower in the same data center adds about one round trip, ~0.5 ms.',
+        'Follower 1 writes record 42 to its own log and sends a confirmation (an ack). Follower 2 is slower. The leader needs only one ack (the MySQL database defaults to one). A follower in the same building adds about one round trip (a message there and back), ~0.5 ms.',
       leader: { sub: 'log 42 · x=5', tone: 'ok' },
       f1: { sub: 'log 42 · x=5', tone: 'ok' },
       f2: { sub: 'log 41 · x=4 (slow)' },
       active: ['f1'],
-      packets: [{ from: 'f1', to: 'leader', label: 'ack', tone: 'ok' }],
+      packets: [{ from: 'f1', to: 'leader', label: 'got it', tone: 'ok' }],
       ack: true,
-      note: 'durable on 2 of 3',
+      note: 'saved on 2 of 3',
       noteTone: 'ok',
     },
     {
@@ -145,12 +145,12 @@ function stepsFor(mode: Mode): Step[] {
     },
     {
       caption:
-        'Failover promotes follower 1, the follower with the longest log. x = 5 survives. Follower 2 catches up from the new leader. The price: every write paid one extra round trip, and a slow or dead follower can stall commits. MySQL falls back to asynchronous after a timeout (default 10 s).',
+        'Failover makes follower 1 the new leader, because it has the longest log. x = 5 survives. Follower 2 catches up from the new leader. The price: every write paid one extra round trip, and a slow or dead follower can stall commits. MySQL falls back to asynchronous after a wait of 10 s by default.',
       leader: { sub: 'crashed', tone: 'bad' },
       f1: { sub: 'new leader · x=5', tone: 'ok' },
       f2: { sub: 'log 41 → catching up' },
       active: ['f1'],
-      packets: [{ from: 'f1', to: 'f2', label: 'rec 42', tone: 'ok' }],
+      packets: [{ from: 'f1', to: 'f2', label: 'log 42', tone: 'ok' }],
       note: 'x=5 kept',
       noteTone: 'ok',
     },
@@ -169,8 +169,8 @@ export default function ReplicationCommit() {
           value={mode}
           onChange={setMode}
           options={[
-            { id: 'async', label: 'Async: right after its own fsync' },
-            { id: 'semi', label: 'Semi-sync: after 1 follower acks' },
+            { id: 'async', label: 'Async: right after its own disk write' },
+            { id: 'semi', label: 'Semi-sync: after 1 follower confirms' },
           ]}
         />
       </div>
@@ -186,12 +186,12 @@ export default function ReplicationCommit() {
           const promoted = s.f1.sub.startsWith('new leader');
           const edges: FlowEdge[] = crashed
             ? promoted
-              ? [{ from: 'f1', to: 'f2', label: 'ship log', labelAt: [-34, 0], dashed: true }]
+              ? [{ from: 'f1', to: 'f2', label: 'send log', labelAt: [-34, 0], dashed: true }]
               : []
             : [
                 { from: 'client', to: 'leader', head: 'both' },
-                { from: 'leader', to: 'f1', label: 'ship log', labelAt: [-8, -20], dashed: !s.ack, head: s.ack ? 'both' : 'end' },
-                { from: 'leader', to: 'f2', label: 'ship log', labelAt: [-8, 22], dashed: true },
+                { from: 'leader', to: 'f1', label: 'send log', labelAt: [-8, -20], dashed: !s.ack, head: s.ack ? 'both' : 'end' },
+                { from: 'leader', to: 'f2', label: 'send log', labelAt: [-8, 22], dashed: true },
               ];
           const notes: FlowNote[] = s.note ? [{ x: 255, y: 262, text: s.note, anchor: 'middle', tone: s.noteTone, size: 16 }] : [];
           return (

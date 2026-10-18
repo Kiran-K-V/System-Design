@@ -21,7 +21,7 @@ interface Step {
 
 const steps: Step[] = [
   {
-    caption: 'Replication factor 3: three replicas hold the row x. All three have x = 1. The client talks to any node. That node becomes the coordinator for this request. It forwards the work to the replicas that own the key. The consistency level says how many replicas must answer before the coordinator replies.',
+    caption: 'Replication factor 3: three replicas hold the row x. All three have x = 1. The client talks to any node. That node becomes the coordinator for this request, the one that manages it. It forwards the work to the replicas that own the key. The consistency level says how many replicas must answer before the coordinator replies.',
     a: { sub: 'x = 1' },
     b: { sub: 'x = 1' },
     c: { sub: 'x = 1' },
@@ -30,7 +30,7 @@ const steps: Step[] = [
     note: 'RF = 3',
   },
   {
-    caption: 'Write x = 2 at consistency ONE. The coordinator sends the write to all three replicas. ONE means only a single replica must respond. Replica A answers first, so the coordinator tells the client OK at once. The messages to B and C are still on the way.',
+    caption: 'Write x = 2 at consistency ONE. The coordinator sends the write to all three replicas. ONE means only a single replica must respond. Replica A confirms first, so the coordinator tells the client OK at once. The messages to B and C are still on the way.',
     a: { sub: 'x = 2', tone: 'ok' },
     b: { sub: 'x = 1', tone: 'warn' },
     c: { sub: 'x = 1', tone: 'warn' },
@@ -39,14 +39,14 @@ const steps: Step[] = [
       { from: 'coord', to: 'a', label: 'x=2' },
       { from: 'coord', to: 'b', label: 'x=2', delay: 0.1 },
       { from: 'coord', to: 'c', label: 'x=2', delay: 0.2 },
-      { from: 'a', to: 'coord', label: 'ack', tone: 'ok', delay: 1.0 },
+      { from: 'a', to: 'coord', label: 'got it', tone: 'ok', delay: 1.0 },
       { from: 'coord', to: 'client', label: 'OK', tone: 'ok', delay: 1.9 },
     ],
-    note: 'write at ONE: 1 ack needed',
+    note: 'write at ONE: 1 confirmation needed',
     noteTone: 'ok',
   },
   {
-    caption: 'Read x at consistency ONE. The coordinator asks one replica. It happens to pick C, which has not applied the write yet. C answers x = 1. The write was acknowledged, and the read still returned the old value. W + R = 1 + 1 = 2, which is not more than 3, so a read can miss the write.',
+    caption: 'Read x at consistency ONE. The coordinator asks one replica. It happens to pick C, which has not applied the write yet. C answers x = 1. The write was acknowledged, and the read still returned the old value. W + R = 1 + 1 = 2 (W is replicas that must confirm a write, R is replicas asked on a read), which is not more than 3, so a read can miss the write.',
     a: { sub: 'x = 2' },
     b: { sub: 'x = 1', tone: 'warn' },
     c: { sub: 'x = 1', tone: 'bad' },
@@ -71,7 +71,7 @@ const steps: Step[] = [
     noteTone: 'ok',
   },
   {
-    caption: 'Switch to QUORUM for reads and writes. QUORUM means a majority of the replicas: n/2 + 1, which is 2 of 3. Write x = 3. The coordinator sends it to all three and waits for two acks. A and B answer, so it tells the client OK. C is still behind.',
+    caption: 'Switch to QUORUM for reads and writes. QUORUM means a majority of the replicas: n/2 + 1, which is 2 of 3. Write x = 3. The coordinator sends it to all three and waits for two confirmations. A and B answer, so it tells the client OK. C is still behind.',
     a: { sub: 'x = 3', tone: 'ok' },
     b: { sub: 'x = 3', tone: 'ok' },
     c: { sub: 'x = 2', tone: 'warn' },
@@ -80,11 +80,11 @@ const steps: Step[] = [
       { from: 'coord', to: 'a', label: 'x=3' },
       { from: 'coord', to: 'b', label: 'x=3', delay: 0.1 },
       { from: 'coord', to: 'c', label: 'x=3', delay: 0.2 },
-      { from: 'a', to: 'coord', label: 'ack', tone: 'ok', delay: 1.0 },
-      { from: 'b', to: 'coord', label: 'ack', tone: 'ok', delay: 1.1 },
+      { from: 'a', to: 'coord', label: 'got it', tone: 'ok', delay: 1.0 },
+      { from: 'b', to: 'coord', label: 'got it', tone: 'ok', delay: 1.1 },
       { from: 'coord', to: 'client', label: 'OK', tone: 'ok', delay: 2.0 },
     ],
-    note: 'write at QUORUM: 2 acks needed',
+    note: 'write at QUORUM: 2 confirmations needed',
     noteTone: 'ok',
   },
   {

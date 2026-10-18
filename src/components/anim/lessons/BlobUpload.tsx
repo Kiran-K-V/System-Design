@@ -15,14 +15,14 @@ interface Step {
 const steps: Step[] = [
   {
     caption:
-      'A user wants to upload a 200 MiB video. The naive path sends the bytes through the app server. API Gateway caps a request body at 10 MB, and every upload would tie up app server connections and bandwidth. So the client first asks the API for permission, and sends the bytes somewhere else.',
+      'A user wants to upload a 200 MiB video. The naive path sends the bytes through the app server. The API gateway (the shared front door of the system) caps a request body at 10 MB, and every upload would tie up app server connections and bandwidth. So the client first asks the API for permission, and sends the bytes somewhere else.',
     active: 'client',
     edges: [{ from: 'client', to: 'api', label: 'I want to upload', labelAt: [-62, -8] }],
     packets: [{ from: 'client', to: 'api' }],
   },
   {
     caption:
-      'The API checks who the user is and what they may upload. It starts a multipart upload in the object store (the store returns an upload id) and signs one URL per part. Signing is local math with the API’s credentials. A pre-signed URL is a bearer token: whoever holds it can do that one action until it expires.',
+      'The API checks who the user is and what they may upload. It starts a multipart upload in the object store (the store returns an upload id) and signs one URL per part. Signing is local math with the API’s credentials. A pre-signed URL is like a visitor pass: whoever holds it can do that one action until it expires.',
     active: 'api',
     edges: [
       { from: 'api', to: 'store', label: 'start upload', labelAt: [48, -2] },
@@ -33,7 +33,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'The client cuts the file into 16 MiB parts (13 parts, so shown here as four) and PUTs them straight to the store, several at a time. The app server is not in the path. Each response carries an ETag, a fingerprint of that part. The client keeps the part number and ETag of each.',
+      'The client cuts the file into 16 MiB parts (13 parts, so shown here as four) and PUTs them straight to the store, several at a time. The app server is not in the path. Each response carries an ETag, a short fingerprint of that part’s bytes. The client keeps the part number and ETag of each.',
     active: 'client',
     edges: [{ from: 'client', to: 'store', label: 'PUT parts in parallel', labelAt: [0, -34] }],
     packets: [{ from: 'client', to: 'store' }, { from: 'client', to: 'store', delay: 0.25 }],
@@ -63,7 +63,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Reads go through a CDN. The first viewer in a region misses the cache, so the CDN fetches from the store (the origin) and keeps a copy. Later viewers nearby get it from the edge. The object store is the durable home. The CDN absorbs the read traffic (lesson 2.7).',
+      'Reads go through a CDN. A CDN is a network of servers near users that keep copies of files. The first viewer in a region misses the cache, so the CDN fetches from the store (the origin) and keeps a copy. Later viewers nearby get it from the edge. The object store is the durable home. The CDN absorbs the read traffic (lesson 2.7).',
     active: 'cdn',
     edges: [
       { from: 'client', to: 'cdn', label: 'GET video', labelAt: [-40, 20] },

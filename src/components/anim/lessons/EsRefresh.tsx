@@ -17,12 +17,12 @@ interface Step {
 
 const steps: Step[] = [
   {
-    caption: 'A shard keeps new documents in three places. An in-memory buffer takes fresh writes. Segments are small immutable pieces of the index that search can read. The translog is a log on disk. We follow one document, d1, from write to searchable.',
+    caption: 'A shard keeps new documents in three places. An in-memory buffer takes fresh writes. Segments are small pieces of the index that search can read and that never change after they are written. The translog is a log file on disk, where each operation is added at the end. We follow one document, d1, from write to searchable.',
     doc: 'none',
     translog: false,
   },
   {
-    caption: 'Index d1. The shard adds it to the in-memory buffer and appends it to the translog. By default the write is acknowledged only after the translog is fsynced on the primary and the replicas. So d1 is safe if the node crashes, even though it is not in any segment.',
+    caption: 'Index d1. The shard adds it to the in-memory buffer and appends it to the translog. By default the write is confirmed to the client only after the translog is forced onto disk on the primary and the replicas. So d1 is safe if the node crashes, even though it is not in any segment.',
     doc: 'buffer',
     translog: true,
     active: 'buffer',
@@ -35,7 +35,7 @@ const steps: Step[] = [
     search: { text: 'search: 0 hits', tone: 'bad' },
   },
   {
-    caption: 'Refresh. By default Elasticsearch refreshes every second, but only on indices that got a search in the last 30 seconds. A refresh writes the buffer into a new segment and opens it for search. It lands in the filesystem cache first, so it is much cheaper than a commit to disk.',
+    caption: 'Refresh. By default Elasticsearch refreshes every second, but only on indices that got a search in the last 30 seconds. A refresh writes the buffer into a new segment and opens it for search. It lands in the operating system’s memory cache for files first, so it is much cheaper than writing to disk for good.',
     doc: 'segment',
     translog: true,
     active: 'segment',
@@ -48,7 +48,7 @@ const steps: Step[] = [
     search: { text: 'search: 1 hit', tone: 'ok' },
   },
   {
-    caption: 'Flush. A flush performs a Lucene commit and starts a new translog generation. The segments are written to disk for good. The old translog is no longer needed for recovery. Refresh makes data searchable. Flush makes it durable in the index files.',
+    caption: 'Flush. A flush writes the segments to disk for good (a Lucene commit) and starts a new, empty translog. The old translog is no longer needed for recovery. Refresh makes data searchable. Flush makes it durable in the index files.',
     doc: 'committed',
     translog: false,
     active: 'disk',
@@ -82,7 +82,7 @@ export default function EsRefresh() {
         <SketchSvg width={680} height={310} label="A document moves from the in-memory buffer to a searchable segment to a committed segment, with the translog recording it on the way">
           <Zone cx={105} cy={115} w={170} h={110} title="Memory buffer" sub="not searchable" tone={s.active === 'buffer' ? 'accent' : 'default'} seed="esbuf" />
           <Zone cx={340} cy={115} w={170} h={110} title="Segment" sub="searchable" tone={s.active === 'segment' ? 'accent' : 'default'} seed="esseg" />
-          <Zone cx={575} cy={115} w={170} h={110} title="Segment on disk" sub="committed" tone={s.active === 'disk' ? 'accent' : 'default'} seed="esdisk" />
+          <Zone cx={575} cy={115} w={170} h={110} title="Segment on disk" sub="saved for good" tone={s.active === 'disk' ? 'accent' : 'default'} seed="esdisk" />
           <Zone cx={105} cy={256} w={170} h={92} title="Translog" sub="on disk" dashed seed="estrans" tone={s.translog ? 'default' : 'muted'} />
 
           {s.doc === 'buffer' && <Fade step={i} born={1}><Doc cx={105} cy={134} /></Fade>}

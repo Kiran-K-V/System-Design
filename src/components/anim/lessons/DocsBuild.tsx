@@ -6,7 +6,7 @@ const nodes: BuildNode[] = [
   { id: 'store', x: 385, y: 340, w: 120, h: 70, label: 'Doc store', shape: 'db', step: 0 },
   { id: 'collab', x: 300, y: 200, w: 150, h: 64, label: 'Collab server', sub: 'one owner per doc', step: 1 },
   { id: 'b', x: 55, y: 290, w: 80, h: 56, label: 'Editor B', step: 1 },
-  { id: 'oplog', x: 510, y: 200, w: 110, h: 70, label: 'Op log', shape: 'db', step: 2 },
+  { id: 'oplog', x: 510, y: 200, w: 110, h: 70, label: 'Edit log', shape: 'db', step: 2 },
   { id: 'cursors', x: 490, y: 75, w: 130, h: 56, label: 'Cursors', sub: 'memory only', shape: 'dashed', step: 4 },
   { id: 'snap', x: 625, y: 340, w: 120, h: 56, label: 'Snapshots', step: 5 },
 ];
@@ -31,7 +31,7 @@ const steps: BuildStep[] = [
   {
     req: 'FR2: many editors, one document',
     caption: 'Each editor opens a WebSocket (lesson 2.5) to a collaboration server. All editors of one document are routed to the same server, chosen by hashing the document id (lesson 4.8). That server orders their edits.',
-    packets: [{ from: 'a', to: 'collab', label: 'op' }, { from: 'b', to: 'collab', label: 'op', delay: 0.4 }],
+    packets: [{ from: 'a', to: 'collab', label: 'edit' }, { from: 'b', to: 'collab', label: 'edit', delay: 0.4 }],
   },
   {
     req: 'NFR: no edit is lost',
@@ -40,18 +40,18 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR3: edits appear live',
-    caption: 'No new box. After the server orders and merges an edit, it sends the result to every other editor on the same document. The merge step is OT or a CRDT. The deep dive below works one example by hand.',
-    packets: [{ from: 'collab', to: 'a', label: 'op', tone: 'ok' }, { from: 'collab', to: 'b', label: 'op', tone: 'ok' }],
+    caption: 'No new box. After the server orders and merges an edit, it sends the result to every other editor on the same document. The merge step is operational transform or a CRDT, two methods the lesson explains below. The deep dive below works one example by hand.',
+    packets: [{ from: 'collab', to: 'a', label: 'edit', tone: 'ok' }, { from: 'collab', to: 'b', label: 'edit', tone: 'ok' }],
     active: ['collab'],
   },
   {
     req: 'FR4: see cursors and presence',
-    caption: 'Cursor positions live in memory on the collaboration server. They are not written to any database. The server throttles them and drops a user who stops sending heartbeats.',
+    caption: 'Cursor positions live in memory on the collaboration server. They are not written to any database. The server throttles them and drops a user who stops sending small "still here" messages.',
     packets: [{ from: 'collab', to: 'cursors', label: 'cursor' }],
   },
   {
     req: 'NFR: storage stays bounded',
-    caption: 'A snapshot job saves the full text every N operations and lets old log entries be trimmed. To open a document or recover after a crash, load the latest snapshot and replay the few operations after it.',
+    caption: 'A snapshot job saves a copy of the full text every N operations and lets old log entries be trimmed. To open a document or recover after a crash, load the latest snapshot and replay the few operations after it.',
     packets: [{ from: 'snap', to: 'oplog', label: 'read' }, { from: 'snap', to: 'store', label: 'save', delay: 0.9 }],
   },
 ];

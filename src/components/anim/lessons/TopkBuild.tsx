@@ -12,7 +12,7 @@ const nodes: BuildNode[] = [
   { id: 'reader', x: 64, y: 250, w: W, h: H, label: 'Reader', step: 2 },
   { id: 'topapi', x: 212, y: 250, w: W, h: H, label: 'Top-K API', step: 2 },
   { id: 'cache', x: 360, y: 250, w: W, h: H, label: 'Cache', sub: 'list per window', step: 2 },
-  { id: 'job', x: 508, y: 250, w: W, h: H, label: 'Top-K job', sub: 'min-heap of K', step: 2 },
+  { id: 'job', x: 508, y: 250, w: W, h: H, label: 'Top-K job', sub: 'keeps K biggest', step: 2 },
   { id: 'rollup', x: 656, y: 250, w: W, h: H, label: 'Rollup', sub: '1h, 1d, 1mo', step: 3 },
 ];
 
@@ -32,17 +32,17 @@ const edges: BuildEdge[] = [
 const steps: BuildStep[] = [
   {
     req: 'FR1: record every view',
-    caption: 'The View API does one cheap thing: append the event to a Kafka topic (lesson 8.6). It does not touch a counter. The log absorbs the burst.',
+    caption: 'The View API does one cheap thing: append the event to Kafka, a durable log that only grows at the end (lesson 8.6). It does not touch a counter. The log absorbs the burst.',
     packets: [{ from: 'viewer', to: 'api', label: 'view' }, { from: 'api', to: 'kafka', label: 'view', delay: 0.9 }],
   },
   {
     req: 'FR1: count views per video',
-    caption: 'A Flink job reads the topic, keyed by video id (lesson 8.7). It sums views for one minute, then writes one partial count per video. The store sees far fewer writes than there are views.',
+    caption: 'A Flink job (a program that processes a stream of events, lesson 8.7) reads the log and groups events by video id. It sums views for one minute, then writes one partial count per video. The store sees far fewer writes than there are views.',
     packets: [{ from: 'kafka', to: 'flink', label: '+1' }, { from: 'flink', to: 'counts', label: '+n', delay: 0.9 }],
   },
   {
     req: 'FR1: read the all-time top K',
-    caption: 'Nobody sorts billions of rows per request. A background job scans the counts, keeps a min-heap of size K, and writes the finished list to a cache. The API reads that one small list.',
+    caption: 'Nobody sorts billions of rows per request. A background job scans the counts, keeps only the K biggest counts seen so far (a min-heap), and writes the finished list to a cache. The API reads that one small list.',
     packets: [{ from: 'counts', to: 'job', label: 'scan' }, { from: 'job', to: 'cache', label: 'top K', delay: 0.9 }, { from: 'reader', to: 'topapi', delay: 1.8 }],
   },
   {
@@ -52,7 +52,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: lists are about a minute old',
-    caption: 'Freshness is the sum of the pipeline delays: the Flink emit period, the job period, and the cache refresh. Keep each short and the total stays near the one-minute goal.',
+    caption: 'Freshness is the sum of the pipeline delays: how often the Flink job writes its sums, how often the Top-K job runs, and how often the cache refreshes. Keep each short and the total stays near the one-minute goal.',
     active: ['flink', 'job', 'cache'],
   },
 ];

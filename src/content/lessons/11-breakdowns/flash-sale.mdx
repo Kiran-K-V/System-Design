@@ -10,7 +10,7 @@ import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import FlashSaleBuild from '../../../components/anim/lessons/FlashSaleBuild.tsx';
 import FlashSaleOversell from '../../../components/anim/lessons/FlashSaleOversell.tsx';
 
-Ten thousand pairs of limited-edition shoes go on sale at noon. Ten million people want them. Most systems spread load over many rows and many servers. Here every request wants the same row. Adding servers does not help, because the bottleneck is one number. The new ideas: extreme contention on one counter, an atomic decrement in Redis, a waiting room, and a reconcile step back to the database.
+Ten thousand pairs of limited-edition shoes go on sale at noon. Ten million people want them. Most systems spread load over many rows and many servers. Here every request wants the same row. Adding servers does not help, because the bottleneck is one number. The new ideas: extreme contention on one counter, an atomic decrement in Redis, a waiting room, and a reconcile step back to the database. **Atomic** means one step that nothing can interrupt: it happens fully or not at all, and no other request sees it half done. To **decrement** is to subtract 1. To **reconcile** is to compare two records of the same fact and fix the one that is wrong. Redis is a very fast in-memory store for small values such as counters.
 
 ## Requirements
 
@@ -62,11 +62,11 @@ Start with the obvious design, then the fix.
 
 The naive design reads, checks, and writes in three steps. Between the read and the write, the world changes. This is the check-then-act race from lesson [9.4](/learn/09-patterns/contention/). Making the row lock bigger is the usual first fix: `SELECT ... FOR UPDATE` on the product row. It is correct. It is also a queue of one. If each reservation holds the lock for 5 ms, the best case is one over the hold time. That is 1 / 0.005 = 200 reservations per second. For 10 million users that is hopeless.
 
-Redis (lesson [8.2](/learn/08-technologies/redis/)) runs commands one at a time on one thread. So a single `DECR` is atomic, and it takes microseconds, not milliseconds. A few details matter.
+Redis (lesson [8.2](/learn/08-technologies/redis/)) runs commands one at a time on one thread. So a single `DECR` (decrement by 1 and return the new value) is atomic, and it takes microseconds, not milliseconds. Two buyers sending `DECR` at the same instant get two different answers, never the same one. A few details matter.
 
 - **Seed the key first.** Redis docs say that if the key does not exist, it is set to 0 before the decrement. An unseeded counter starts at -1. Set it to 10,000 before the sale opens.
 - **A negative result means "none left".** The API sends `INCR` to put the unit back, and answers `409`. The counter dips below zero for a moment, but nobody is ever given a unit from it.
-- **A Lua script avoids the dip.** The Redis docs guarantee that a script runs atomically, with other activity blocked while it runs. This script does the check and the decrement in one step.
+- **A Lua script avoids the dip.** Lua is a small scripting language that Redis can run inside the server. The Redis docs guarantee that a script runs atomically, with other activity blocked while it runs. This script does the check and the decrement in one step.
 
 ```lua
 local left = tonumber(redis.call('GET', KEYS[1]))
@@ -76,19 +76,19 @@ end
 return -1
 ```
 
-- **One per person.** Before the decrement, run `SET reserved:sale:user NX`. It succeeds only for a first attempt. A second attempt gets `409` without touching the counter.
+- **One per person.** Before the decrement, run `SET reserved:sale:user NX`. The `NX` flag means "only if the key does not exist yet". So it succeeds only for a first attempt. A second attempt gets `409` without touching the counter.
 
 ### Holding stock while someone pays
 
 Payment can take 10 seconds or more. Do not hold a database lock for that time. The reservation row is the hold. It has an `expires_at`, set to about 5 minutes from creation.
 
-Two things can happen to a `held` reservation, and they can happen at the same moment. The user pays, or the sweeper expires it. Make both moves conditional on the status. Payment runs `UPDATE ... SET status='paid' WHERE id=? AND status='held'`. The sweeper runs `SET status='expired' WHERE status='held' AND expires_at < now()`. Whichever statement runs first wins. The other changes zero rows. The sweeper adds 1 to the counter only for rows it changed.
+Two things can happen to a `held` reservation, and they can happen at the same moment. The user pays, or the sweeper expires it. Make both moves conditional on the status. Payment runs `UPDATE ... SET status='paid' WHERE id=? AND status='held'`. The sweeper runs `SET status='expired' WHERE status='held' AND expires_at < now()`. Whichever statement runs first wins. The other changes zero rows. The sweeper is a background job that runs every few seconds. It adds 1 to the counter only for rows it changed.
 
 ### Surviving the burst
 
 Ten million users, each reloading every 5 seconds, is 10,000,000 / 5 = 2,000,000 requests per second. The CDN (lesson [2.7](/learn/02-networking/cdn-proxies/)) absorbs page views. But every user also wants to press reserve at 12:00:00.
 
-A **waiting room** is admission control at the edge. Users who arrive get a place in line, and a token when their turn comes. The Sale API accepts only requests with a valid token, so the API and Redis see the rate we choose. It is a rate limiter (lesson [7.4](/learn/07-reliability/rate-limiting/)) that holds users in a queue instead of rejecting them.
+A **waiting room** is admission control at the edge, the way a club doorman lets people in a few at a time so the room never overfills. Users who arrive get a place in line, and a token when their turn comes. The Sale API accepts only requests with a valid token, so the API and Redis see the rate we choose. It is a rate limiter (lesson [7.4](/learn/07-reliability/rate-limiting/)) that holds users in a queue instead of rejecting them.
 
 Pick the rate from the slowest part. Say Redis and the reservation table can take 2,000 reservations per second with room to spare. Then the waiting room admits 2,000 users per second.
 

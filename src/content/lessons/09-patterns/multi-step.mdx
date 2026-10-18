@@ -56,7 +56,7 @@ That is one cost. There are two more.
 
 Microservices.io, which documents the saga pattern, states the same conclusion in its forces list: "2PC is not an option."
 
-The second naive idea is to call the three services in order from one request handler. Each service call gets its own retry. That fails when the handler dies. Nothing remembers how far the order got. It is the dual-write problem from [lesson 6.5](/learn/06-async/cdc/) with three writes instead of two.
+The second naive idea is to call the three services in order from one request handler. Each service call gets its own retry. That fails when the handler dies. Nothing remembers how far the order got. It is the dual-write problem from [lesson 6.5](/learn/06-async/cdc/) with three writes instead of two. Dual write means changing two systems with two separate calls, so a crash between them leaves one changed and one not.
 
 ## The mechanism: a saga
 
@@ -71,28 +71,28 @@ Four rules make compensation work.
 1. **A compensation is a new action, not a rollback.** The charge committed and stays in the history. The refund is a second record. Microservices.io notes that a saga has no automatic rollback: a developer must design each compensation.
 2. **Compensations must be retried until they succeed, and they must be idempotent.** A refund that runs twice must refund once ([lesson 3.4](/learn/03-api-design/idempotency/)). A compensation that can fail for good leaves the system broken.
 3. **Put steps that cannot be undone last.** You cannot unsend an email. Reserve stock and take payment first. Send the confirmation only after every step has succeeded.
-4. **Expect visible middle states.** A saga has no isolation, the "I" in ACID. Between step 2 and the refund, the order is PENDING and the card is charged. Other readers can see that. A status field such as PENDING and CANCELLED makes the state honest, and the UI can show "processing."
+4. **Expect visible middle states.** A saga has no isolation. Isolation is the "I" in ACID, the four promises of a database transaction from lesson [4.4](/learn/04-data/transactions/): all or nothing, valid data, no peeking at half-done work, and saved on disk. Between step 2 and the refund, the order is PENDING and the card is charged. Other readers can see that. A status field such as PENDING and CANCELLED makes the state honest, and the UI can show "processing."
 
 ## Who drives the saga
 
-Two styles exist. Both are named in the microservices.io pattern.
-
-<MultiStepStyles />
+Two styles exist. Both are named in the microservices.io pattern. Both use an **event bus**, which is a shared channel: a service drops a message on it, and any service that listens gets a copy.
 
 - **Choreography.** There is no coordinator. Each service listens for events and decides what to do. Payment hears "order created" and charges. Inventory hears "payment done" and reserves. It has no central point of failure. The cost is that the flow exists only as a web of subscriptions. To answer "where is order 7 stuck?" you must read logs from several services.
-- **Orchestration.** One orchestrator holds the flow. It tells the payment service to charge, waits for the answer, then tells inventory. The flow is in one place. The cost is that the orchestrator must keep its own state durably, or a crash loses the saga.
+- **Orchestration.** One orchestrator holds the flow. It tells the payment service to charge, waits for the answer, then tells inventory. The flow is in one place. The cost is that the orchestrator must keep its own state durably, which means saved on disk, or a crash loses the saga.
+
+<MultiStepStyles />
 
 A rule of thumb: choreography suits two or three steps with little branching. Orchestration suits longer flows, branches, timeouts, and anything the business wants to watch.
 
 ## Reliable events: the outbox
 
-Every step does two things: change its database and publish an event. If it does them as two separate writes, a crash between them breaks the saga ([lesson 6.5](/learn/06-async/cdc/) shows that failure). The fix is the **transactional outbox**. The step writes its business row and an outbox row in one local transaction. A relay reads the outbox, by polling it or by tailing the database log, and publishes to the broker. The event exists if and only if the change committed.
+Every step does two things: change its database and publish an event. If it does them as two separate writes, a crash between them breaks the saga ([lesson 6.5](/learn/06-async/cdc/) shows that failure). The fix is the **transactional outbox**. The step writes its business row and an outbox row in one local transaction. A relay, a small process that copies rows to the queue, reads the outbox. It either polls the table on a timer or tails the database log, which means reading the database's own record of changes as they happen. Then it publishes to the broker, the server that holds the queue. The event exists if and only if the change committed.
 
 The relay can publish the same row twice, for example if it crashes before marking the row sent. So the next step must be idempotent. It can store the event id and skip a repeat ([lesson 6.3](/learn/06-async/delivery-semantics/)). I give no polling interval here, because the right value depends on your latency target and load. I also found no primary source that fixes one.
 
 ## Workflow engines: the orchestrator you do not build
 
-Writing a durable orchestrator yourself means writing a state table, a retry timer, and a recovery scan. You also write a way to resume after a crash. A **workflow engine** gives you that. [Temporal](/learn/08-technologies/temporal/) (lesson 8.9) keeps an Event History of every step. If a worker dies, another worker replays the workflow code against that history and continues from the last recorded step. Your saga becomes ordinary code:
+Writing a durable orchestrator yourself means writing a state table, a retry timer, and a recovery scan. You also write a way to resume after a crash. A **workflow engine** gives you that. [Temporal](/learn/08-technologies/temporal/) (lesson 8.9) keeps an Event History, a saved log of every step. If a worker dies, another worker replays the workflow code, which means it runs the code again and feeds it the saved answers instead of redoing the work. Then it continues from the last recorded step. Your saga becomes ordinary code:
 
 ```ts
 // Pseudocode, not a real SDK call.
@@ -109,7 +109,7 @@ async function placeOrder(order) {
 }
 ```
 
-Temporal runs the three calls as activities. Per the Temporal docs, activities are retried by default and workflow code is not. The workflow code must be deterministic: no clock reads, random numbers, or direct network calls, because it re-runs on replay. AWS Step Functions offers the same idea as a managed service. It has `Retry` and `Catch` on its states, and with no catcher an error fails the whole execution.
+Temporal runs the three calls as activities, its name for steps that touch the outside world. Per the Temporal docs, activities are retried by default and workflow code is not. The workflow code must be deterministic, which means it gives the same result every time it runs: no clock reads, random numbers, or direct network calls, because it re-runs on replay. AWS Step Functions offers the same idea as a managed service from Amazon. It has `Retry` and `Catch` on its states, and with no catcher an error fails the whole execution.
 
 ## Numbers
 
@@ -128,7 +128,7 @@ The point is that compensation is a normal path with real traffic, not a rare ed
 | Two-phase commit | Atomic commit across databases | Blocking if the coordinator fails. Locks held over the network. All parties must join | Rare. A few databases you control |
 | Saga with choreography | No central service. Loose coupling | Flow hard to trace. Cycles are easy to create | Two or three steps |
 | Saga with orchestration | Flow in one place. Easy to monitor | Orchestrator needs durable state | Longer flows, branches, timeouts |
-| Outbox for step events | No lost events without 2PC | A relay to run. Duplicates. Developers can skip the outbox write | Every step that publishes an event |
+| Outbox for step events | No lost events without 2PC | A relay to run. Duplicates. Developers can forget the outbox write | Every step that publishes an event |
 | Workflow engine | Durable state and retries built in | Determinism rules. Workflow versioning. One more system to run | Flows that run long or are business critical |
 
 <Callout type="tip">
