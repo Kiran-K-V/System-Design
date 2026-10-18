@@ -33,12 +33,12 @@ const steps = [
   { caption: 't = 2 s. Nothing yet. Short polling is silent between polls. The other three just wait.' },
   { caption: 't = 3 s. The server event happened at 2.5 s. Long polling, SSE and WebSocket delivered it at once (a held request answers). Short polling only learns of it now, at its next poll: 0.5 s late. The delay can be up to a full poll interval.' },
   { caption: 't = 4 s. Long polling answered, so its client immediately sent a new request. That is a new HTTP request and a full set of headers every time, but never an empty one.' },
-  { caption: 't = 5 s. Short polling asks again: empty again. At a 2 second interval, a quiet system still sends 1,800 requests per hour per user.' },
+  { caption: 't = 5 s. Short polling asks again: empty again. At a 2 second interval, even a quiet system sends 1,800 requests per hour for each user.' },
   { caption: 't = 6 s. Event 2 occurred at 5.5 s. Three approaches delivered it at once. Short polling still waits for t = 7.' },
   { caption: 't = 7 s. Short polling delivers event 2, 1.5 s late. That is the worst case for this schedule: the event came right after a poll.' },
   { caption: 't = 8 s. Quiet. SSE and WebSocket spend nothing while idle: one open connection, no new requests. The cost is server memory for each open connection.' },
   { caption: 't = 9 s. Event 3 occurred at 8.5 s. Short polling gets it at 9 s, 0.5 s late.' },
-  { caption: 'Tally. Short polling: 5 requests, 2 empty, delay 0.5 to 1.5 s. Long polling: 4 requests, 0 empty, delay ~one-way latency. SSE: 1 request, same delay. WebSocket: 1 upgrade request, same delay, and the browser can also send over the same connection.' },
+  { caption: 'Tally. Short polling: 5 requests, 2 empty, delay 0.5 to 1.5 s. Long polling: 4 requests, 0 empty, delay about one trip over the network. SSE: 1 request, same delay. WebSocket: 1 upgrade request, same delay, and the browser can also send over the same connection.' },
 ];
 
 function Dot({ cx, cy, color, hollow }: { cx: number; cy: number; color: string; hollow?: boolean }) {

@@ -56,9 +56,9 @@ export default function ReconnectStorm() {
       title="Reconnect storm: what happens when a gateway dies"
       caption={
         <>
-          Without jitter, all {fmt(clients)} clients arrive in the same second: <strong>{st.spikeOverload.toFixed(1)}x</strong> what the survivors accept per second. With jitter over {windowSec} s the
+          Without jitter, all {fmt(clients)} clients arrive in the same second: <strong>{st.spikeOverload.toFixed(1)}x</strong> what the remaining gateways accept per second. With jitter (a random wait) spread over {windowSec} s the
           expected rate is {fmt(Math.round(st.flatRate))} per second, <strong>{st.flatOverload.toFixed(2)}x</strong> capacity.
-          {st.flatOverload > 1 ? ' Still above capacity: widen the window or add gateways.' : ' Under capacity: the survivors absorb it.'}
+          {st.flatOverload > 1 ? ' Still above capacity: widen the window or add gateways.' : ' Under capacity: the remaining gateways absorb it.'}
         </>
       }
     >
@@ -72,7 +72,7 @@ export default function ReconnectStorm() {
         </label>
         <label className="block text-sm">
           <span className="flex justify-between">
-            <span>Jitter window</span>
+            <span>Jitter window (range of random waits)</span>
             <span className="font-mono tabular-nums">{windowSec} s</span>
           </span>
           <input type="range" min={1} max={120} value={windowSec} onChange={(e) => setWindowSec(+e.target.value)} className="mt-1 w-full accent-[var(--accent)]" />
@@ -87,7 +87,7 @@ export default function ReconnectStorm() {
       </div>
       <div className="mt-5 grid gap-4 sm:grid-cols-2">
         <Chart vals={spike} title="No jitter: everyone retries together" color="var(--bad)" rateNote={`${fmt(st.spikeRate)} arrivals in 1 s`} />
-        <Chart vals={flat} title="Full jitter: spread over the window" color="var(--ok)" rateNote={`~${fmt(Math.round(st.flatRate))} per s`} />
+        <Chart vals={flat} title="With jitter: each client waits a random time" color="var(--ok)" rateNote={`~${fmt(Math.round(st.flatRate))} per s`} />
       </div>
     </WidgetFrame>
   );

@@ -1,5 +1,5 @@
 ---
-summary: HTTP only answers questions. Polling, long polling, SSE, WebSocket and WebRTC are five ways to let the server speak first, and each trades idle cost, direction and state.
+summary: 'HTTP only answers questions. Polling, long polling, SSE, WebSocket and WebRTC are five ways to let the server speak first, and each trades idle cost, direction and state.'
 requires: ['02-networking/http-tls', '02-networking/load-balancing']
 ---
 
@@ -13,37 +13,68 @@ import ReconnectStorm from '../../../components/anim/lessons/ReconnectStorm.tsx'
 
 ## The problem
 
-HTTP (lesson 2.3) is request and response. The client always speaks first. The server answers and then has nothing more to say.
+Alice types "hi" in a chat app. Bob has the same chat open in his browser. Bob must see "hi" within a second. Bob has not clicked anything.
 
-A chat app breaks that rule. Alice sends a message. Bob's browser must show it within a second, and Bob has asked for nothing. The server has news and no way to deliver it. The same is true for a live score, a delivery map, or a document that three people edit.
+HTTP (lesson 2.3) cannot do this by itself. In HTTP, the client always speaks first. The client sends a request. The server sends one response. Then the server has nothing more to say, until the client asks again.
 
-So how does the server reach the client? Every answer below is a trick on top of the same HTTP and TCP you already know. Each trick changes three costs: what an idle client costs, how late the news arrives, and who may send.
+Think of a shop counter. You walk up and ask a question. The clerk answers. The clerk never walks to your house to tell you that the shop got new stock.
 
-## Naive solution: short polling
+Now give the two directions a name. When the client asks and the server answers, that is **pull**: the client pulls data from the server. When the server sends data on its own, that is **push**: the server pushes data to the client. HTTP only pulls. A chat message, a live score, a delivery map and a shared document all need push.
 
-**Short polling** means the client asks "anything new?" on a timer. It is plain HTTP. Any server, proxy and CDN supports it. A poll is stateless, so a load balancer can send it to any server.
+So the question for this lesson is: how can a server push to a client? Every answer here is a trick built on the same HTTP and TCP you already know. Each trick changes three costs:
 
-It fails in two ways. First, most polls are empty. Say the browser polls every 2 seconds. That is 1,800 requests per hour per user. If 1 million users are online, the servers see 500,000 requests per second (1,000,000 / 2). Most carry no data, and every one pays for headers, auth and a log line.
+1. What does an idle client cost? (A client with no news still holds something open.)
+2. How late does the news arrive?
+3. Who may send? Only the server, or both sides?
 
-Second, the news is late. An event that happens just after a poll waits almost a full interval. A 2 second interval means up to 2 seconds of delay. Polling every 100 ms cuts the delay and multiplies the load by 20.
+You will meet five tricks. Each one fixes a weak point of the one before it.
 
-You cannot lower both. That is the signal to hold the connection open instead. Step through four approaches on the same three events. Watch the request count and the delay in each lane.
+## The naive way: short polling
 
-<RealtimeLanes client:visible />
+Start with the simplest idea. The client asks "anything new?" on a timer.
 
-## The mechanism: hold a connection open
+A kid in the back of a car asks "are we there yet?" every two minutes. Each time, the answer is almost always "no". The kid learns the news only when the kid asks.
 
-### Long polling
+This is **short polling**. To **poll** means to ask again and again on a timer. Short polling is plain HTTP. Every server, proxy and CDN supports it. It is also **stateless**: the server remembers nothing between requests (lesson 2.3). So a load balancer (the machine that spreads requests over many servers, lesson 2.4) can send each poll to any server.
 
-The client sends a request. The server does not answer yet. It holds the request open until it has news (or a timeout of tens of seconds). It then answers, and the client sends the next request at once.
+Why does it exist? Because it needs nothing new. You can build it in an afternoon.
 
-The delay drops to about one network trip. No poll is empty, because a response always carries data (except at timeout). But every event still costs a full new HTTP request with all its headers. And each client holds one open request on the server at all times.
+It fails in two ways. Here are the numbers.
 
-Long polling works everywhere HTTP works. That is its value. Use it as a fallback.
+**Failure 1: most polls are empty.** Say the browser polls every 2 seconds. That is 3,600 / 2 = 1,800 requests per hour for one user. Now say 1 million users are online. The servers get 1,000,000 / 2 = 500,000 requests per second. Almost all of them carry no data. Each one still pays for its headers, a login check and a log line.
 
-### Server-sent events (SSE)
+**Failure 2: the news is late.** Suppose an event happens just after a poll. It waits almost one full interval for the next poll. With a 2 second interval, news can be up to 2 seconds late. You can poll every 100 ms to cut the delay. That multiplies the load by 20.
 
-**SSE** (server-sent events) keeps one HTTP response open forever. The server writes events into it as lines of text. The browser reads them with the `EventSource` API.
+You cannot lower both costs. If you poll more, the load grows. If you poll less, the delay grows. The way out is to stop asking again and again, and to keep one connection open instead.
+
+## Fix 1: long polling
+
+What if the server did not answer at once? What if it held the request open until it had news?
+
+At a restaurant counter you order food. The clerk does not say "not ready" and send you away. The clerk says "wait here". You stand there until the food is ready. Then you take it and order the next dish.
+
+This is **long polling**:
+
+1. The client sends a request.
+2. The server holds it. It does not answer yet.
+3. When news arrives, the server answers with it. If nothing happens for tens of seconds, the server answers anyway with "nothing new". That time limit is a **timeout**. It stops the request from hanging forever.
+4. The client sends the next request at once.
+
+Why does this exist? It cuts the delay to about one trip over the network, because the answer is ready the moment the news is. It also removes empty polls (except at the timeout). And it works anywhere HTTP works.
+
+The cost: every event still needs a whole new HTTP request, with all its headers. And the server now holds one open request for every client, all the time. A 30 second timeout means an idle user still sends 3,600 / 30 = 120 requests per hour. That is far better than 1,800, but not zero.
+
+Long polling is a good fallback for old or strict networks. For a main design, we can do better.
+
+## Fix 2: server-sent events (SSE)
+
+What if the answer never ended? What if the server kept one HTTP response open forever and kept writing into it?
+
+Think of a radio station. You tune in once. After that, the station sends you songs as it has them. You do not call the station for each song. You cannot talk back through the radio either.
+
+This is **SSE**, short for **server-sent events**. The browser sends one ordinary HTTP request, a `GET`. The server answers with a header that says the body is an event stream. That header is `Content-Type: text/event-stream`. A **content type** is a label on a response that tells the browser how to read the body. The server then never closes the response. It writes events into it as lines of text.
+
+In the browser, a built-in object called `EventSource` opens this stream and calls your code for each event. One event looks like this:
 
 ```text
 id: 41
@@ -52,90 +83,179 @@ data: {"from":"alice","text":"hi"}
 
 ```
 
-The spec (WHATWG HTML Standard) sets the format. Fields are `data`, `event`, `id` and `retry`. A blank line ends one event. The media type is `text/event-stream`, and the text must be UTF-8.
+A blank line ends one event. The `id` is a number you choose. The `data` is the payload. The `event` field is an optional name.
 
-SSE flows one way only: server to client. The client talks back with normal HTTP requests. In return you get **automatic reconnect with replay**. The browser remembers the last `id` it saw. After a drop it reconnects and sends `Last-Event-ID`. Your server answers with everything after that id.
+Why does SSE exist? Long polling made a new request for every event. SSE pays for the request once. After that, each event costs only the few lines of text it needs. It is cheap, and it is plain HTTP, so proxies and load balancers handle it.
+
+The best part is what the browser does when the connection drops. Phones leave Wi-Fi. Proxies close quiet connections. The browser remembers the `id` of the last event it saw. It reconnects on its own. It sends that `id` in a header called `Last-Event-ID`. The header means "I have everything up to this id". Your server then **replays** the events after that id. It can do that only if it keeps recent events in a short list keyed by id. That list is the **replay buffer**. SSE gives you the id and the header. You write the buffer.
+
+Step through a drop and a recovery.
 
 <SseResume client:visible />
 
-Two details matter in production. SSE over HTTP/1.1 is limited by MDN to 6 connections per browser and domain, shared across all tabs. Over HTTP/2 the limit is the negotiated stream count, which MDN says defaults to 100. And legacy proxies drop quiet connections. So the spec suggests a comment line (a line starting with `:`) every 15 seconds or so.
+SSE flows one way only: server to client. If the client has something to say, it sends a normal HTTP request. That is fine for a news feed, a live score or a progress bar.
 
-### WebSocket
+Two limits matter in production.
 
-A **WebSocket** (RFC 6455) turns one HTTP request into a two-way pipe. After the upgrade, both sides send **frames** (small message units) whenever they like. It is **full duplex**: both directions at once.
+- **A browser allows about 6 SSE connections per website over HTTP/1.1.** All tabs share that number. Open a 7th tab on the same site and its stream waits. HTTP/2 can carry many streams on one connection (lesson 2.3). There the limit is the number of streams the two sides agree on. The default is 100.
+- **A quiet stream looks dead to proxies.** A **proxy** is a middle machine that passes traffic between the browser and your server. Some proxies close a connection with no traffic. So the server sends a **comment line** (a line that starts with a colon, which browsers ignore) every 15 seconds or so, just to keep the line busy.
+
+## Fix 3: WebSocket
+
+SSE is one way. A chat app needs the client to talk often, too. With SSE, every chat message from Bob needs a separate HTTP request. What if one connection carried both directions?
+
+A phone call does this. Both people can talk and listen at the same time. A radio cannot.
+
+A **WebSocket** is a two-way pipe between a browser and a server. It is built on one TCP connection (lesson 2.1) that starts as HTTP. Both sides can send a message at any moment. The word for "both directions at once" is **full duplex**. (A walkie-talkie is the opposite: one side at a time.)
+
+It starts with an **upgrade**. The browser sends a normal HTTP request. It adds two things: a header `Upgrade: websocket` (it asks to switch languages), and a header `Sec-WebSocket-Key` that holds a random value. The server must prove that it really speaks WebSocket. It mixes the key with a fixed phrase that every WebSocket server knows. It scrambles the result with a **hash** (a one-way scramble: easy to compute, impossible to reverse). It sends the result back. A plain HTTP server would not know this recipe, so it cannot answer by accident.
+
+The server also sends the status `101 Switching Protocols`. A **status code** is the number at the top of an HTTP reply that says how it went (200 means OK). Status 101 means: this same connection now speaks WebSocket. No new connection. No more HTTP headers.
+
+From then on, each message travels in a **frame**. This word has a second meaning here. In lesson 2.1, a frame was one unit on a single network link. A WebSocket frame is a different thing: a small unit of message inside the WebSocket connection. Same word, different layer.
+
+A frame has a tiny header of 2 to 14 bytes. Two special frames help you check the other side. A **ping** frame asks "are you there?". The other side must answer with a **pong** frame. A **close** frame ends the connection politely. Frames from the browser also carry a small random scramble key called a **mask**. Servers do not mask. The box at the end of this lesson explains why.
+
+Here is the whole life of a WebSocket.
 
 <WsUpgrade client:visible />
 
-Frames are cheap. A header is 2 to 14 bytes. A chat message costs a few bytes of framing, not hundreds of bytes of HTTP headers. That is why WebSocket suits chat, games, and shared editing, where the client talks as often as the server.
+Why do frames matter? An HTTP request often carries hundreds of bytes of headers. A WebSocket message from the browser that says "hi" costs 2 bytes of header, 4 bytes of mask and 2 bytes of text: 8 bytes in all. The server's reply "hello" costs 2 bytes of header and 5 bytes of text: 7 bytes. That is why WebSocket fits chat, games and shared editing. In those apps the client talks as often as the server.
 
-The price is that the connection is now **state**. A browser's `WebSocket` does not reconnect by itself. Your code must handle `close` and `error`, reconnect, and work out what it missed. A load balancer must keep the socket on one server for its whole life. A deploy that restarts servers drops every socket on them.
+The price is that the connection is now **state**: something the server must remember for each client for as long as the connection lives.
 
-### WebRTC
+- A browser's `WebSocket` does not reconnect by itself. Your code must handle the `close` and `error` events, reconnect, and work out what it missed.
+- The load balancer must keep the connection on one server for its whole life.
+- A deploy that restarts a server drops every socket on it.
 
-**WebRTC** lets two browsers talk directly, mostly for audio and video. The server is not in the data path, which saves bandwidth and delay. But most devices sit behind a router that hides them with **NAT** (network address translation). So WebRTC runs a framework called ICE. A **STUN** server tells a device its public address. If the router blocks direct links (MDN calls out symmetric NAT), a **TURN** server relays all the data. MDN notes TURN "comes with some overhead", so it is a last resort.
+## Side by side
 
-Before any of that, the two peers must swap connection details. They need some channel for that, and the standard does not pick one. Many apps use a WebSocket. In system design, WebRTC is the answer to "video call" and "peer-to-peer", and the wrong answer to "chat" or "notifications".
+You have now met four ways to get news to a browser. Watch all four on the same three events. Look at the delay and the request count in each lane.
+
+<RealtimeLanes client:visible />
+
+Short polling asks 5 times in 9 seconds, and 2 of those asks find nothing. Long polling makes 4 requests and none is empty. SSE and WebSocket make 1 request each and keep it open. Short polling delivers news late. The other three deliver it about one network trip after it happens.
+
+## Fix 4: WebRTC (a different job)
+
+The first four tricks all send data through your server. For a video call, that is wasteful. Two people could send video straight to each other.
+
+Picture two friends who want to talk by phone. They do not call each other first. They ask a mutual friend to pass along each other's number. Once they have the numbers, they talk directly. The mutual friend is not on the line.
+
+**WebRTC** works the same way. It lets two browsers send audio, video or data directly to each other. This is called **peer to peer** ("peer" means an equal, here the other browser). Your server stays out of the media path. That saves your bandwidth and shortens the delay.
+
+There are three problems to solve.
+
+**Problem 1: finding each other.** The two browsers have no addresses for each other yet. They need a channel to swap connection details. This swap is called **signaling**. WebRTC does not pick the channel. Many apps use a WebSocket for it. After signaling, your server is no longer needed for the media.
+
+**Problem 2: hidden devices.** Most laptops and phones sit behind a home or office router that shares one public IP address among many devices. The router uses **NAT** (network address translation) to do this. Think of an office with one public phone number. A receptionist forwards each call to the right desk. Outsiders cannot dial a desk directly. NAT exists because the world ran out of public addresses (lesson 2.1). A device behind NAT does not know its own public address, and a stranger cannot start a connection to it.
+
+To get through, WebRTC uses a process called **ICE**. ICE tries several paths and uses the best one that works. It uses two helpers.
+
+- A **STUN** server answers one question: "What address do you see me coming from?" It is like phoning a friend and asking what number shows on their caller ID. The two browsers then try to connect using those public addresses.
+- Some routers are strict and refuse a direct link. Then ICE falls back to a **TURN** server. TURN relays all the data between the two browsers. It works almost every time, but you pay for the relay. As a rough example, relay 1,000 calls at 1 Mbps of video each way and your servers carry 1,000 x 2 x 1 Mbps = 2 Gbps. So TURN is the last resort.
+
+**Problem 3: stale media.** WebRTC sends audio and video over UDP when it can (lesson 2.1). Old audio is useless, so waiting for a lost packet (head-of-line blocking) is wrong for a call. Video calls also care about **jitter**. Here that word means the network sense: how much the delay of packets varies from one packet to the next. If delays vary a lot, the audio stutters. (The other meaning of jitter, random retry timing, comes later in this lesson. It is a different idea.)
+
+In system design, WebRTC is the answer to "video call" and "peer to peer". It is the wrong answer to "chat" and "notifications". Those need your server to store and route messages.
 
 ## Keeping connections alive
 
-An idle socket looks dead to every box between the client and you. Nginx, by default, closes a proxied connection after 60 seconds without data (`proxy_read_timeout`). Phones switch networks and never send a close frame.
+An open connection can go quiet. Is the other side still there?
 
-The fix is a **heartbeat**: a small message sent on a timer, in both directions. In WebSocket it is a ping frame, answered by a pong. Discord's gateway lets the server choose the interval: the Hello message carries `heartbeat_interval` in milliseconds. If the client sees no acknowledgement, it drops the connection and reconnects. A missed heartbeat is the only way to learn the network vanished.
+Think of a phone call where nobody speaks for a minute. You say "hello, still there?" Then you learn whether the line is dead.
+
+An idle connection looks dead to every machine in the middle. A popular proxy program called nginx closes a proxied connection after 60 seconds without data (the setting is `proxy_read_timeout`). A phone that switches from Wi-Fi to mobile data may never send a close frame at all. The server keeps the dead socket until something tells it to stop.
+
+The fix is a **heartbeat**: a tiny message sent on a timer, in both directions. In WebSocket it is the ping and pong frames from above. If the sender gets no answer in time, it treats the connection as dead, closes it and reconnects. Without a heartbeat, a missed network is invisible.
+
+The timer matters. With a 60 second proxy timeout, a ping every 20 to 30 seconds gives at least two chances before the proxy cuts the line. Discord lets the server pick the interval: its first message to the client carries a value called `heartbeat_interval`, in milliseconds.
+
+A heartbeat gives you one more thing: **presence**. Presence is "who is online right now", like the green dot next to a friend's name. Each heartbeat says "I am here". If a user's heartbeats stop for, say, two intervals, the system marks the user offline. For example, with a 30 second heartbeat, a user disappears about 60 to 90 seconds after the network dies. Presence is a guess based on silence, not a fact.
 
 ## Scaling: sockets are state
 
-A stateless HTTP server is easy to scale (lesson 2.4). Any server can take any request. A socket breaks that. The user is attached to one machine, and a message for the user must reach that machine.
+Now your chat has 1 million users, each with one open socket. A stateless HTTP server is easy to scale. Any server can take any request (lesson 2.4). A socket breaks that rule. The user is attached to one machine. A message for that user must reach that machine.
 
-The common answer splits two jobs. **Gateways** hold sockets and nothing else. **Channel servers** (or a pub/sub layer, Module 6) decide who gets which message. Slack describes this design. Each channel has one owning channel server, picked by consistent hashing. The channel server sends a message to every gateway with a subscriber. Each gateway writes to its own sockets.
+Think of a company phone system. Each employee's call is on one specific line. To reach Dan, you must find Dan's line.
+
+The common design splits two jobs.
+
+- A **gateway** is a server that holds sockets and does nothing else. It knows which users are on it, and which channels those users watch. A **channel** is one chat room, such as `#general`.
+- A **channel server** knows the subscribers of a channel and decides who gets which message. Each channel has exactly one owner. All the messages of a channel meet in one place, so they get one order.
+
+How does the system pick the owner of a channel? It hashes the channel id (the same one-way scramble as before) and uses the result to choose a server. The same id always gives the same server. The named method is **consistent hashing**. It is built so that when a server joins or leaves, only a small share of channels change owners. That matters here because owners die often.
+
+Alice's message takes this path:
+
+1. Alice sends it as a normal HTTP request to the **API**. An API is the front door of your service: the address where programs send requests. Writes stay on the stateless path you already know.
+2. The API finds the owner of the channel.
+3. The owner sends the message to each gateway that has a subscriber of that channel.
+4. Each gateway writes the message into the sockets of its own users.
+
+Step 3 is **fan-out**: one message spreads out to many receivers, like a fan opening. The key trick is that fan-out happens in two levels. The channel server sends one message per gateway. Each gateway then sends one per user. A channel with 1 million watchers on 500 gateways costs the channel server 500 sends, not 1,000,000.
 
 <SocketFanout client:visible />
 
-Slack reports about 16 million channels per host at peak. Delivery worldwide takes about 500 ms. A replacement channel server is ready in under 20 seconds.
+Slack describes this design. It reports about 16 million channels per host at peak. A message reaches users worldwide in about 500 ms. A replacement channel server is ready in under 20 seconds.
 
-### Reconnects can cause the outage
+## When many clients reconnect at once
 
-Say a gateway holds 100,000 sockets and dies. All 100,000 clients notice at about the same moment. If each retries immediately, the survivors receive 100,000 connection attempts in one second. They fail, the clients retry, and the storm continues.
+Now a gateway dies. It held 100,000 sockets. All 100,000 clients notice at about the same moment. Each one reconnects at once. The surviving gateways receive 100,000 connection attempts in one second. They cannot take them. Attempts fail. Clients retry. The retries hit the survivors again. A small failure becomes a big outage. This is a **reconnect storm**.
 
-Two rules fix it. **Exponential backoff** doubles the wait after each failed attempt. **Jitter** adds randomness, so clients do not retry in step. Backoff without jitter keeps clients synchronized: they all wait the same 2, 4, 8 seconds. Try the widget. Set your own capacity.
+Picture a theatre. The fire alarm rings. Everyone runs to the same door at the same time. The door jams. If people left at different moments, all would get out.
+
+Two rules fix it.
+
+**Exponential backoff.** After each failed attempt, the client waits twice as long: 1 s, 2 s, 4 s, 8 s, up to a cap such as 30 s. Why it exists: a server that is struggling needs quiet time, and backoff gives it more quiet time the longer it stays down.
+
+**Jitter.** Here, jitter means the retry sense: a random amount added to the wait. (It has nothing to do with the packet-delay jitter above.) Backoff alone is not enough. All 100,000 clients start together and follow the same 1, 2, 4 schedule. So they all retry in lockstep, and each retry is a new spike. With jitter, each client picks a random wait inside a window. The spikes spread into a flat flow.
+
+The numbers are easy. Suppose the survivors accept 5,000 new connections per second. Without jitter, 100,000 arrive in one second. That is 20 times what they can accept. With jitter spread over 30 seconds, about 100,000 / 30 = 3,333 arrive per second. That is below 5,000, so the survivors cope. Change the sliders and see.
 
 <ReconnectStorm client:visible />
 
-Reconnect also has to **resume**. Discord's client sends the `session_id` and the last sequence number `seq` it saw. The server replays the missed events in order. SSE gives you the same idea with `Last-Event-ID`. For a WebSocket, you build it.
+A reconnect must also **resume**. A new socket restores the pipe. It does not give back the messages sent while the user was offline. So every message carries a **sequence number**, a counter that grows by one for each message. The client remembers the last number it saw. After reconnecting it says "I saw up to 57". The server replays 58 and later. Discord's gateway does this with a `session_id` and the last sequence number. SSE does the same with `Last-Event-ID`. For a WebSocket you build it yourself.
 
 ## Numbers
 
 | Method | Idle requests per hour per user | Delay after an event |
 |---|---|---|
-| Short polling, 2 s | 1,800 | 0 to 2 s |
-| Short polling, 30 s | 120 | 0 to 30 s |
-| Long polling | 1 per event, plus timeouts | ~1 network trip |
-| SSE | 1 (the stream) | ~1 network trip |
-| WebSocket | 1 (the upgrade) | ~1 network trip |
+| Short polling, every 2 s | 3,600 / 2 = 1,800 | 0 to 2 s |
+| Short polling, every 30 s | 3,600 / 30 = 120 | 0 to 30 s |
+| Long polling, 30 s timeout | 1 per event, plus up to 120 timeouts | About 1 network trip |
+| SSE | 1 (the stream stays open) | About 1 network trip |
+| WebSocket | 1 (the upgrade) | About 1 network trip |
 
-Idle memory per connection and sockets per server depend on your runtime and kernel settings. Do not quote a number from memory. Measure with a test, or say "I would load test it".
+Two more numbers to keep:
+
+- 1 million users polling every 2 s means 500,000 requests per second on the servers.
+- A channel of 1 million subscribers on 500 gateways costs 500 sends from the channel server.
+
+Memory per open connection, and sockets per server, depend on your language and your operating system settings. Do not quote a number from memory. Measure it with a test, or say "I would load test it".
 
 ## Trade-offs
 
 | Choice | You gain | You pay | Pick it when |
 |---|---|---|---|
-| Short polling | Stateless, works through any proxy | Empty requests, delay up to the interval | Slow updates (every minute or more) |
-| Long polling | Near real time over plain HTTP | A held request per client, a full request per event | Fallback, or a legacy network |
-| SSE | Auto-reconnect and replay, plain HTTP | One way only, 6 connections per domain on HTTP/1.1 | Feeds, notifications, dashboards |
-| WebSocket | Two ways, tiny frames | Stateful sockets, manual reconnect, special LB and deploy care | Chat, games, collaboration |
+| Short polling | Stateless, works through any proxy | Empty requests, delay up to the interval | Updates are slow (every minute or less often) |
+| Long polling | Near real time over plain HTTP | A held request per client, a full request per event | Fallback, or a strict old network |
+| SSE | Auto-reconnect and replay, plain HTTP | One way only, about 6 connections per site on HTTP/1.1 | Feeds, notifications, dashboards |
+| WebSocket | Two ways, tiny frames | Stateful sockets, manual reconnect, care in load balancing and deploys | Chat, games, shared editing |
 | WebRTC | Peer to peer, no server in the media path | Signaling, NAT traversal, TURN cost | Video and voice calls |
 
 ## In practice
 
 <Callout type="tip">
-Start from the direction of data, not from a favorite tool. "Updates only flow server to client, so SSE: it reconnects and resumes by itself. If the client also sends often, like chat, use WebSocket." Then name the scale problem. Sockets are state, so gateways hold them and a channel layer routes messages. Add heartbeats and reconnect with jitter.
+Start from the direction of data, not from a favorite tool. Say: "Updates only flow server to client, so SSE: it reconnects and resumes by itself. If the client also sends often, like chat, use WebSocket." Then name the scale problem: sockets are state, so gateways hold them and a channel layer routes messages. Add heartbeats, and reconnect with backoff and jitter.
 </Callout>
 
 <Callout type="mistake">
-Do not say "WebSocket is always better" or "SSE is two-way". WebSocket costs you a stateful fleet. SSE is one way. Also do not answer "what if a server dies?" with "the client reconnects". Say how it resumes (last id or sequence number), and how you stop a reconnect storm (backoff plus jitter).
+Do not say "WebSocket is always better" or "SSE is two-way". WebSocket costs you a stateful fleet. SSE is one way. Also do not answer "what if a server dies?" with "the client reconnects". Say how it resumes (the last id or sequence number), and how you stop a reconnect storm (backoff plus jitter).
 </Callout>
 
-<Callout type="deep" title="Why a WebSocket client must mask frames">
-RFC 6455 requires every client frame to carry a random 4-byte mask. It also requires the server to close on an unmasked one. The mask is not encryption. It stops a script in the browser from crafting bytes that a confused proxy might read as an HTTP request. Such a read would poison the proxy's cache. Servers never mask. Use TLS (wss://) for real confidentiality.
+<Callout type="deep" title="Why a WebSocket browser must mask its frames">
+The WebSocket standard requires every frame from a browser to carry a random 4-byte mask. A server must close the connection if it gets an unmasked frame from a browser. The mask is not encryption. It protects old proxies. A script in a web page could otherwise craft bytes that a confused proxy reads as a new HTTP request. That could poison the proxy's cache. Servers never mask. For real secrecy, use the encrypted form of WebSocket. Its address starts with `wss://`, just as `https://` is HTTP over TLS (lesson 2.3).
 </Callout>
 
 ## Check yourself
@@ -156,15 +276,15 @@ RFC 6455 requires every client frame to carry a random 4-byte mask. It also requ
       options: [
         'WebSocket, because it is full duplex and handles any live feed',
         'Short polling every 100 ms, with each request asking for new scores',
-        'WebRTC data channels, which are built for peer-to-peer media',
+        'WebRTC, because it is built for direct links between browsers',
         'SSE with an event id, so the browser resumes with Last-Event-ID',
       ],
       answer: 3,
-      explain: 'Data flows one way, and the browser reconnects and asks for missed events on its own. You keep a short replay buffer by id. WebSocket works too, but you would write the reconnect and replay yourself for no gain.',
+      explain: 'Data flows one way, and the browser reconnects and asks for missed events on its own. You keep a short replay buffer keyed by id. WebSocket works too, but you would write the reconnect and replay yourself for no gain.',
     },
     {
       id: 'real-time-transport-websocket-connections-die-after',
-      q: 'Your WebSocket connections die after exactly 60 seconds of silence, behind nginx. Users on slow chats complain. What is the most likely cause and fix?',
+      q: 'Your WebSocket connections die after exactly 60 seconds of silence, behind nginx. Users in slow chats complain. What is the most likely cause and fix?',
       options: [
         'Proxy idle timeout (60 s by default). Send a heartbeat ping often.',
         'The browser has a 60 s limit on idle sockets. Open a second socket.',
@@ -212,7 +332,7 @@ No lesson text covers these cases. Use what you learned.
       options: [
         'SSE: it reconnects automatically, so the server can push updates',
         'Polling every second, with each poll sent from the client to the server',
-        'Server-side rendering: the server redraws the whole board on each move',
+        'Page reload: the server sends a fresh copy of the whole board on each move',
         'WebSocket: one two-way connection with small frames',
       ],
       answer: 3,
@@ -246,6 +366,8 @@ No lesson text covers these cases. Use what you learned.
 />
 
 ## Further reading
+
+You do not need any of these for this course. They are the official sources behind the numbers above.
 
 - [RFC 6455: The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455) (section 1.3 handshake, section 5.1 masking, section 5.5.2 ping and pong)
 - [WHATWG HTML Standard: Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html) (event stream format, Last-Event-ID, retry)

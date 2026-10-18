@@ -33,7 +33,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'The API must find who owns #general. A hash of the channel id picks one channel server, so all messages of a channel meet in one place and get one order. (Module 4 shows the hash ring that does this.)',
+      'The API must find who owns #general. A hash of the channel id picks one channel server, so all messages of a channel meet in one place and get one order. The same channel id always picks the same server.',
     note: '2. hash(channel) -> one owner',
     packets: [{ from: 'api', to: 'cs', label: 'msg' }],
     active: ['cs'],
@@ -61,7 +61,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Failure 1: the channel server dies. Users stay connected, because sockets live on the gateways. A ring manager replaces the owner. Slack reports a replacement ready in under 20 seconds, with only the channels on that host delayed.',
+      'Failure 1: the channel server dies. Users stay connected, because sockets live on the gateways. A coordinator picks a new owner. Slack reports a replacement ready in under 20 seconds, with only the channels on that host delayed.',
     note: 'channel server down: delay, no disconnects',
     noteTone: 'bad',
     packets: [],
