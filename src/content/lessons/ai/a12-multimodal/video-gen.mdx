@@ -1,0 +1,251 @@
+---
+summary: 'A video is a stack of images over time, so cost grows with frame count, and attention across frames grows faster still. Vendors sell it per second, and the job is async: create, poll, download before the link expires. Price a clip per second, keep your own copy, and pin the model id.'
+requires: ['ai/a12-multimodal/diffusion-serving']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai12VidFrames from '../../../../components/anim/lessons/Ai12VidFrames.tsx';
+import Ai12VidJob from '../../../../components/anim/lessons/Ai12VidJob.tsx';
+import Ai12VidCost from '../../../../components/anim/lessons/Ai12VidCost.tsx';
+
+## The problem
+
+Your product lets a user type a sentence and get an 8-second clip. In lesson A12.3 you served images. A good image takes seconds and costs cents. So you plan to call the same kind of model 8 times a second and glue the results together.
+
+Three things break that plan. The clip must look like one scene, not 192 unrelated pictures. The job takes much longer than a web request should stay open. And the price is set per second of video, so a long clip costs more in a straight line, or worse.
+
+The numbers set the scale. The Veo 3.1 guide on the Gemini API lists a request latency of "Min: 11 seconds; Max: 6 minutes (during peak hours)" (as of 2026-10-18, [Veo guide](https://ai.google.dev/gemini-api/docs/veo)). The same API lists Veo 3.1 Standard at $0.40 per second of video at 720p ([pricing page](https://ai.google.dev/gemini-api/docs/pricing), "Last updated 2026-10-16 UTC"). One 8-second clip is 8 x $0.40 = $3.20.
+
+This lesson answers four questions:
+
+1. Why does a second of video cost so much more than an image?
+2. How do models build a clip that holds together?
+3. How do you run a job that takes minutes?
+4. What does a clip cost, and what can change under you?
+
+The design has three bars. Quality bar: the clip follows the prompt and does not flicker. Lesson A12.5 shows how to measure that. Latency budget: seconds to minutes, so the product must be async. Cost per request: a few dollars at list price for 8 seconds, as the sections below work out.
+
+## Question 1: why does video cost more than an image?
+
+A **frame** is one still image. A video is a list of frames shown one after another. The **frame rate**, written fps, is how many frames play each second. Cinema uses 24. The three Veo model groups output 24 fps, according to the Veo guide.
+
+Think of a flip book. Each page is a frame. A longer or smoother book needs more pages.
+
+Now derive the count. A 5-second clip at 24 fps has 5 x 24 = 120 frames. An 8-second Veo clip has 8 x 24 = 192 frames. If one frame costs one image, a 5-second clip costs 120 images. That is the first multiplier, and it is a straight line in length.
+
+The second multiplier is harder to see. Recall from lesson A1.2 that a transformer turns its input into **tokens** (small pieces such as image patches) and runs **attention**, where each token looks at other tokens to decide what matters. Attention compares every token with every other token it may see. If a frame has N tokens and each token only looks inside its own frame, one frame costs about N x N comparisons. Working frame by frame, F frames cost F x N x N.
+
+But that gives you F separate pictures. For the frames to agree on what the red car looks like, tokens must look across frames. Suppose every token looks at every token in every frame. There are F x N tokens in all. The comparisons are (F x N) x (F x N) = F x F x N x N. Divide by the frame-by-frame work, F x N x N, and the ratio is F. For 120 frames the all-frames-at-once design costs 120 times more attention work than the frame-by-frame design.
+
+The animation shows both lines. The work unit is one image's worth of attention. The bars use a log scale, because the numbers span four orders of magnitude.
+
+<Ai12VidFrames client:visible />
+
+Read the third step. 120 frames frame by frame is 120 units. All at once is 120 x 120 = 14,400 units. Read the fourth. Doubling the clip to 10 seconds doubles the first number to 240 and quadruples the second to 57,600.
+
+This is a model of cost, not a bill. Real systems shrink the problem. I did not verify the internals of any vendor's model, and vendors do not all publish them. What I can say is why designers have to: a plain all-to-all design grows with the square of the frame count. The tricks in the next section exist to cut that.
+
+## Question 2: how do models build a clip that holds together?
+
+There are three families of approach. Each trades cost against consistency.
+
+### Approach 1: frame by frame
+
+Run an image model once per frame. The pictures are good, but nothing links frame 7 to frame 8. The red car changes shade. A hand gains a finger and loses it. This **flicker** is the failure that gives frame-by-frame its name. Its cost is the straight line: F images. Its quality is the weakest, because no frame knows about any other.
+
+A common patch is to hand each frame the previous frame as a hint. That cuts the flicker but makes frames depend on each other, so you cannot render all of them in parallel on different GPUs. Serial work stretches latency.
+
+### Approach 2: latent video diffusion
+
+Lesson A12.3 introduced the **latent**: a small compressed version of an image, made by an autoencoder, in which the model does its work, before a decoder turns it back into pixels. **Diffusion** starts from noise and removes a little of it at each step until a clean result remains.
+
+Latent video diffusion applies the same idea to the whole clip at once. The model denoises a block of latents that spans time as well as space. The model can then make attention work across frames, so the car keeps its shade. It can also compress the time axis, so the model sees fewer latent frames than output frames. Compression is the main reason the F x F cost above stays affordable. Designs commonly split attention into a spatial step (inside a frame) and a temporal step (across frames at the same position), which turns F x F x N x N into something nearer F x N x N + N x F x F. The sum is smaller when N is large. I have not confirmed which vendor uses which split, so treat this as the design idea, not a statement about any product.
+
+Everyday picture: instead of repainting every page of the flip book, you sketch the whole motion on one big sheet and then fill in the pages from it.
+
+### Approach 3: cascades
+
+A **cascade** is a chain of models, each doing one job. A first model makes a short, small, low-frame-rate clip that gets the story right. Later models raise the resolution and insert frames in between. Picture a film crew: the director blocks the scene, then others polish it.
+
+Why use it? Each stage works on less data, so the whole chain can be cheaper than one giant model. The cost is more moving parts and more places for errors to creep in. I could not source how any current vendor builds its pipeline, so this lesson does not claim one.
+
+### What to take away
+
+You do not pick the approach as an API user. You see it in three places: the price per second, the latency, and how the clip looks. Know that the quality gap between vendors comes from this choice, and run your own test on your own prompts (lesson A12.5).
+
+## The naive way: one HTTP call that returns the video
+
+The simple design: your server calls the vendor, waits, and returns the file to the browser. It works on a laptop. Here is how it fails.
+
+The vendor's range is 11 seconds to 6 minutes. Your browser, load balancer, and server each have their own idle timeout, and a request held that long is a request that will be cut. When it is cut, the vendor may still charge you, because the work has run. The user clicks again. Now two jobs run, and you pay for both.
+
+The fix is not a longer timeout. A request that lasts minutes is the wrong shape. The backend track has a full lesson on this shape.
+
+<CrossTrackLink id="09-patterns/long-running-tasks">
+Work that takes minutes cannot hold a request open. You accept the work, return a job id, run it on a worker, and report status when asked. Leases and heartbeats reassign a job whose worker dies. Video vendors have built this on their side. Your side needs the same shape.
+</CrossTrackLink>
+
+## The real fix: an async job, on both sides
+
+You face two jobs. The vendor runs one with its own API. You run the other for your users. Use the same pattern twice.
+
+### The vendor's side: create, poll, download
+
+The Veo guide describes the flow. Your request "immediately returns an `operation` object." Its `name` field is the job id. You poll the operation until its `done` status is true. The guide's sample loop sleeps 10 seconds between checks (the REST sample's comment says 5 seconds, so the page disagrees with itself). A finished response holds the video location. You then download the file.
+
+**Polling** means asking again and again whether the job is done, like checking the oven. The alternative is a **webhook**: the vendor calls a URL of yours when the job ends, like an oven that rings. I did not find webhook support on the pages I read for Veo, Runway, or Luma, so check each vendor's docs before you plan on one. Runway's API reference lists a task-detail endpoint for polling by id. It does not state the status values or any link expiry on the page I could read.
+
+The animation walks the whole life of one job.
+
+<Ai12VidJob client:visible />
+
+Two details from the Veo guide matter for your design.
+
+- **The link expires.** "Generated videos are stored on the server for 2 days, after which they are removed." So the download is part of the job, not an optional extra. Copy the file into your own object storage, and serve users from it through your CDN. Those two topics are in the backend track ([blob storage](/learn/backend/08-in-the-wild/blob-storage/) and the large blobs pattern); this lesson does not reteach them.
+- **Blocked clips are free.** "You will not be charged if your video is blocked from generating." A blocked clip still ends the job, with no video. Your code must handle a finished job with nothing to download.
+
+### Your side: the same pattern
+
+Your API accepts the user's request, saves a job row (user, prompt, vendor operation name, state), and returns a job id at once. A worker polls the vendor. When done, it downloads the file to your storage and marks the job ready. The browser polls your API, or you push an event over the channel from the real-time lessons.
+
+Make the job row the source of truth. If your worker crashes after the vendor finishes, a new worker reads the stored operation name and resumes. This also stops the double-click problem: a second click with the same request key finds the first job.
+
+How often does it fail? I found no failure rate published for these services. Plan for it anyway: measure your own failure and block rates for a week, and set your retry budget from them.
+
+## What a clip costs
+
+Prices are public list prices, as of 2026-10-18.
+
+| Provider and model | Unit | Price | Source |
+|---|---|---|---|
+| Google Veo 3.1 Standard, audio on | per second | $0.40 at 720p and 1080p, $0.60 at 4k | [Gemini API pricing](https://ai.google.dev/gemini-api/docs/pricing) |
+| Google Veo 3.1 Fast, audio on | per second | $0.10 at 720p, $0.12 at 1080p, $0.30 at 4k | same page |
+| Google Veo 3.1 Lite, audio on | per second | $0.05 at 720p, $0.08 at 1080p, no 4k | same page |
+| Runway gen4.5 | per second | 12 credits, at $0.01 per credit, so $0.12 | [Runway pricing](https://docs.dev.runwayml.com/guides/pricing/) |
+| Runway gen4_turbo | per second | 5 credits, so $0.05 | same page |
+| Luma Ray3.2, 5 s clip | per video | $0.30 at 720p, $1.20 at 1080p | [Luma API pricing](https://lumalabs.ai/api/pricing) |
+| Luma Ray3.2, 10 s clip | per video | $0.90 at 720p, $3.60 at 1080p | same page |
+
+Runway's page lists no date and no resolution, and Luma's lists no date. Treat those two rows as the list price on the day I read them, and re-read before you budget.
+
+Compare on one unit, dollars per second of video. Luma's 5-second 1080p clip is $1.20 / 5 = $0.24 per second. Its 10-second 1080p clip is $3.60 / 10 = $0.36 per second. So a longer clip is not twice the price of a shorter one: it is three times. Per-second tables hide that, and per-video tables hide the per-second price. Convert both.
+
+Try it. The widget multiplies list price by length, and it enforces the Veo rule that 1080p and 4k need 8 seconds.
+
+<Ai12VidCost client:visible />
+
+Worked example. Your app serves 1,000 clips a day, each 8 seconds. On Veo 3.1 Fast at 720p, that is 1,000 x 8 x $0.10 = $800 a day. On Veo 3.1 Standard at 1080p it is 1,000 x 8 x $0.40 = $3,200 a day. The tier gap is 4 times at the same length. A common design is to render drafts on the cheap tier and charge the expensive tier only after the user approves a draft. That design is my suggestion, not a vendor feature.
+
+### The case of the missing model
+
+OpenAI's deprecations page lists the Videos API and the sora-2 models as removed on September 24, 2026, with no replacement listed (as of 2026-10-18, [deprecations page](https://developers.openai.com/api/docs/deprecations)). I could not load OpenAI's official Sora pricing page, so this lesson quotes no Sora price. The lesson for your design: a model id is not permanent. Pin the id, test a second provider on your prompts, and keep your code behind your own interface so a swap takes a day, not a quarter.
+
+## Numbers
+
+State all three bars before you build.
+
+- **Quality bar.** A prompt-following check and a flicker check, scored on a fixed set of 100 prompts, plus human votes (lesson A12.5). Re-run on every model change.
+- **Latency budget.** Veo's listed range is 11 seconds to 6 minutes. At a 10-second poll, that is 2 to 36 polls per job. Design the screen for minutes: a progress state, a notification when done, and a way to leave and return.
+- **Cost per request.** 8 seconds is $0.80 (Fast, 720p) to $3.20 (Standard, 1080p). Add storage and CDN egress for your copy, and the cost of jobs that are blocked or fail. Blocked Veo jobs are free, but failed or abandoned ones may not be, so check each vendor.
+
+The GPU view helps when you compare with self-hosting. Take 5 seconds at 24 fps, 120 frames, and suppose, illustratively, that one frame costs 2 GPU seconds. That is 240 GPU seconds. At $3.99 per H100 GPU-hour (Lambda, on-demand, as of 2026-10-15, [pricing page](https://lambda.ai/pricing)) that is 240 / 3,600 x $3.99 = $0.27. The 2 seconds per frame is a made-up figure, not a measurement. Real video models do not render frames independently, so use the number as a way to check a vendor's price against your own cost, not as a forecast.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Hosted video API | No GPUs, fast start, vendor improves the model | Per-second price, vendor limits, a model that can be removed | Volume is low or unknown, and the quality bar is high |
+| Cheap tier for drafts, premium for finals | Lower spend per accepted clip | Two code paths, users see a quality step | Many users reject the first try |
+| Short clips (4 to 8 s) | Lower cost, lower latency, fewer artifacts | More joins for longer stories | The product is a social clip or a product shot |
+| Download and re-host | Links never expire, you control CDN and takedown | Storage and egress cost | Always, if a user may open the clip later than the vendor keeps it |
+| Poll vs webhook | Polling works behind any firewall | Wasted calls, delay up to one poll interval | Webhook support is unconfirmed or your endpoint is private |
+| Self-host an open video model | Cost per clip falls at high volume | GPU ops, serving work, your own safety checks | Volume is high and stable (see lesson A2.7) |
+
+## What experienced teams know
+
+1. **Resolution and length are coupled.** On Veo 3.1, 1080p and 4k need 8 seconds ([Veo guide](https://ai.google.dev/gemini-api/docs/veo)). Budget at the 8-second price, not the 4-second one.
+2. **Download within 2 days.** The vendor removes Veo output after 2 days ([Veo guide](https://ai.google.dev/gemini-api/docs/veo)). Copy it into your storage inside the job, not later.
+3. **Blocked output is not billed.** Veo does not charge for a blocked video ([Veo guide](https://ai.google.dev/gemini-api/docs/veo)). Your state machine needs a "finished, no video" end state, and your user needs a message.
+4. **Model ids get removed.** OpenAI's Videos API and sora-2 models were removed on 2026-09-24 with no replacement ([deprecations page](https://developers.openai.com/api/docs/deprecations)). Pin ids, keep a second provider warm, and watch deprecation pages.
+5. **Convert every price to dollars per second.** Luma's 1080p clip costs $0.24 per second at 5 s and $0.36 at 10 s ([Luma pricing](https://lumalabs.ai/api/pricing)). Per-video and per-second tables do not compare until you convert.
+6. **Tier price gaps are large.** Veo 3.1 Standard is $0.40 per second at 720p and Fast is $0.10, a 4 times gap ([pricing page](https://ai.google.dev/gemini-api/docs/pricing)). Route by purpose.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "Video is frames over time, so cost grows with seconds, and cross-frame attention grows faster. I would put generation behind an async job: return a job id, poll the vendor operation, download to our own storage before the vendor link expires, and serve from our CDN. I would budget per second at the 8-second price, route drafts to a cheap tier, pin the model id, and keep a second provider." That names cost, async shape, expiry, and vendor risk in one breath.
+</Callout>
+
+<Callout type="mistake">
+Do not hold the HTTP request open for the clip. Do not store the vendor's link as the permanent address. Do not quote one price per clip without saying length, resolution, and tier. Do not claim you know how a vendor's model works inside when it has not published that.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A Veo 3.1 Fast clip at 1080p costs $0.12 per second. How much does one 8-second clip cost?',
+      options: ['$0.12', '$0.48', '$0.96', '$1.20'],
+      answer: 2,
+      explain: '8 s x $0.12 = $0.96. The $0.12 option is the price of one second. The $0.48 option uses 4 seconds, but 1080p needs 8 seconds on Veo 3.1.',
+    },
+    {
+      q: 'A design lets every token in every frame attend to every token in every frame. You double the clip length at the same frame rate. How does attention work change?',
+      options: ['It grows 4 times, since frames double and the pairs grow with the square', 'It doubles, since the number of frames doubles', 'It stays the same, since each frame is unchanged', 'It grows 8 times, since time, height, and width all double'],
+      answer: 0,
+      explain: 'Tokens double, so pairs of tokens grow 2 x 2 = 4 times. Doubling is true only for the frame-by-frame design. Height and width did not change, so there is no factor 8.',
+    },
+    {
+      q: 'Luma lists a 1080p clip at $1.20 for 5 seconds and $3.60 for 10 seconds. What does that show?',
+      options: ['The price per second is the same for both lengths', 'The 10 s clip costs 3 times as much, so the per-second price rises', 'The 10 s clip is a better deal than two 5 s clips', 'The per-second price falls as clips get longer'],
+      answer: 1,
+      explain: '$1.20 / 5 = $0.24 per second, and $3.60 / 10 = $0.36 per second. A 10 s clip is $3.60 against $2.40 for two 5 s clips, so it is not a better deal. Always convert to one unit before you compare.',
+    },
+    {
+      q: 'Your app saves the vendor link for each Veo clip and shows it to users. A user opens a clip on day 3. What is the most likely result, and what is the fix?',
+      options: ['The link works, since vendors keep media for a year', 'The link works, but slowly, as the clip moves to cold storage', 'The link is billed again, so cache it in the browser', 'The vendor removed it after 2 days, so copy it into your storage in the job'],
+      answer: 3,
+      explain: 'The Veo guide says output is stored for 2 days, then removed. The download is part of the job. Browser caching does not help, since the file is gone from the vendor.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="GPU cost of 5 seconds of video"
+  scenario="A clip is 5 seconds at 24 fps. Suppose, illustratively, that one frame takes 2 GPU seconds to render, and render frames one after another on one H100 at $3.99 per GPU-hour (Lambda, on-demand, as of 2026-10-15). The 2 seconds per frame is made up for this exercise, not a measurement."
+  steps={[
+    {
+      prompt: 'How many frames are in the clip?',
+      answer: 120,
+      within: 1.1,
+      explain: '5 s x 24 frames per second = 120 frames.',
+    },
+    {
+      prompt: 'How many GPU seconds does the clip need?',
+      unit: 'seconds',
+      answer: 240,
+      within: 1.1,
+      explain: '120 frames x 2 GPU seconds = 240 GPU seconds, which is 4 minutes of one GPU.',
+    },
+    {
+      prompt: 'What is the GPU cost of the clip, in USD?',
+      unit: 'USD',
+      answer: 0.27,
+      within: 1.2,
+      explain: '240 / 3,600 = 0.0667 GPU-hours. 0.0667 x $3.99 = $0.266, about $0.27. At this made-up speed, GPU cost is below the Luma 5 s 720p list price of $0.30, before idle time, storage, and margin.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Gemini API: generate video with Veo](https://ai.google.dev/gemini-api/docs/veo) (async operations, limits, retention)
+- [Gemini API pricing](https://ai.google.dev/gemini-api/docs/pricing)
+- [Runway API pricing](https://docs.dev.runwayml.com/guides/pricing/)
+- [OpenAI deprecations](https://developers.openai.com/api/docs/deprecations) (Sora removal)

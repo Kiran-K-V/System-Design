@@ -1,0 +1,272 @@
+---
+summary: 'A vision-language model cuts an image into square patches, runs each patch through a vision encoder, and projects the results into tokens the language model reads like text. Those tokens are billed as input and grow with resolution. Models still miscount small objects, misread tiny text, and misjudge position, so you crop, resize, and test before you trust them.'
+requires: ['ai/a1-model-function/embeddings', 'ai/a1-model-function/forward-pass', 'ai/a3-llm-apis/files-images-input']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai12VlmWalk from '../../../../components/anim/lessons/Ai12VlmWalk.tsx';
+import Ai12VlmResCost from '../../../../components/anim/lessons/Ai12VlmResCost.tsx';
+
+## The problem
+
+You run a marketplace. Sellers upload product photos, and a model must tag each one: colour, material, and whether the box is damaged. You test on ten photos and it works well. Then three things happen in production.
+
+1. A phone photo is 3024 x 4032 pixels. The bill per photo is three times what you estimated from your test images.
+2. The model says a photo shows 14 screws. A person counts 23.
+3. The model reads a part number in a small label as "8" when it is "6".
+
+All three have one cause. A language model reads tokens. A picture is not made of tokens, so something must turn the picture into tokens first. How that step works decides what it costs and what it gets wrong.
+
+This lesson opens that step. Lesson [A3.5](/learn/ai/a3-llm-apis/files-images-input/) gave the billing rule and the upload limits. Here we look at why the rule has that shape, and what it means for quality. The questions on the way are:
+
+1. How does a model read a picture at all?
+2. How do patches become tokens the language model can read?
+3. What does an image cost, and how does cost grow with size?
+4. What do these models get wrong, and how do you prepare for it?
+
+A **vision-language model**, or VLM, is a language model that accepts images as well as text, and answers in text. It reads a picture and writes about it. It does not draw pictures. Drawing is a different family, covered in lesson A12.3.
+
+## Question 1: how does a model read a picture?
+
+A picture is a grid of pixels. Each pixel is three numbers: how much red, green, and blue. A 224 x 224 picture is 224 x 224 = 50,176 pixels, or 150,528 numbers. A language model can handle thousands of tokens, not hundreds of thousands. And one pixel alone says nothing, as one letter alone says little.
+
+The fix came from a 2020 paper titled "An Image is Worth 16x16 Words". It is called the **Vision Transformer**, or ViT. Its idea is to treat a picture like a sentence. Cut the picture into square **patches**, 16 x 16 pixels each. Treat each patch as one word. The paper says image patches are treated the same way as tokens in language processing.
+
+Think of a jigsaw puzzle. You do not study each speck of colour. You look at pieces, and each piece holds a small part of the scene, such as an edge of a wheel or a corner of a label. A patch is a piece.
+
+Why a square piece and not single pixels? Because a Transformer compares every item with every other item. This is the attention (each item looks at every other item) you met in lesson [A1.4](/learn/ai/a1-model-function/attention-cost/), and its cost grows with the square of the item count. Pixel by pixel, a small picture would have 50,176 items. In 16 x 16 patches it has 14 x 14 = 196. That is 256 times fewer items, and the cost of attention falls by the square of that.
+
+The patch count follows one line, from the paper: the number of patches is the width times the height divided by the patch area. At 224 x 224 with 16-pixel patches, 224 x 224 / (16 x 16) = 196 (my arithmetic, from the paper's formula). Patch size is a design choice. The paper writes a model as ViT-L/16, where "L" is the model size and "/16" is the patch size. A smaller patch keeps more detail but gives more patches.
+
+Remember the number 196. It is the count of items the vision part works with for one small picture.
+
+## Question 2: how do patches become tokens?
+
+Two parts do the work. A **vision encoder** reads the patches. A **projector** reshapes what the encoder wrote so the language model can use it. The animation below walks through one toy image. It uses a patch of 28 x 28 pixels, the size Anthropic documents. The image size is made up (illustrative) so that you can see every patch.
+
+<Ai12VlmWalk client:visible />
+
+Now each part in more detail.
+
+### The vision encoder
+
+An encoder is a Transformer that turns input into feature vectors. A **feature vector** is a list of numbers that describes what the model found. It is the same idea as the embedding you met in lesson [A1.2](/learn/ai/a1-model-function/embeddings/): a list of numbers where similar things are near each other.
+
+Step one is to flatten each patch into a list of numbers and multiply it by a learned matrix. The ViT paper calls this a trainable linear projection. Step two adds the position of each patch, because the same piece looks different in the top left than in the bottom right. The paper uses learnable position embeddings, a table the model looks up, as in lesson A1.2. Then the Transformer layers let each patch look at all the others. After that, each vector holds both what its patch shows and some of its neighbours.
+
+How is an encoder trained? A common recipe is CLIP, from OpenAI. It trains an image encoder and a text encoder together on 400 million image and caption pairs. The aim is that a picture and its caption land near each other, and mismatched pairs land far apart. This is called contrastive training. The paper's headline result was zero-shot transfer: the model could label pictures from a list of class names it had never been trained on. A follow-up called SigLIP changes the loss so that it scores each pair on its own rather than comparing it with every other pair in the batch. The SigLIP paper says this allows larger batches. For you, the point is that the encoder learned from captions, so its features line up with words.
+
+### The projector
+
+The encoder's vectors are not yet in the language model's space. They have a different width and a different meaning. A **projector** is a small learned layer that maps them into vectors the same width as the model's word embeddings. After this step each vector is an **image token**. The language model can read it next to text tokens.
+
+The open LLaVA project shows the simplest version. It takes a CLIP vision encoder, labelled ViT-L/14 in its paper, and a language model called Vicuna. Between them sits a single trainable matrix. The paper says it maps the visual features to tokens of the same dimension as the word embedding space. Think of a plug adapter. Two systems, built apart, need one cheap part in the middle.
+
+LLaVA trains in two stages. In stage one, the vision encoder and the language model are both frozen, and only the projector learns. **Frozen** means its weights do not change. In stage two, the projector and the language model train together. The paper says the vision encoder stays frozen throughout. A frozen encoder and a small trained adapter are cheap to train.
+
+Other designs exist. The BLIP-2 paper puts a lightweight Querying Transformer between a frozen encoder and a frozen language model. It is a small Transformer that picks out useful information, rather than passing every patch through. I do not give its size, because I did not confirm it. Closed models such as Claude, GPT, and Gemini do not publish their recipe. What the providers' pages do state is how they count tokens, and that is what you pay for.
+
+### Big images: tiles
+
+Encoders are trained at a fixed size. One CLIP encoder variant takes a 336 x 336 picture and uses 14-pixel patches. That is 24 x 24 = 576 patches (my arithmetic). What if your image is 1344 x 336? One fix is to cut it into tiles. The LLaVA-NeXT post calls its version AnyRes. It picks from a set of grids on a 336-pixel base, and lists 672 x 672, 336 x 1344, and 1344 x 336 among the supported sizes. Each tile goes through the encoder on its own. The post says this reduces hallucination. If every tile costs 576 tokens, a 672 x 672 image is 4 x 576 = 2,304 tokens (my arithmetic: the post does not give a total, and a model may add an overview image on top). The lesson to keep: more pixels means more tiles or patches, and that means more tokens.
+
+## Question 3: what does an image cost?
+
+From the language model's side, an image token is a token. It enters the context window, it is processed in the prefill step, the stage that reads the whole input before the first output token appears (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)), and it is billed as input. Anthropic's vision page states the rule: Claude views images in patches of 28 x 28 pixels, and an image costs the width divided by 28, rounded up, times the height divided by 28, rounded up. The page prices an image at the model's ordinary per-token input price.
+
+Here is the arithmetic for a 1000 x 1000 image. 1000 / 28 = 35.7, which rounds up to 36. So 36 x 36 = 1,296 tokens. At Sonnet 5.5's input price of $2 per million tokens (as of 2026-10-18, [pricing page](https://platform.claude.com/docs/en/about-claude/pricing)), one image costs 1,296 x $2 / 1,000,000 = $0.0026. For 1,000 images, that is $2.59.
+
+Every provider has its own rule. I read these three pages on 2026-10-18.
+
+| Provider | Rule as the page states it | 1000 x 1000 image |
+|---|---|---|
+| Anthropic | 28 x 28 pixel patches, one token each, after a resize cap | 1,296 tokens |
+| OpenAI, tile models such as gpt-4.1 | Scale to fit 2048 px, shortest side to 768 px, count 512 px tiles. Tokens = 85 + 170 per tile | 765 tokens (my arithmetic: 768 x 768 is 4 tiles, 85 + 4 x 170) |
+| OpenAI, patch models | 32 x 32 pixel patches, times a model multiplier. The page lists 1.2 for several current models | 1,229 tokens (the page's own example at 1.2) |
+| Google Gemini | 258 tokens if both sides are at most 384 px. Larger images are cut into 768 x 768 tiles at 258 tokens each. The page calls its tile formula rough | Not computed: the page gives two different tile rules |
+
+The Gemini page gives one worked example for its rough formula: a 960 x 540 image makes 6 tiles. At 258 tokens each, that is 6 x 258 = 1,548 tokens (my arithmetic). Gemini also has a media-resolution setting that caps the tokens per image. I did not confirm its per-level counts, so I leave them out. Do not copy any number from this table into a budget without reading the current page. The only fixed point is the shape of the rule: cost follows the area of the image, then flattens at a cap.
+
+### Where the cap bites
+
+Anthropic downsizes a large image before counting. The vision page lists two tiers.
+
+| Tier | Models | Max long edge | Max visual tokens |
+|---|---|---|---|
+| High-resolution | Claude 4.7 and later | 2576 px | 4784 |
+| Standard | All other models | 1568 px | 1568 |
+
+I read Sonnet 5.5 and Opus 5.5 as "later than 4.7", and the page's own Opus 5.5 example uses the high-resolution tier. For the 1000 x 1000 example above, both tiers give 1,296 tokens, so the reading does not change that number.
+
+The page's 1920 x 1080 row shows the cap at work. On the standard tier it is shrunk to 1456 x 819 and costs 1,560 tokens. On the high-resolution tier it is not shrunk and costs 2,691. The page says the high tier can use up to about three times as many tokens as the standard one.
+
+Try it. Drag the slider and watch where the bars stop growing. Switch the shape to 16:9 and compare the three rules at one price.
+
+<Ai12VlmResCost client:visible />
+
+Two things to notice. First, doubling both sides of an image roughly quadruples the patches, until a cap stops it. A 500 x 500 image is 18 x 18 = 324 tokens. A 1000 x 1000 image is 1,296. That is exactly 4 times. Second, past the cap, extra pixels cost nothing and add no detail. They are thrown away before the model sees them.
+
+### What it adds to latency
+
+Image tokens go through prefill, the compute-heavy step before the first output token. More input tokens mean a longer wait for the first word. I found no published figure for the extra time per image, so I give none. Measure it on your own model and image sizes. Anthropic's vision page adds one more cost: if you send base64 images in a multi-turn chat, each request resends the history, and that can raise request size and latency. The page recommends the Files API for images that you reuse.
+
+## The naive way: send the phone photo as it is
+
+The simple design takes the upload, sends it to the model, and trusts the answer. Here is what that does to the marketplace.
+
+A 3024 x 4032 photo (a common 12-megapixel phone size, illustrative) on a high-resolution Claude tier is downsized to 1659 x 2212 and costs 4,740 tokens. At $2 per million, that is $0.0095 per photo, or $9.48 per 1,000. Resized to 1000 x 1333 first, it costs 36 x 48 = 1,728 tokens, or $3.46 per 1,000. The shrink saves about 64% (1 - 1,728 / 4,740), and a whole-scene tag may not need the extra detail (test it). The numbers use the rules above and the helper in this lesson's code.
+
+The cost is the small problem. The big one is that the photo has hidden weak spots. Next section.
+
+## What these models get wrong
+
+VLMs are strong on describing scenes. They are weak at tasks that a person does by looking closely. Three weaknesses show up in every vendor's own docs.
+
+**Counting.** Anthropic's vision page says Claude can give approximate counts, but might not always be accurate, especially with large numbers of small objects. OpenAI's guide says the same: the model may give approximate counts. Here is my reading of why, not a claim from either page. The model sees patches, not objects. If 23 screws sit in 6 patches, no token stands for one screw, so the count must be reasoned out from blurred evidence.
+
+**Small text.** Anthropic's page says a resize might make text less legible, and that heavy JPEG compression can make text difficult to read. OpenAI's guide says to enlarge text within the image. Text that is smaller than one patch loses its shape. A "6" and an "8" differ by a few pixels.
+
+**Where things are.** Anthropic's page says coordinate and localization outputs are approximate, and OpenAI's page says the model struggles with tasks that need precise spatial localization, such as identifying chess positions. Anthropic's page also warns of mistakes on low-quality, rotated, or very small images under 200 pixels.
+
+There is research on this. The BlindTest paper built simple tasks that people find easy: do two circles overlap, how many times do two lines cross, which letter is circled, how many circles are in a logo. It reports that four state-of-the-art VLMs were 58.07% accurate on average, and that the best, Claude 3.5 Sonnet, scored 77.84%. People would score close to 100%. The test used models from 2024, so today's numbers differ. The finding that matters is the pattern: the models did worst when shapes overlapped or sat close together. The authors also report that the vision encoders appear to hold enough information to solve the tasks, and that the language model fails to turn it into the right answer. If that holds, a bigger image alone will not fix it.
+
+Put a number on it for your case. If the best model fails about 22% of such simple tasks (100% - 77.84%), then a tagger that depends on counting small things will be wrong often. Test your task on a labelled set (see the [golden sets lesson](/learn/ai/a8-evals/golden-sets/)) before you ship. Do not expect a good result from a demo.
+
+## The real fix: prepare the image, then check the answer
+
+You control the image before it reaches the model. These steps come from the vendors' own guidance.
+
+**1. Resize to the model's limit yourself.** If Anthropic must shrink an image, coordinates it returns refer to the shrunk image, not yours. The coordinates page gives an example. An A4 page scanned at 130 DPI is 1075 x 1520 pixels. Both sides are under 1568, but it costs 39 x 55 = 2,145 tokens, so the standard tier shrinks it to 924 x 1307. A high-resolution tier does not. The shrink is easy to miss, and the page calls it the most common cause of misaligned coordinates. Resize first and the coordinates match your image. To make a silent shrink fail loudly, set `"oversized_image": "error"` on the image block. The page says the request is then rejected, not resized.
+
+**2. Crop to what matters.** For a small target, the coordinates page says to crop the region and send the crop, then add the crop's origin to the coordinates the model returns. A crop of the part-number label at 300 x 100 is 11 x 4 = 44 tokens (ceil(300/28) = 11, ceil(100/28) = 4), and the model sees the label at far higher detail than inside a full photo. Cropping gives it more detail for fewer tokens. (Use it only if you know where the label is, for example from a first, cheap pass.)
+
+**3. Do not squeeze the format.** Anthropic's page says lossy compression can introduce artifacts, especially after several passes. Look at the image you actually send. For text, prefer PNG or a high quality setting.
+
+**4. Put images before text, and label each one.** The page says Claude works best when images come before text, and suggests labels such as "Image 1:" when you send several.
+
+**5. Ask for pixel coordinates, not normalized ones.** The page says Claude does not work well with a 0 to 1000 scale, and normalising is better done in your own code.
+
+**6. Upload once, reuse.** For an image that appears in many turns, use the Files API from lesson A3.5, and keep file ids away from user input.
+
+**7. Do not trust one pass on a hard case.** Check the output: spot-check boxes visually, and use code or a second view for counts that matter. Where a count decides money or safety, use a detector or a person. The Anthropic page says outputs should be reviewed in high-stakes cases.
+
+**8. Treat text in an image as untrusted.** An image can carry words that tell the model what to do. Lesson [A10.2](/learn/ai/a10-safety/prompt-injection/) covers the defence.
+
+## Numbers
+
+Fix three numbers for the tagger before you build it. All inputs are illustrative where marked.
+
+- **Quality bar.** Set a target per task on a labelled set of real uploads, for example "colour tag correct on 95% of 500 photos" and "screw count exact on at least 80%". The counting target is a choice for this example, not a standard. Measure counting separately, because the research above says it is the weak point.
+- **Latency budget.** Say 3 seconds at the 95th percentile (95% of requests are faster) for the user to see tags (illustrative). Image tokens add to prefill. Measure the first-token time with your image sizes, since I found no published figure.
+- **Cost per request.** 1,728 image tokens at $2 per million is $0.0035 per photo, plus the text prompt and the output. At $10 per million output tokens (Sonnet 5.5, same page and date), a 100-token answer adds $0.001. Total about $0.0045 per photo, or $4.50 per 1,000 (illustrative: the 100-token answer is an assumption). At 1 million photos a month, that is about $4,500, against about $10,500 if you send the raw 4,740-token photo ($0.0095 + $0.001 = $0.0105 each).
+
+How often do these fail? You do not know until you measure. The research says counting on small objects is wrong in a large share of cases, so plan for a review path for the cases that matter.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Send the full-size photo | Maximum detail, no code | Tokens up to the cap, slow first token | Dense charts, tiny text, and you cannot crop |
+| Downscale to a target size | Fewer tokens, faster, predictable coordinates | May lose small text | Whole-scene tagging, most pipelines |
+| Crop to a region | Higher detail on the target for few tokens | You must find the region first | Small labels, one field of a form |
+| Tile a large image | Keeps detail over a big canvas | Tokens add up per tile | Maps, wide scans, diagrams |
+| Use OCR (text-reading software) or a detector instead | Exact text, exact counts | Another system to run | The answer must be exact |
+| Cheaper, smaller model | Lower price per token | May fail on hard images | The image task is simple and tested |
+
+## What experienced teams know
+
+1. **A token count is an estimate.** Anthropic's [coordinates page](https://platform.claude.com/docs/en/build-with-claude/vision-coordinates) says a successful count does not mean the image will be accepted. Budget with the count, but still handle a rejection.
+2. **A silent resize is the usual cause of drifting coordinates.** The same page says the token limit often triggers the shrink, even when no side exceeds the edge limit. Resize in your own code, or set the error option, so that a change of model tier cannot hide it.
+3. **Counting and spatial tasks are weak on purpose-built tests.** The [BlindTest paper](https://arxiv.org/abs/2407.06581) reports 58.07% average and 77.84% for the best of four models on tasks that people find easy. Score these tasks on their own, apart from your average.
+4. **The connector can be cheap.** The [LLaVA paper](https://arxiv.org/abs/2304.08485) trains only a projection matrix in stage one with frozen parts. If you fine-tune a VLM, see lesson [A11.2](/learn/ai/a11-finetuning/sft-lora/) for the adapter idea, and note which parts you freeze.
+5. **Rules differ by provider and change.** OpenAI's [images guide](https://developers.openai.com/api/docs/guides/images-vision) lists tile models and patch models with different multipliers, and Anthropic has two tiers. Keep the rule in config with a date, and check a count on a sample before a large batch.
+6. **Reuse beats re-send.** Anthropic's [vision page](https://platform.claude.com/docs/en/build-with-claude/vision) recommends the Files API when images appear across turns, because each turn resends base64 otherwise.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "The image is cut into patches, a vision encoder turns each into a vector, and a projector maps those into the language model's token space. So an image is a count of tokens, set by its area and capped by the model. I would crop and resize before upload, put the image before the text, and test counting and small text separately on a labelled set, since those are the known weak spots." Then give one number: a 1000 x 1000 image is 1,296 tokens, about $2.59 per 1,000 at $2 per million.
+</Callout>
+
+<Callout type="mistake">
+Do not say "send the highest resolution, it is always better". Past the cap the extra pixels are discarded, and the cost rises with area below it. Do not trust a VLM for exact counts or tiny text with no check. Do not budget with an old pixel-area rule, or one number for all providers. And do not forget the model may have shrunk your image, so its coordinates are for the smaller one.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An image is 560 x 280 pixels and sits under the downscale cap. The model counts 28 x 28 pixel patches. How many image tokens does it cost?',
+      options: ['30 tokens', '200 tokens', '560 tokens', '156,800 tokens'],
+      answer: 1,
+      explain: '560 / 28 = 20 columns and 280 / 28 = 10 rows, so 20 x 10 = 200 tokens. Adding the two counts gives 30, which is wrong because patches fill an area. 156,800 is the pixel count, and 560 is only the width.',
+    },
+    {
+      q: 'You double both the width and the height of an image that is well under the cap. What happens to its token cost?',
+      options: ['It stays the same, since price is per image', 'It doubles, since each side is doubled', 'It grows 3 times, since patches overlap', 'It grows 4 times, since patches fill area'],
+      answer: 3,
+      explain: 'Patch count is columns x rows. Doubling both sides doubles each, so the product grows 4 times (500 x 500 is 324 tokens, 1000 x 1000 is 1,296). Patches do not overlap, and the price is per token, not per image.',
+    },
+    {
+      q: 'A VLM describes a workshop photo well but says there are 14 screws when a person counts 23. Which reading fits the evidence best?',
+      options: ['Tokens are patches, so none stands for one small object', 'The model reads every pixel, but the price rule hides the extras', 'The projector deletes any object that is smaller than the text', 'Counting works exactly, so the photo must have been compressed'],
+      answer: 0,
+      explain: 'Vendor docs say counts are approximate, especially for many small objects, and the model sees patches, not objects. The model does not read pixel by pixel, and vendors do not say the projector deletes objects. Exact counting is not a promise.',
+    },
+    {
+      q: 'You send 1920 x 1080 screenshots to a standard-tier model and the boxes it returns land in the wrong place on your original. What is the likely cause and the fix?',
+      options: ['The model rounds all coordinates to the nearest ten, so ask for floats', 'The model returns normalized coordinates, so multiply by 1000', 'It was shrunk to 1456 x 819, so pre-resize or reject oversize', 'The prompt came before the image, so move it after the image'],
+      answer: 2,
+      explain: 'On the standard tier the token limit forces a shrink to 1456 x 819, and coordinates refer to that smaller image. Pre-resize yourself, or set the error option so a shrink fails loudly. Rounding, normalization, and prompt order are not the cause here.',
+    },
+  ]}
+/>
+
+<Ballpark
+  client:visible
+  title="Cost of 1,000 product photos"
+  scenario="You tag 1,000 square photos of 1000 x 1000 pixels. The model counts 28 x 28 pixel patches. It is priced at $2 per million input tokens (Sonnet 5.5, as of 2026-10-18). Ignore the text prompt and the output. Then see what a smaller upload saves."
+  steps={[
+    {
+      prompt: 'How many image tokens does one 1000 x 1000 photo cost?',
+      unit: 'tokens',
+      answer: 1296,
+      within: 1.1,
+      explain: 'ceil(1000 / 28) = 36 columns and 36 rows, so 36 x 36 = 1,296 tokens. This matches the example on Anthropic\'s vision page.',
+    },
+    {
+      prompt: 'How many image tokens do 1,000 photos cost in total?',
+      unit: 'tokens',
+      answer: 1296000,
+      within: 1.1,
+      explain: '1,296 x 1,000 = 1,296,000 tokens, or about 1.3 million.',
+    },
+    {
+      prompt: 'What is the input cost of those 1,000 photos at $2 per million tokens?',
+      unit: 'USD',
+      answer: 2.59,
+      within: 1.1,
+      explain: '1.296 million x $2 = $2.59. That is about $0.0026 per photo.',
+    },
+    {
+      prompt: 'You resize each photo to 500 x 500 first. How many tokens does one photo cost?',
+      unit: 'tokens',
+      answer: 324,
+      within: 1.1,
+      explain: 'ceil(500 / 28) = 18, so 18 x 18 = 324 tokens. That is 4 times fewer, so 1,000 photos cost about $0.65. Check on a labelled sample that the tags still hold.',
+    },
+  ]}
+/>
+
+## Further reading
+
+You do not need the papers to use the idea. They are the sources for the claims above.
+
+- [An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale](https://arxiv.org/abs/2010.11929)
+- [Visual Instruction Tuning (LLaVA)](https://arxiv.org/abs/2304.08485)
+- [Vision Language Models Are Blind (BlindTest)](https://arxiv.org/abs/2407.06581)
+- [Anthropic: Vision](https://platform.claude.com/docs/en/build-with-claude/vision) and [OpenAI: Images and vision](https://developers.openai.com/api/docs/guides/images-vision)

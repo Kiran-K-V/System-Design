@@ -1,0 +1,295 @@
+---
+summary: 'A voice agent chains voice activity detection, speech to text, an LLM, text to speech, and the network. Run in sequence they take about 1.5 seconds to first audio. Streaming each stage brings it near 680 ms. Endpointing and the LLM are the big costs. Build the budget, then price a call-minute.'
+requires: ['ai/a2-inference-cost/prefill-decode', 'ai/a3-llm-apis/streaming', 'ai/a3-llm-apis/realtime-apis', '02-networking/real-time-transport']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai12SpeechGantt from '../../../../components/anim/lessons/Ai12SpeechGantt.tsx';
+import Ai12SpeechBudget from '../../../../components/anim/lessons/Ai12SpeechBudget.tsx';
+
+## The problem
+
+A person asks a question out loud and expects an answer the way a person gives one. In a phone call, a gap of a second already feels like a bad line. A chat app can take three seconds to reply and nobody minds.
+
+So a voice agent has a tight deadline. ElevenLabs, a voice-AI vendor, says a natural-feeling agent aims for a median time to first audio under 800 ms, and a 95th-percentile time under 1.5 seconds (as of 2026-10-18, [latency guide](https://elevenlabs.io/blog/voice-agent-latency-optimization)). **Time to first audio** (TTFA) is the time from the moment the user stops talking to the moment the first sound of the answer plays. **P50** is the median: half of all turns are faster. **P95** means 95 of 100 turns are faster, so 1 in 20 turns is slower.
+
+The same text agent that feels fine in chat can blow this budget. A chat agent runs one model. A voice agent runs at least four components and a network. Every one of them adds time, and the user hears the sum.
+
+This lesson answers five questions:
+
+1. What are the stages, and what does each cost?
+2. Why does running them in a row fail?
+3. How does the agent know the user has finished?
+4. What does the full budget look like?
+5. What does a minute of call cost?
+
+## What a voice turn is made of
+
+A **cascaded** voice agent is a chain of services. Audio goes in one end. Audio comes out of the other. Here are the stages, in the order the audio meets them. Each term is defined once here, and then used.
+
+**Capture and endpointing.** The microphone produces a stream of small audio slices. **Voice activity detection** (VAD) is a small model that labels each slice as speech or silence. Open-source VADs work on very short slices: the Python webrtcvad package takes 10, 20, or 30 ms of 16-bit mono audio, and Silero VAD takes chunks of 30 ms or more. **Endpointing** is the decision that the user has finished the turn. The simplest rule is a **silence threshold**: if the last N milliseconds were silence, the turn is over. Think of a waiter who walks away when you stop talking for a moment. The cost is the waiting itself, because you cannot know the person is done until the silence has lasted.
+
+**Speech to text** (STT, also called ASR). A model turns audio into words. A **streaming** STT service sends back partial text while you are still speaking. Deepgram calls these **interim** results ("preliminary results"). When the service is sure, it sends a **final** result, the definitive transcript of the audio so far. Only the **STT finalization** time lands on the user's clock, because the rest of the work ran while the user was talking.
+
+**The LLM.** The transcript goes into the model, as in lesson [A3.2](/learn/ai/a3-llm-apis/streaming/). What the user waits for is the **time to first token** (TTFT): the prefill of the whole prompt, plus one decode step. Lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) explained why. Every later token comes at the decode speed.
+
+**Text to speech** (TTS). A model turns text into audio. A streaming TTS service "returns audio in chunks as synthesis proceeds", in ElevenLabs' words, so the first audio can play before the whole sentence is made. The number that matters is the time to first audio from the TTS call.
+
+**Player buffering.** The client does not play the first byte at once. It keeps a short buffer so that playback does not stutter. That buffer is a small, fixed wait.
+
+**Network.** Every hop between the user, your server, and the model providers adds delay. We come back to it below.
+
+## The naive way: run the stages in sequence
+
+The simplest build treats each stage as a function call. Record until the user stops. Send the audio to STT and wait for the full transcript. Send the transcript to the LLM and wait for the full answer. Send the full answer to TTS and wait for the whole clip. Play it.
+
+Each stage finishes completely before the next one starts. The user waits for the sum of the **full** times, and the long ones are the model and the voice, because each of them works through the whole answer.
+
+Step through the timeline below. The stage times, except the LLM and TTS lines of the sequential run, are the P50 values in the ElevenLabs budget. The answer length and speeds are my illustration: 41 tokens (about 30 words), decoded at 80 tokens per second after the first token, and 400 ms for TTS to make the whole clip.
+
+<Ai12SpeechGantt client:visible />
+
+Check the sums. Sequential: 120 + 60 + 60 + 750 + 400 + 80 = 1,470 ms. The LLM line is 250 ms to the first token plus 40 more tokens at 80 per second (500 ms), so 750 ms. Streamed: 120 + 60 + 60 + 250 + 110 + 80 = 680 ms, the ElevenLabs P50 total. The saving is 1,470 - 680 = 790 ms, about 2.2 times.
+
+Notice what streaming did not do. No stage got faster. The streamed LLM still needs 750 ms to write the whole answer. But the user only needs the first piece, so the rest happens in the background, while the voice speaks. That is **overlap**: the later part of one stage runs in parallel with the early part of the next.
+
+## The real fix: stream every stage and overlap them
+
+Four rules turn the sequential build into a streamed one.
+
+**1. Send audio to STT while the user speaks.** Do not wait for the end of the turn. By the time the VAD says the turn is over, the transcript is nearly ready. That is why STT finalization is only 60 ms at P50 in the table.
+
+**2. Stream tokens from the LLM into TTS.** The LLM streams as in lesson A3.2. You do not wait for the last token. You cut the stream at a natural break and feed it on. ElevenLabs suggests starting TTS on the first sentence while the model writes the rest. The table does not say how much text TTS waits for before it starts. A longer first chunk sounds smoother, and a shorter one starts sooner. I treat that as a tuning knob you measure.
+
+**3. Stream audio from TTS to the player.** The player starts as soon as it has its small buffer.
+
+**4. Keep the stages close together.** ElevenLabs lists "collocated models" as a way to avoid latency from hops between separately hosted models. Running STT, LLM, and TTS in one region, or in one provider, removes network round trips.
+
+There is a fifth trick that spends money to buy time. LiveKit calls it **preemptive generation**: it starts the LLM "before the user's end of turn is confirmed". If the user turns out to be done, the answer is already under way. If the user keeps talking, the work is thrown away. LiveKit's docs say plainly that it "increases LLM token usage", and that by default only the LLM runs early, while "TTS waits until the turn is confirmed". It is a trade of dollars for milliseconds. The docs suggest turning it off when users talk in long stretches, such as dictation.
+
+## Turn-taking: when is the user done?
+
+Endpointing is the largest cost the product team controls, so it gets its own section. The ElevenLabs guide gives an example: "if you wait for, say, 700 ms of silence before declaring the turn over," you add 700 ms to every turn. The page calls that an example, not a recommended setting. In the budget table below, "capture and endpointing" is 120 ms at P50. A 700 ms wait would be almost six times that.
+
+You might think, then, that you should set the silence threshold very low. The failure is the mirror image. People pause in the middle of a thought, say "um", or stop to remember a number. LiveKit's guide says that short pauses, filler words, and hesitations "can all look the same to a basic detector". A threshold that is too short cuts the user off. The agent starts to answer a half-finished sentence, the user talks over it, and the call goes badly. A threshold that is too long makes the agent feel slow. You set a point on a curve. You cannot remove the trade-off with a number alone.
+
+Three ways to do better than a fixed silence number, all from provider docs:
+
+- **Turn-detection models that read the words.** OpenAI's `semantic_vad` is a classifier "based on the words they have uttered". Its `eagerness` setting takes `low`, `high`, or `auto` (which is `medium`, the default). LiveKit's turn detector uses audio and text models that judge the end of a turn "from the meaning of speech", and runs alongside a VAD. Pipecat's Smart Turn is an open-source model that takes up to 8 seconds of 16 kHz audio and reports running in "under 100ms on most cloud instances". Each of these costs some compute. In return, "I'd like a table for..." can get a longer wait than "Thanks, that's all."
+- **Server VAD settings.** OpenAI's `server_vad` exposes `silence_duration_ms`. The docs say shorter values detect turns faster. They give no default in the page I read.
+- **Start work early.** Preemptive generation, above, starts the LLM before the turn is certain.
+
+Pick by the product. A voice command box ("turn off the lights") wants a short wait. A tutor or an intake call wants a long one. Whichever you pick, measure the **cut-off rate**, the share of turns where the user was still talking. The sources give no standard value for it, so you set your own bar.
+
+## Barge-in, briefly
+
+**Barge-in** is when the user speaks while the agent is still talking. The agent must stop the sound at once. Lesson [A3.10](/learn/ai/a3-llm-apis/realtime-apis/) covers the event design: stop playback, cancel the response, and truncate the stored transcript to what was heard. It also covers which side owns the audio on WebRTC and on a WebSocket. This lesson adds only the latency side.
+
+A barge-in decision can be wrong. LiveKit calls it a **false interruption** "when VAD hears speech and stops the agent but no transcript materializes", for example a cough or background noise. By default its agent "waits out a silence window and then resumes where it left off". A related case is a **backchannel**: a short sound a listener makes to say "I'm following", such as "mm-hm". It should not stop the agent. LiveKit's adaptive mode "uses an audio model that distinguishes real barge-ins from backchannels using acoustic cues". So the design question is not only how fast the agent stops. It is also how sure it is that it should.
+
+## The network
+
+<CrossTrackLink id="02-networking/real-time-transport">
+A voice agent needs audio to flow both ways at once. WebSocket carries it over one long connection through your server. WebRTC sends media with a protocol built for it, with NAT traversal and a relay as fallback. That lesson covers the wire. This lesson counts what the wire costs in milliseconds.
+</CrossTrackLink>
+
+In the ElevenLabs table, "network (client to your server to our API)" is 60 ms at P50 and 160 ms at P95. The same page says the round trip over the public internet is typically 20 to 200 ms, depending on how near the user is. The page does not say how it measured these.
+
+OpenAI recommends WebRTC over WebSockets for browser and mobile clients "for more consistent performance". Its page gives no millisecond figure. I found no vendor source that states how many milliseconds WebRTC adds or saves against WebSocket, so I give none. Test on your own users' networks. The one rule that does follow from the numbers: put your server and your providers in the same region, so the 60 ms is not 200 ms.
+
+## The latency budget
+
+A **latency budget** assigns a time to each stage. Their sum is the TTFA, and you compare it with the target. Here is the ElevenLabs table, which the page calls "illustrative ranges to plan against".
+
+| Stage | What it is | P50 (ms) | P95 (ms) |
+|---|---|---|---|
+| Capture and endpointing | VAD plus the silence wait | 120 | 280 |
+| STT finalization | Final transcript after the turn ends | 60 | 150 |
+| Network | Client to your server to the API | 60 | 160 |
+| LLM first token | TTFT | 250 | 600 |
+| TTS first audio | First sound from the voice | 110 | 220 |
+| Player buffering | Client playback buffer | 80 | 150 |
+| **Total TTFA** | Sum | **680** | **1,560** |
+
+Check the sums. P50: 120 + 60 + 60 + 250 + 110 + 80 = 680. P95: 280 + 150 + 160 + 600 + 220 + 150 = 1,560. The P50 total meets the 800 ms target with 120 ms to spare. The P95 total, 1,560 ms, misses the 1,500 ms target by 60 ms. The LLM is the largest line at both percentiles: 250 / 680 = 37% at P50, and 600 / 1,560 = 38% at P95. A second ElevenLabs page says a total "below 700 ms is a good target", a little tighter than the 800 ms figure. Vendors differ, so set your own bar.
+
+Two points about these numbers. First, P95 means something for a call, because a call is many turns. If one turn in 20 runs slower than 1,560 ms, a 10-turn call has a 1 - 0.95^10 = 40% chance of at least one such turn. A median target alone hides that. The ElevenLabs guide says to focus on percentiles, "rather than mean". Second, adding stage percentiles overstates the real total P95 if stage delays are independent, and understates it if one cause slows several stages at once. Treat the sum as a planning number.
+
+Now use the builder. Start from the table, then try a 700 ms silence wait (capture and endpointing slider to 700), or a slower LLM.
+
+<Ai12SpeechBudget client:visible />
+
+With the endpointing slider at 700 ms, the P50 total is 680 - 120 + 700 = 1,260 ms. That is 460 ms over the target, and endpointing becomes the largest line.
+
+## Cascaded or speech to speech
+
+Lesson A3.10 compared the two designs as a table of design reasoning. Here is what the sources add. OpenAI's voice-agents guide says a speech-to-speech session (its Realtime API) suits "speech, reasoning, and tool use in one session", and a chained build (STT, an agent, TTS) gives "control over each speech and text stage". It recommends the chained build when "each stage needs to be visible or replaceable".
+
+That is all the guide says. It does not compare latency, cost, or voice quality. Google's Live API page does not give latency figures either. I found no primary source with a fair head-to-head number, so I make no claim about which is faster or cheaper. Build both on a sample of your calls and measure TTFA and cost with your own prompts.
+
+What the table in this lesson gives you is a way to ask the question. For a speech-to-speech model, some lines of the budget merge (STT, LLM, and TTS become one model), and the VAD and network lines stay. Run the same builder with your measured numbers.
+
+## What a call-minute costs
+
+A budget has a dollar side too. Here are the live prices, each fetched on 2026-10-18. Take the numbers as list prices. They change.
+
+| Piece | Provider and model | Price | Source |
+|---|---|---|---|
+| STT, streaming | ElevenLabs Scribe v2 Realtime | $0.39 per hour of audio | [elevenlabs.io/pricing/api](https://elevenlabs.io/pricing/api) |
+| LLM | Claude Sonnet 5.5 | $2 per million input tokens, $10 per million output tokens | [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) |
+| LLM | Claude Haiku 5.5 (prompts up to 100,000 tokens) | $0.10 in, $0.50 out per million tokens | same page |
+| TTS | ElevenLabs Flash or Turbo | $0.04 per 1,000 characters | [elevenlabs.io/pricing/api](https://elevenlabs.io/pricing/api) |
+| TTS | ElevenLabs Multilingual v2 or v3 | $0.08 per 1,000 characters | same page |
+
+ElevenLabs also has a credit-based plan page with other figures. These come from its API pricing page.
+
+**Worked example.** All assumptions are illustrative. Take one minute of a call:
+
+- The user's audio streams to STT for the whole 60 seconds.
+- The agent speaks 30 seconds. At about 75 words with 6 characters per word, that is 450 characters.
+- There are 4 turns. Each LLM call sends 1,500 input tokens, because the whole history goes in again. The agent writes 100 tokens in all.
+
+STT: 60 seconds is 1/60 of an hour, so $0.39 / 60 = $0.0065.
+LLM on Sonnet 5.5: input 4 x 1,500 = 6,000 tokens x $2 / 1,000,000 = $0.012. Output 100 x $10 / 1,000,000 = $0.001. Total $0.013.
+TTS on Flash: 450 / 1,000 x $0.04 = $0.018.
+
+The call-minute costs $0.0065 + $0.013 + $0.018 = **$0.0375**. A one-hour call is $2.25. 100,000 call-minutes a day is $3,750.
+
+Swap in Haiku 5.5: LLM input 6,000 x $0.10 / 1,000,000 = $0.0006, output 100 x $0.50 / 1,000,000 = $0.00005. The LLM drops to $0.00065. The total is $0.0065 + $0.00065 + $0.018 = **$0.02515**. TTS is now 72% of the bill ($0.018 / $0.02515). Moving TTS to the $0.08 voice instead of Flash would raise the Sonnet case to $0.0555.
+
+Two lessons come out of the sums. First, a cheaper LLM does not make a voice call cheap. The voice and the transcription are a fixed floor, here about $0.025 per minute. Second, history re-sent every turn grows. A 10-minute call with a growing history costs more per minute at the end than at the start, so check the average on real call lengths. Lesson [A3.9](/learn/ai/a3-llm-apis/cost-metering/) shows how to meter it.
+
+For a speech-to-speech model, OpenAI's realtime-costs page says user audio is 1 token per 100 ms (600 per minute) and assistant audio is 1 token per 50 ms (1,200 per minute). On `gpt-realtime-mini`, at $10 per million audio input tokens and $20 per million output tokens (as of 2026-10-18, [pricing](https://developers.openai.com/api/docs/pricing)), this example's audio is 600 x $10 / 1,000,000 + 600 x $20 / 1,000,000 = $0.006 + $0.012 = $0.018. That leaves out history. The page says "the entire conversation is sent to the model for each Response", and cached input is best-effort. So later turns cost more, and this is a floor, not a total. I do not compare it with the cascade, because the sources do not.
+
+## Numbers
+
+State three numbers for any voice design.
+
+- **Quality bar.** P50 TTFA under 800 ms and P95 under 1,500 ms (the ElevenLabs targets). Add a cut-off rate you set yourself and measure it on real calls: the share of turns where the agent started while the user was still speaking.
+- **Latency budget.** The table above. At P50 it sums to 680 ms. At P95 it sums to 1,560 ms, which is over target, so a design that meets only the P50 has not met the bar.
+- **Cost per request.** About $0.0375 per call-minute with Sonnet 5.5 and Flash, and about $0.025 with Haiku 5.5 (illustrative assumptions above, prices as of 2026-10-18).
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Short silence threshold | Replies start sooner | More cut-offs of users who pause | Short commands |
+| Long threshold or semantic turn model | Fewer cut-offs | Slower replies, or model compute | Open conversation, intake calls |
+| Preemptive generation | Answer already under way at turn end | Extra LLM tokens when the user keeps talking | Short turns, tight latency bar |
+| Start TTS on the first sentence | Audio starts before the answer is done | A choppy voice if the first chunk is too short | Almost always |
+| Small, fast LLM | Lower TTFT and cost | Weaker reasoning | Simple tasks and scripted flows |
+| Co-locate STT, LLM, TTS | Fewer network hops | Less choice of vendor per stage | Latency is the main bar |
+| Cascaded build | Control and visibility per stage | More hops to tune | You must inspect or replace stages |
+| Speech to speech | One session for speech, reasoning, and tools | Less visibility per stage | You value one session over control |
+
+## What experienced teams know
+
+1. **Plan with percentiles, not averages.** The [ElevenLabs guide](https://elevenlabs.io/blog/voice-agent-latency-optimization) targets P50 under 800 ms and P95 under 1.5 seconds, and says to focus on those "rather than mean". A call has many turns, so the slow tail is what users remember.
+2. **Endpointing is a product decision with a latency price.** The same guide's 700 ms example shows one silence setting can cost more than the whole STT, TTS, and network budget put together (60 + 110 + 60 = 230 ms at P50).
+3. **Start speaking before the answer is written.** ElevenLabs' [TTS pipeline post](https://elevenlabs.io/blog/enhancing-conversational-ai-latency-with-efficient-tts-pipelines) recommends starting synthesis on the first sentence while the model writes the rest.
+4. **Keep the models close.** The same post lists collocated models as a way to avoid latency from hops between separately hosted ones.
+5. **Speculation costs tokens.** LiveKit's [audio docs](https://docs.livekit.io/agents/build/audio/) say preemptive generation increases LLM token usage and discards the speculative answer when the chat context changes. Measure how often your users keep talking before you turn it on.
+6. **Plan for false stops.** LiveKit's [turn-detection post](https://livekit.com/blog/turn-detection-and-interruption-handling) says VAD can stop the agent on a cough or noise with no transcript behind it. The default is to wait and then resume. An agent that stops on every noise is as annoying as one that never stops.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "A cascaded voice agent is VAD, streaming STT, an LLM, streaming TTS, and a network hop. Sequentially it is over a second and a half. I stream every stage and overlap them, so I wait for first outputs, not full outputs. My bar is P50 under 800 ms and P95 under 1.5 seconds. The big lines are the LLM first token and the endpointing wait. I'd tune endpointing against a cut-off rate. I'd cost it per call-minute: STT, LLM with history re-sent, and TTS." That names the deadline, the fix, the trade-off, and the money in one breath.
+</Callout>
+
+<Callout type="mistake">
+Do not quote one latency number without saying which percentile and which stages it includes. Do not add up full stage times when the stages are streamed. Do not set the silence threshold to the lowest value that works in a quiet demo. And do not claim that WebRTC or speech to speech is "faster" without a measurement on your own traffic.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Time to first audio and cost of a call"
+  scenario="A streamed voice agent. Stage times at P50: VAD with endpointing 120 ms, STT finalization 60 ms, network 60 ms, LLM first token 250 ms, TTS first audio 110 ms. The player adds a buffer of 80 ms. Prices: ElevenLabs Scribe v2 Realtime $0.39 per hour, Claude Sonnet 5.5 $2 / $10 per million tokens, ElevenLabs Flash $0.04 per 1,000 characters (as of 2026-10-18)."
+  steps={[
+    {
+      prompt: 'Add the five stages (not the player buffer). What is the time to first audio, in ms?',
+      unit: 'ms',
+      answer: 600,
+      within: 1.1,
+      explain: '120 + 60 + 60 + 250 + 110 = 600 ms.',
+    },
+    {
+      prompt: 'Add the 80 ms player buffer. What is the total, in ms?',
+      unit: 'ms',
+      answer: 680,
+      within: 1.1,
+      explain: '600 + 80 = 680 ms, the ElevenLabs P50 total. It is under the 800 ms target by 120 ms.',
+    },
+    {
+      prompt: 'The team sets a 700 ms silence wait, which replaces the 120 ms capture and endpointing line. New total, in ms?',
+      unit: 'ms',
+      answer: 1260,
+      within: 1.1,
+      explain: '680 - 120 + 700 = 1,260 ms. That is 460 ms over the 800 ms target.',
+    },
+    {
+      prompt: 'Cost of one call-minute. STT hears 60 s. There are 4 LLM calls of 1,500 input tokens, and 100 output tokens in all. TTS speaks 450 characters. In USD per hour of call (60 minutes), what is the bill?',
+      unit: 'USD',
+      answer: 2.25,
+      within: 1.1,
+      explain: 'STT: $0.39 / 60 = $0.0065. LLM: 6,000 x $2 / 1e6 + 100 x $10 / 1e6 = $0.012 + $0.001 = $0.013. TTS: 0.45 x $0.04 = $0.018. Per minute $0.0375. Per hour 60 x $0.0375 = $2.25.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A voice agent runs speech to text, the LLM, and text to speech, each finishing before the next starts. You switch every stage to streaming. What does that change about the time to first audio?',
+      options: [
+        'Each stage runs faster, because streaming makes the models decode quicker',
+        'The wait counts each stage\'s first output, not its complete output',
+        'Nothing changes, because the stages still run in the same order',
+        'The network time falls, because audio travels in smaller chunks',
+      ],
+      answer: 1,
+      explain: 'Streaming does not speed up any stage. It lets the next stage start on the first piece, so the user waits for first outputs instead of full outputs. The order stays the same. Smaller chunks do not cut the network round trip.',
+    },
+    {
+      q: 'A team lowers the silence wait that ends a user turn from 700 ms to 400 ms. Nothing else changes. What is the most likely result?',
+      options: [
+        'Replies start about 300 ms later, as the model gets less audio',
+        'Nothing changes, because the wait is billed but not heard',
+        'Replies start about 700 ms sooner, because the wait is gone',
+        'About 300 ms sooner, but more users get cut off mid-pause',
+      ],
+      answer: 3,
+      explain: 'The wait is a direct part of time to first audio, so 300 ms less wait means replies come about 300 ms sooner. People pause mid-thought, so a shorter wait ends more turns too early. The wait is not removed, only shortened.',
+    },
+    {
+      q: 'Take the P50 stage times 120, 60, 60, 250, 110, and 80 ms. You swap the LLM for one with a 500 ms first-token time. What is the new time to first audio?',
+      options: ['930 ms', '1,180 ms', '780 ms', '1,430 ms'],
+      answer: 0,
+      explain: 'The old total is 680 ms. The LLM line goes from 250 ms to 500 ms, so the total rises by 250 ms: 680 - 250 + 500 = 930 ms. That is now over the 800 ms P50 target.',
+    },
+    {
+      q: 'One call-minute uses Haiku 5.5 as the LLM and ElevenLabs Flash for speech, with the assumptions in this lesson. Which part costs the most?',
+      options: [
+        'STT, because it hears the whole minute',
+        'The LLM, because history is re-sent every turn',
+        'TTS, at about $0.018 of about $0.025',
+        'All three cost about the same',
+      ],
+      answer: 2,
+      explain: 'With Haiku 5.5 the LLM is about $0.00065, STT is $0.0065, and TTS is $0.018, so TTS is about 72% of $0.02515. The LLM only dominates when the model is expensive, as with Sonnet 5.5 at $0.013.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [ElevenLabs, Voice agent latency optimization](https://elevenlabs.io/blog/voice-agent-latency-optimization): the budget table and targets used here.
+- [ElevenLabs, Efficient TTS pipelines](https://elevenlabs.io/blog/enhancing-conversational-ai-latency-with-efficient-tts-pipelines): sentence-level TTS and co-located models.
+- [LiveKit, Turn detection and interruption handling](https://livekit.com/blog/turn-detection-and-interruption-handling): false interruptions and backchannels.
+- [OpenAI, Voice activity detection](https://developers.openai.com/api/docs/guides/realtime-vad): `server_vad`, `semantic_vad`, and `eagerness`.
