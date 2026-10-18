@@ -14,7 +14,7 @@ interface Step {
 
 const steps: Step[] = [
   {
-    caption: 'Three users, three posts, two follows. This is all the data. Five kinds of database can hold it. What differs is the primary access path: the one question the database answers cheaply. Watch how the same facts change shape.',
+    caption: 'Three users, three posts, two follows. This is all the data. Five kinds of database can hold it. What differs is the main question each one answers cheaply (its access path). Watch how the same facts change shape.',
     shape: 'facts',
     good: 'Q1: latest posts\nof Ana?\nQ2: who is two\nfollows away from Ana?\nQ3: posts per day,\nall users?',
     weak: '',
@@ -23,10 +23,10 @@ const steps: Step[] = [
     caption: 'Relational. Facts live in tables, one row per fact, joined by keys. A user is stored once. The posts table points at it with user_id. The database can answer questions you did not plan, because every column can be filtered, joined, and indexed (lesson 4.3), and a transaction can change several rows together (lesson 4.4).',
     shape: 'relational',
     good: 'Any filter, any join,\nmulti-row transactions.\nQ1, Q2 and Q3 all work.',
-    weak: 'Writes go through one\nprimary machine until\nyou shard (lesson 4.7).',
+    weak: 'All writes go through one\nmachine until you split\nthe data (lesson 4.7).',
   },
   {
-    caption: 'Key-value. The whole database is a map from a key to a value. The database does not look inside the value. Get and put by key are the fastest operations any store offers. Redis adds atomic operations on values, such as INCR for counters. The price: there is no query by anything but the key.',
+    caption: 'Key-value. The whole database is a map from a key to a value. The database does not look inside the value, so it is just stored bytes. Get and put by key are the fastest operations any store offers. Redis, a popular key-value store, can also add 1 to a stored number in one safe step (INCR), which suits counters. The price: there is no query by anything but the key.',
     shape: 'kv',
     good: 'get/put by key at very\nhigh rate. Sessions,\ncaches, counters.',
     weak: 'No "posts by Ana".\nYou would keep a list\nunder another key.',
@@ -34,17 +34,17 @@ const steps: Step[] = [
   {
     caption: 'Document. One record holds a nested structure. The rule from the MongoDB docs: data that is accessed together should be stored together. Ana and her posts come back in one read, with no join. Fields can differ from document to document. The price: facts shared across documents are copied, and unbounded lists make documents grow without limit.',
     shape: 'document',
-    good: 'One read returns the\nwhole aggregate.\nVaried record shapes.',
+    good: 'One read returns the\nwhole nested record.\nVaried record shapes.',
     weak: 'Many-to-many links and\nshared facts are your\ncode. Q2 is hard.',
   },
   {
-    caption: 'Wide-column. A row is addressed by a partition key, which picks the node, and a clustering key, which sorts rows inside the partition. All of Ana\'s posts sit together, newest first. Q1 is one sequential read. The store is a log-structured engine (lesson 4.3), so writes are fast. The price: you ask only what the keys were built for.',
+    caption: 'Wide-column. A row is addressed by a partition key, which picks the machine, and a clustering key, which sorts the rows stored together on that machine. All of Ana\'s posts sit together, newest first. Q1 is one sequential read. The store only appends writes to files and merges them later (the LSM tree of lesson 4.3), so writes are fast. The price: you ask only what the keys were built for.',
     shape: 'wide',
     good: 'Huge write rates. "Latest\nN rows for one key" is\none partition read.',
     weak: 'A new question needs a\nnew table. Cassandra:\n"a table for each query".',
   },
   {
-    caption: 'Graph. Entities are nodes. Relationships are first-class, typed, directed edges that are stored with the nodes. Q2 becomes a two-hop walk: Ana, Ben, Cy. In a relational store that is a self-join per hop. The price: totals over all the data (Q3) are not what this shape is for.',
+    caption: 'Graph. Entities are nodes. Relationships are stored as labeled arrows (edges) right next to the nodes. Q2 becomes a two-hop walk: Ana, Ben, Cy. In a relational store each hop needs another join of the follows table with itself. The price: totals over all the data (Q3) are not what this shape is for.',
     shape: 'graph',
     good: 'Paths across many hops:\nfriends of friends,\nfraud rings.',
     weak: 'Bulk totals over all\nnodes (Q3) are not\nits strength.',
@@ -140,7 +140,7 @@ function Drawing({ shape }: { shape: Shape }) {
             );
           })}
           <HandText x={225} y={282} size={14} color="var(--muted)">
-            The store sees the left side only. The right side is opaque bytes.
+            The store sees the left side only. It does not look inside the right side.
           </HandText>
         </g>
       );

@@ -13,13 +13,13 @@ import RelBulkheadLab from '../../../components/anim/lessons/RelBulkheadLab.tsx'
 
 [Lesson 7.2](/learn/07-reliability/timeouts-retries/) gave every call a time limit. That caps how long one call hurts. It does not stop the next call from hurting just as much.
 
-Say 500 calls per second go to a dependency that has stopped answering. Each call waits for a 1-second timeout. By Little's law ([lesson 1.3](/learn/01-one-machine/throughput-vs-latency/)) that is 500 x 1 = 500 threads held at any moment. A pool of 200 threads cannot cover it. The caller is stuck on a dependency it already knows is broken, and every retry makes it worse.
+Say 500 calls per second go to a dependency that has stopped answering. Each call waits for a 1-second timeout. By Little's law ([lesson 1.3](/learn/01-one-machine/throughput-vs-latency/)), the number of calls in flight equals the arrival rate times the time each call takes. Here that is 500 x 1 = 500 threads held at any moment. A thread is one worker inside your server that handles one call at a time. A pool of 200 threads cannot cover 500. The caller is stuck on a dependency it already knows is broken, and every retry makes it worse.
 
 The caller needs a way to learn from its own recent failures and stop calling.
 
 ## Naive solutions
 
-**Ping first.** "Check that the dependency is healthy, then call." It costs an extra call. The answer is stale by the time the real call goes out. And the ping can pass while the real call fails (gray failure, [lesson 7.1](/learn/07-reliability/failure-modes/)).
+**Ping first.** "Check that the dependency is healthy, then call." It costs an extra call. The answer is stale by the time the real call goes out. And the ping can pass while the real call fails (gray failure, [lesson 7.1](/learn/07-reliability/failure-modes/): a dependency that is sick in some ways but still answers simple checks).
 
 **Shorter timeouts only.** A 100 ms timeout holds 50 threads at 500 calls per second, not 500. Better. But every call still goes out, still waits, and still fails. The dependency, which may be recovering, still gets the full load.
 
@@ -31,7 +31,7 @@ What you want is a rule. The rule says: "this has failed N times in a row; stop 
 
 The name comes from the electrical device. A breaker trips when the current is too high and cuts the circuit, so the wires do not burn. A software **circuit breaker** wraps a call and does the same.
 
-Martin Fowler's article describes it as a small state machine with three states.
+Martin Fowler's article describes it as a small state machine: a thing that is always in exactly one of a few named states, and moves between them by fixed rules. This one has three states.
 
 - **Closed.** Calls pass through. A failure adds one to a counter. A success resets the counter to zero.
 - **Open.** The counter reached the threshold. Calls fail at once. The dependency is not called.
@@ -76,11 +76,11 @@ The price of a bulkhead is that capacity is split. When B is healthy, its 25 thr
 
 The same idea applies on the server side. When a server is overloaded, it is better to refuse some work early. Accepting everything and serving it all badly is worse.
 
-The Google SRE book says to reject excess requests early. It also describes **client-side throttling**. Each client keeps its last two minutes of history of requests and accepts. The client keeps sending until requests are K times the accepts. After that it rejects some calls itself, without touching the network. A client behaves like a breaker that opens by degrees.
+The Google SRE book (a book by Google's site reliability engineers, the people who run its services) says to reject excess requests early. It also describes **client-side throttling**. Each client keeps its last two minutes of history of requests and accepts. The client keeps sending until requests are K times the accepts. K is a tuning number you pick, such as 2. After that it rejects some calls itself, without touching the network. A client behaves like a breaker that opens by degrees.
 
-Stripe's rate-limiting post describes a **fleet usage load shedder**. It reserves capacity for critical methods, such as creating a charge. If the reserve is 20%, any non-critical request above the 80% share is rejected with a 503. Their **worker utilization shedder** is the last line of defense. It sorts traffic into four groups (critical methods, POSTs, GETs, and test mode traffic) and sheds test mode traffic first. Stripe warns that shedding and restoring load must happen slowly, to avoid flapping.
+Stripe's rate-limiting post describes a **fleet usage load shedder**. It reserves capacity for critical methods, such as creating a charge. If the reserve is 20%, any non-critical request above the 80% share is rejected with a 503 (the HTTP code for "service unavailable, try later"). Their **worker utilization shedder** is the last line of defense. It watches how busy the worker processes are. It sorts traffic into four groups (critical methods, POSTs that change data, GETs that only read, and test mode traffic) and sheds test mode traffic first. Stripe warns that shedding and restoring load must happen slowly, to avoid flapping, which means switching on and off again and again.
 
-Shedding is not free. The AWS article on load shedding says "the act of shedding load isn't free, so eventually the server falls prey to Amdahl's law and goodput drops". Rejecting a request still costs a little work. Shed early and cheaply.
+Shedding is not free. The AWS article on load shedding says "the act of shedding load isn't free, so eventually the server falls prey to Amdahl's law and goodput drops". Amdahl's law says a fixed share of work that cannot be sped up caps the total gain. Goodput is the count of requests served well, as opposed to all requests received. Rejecting a request still costs a little work. Shed early and cheaply.
 
 If your work flows through a queue instead of direct calls, the same pressure appears as a growing backlog. [Lesson 6.4](/learn/06-async/backpressure-dlq/) covers backpressure there.
 

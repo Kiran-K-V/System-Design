@@ -15,7 +15,7 @@ import InvertedIndexBuild from '../../../components/anim/lessons/InvertedIndexBu
 
 Lesson 4.2 ended with a two-line database: append on write, scan on read. A scan is fine for 1,000 rows. Now take a table of **1 billion orders** at ~200 B per row. That is 200 GB.
 
-Your app asks: `SELECT * FROM orders WHERE order_id = 7351902264`. The answer is one row. To find it without help, the database reads the whole table. A fast NVMe disk reads 3 to 7 GB/s in a straight line (lesson 1.2). So the scan takes about **30 to 70 seconds**. Your target is a few milliseconds.
+Your app asks: `SELECT * FROM orders WHERE order_id = 7351902264`. The answer is one row. To find it without help, the database reads the whole table. A fast SSD (an NVMe disk) reads 3 to 7 GB/s in a straight line (lesson 1.2). So the scan takes about **30 to 70 seconds**. Your target is a few milliseconds.
 
 An **index** is the fix. It is a second structure, built from one or more columns, that lets the database jump to the right rows. The index costs disk space and slows every write. You must know how much, and when it is worth it.
 
@@ -23,7 +23,7 @@ An **index** is the fix. It is a second structure, built from one or more column
 
 Suppose the keys sit in a file, sorted. You find a key by **binary search**: look at the middle, discard half, repeat. For 1 billion keys that is log2(10^9) = ~30 steps.
 
-Each step lands on a different place in the file. Each is a separate page read. Page reads from SSD cost ~100 µs, so 30 steps cost ~3 ms. That is far better than 50 seconds. But two things are wrong.
+Each step lands on a different place in the file. Each is a separate page read. (A **page** is the fixed-size block, here 8 KB, that a database reads from disk in one go. A disk cannot hand you one byte, only a whole page.) Page reads from SSD cost ~100 µs, so 30 steps cost ~3 ms. That is far better than 50 seconds. But two things are wrong.
 
 1. **30 page reads is too many.** Each read returns an 8 KB page, and we use one key from it. Waste.
 2. **A sorted file cannot take inserts.** A new key belongs in the middle. Making room means shifting about half the file, ~100 GB.
@@ -32,9 +32,9 @@ The first problem has a direct fix. Make each step of the search consume a whole
 
 ## The mechanism: the B-tree
 
-A **B-tree** is a tree where every node is exactly one page. A node holds sorted keys and, between them, pointers to child pages. To find a key, read the root. Pick the child whose range contains the key. Read that child, and repeat until you reach a **leaf**. A leaf holds the key and a pointer to the table row.
+A **B-tree** is a tree where every node is exactly one page. A node holds sorted keys and, between them, pointers to child pages. To find a key, read the root. Pick the child whose range contains the key. Read that child, and repeat until you reach a **leaf**. A leaf holds the key and a pointer to the table row. (A pointer is the stored location of the row, like a page number in a book index.)
 
-Most databases use the **B+tree** variant. Only leaves hold row pointers. Leaves are also chained in a doubly linked list in key order. So a range query (`BETWEEN`) finds the first key and then walks along the leaves. The tree is **balanced**: every leaf is at the same depth. That is the property that keeps lookups predictable.
+Most databases use the **B+tree** variant. Only leaves hold row pointers. Leaves are also chained to their neighbors in key order, each leaf pointing to the next. So a range query (`BETWEEN`, for example all orders from 100 to 200) finds the first key and then walks along the leaves. The tree is **balanced**: every leaf is at the same depth. That is the property that keeps lookups predictable.
 
 ### Height: do the arithmetic
 
@@ -75,7 +75,7 @@ Notice how rare a split is. In a real index with F = 400, a leaf that just split
 
 ### What an index costs on write
 
-A lookup got cheap. A write got dearer. A row insert touches the table page **and one leaf page in every index** on the table. A table with 6 indexes writes 1 table page plus 6 index leaf pages for each insert. All of these writes happen in place (lesson 4.2) and are recorded in the log. An update that changes an indexed column must change that index as well.
+A lookup got cheap. A write got dearer. A row insert touches the table page **and one leaf page in every index** on the table. A table with 6 indexes writes 1 table page plus 6 index leaf pages for each insert. All of these writes happen in place (lesson 4.2): each page is overwritten where it sits. They are also recorded in the write-ahead log. An update that changes an indexed column must change that index as well.
 
 That is why the rule is **not** "index every column". Index the columns that the hot queries filter, join, or sort on. Drop the rest.
 
@@ -93,9 +93,9 @@ Three rules follow. Use the widget to check each one. Pick an index, pick a quer
 
 ## Another way: the LSM tree
 
-A B-tree updates pages in place. Each insert is a random page write. When the write rate is very high, that is the bottleneck. Lesson 4.2 introduced the other family: log-structured storage. Its index is the **LSM tree** (log-structured merge tree), used by RocksDB, Cassandra, and LevelDB.
+A B-tree updates pages in place. Each insert is a random page write, a write to some spot in the middle of a file. Disks are much faster at writing one long stretch in order than at jumping around. When the write rate is very high, that is the bottleneck. Lesson 4.2 introduced the other family: log-structured storage. Its index is the **LSM tree** (log-structured merge tree), used by RocksDB, Cassandra, and LevelDB. (These are storage engines and databases built on this idea. RocksDB is a storage library that other databases embed.)
 
-Writes go to a sorted map in RAM, the **memtable**, and to a log for crash safety. A full memtable is flushed as one sorted, immutable file, an **SSTable**. Nothing is edited in place. Old versions pile up in older files. A background job, **compaction**, merges files and drops overwritten and deleted keys.
+Writes go to a sorted map in RAM, the **memtable**, and to a log for crash safety (the write-ahead log of lesson 4.2). A full memtable is flushed as one sorted file that is never edited again (immutable), an **SSTable**. Nothing is edited in place. Old versions pile up in older files. A background job, **compaction**, merges files and drops overwritten and deleted keys. Think of it as merging several sorted piles of index cards into one tidy pile.
 
 Step through it. Watch the read in steps 7 and 8.
 
@@ -105,23 +105,23 @@ A read must check the memtable, then files from newest to oldest. To avoid usele
 
 The memory cost is real. At 9.9 bits per key, 1 billion keys need 9.9 × 10^9 bits, ~1.2 GB of filters.
 
-The bill moves, it does not vanish. Compaction rewrites the same data many times. The RocksDB docs say the write amplification of leveled compaction is "often larger than 10". Every byte you write may be written to disk ten times or more, in the background.
+The bill moves, it does not vanish. Compaction rewrites the same data many times. This is called **write amplification**: the ratio of bytes the disk writes to bytes your app wrote. The RocksDB docs say it is "often larger than 10" for leveled compaction. Every byte you write may be written to disk ten times or more, in the background. At 20 MB/s of app writes, that is 200 MB/s of disk writes.
 
 ## Two more index shapes
 
 **Hash index.** It maps a hash of the key to a row location. Lookup by equality is one step. But a hash scatters neighbors, so it cannot do ranges or sorted output. PostgreSQL's docs say a hash index stores a 32-bit hash code and "can only handle simple equality comparisons". A B-tree does equality almost as fast and does everything else. Hash indexes are rare in practice.
 
-**Inverted index.** A B-tree answers "which row has this key?". Search needs the opposite: "which rows **contain** this word?". An inverted index maps each term to a **posting list** of the documents that hold it. PostgreSQL's GIN index is this, and Lucene (inside Elasticsearch) is built on it. Watch one get built from three documents.
+**Inverted index.** A B-tree answers "which row has this key?". Search needs the opposite: "which rows **contain** this word?". An inverted index maps each term to a **posting list** of the documents that hold it. PostgreSQL's GIN index (its name for this kind of index) is this, and Lucene is built on it. Lucene is the search library inside Elasticsearch, a popular search server. Watch one get built from three documents.
 
 <InvertedIndexBuild client:visible />
 
-Location search is a third need. A B-tree sorts one dimension, so a range on latitude still reads a whole band across the planet. Spatial indexes split the plane into regions instead. PostgreSQL provides the GiST framework for such indexes. Lesson 10.1 builds the idea from scratch.
+Location search is a third need. A B-tree sorts one dimension, so a range on latitude still reads a whole band across the planet. Spatial indexes split the plane into regions instead. PostgreSQL provides a framework called GiST for such indexes. Lesson 10.1 builds the idea from scratch.
 
 ## Numbers
 
 | Fact | Value | Source |
 |---|---|---|
-| Page size: PostgreSQL / InnoDB | 8 kB / 16 KB | Their docs |
+| Page size: PostgreSQL / InnoDB (MySQL's default storage engine) | 8 kB / 16 KB | Their docs |
 | Fan-out, 8 KB page, 20 B entry | ~400 (assumed entry size) | Derived above |
 | B-tree height, 1 billion keys | 4 (any F from 178 to 999) | Derived above |
 | Upper 3 levels of that tree | ~51 MB | Derived above |
@@ -134,7 +134,7 @@ Location search is a third need. A B-tree sorts one dimension, so a range on lat
 
 | Choice | You gain | You pay | Choose when |
 |---|---|---|---|
-| B-tree | Fast point and range reads, sorted output | A random page write per index per insert; page splits | Read-heavy or mixed OLTP. The default. |
+| B-tree | Fast point and range reads, sorted output | A random page write per index per insert; page splits | Read-heavy or mixed OLTP (many small reads and writes, as in an app). The default. |
 | LSM tree | Very high write rate; sequential disk writes | Several files per read; Bloom filter memory; compaction I/O | Write-heavy ingest: events, messages, metrics |
 | Hash index | One-step equality lookup | No ranges, no ordering | Almost never; a B-tree is nearly as fast |
 | Inverted index | Search by contained term | Updates one list per distinct term of each new document | Text search, array contains, tags |

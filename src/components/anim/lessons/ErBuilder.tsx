@@ -58,8 +58,8 @@ const steps = [
   { caption: 'Feature 1 gives two entities: User and Post. A user writes many posts. A post has one author. So we store the author’s id inside the post. That column is a foreign key (a pointer to a row in another table). The relationship is one-to-many.' },
   { caption: 'Feature 2: a user follows many users, and a user is followed by many users. That is many-to-many. A column cannot hold it. So we add a third table, Follow, with one row per pair. This is a junction table.' },
   { caption: 'Feature 3: a user likes many posts, and a post is liked by many users. Many-to-many again. Same fix: a Like table with one row per (user, post).' },
-  { caption: 'Feature 4 is an access pattern: the query the app runs most. To build a timeline we join Follow to Post. Without an index on (user_id, created_at) this scans every post. We add the index because of the query, not because of the shape.' },
-  { caption: 'Feature 5: every post shows its like count. Counting Like rows on every view is expensive, and views outnumber likes 100 to 1 or more. So we copy a derived number into Post: like_count. That is denormalization. We pay on each like, and we save on each view.' },
+  { caption: 'Feature 4 is an access pattern: the query the app runs most. To build a timeline we match Follow rows to Post rows. Without an index on (user_id, created_at) the database reads every post. An index is a sorted lookup list, like the index at the back of a book. We add it because of the query, not because of the shape.' },
+  { caption: 'Feature 5: every post shows its like count. Counting Like rows on every view is expensive, and views outnumber likes 100 to 1 or more. So we copy a derived number into Post: like_count. That is a deliberate copy, called denormalization. We pay on each like, and we save on each view.' },
 ];
 
 export default function ErBuilder() {

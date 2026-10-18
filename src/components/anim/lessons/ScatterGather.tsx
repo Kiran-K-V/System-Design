@@ -13,8 +13,8 @@ const steps: Step[] = [
   { caption: 'Query 1: "orders for user 42". The table is sharded by user_id. The router hashes 42, finds shard 2, and asks only that shard. One shard, one round trip, about 5 ms.', stage: 'key' },
   { caption: 'Query 2: "all orders over $500 today". The amount is not the shard key. The router cannot tell which shards hold matches, so it sends the query to every shard. This is scatter.', stage: 'all' },
   { caption: 'Each shard answers by itself. Three take 4 to 6 ms. Shard 4 is busy and takes 38 ms. The router must wait for the last reply before it can merge. This is gather. The query takes about 38 ms, not 5 ms.', stage: 'slow' },
-  { caption: 'This gets worse with more shards. Say each shard is slow on 1% of requests. Ask 10 shards, and 9.6% of queries hit at least one slow shard. Ask 100 shards, and 63% do. The fan-out query is slow far more often than any one shard.', stage: 'tail' },
-  { caption: 'A common fix: build a second, sharded copy keyed by amount (a global secondary index). The query now asks one index shard, then fetches from the 2 data shards that match. The price: every write updates two places.', stage: 'index' },
+  { caption: 'This gets worse with more shards. Say each shard is slow on 1% of requests. Ask 10 shards, and 9.6% of queries hit at least one slow shard. Ask 100 shards, and 63% do. A query sent to every shard is slow far more often than any one shard.', stage: 'tail' },
+  { caption: 'A common fix: build a second, sharded copy keyed by amount (a global secondary index: a lookup table, itself split across shards, for a column that is not the shard key). The query now asks one index shard, then fetches from the 2 data shards that match. The price: every write updates two places.', stage: 'index' },
 ];
 
 const SY = [45, 125, 205, 285];

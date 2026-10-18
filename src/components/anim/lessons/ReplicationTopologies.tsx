@@ -76,7 +76,7 @@ export default function ReplicationTopologies() {
       <SketchArrow points={[[560, 164], [585, 190]]} head="both" dashed seed={seedOf('l-13')} stroke="var(--muted)" />
       <SketchArrow points={[[640, 164], [615, 190]]} head="both" dashed seed={seedOf('l-23')} stroke="var(--muted)" />
       <HandText x={600} y={296} size={14} color="var(--muted)">
-        {'No failover. Quorum reads.\nConflicts must be merged.\nDynamo, Cassandra'}
+        {'No failover step.\nReads ask several nodes.\nConflicts must be merged.'}
       </HandText>
     </SketchSvg>
   );

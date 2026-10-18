@@ -40,7 +40,7 @@ export default function RelRetrySim() {
       caption={
         <>
           Each bar counts the retry calls that reach the server in a 100 ms slot. The dashed line is what the server can answer in 100 ms (capacity per second divided by 10). Calls above it are rejected and retried again.
-          With no jitter, the clients stay in step: each wave lands in one slot. Jitter spreads the same clients across many slots. Model: our own small simulation with a seeded random number generator, a first retry wait of {BASE_MS} ms,
+          With no jitter, the clients stay in step: each wave lands in one slot. Jitter spreads the same clients across many slots. Model: our own small simulation with random numbers that repeat on every run, a first retry wait of {BASE_MS} ms,
           a cap of {fmt(CAP_MS / 1000)} s, and at most {MAX_CALLS} calls per client. It is not the AWS simulation, so do not compare the exact numbers with the AWS blog.
         </>
       }

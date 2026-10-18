@@ -21,11 +21,11 @@ The client has two bad choices.
 
 This is not rare. Say you process 1 million payments a day, and 0.1% end in an ambiguous timeout (assumption). That is ~1,000 uncertain payments a day. If clients retry blindly, up to ~1,000 customers per day get double charged: ~$50,000 of refunds and angry support tickets.
 
-Retries also come from places you do not control. A mobile network that flaps can cause them. So can a gateway that retries on `502` and a message queue that redelivers (lesson 6.3). Your server must expect the same request twice.
+Retries also come from places you do not control. A mobile network that flaps (drops and returns again and again) can cause them. So can a gateway, which is a front-door server that passes calls on to your service. It may retry on `502`, the status code for "the server behind me failed". A message queue can cause them too. A queue is a waiting line that holds jobs between services, and it may deliver the same job again (lesson 6.3). Your server must expect the same request twice.
 
 ## Naive solutions and where they fail
 
-**"Check first."** Before retrying, the client does `GET /charges?customer=42&amount=50` to see if the charge exists. This fails. The client never got the charge id, so it must search by guess. A customer may really buy two $50 items in one minute. And between the check and the retry, the first request may still be running.
+**"Check first."** Before retrying, the client does `GET /charges?customer=42&amount=50` to see if the charge exists. This fails. The client never got the charge id, so it must search by guess. (An id is the unique number the server gives to each new record.) A customer may really buy two $50 items in one minute. And between the check and the retry, the first request may still be running.
 
 **"Make the server detect duplicates by content."** Reject a second $50 charge for the same customer within 5 minutes. This blocks real purchases and still lets slow retries through.
 
@@ -51,24 +51,24 @@ Stripe's API works this way. The client sends an `Idempotency-Key` header. The s
 
 ### The server side
 
-The key store is where the guarantee lives. Look at each case it must handle.
+The key store is where the guarantee lives. It is a table. Each row holds the key, the saved response, a status, and a **hash** of the request body. A hash is a short fingerprint made from data. The same body always gives the same hash, and a different body almost always gives a different one. The server compares hashes instead of whole bodies. Look at each case it must handle. The status codes `409` and `422` in the animation are explained in the rules below.
 
 <KeyLifecycle client:visible />
 
 The rules that make it correct:
 
-1. **Claim atomically.** "If the key is absent, insert it" must be one atomic step. The step can be a unique constraint, or `SET key value NX` in Redis. NX means "only if not exists". A check followed by an insert has a race: two requests both see "absent" and both run.
-2. **Store the fingerprint.** Save a hash of the request body. If the same key arrives with a different body, that is a client bug. Stripe's idempotency layer compares parameters and errors if they differ. The IETF draft for an `Idempotency-Key` header uses `422` for a mismatch.
-3. **Handle in progress.** If the key exists but has no result yet, a second request must not run the work. Return `409 Conflict` (the draft's choice) or wait for the first to finish.
+1. **Claim atomically.** "If the key is absent, insert it" must be one **atomic** step: one step that no other request can interrupt, like a turnstile that lets one person through at a time. The step can be a unique constraint, which is a database rule that refuses a second row with the same value. Or it can be `SET key value NX` in Redis, a fast in-memory store used for small, quick lookups. NX means "only if not exists". A check followed by an insert has a **race**: two requests both see "absent" and both run, because each looks before the other has written.
+2. **Store the fingerprint.** Save a hash of the request body. If the same key arrives with a different body, that is a client bug. Stripe's idempotency layer compares parameters and errors if they differ. The draft standard for an `Idempotency-Key` header (see Further reading) uses `422` for a mismatch. `422` is the HTTP status code that means "I understood the request, but I refuse its content".
+3. **Handle in progress.** If the key exists but has no result yet, a second request must not run the work. Return `409 Conflict` (the draft's choice; `409` is the HTTP status code that means "this clashes with the current state") or wait for the first to finish.
 4. **Save the response.** Replay the saved status and body. The client cannot tell it was a replay, which is the point.
 5. **Expire keys.** Stripe may remove keys at least 24 hours old. A key store that grows forever is a leak.
 6. **Scope keys.** Combine the key with the caller (customer or API key). Two customers must never collide on `abc123`.
 
 ### The client side
 
-- Generate the key **once per operation**, before the first try. A random UUID v4 works. Stripe suggests it and allows up to 255 characters.
+- Generate the key **once per operation**, before the first try. A random **UUID** works: a 128-bit random value written as 36 characters, such as `3f2b8c1e-...`. The chance that two clients pick the same one is tiny. Stripe suggests it and allows up to 255 characters.
 - **Reuse** the same key for every retry of that operation. A new key per retry would break the whole scheme.
-Retry with **exponential backoff and jitter**: wait 1 s, 2 s, 4 s and so on, plus a random amount. So thousands of clients do not retry in the same instant (lesson 7.2).
+- Retry with **exponential backoff and jitter**. Backoff means each wait is longer than the last: 1 s, 2 s, 4 s and so on. Jitter means you add a random amount. Without jitter, thousands of clients that failed together would all retry in the same instant and hit the server together again (lesson 7.2).
 
 ### Make the write and the key one transaction
 
@@ -76,10 +76,10 @@ There is a gap in the design. What if the server charges the card and crashes be
 
 Two ways to close it:
 
-- **Same transaction.** Put the key row and the charge row in the same database, and write them in one transaction. They both commit or both roll back. Then "key done" and "charge exists" cannot disagree.
+- **Same transaction.** Put the key row and the charge row in the same database, and write them in one **transaction**: a group of database changes that succeed or fail as one unit, like moving money between two accounts. They both commit (become permanent) or both roll back (are undone). Then "key done" and "charge exists" cannot disagree.
 - **Pass the key downstream.** When your service calls an outside payment processor, forward an idempotency key to it too. Stripe's engineering post describes this style of safe retry with recovery points. If a request was rolled back, retrying it wholesale is safe. Otherwise, the server resumes from where it stopped.
 
-A key stuck "in progress" also needs a **lease**: a timeout after which another worker may take it over.
+A key stuck "in progress" also needs a **lease**: a timeout after which another worker may take it over. Think of a library book with a due date. If the first worker crashed, nobody would ever finish the job without a lease. A lease of, say, 30 seconds (assumption) lets a second worker take over once the first has clearly gone.
 
 ### Other ways to get idempotency
 
@@ -87,7 +87,7 @@ You do not always need a key store.
 
 - **Client-chosen id with `PUT`.** `PUT /orders/{client_generated_id}`. The second `PUT` hits the same resource.
 - **Unique business key.** A `UNIQUE (order_id)` constraint on the payments table makes the second insert fail. The server then returns the existing row.
-- **Conditional writes.** "Update where version = 7" fails on a replay, because the version already moved to 8.
+- **Conditional writes.** Each record carries a version number. "Update where version = 7" fails on a replay, because the first run already moved the version to 8.
 
 ## Numbers
 
@@ -115,7 +115,7 @@ Do not say "the server checks if the charge already exists" with no key. There i
 </Callout>
 
 <Callout type="deep" title="The same idea in queues">
-A message queue that guarantees "at least once" delivery will deliver some messages twice. The consumer fixes this the same way: it records the message id in a dedupe table. It does this inside the same transaction as its work. Lesson 6.3 builds on this. Idempotency is the tool that turns at-least-once delivery into effectively-once processing.
+A message queue that guarantees "at least once" delivery will deliver some messages twice. The consumer fixes this the same way: it records the message id in a dedupe table (a table of ids already handled, so a repeat is skipped). It does this inside the same transaction as its work. Lesson 6.3 builds on this. Idempotency is the tool that turns at-least-once delivery into effectively-once processing.
 </Callout>
 
 ## Check yourself
@@ -176,3 +176,5 @@ A message queue that guarantees "at least once" delivery will deliver some messa
 - [Stripe blog: Designing robust and predictable APIs with idempotency](https://stripe.com/blog/idempotency): recovery points and backoff with jitter.
 - [IETF draft: The Idempotency-Key HTTP Header Field](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/): a proposed standard header. The draft has expired, so treat it as a reference design.
 - [RFC 9110, section 9.2.2: Idempotent Methods](https://www.rfc-editor.org/rfc/rfc9110.html#name-idempotent-methods): the HTTP definition.
+
+You do not need to read these sources or the RFC number to follow the lesson. They are here for people who want the formal rules.

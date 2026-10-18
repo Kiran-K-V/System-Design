@@ -50,7 +50,7 @@ There are three common placement rules.
 |---|---|---|---|
 | **Range** | Shard 1 holds ids 1–1M, shard 2 holds 1M–2M, and so on | Range scans stay on one or two shards. Easy to reason about. | Sequential keys (time, auto-increment ids) pile onto the newest range. |
 | **Hash** | `hash(key) mod N`, or a ring | Even spread, even for sequential keys | Range scans touch every shard. Changing N moves almost everything (see consistent hashing, next lesson). |
-| **Directory** | A lookup table maps key to shard | Any placement. You can move one key. | The table is one more service on the hot path. It must be fast and correct. |
+| **Directory** | A lookup table maps key to shard | Any placement. You can move one key. | The table is one more service on the hot path (the steps every request must pass through). It must be fast and correct. |
 
 Go back to the lab. Switch to **Hash**: "Newest ids" is now even. Now pick "One celebrity" with Hash. One shard takes about half of the traffic. Then pick **Directory**. The directory puts the celebrity key alone on one shard, and the other shards share the rest.
 
@@ -58,7 +58,7 @@ Go back to the lab. Switch to **Hash**: "Newest ids" is now even. Now pick "One 
 
 A hot key is one key that gets far more traffic than the others. Examples are a celebrity account, a viral post, and a huge chat room. Hashing cannot fix it, because one key always hashes to one shard.
 
-Discord hit this. It stores messages in Cassandra with the partition key `(channel_id, bucket)`, where a bucket is a fixed time window. The bucket stops one channel from growing into one endless partition. But a channel in a server with hundreds of thousands of members still gets orders of magnitude more traffic than a channel among friends. Discord reported hot partitions that made reads slow. Its fix was a layer of Rust data services that **coalesce** identical concurrent reads. When many users request the same data at once, the service queries the database once. It gives the answer to all of them. It routes by channel id so the same channel always lands on the same service.
+Discord hit this. It stores messages in Cassandra (a database that spreads rows across many machines by key) with the partition key `(channel_id, bucket)`, where a bucket is a fixed time window. The bucket stops one channel from growing into one endless partition. But a channel in a server with hundreds of thousands of members still gets orders of magnitude more traffic than a channel among friends. Discord reported hot partitions that made reads slow. Its fix was a layer of Rust data services that **coalesce** identical concurrent reads. When many users request the same data at once, the service queries the database once. It gives the answer to all of them. It routes by channel id so the same channel always lands on the same service.
 
 Your tools, from cheapest to most costly:
 
@@ -77,7 +77,7 @@ The standard answer is **logical shards**. Create many more small shards than yo
 
 Real systems do this:
 
-- **Notion** shards Postgres by workspace id into **480 logical shards on 32 physical databases**, 15 each. Later it grew the fleet from 32 to 96 databases, because some shards were above 90% CPU at peak. Afterwards CPU and IOPS were about 20% at peak. They copied the data with Postgres logical replication. Skipping index creation during the initial copy cut the sync from 3 days to 12 hours.
+- **Notion** shards Postgres by workspace id into **480 logical shards on 32 physical databases**, 15 each. Later it grew the fleet from 32 to 96 databases, because some shards were above 90% CPU at peak. Afterwards CPU and IOPS (disk reads and writes per second) were about 20% at peak. They copied the data with Postgres logical replication (replication that ships row changes instead of raw disk records, lesson 4.6). Skipping index creation during the initial copy cut the sync from 3 days to 12 hours.
 - **Instagram** packs ids as 41 bits of time, 13 bits of **logical shard** id, and 10 bits of sequence. The 13 bits allow up to 8,192 logical shards. Each id carries the shard that owns the row.
 
 Moving one logical shard has the same four steps every time. The steps are: copy a snapshot, stream the changes made during the copy, pause for a moment, switch the map. Rehearse it before you need it.
@@ -88,11 +88,11 @@ Sharding turns some easy queries into hard ones. A query that includes the shard
 
 <ScatterGather client:visible />
 
-The tail-latency math matters in practice. If each shard is slow (above its own p99, the slowest 1% of requests) 1% of the time, a query over 100 shards is slow in `1 − 0.99^100 ≈ 63%` of cases. The more shards a query touches, the slower it is on average.
+The tail-latency math matters in practice. If each shard is slow 1% of the time (its p99 is the time that 99 of 100 requests beat), a query over 100 shards is slow in `1 − 0.99^100 ≈ 63%` of cases. The more shards a query touches, the slower it is on average.
 
 Two more costs follow:
 
-- **Joins and transactions across shards** are hard. A transaction on two shards needs a protocol such as two-phase commit, which is slow and blocks on failure. The usual design choice is to pick a shard key so that rows used together live together. Notion chose workspace id because users work inside one workspace, so most queries stay on one shard.
+- **Joins and transactions across shards** are hard. A transaction on two shards needs a protocol such as two-phase commit. In it, a coordinator first asks every shard "can you commit?" and only when all say yes tells them to commit. Think of a wedding: nobody says "I do" until everyone has said "ready". It costs two round trips, and if the coordinator dies in the middle, the shards stay locked and wait. The usual design choice is to pick a shard key so that rows used together live together. Notion chose workspace id because users work inside one workspace, so most queries stay on one shard.
 - **Secondary indexes** need a decision. A **local** index lives with each shard: writes are cheap, but a query on that field asks every shard. A **global** index is its own sharded table keyed by the indexed field. Reads are cheap, but each write now updates two shards.
 
 ## Numbers

@@ -42,7 +42,7 @@ const S3: Sst = { slot: 3, name: 'SST-3', born: 8, entries: [e('a', '9', 'ok'), 
 
 const steps: LsmStep[] = [
   {
-    caption: 'An LSM engine has three parts. A memtable: a sorted map in RAM. A write-ahead log on disk, for crash safety (lesson 4.2). And SSTables: sorted, immutable files on disk. Our memtable holds only 3 entries so we can watch it fill.',
+    caption: 'An LSM engine has three parts. A memtable: a sorted map in RAM. A write-ahead log on disk: a file where every write is recorded first, so a crash cannot lose it (lesson 4.2). And SSTables: sorted, immutable files on disk. Our memtable holds only 3 entries so we can watch it fill.',
     mem: [],
     wal: [],
     ssts: [],
@@ -55,7 +55,7 @@ const steps: LsmStep[] = [
     walArrow: true,
   },
   {
-    caption: 'put(b,2). The memtable keeps keys in sorted order: a, b, c. It is now full.',
+    caption: 'put(b,2). The memtable keeps keys in sorted order: a, b, c. It is now full, so the next step writes it to disk.',
     mem: [e('a', '1'), e('b', '2'), e('c', '3')],
     wal: [e('a', '1'), e('c', '3'), e('b', '2')],
     ssts: [],
@@ -93,7 +93,7 @@ const steps: LsmStep[] = [
     ],
   },
   {
-    caption: 'Read get(b). The memtable misses. SST-2 misses too: a small in-memory structure called a Bloom filter says "b is definitely not here", so we skip the disk read. SST-1 has b=2. The more files exist, the more places a read must look. This is read amplification.',
+    caption: 'Read get(b). The memtable misses. SST-2 misses too: a Bloom filter (a small summary kept in memory) says "b is definitely not here", so we skip the disk read. SST-1 has b=2. The more files exist, the more places a read must look. Reads get slower as files pile up.',
     mem: [],
     wal: [],
     ssts: [S1, S2],
@@ -104,7 +104,7 @@ const steps: LsmStep[] = [
     ],
   },
   {
-    caption: 'Compaction. A background job merge-sorts SST-1 and SST-2 into SST-3. For each key it keeps only the newest version. a=1 is dropped. The tombstone for c cancels c=3, and nothing older remains, so c disappears. Result: 3 entries instead of 6, and reads check one file. The cost: the data was rewritten once more (write amplification).',
+    caption: 'Compaction. A background job merge-sorts SST-1 and SST-2 into SST-3. For each key it keeps only the newest version. a=1 is dropped. The tombstone for c cancels c=3, and nothing older remains, so c disappears. Result: 3 entries instead of 6, and reads check one file. The cost: the data was written to disk one more time.',
     mem: [],
     wal: [],
     ssts: [{ ...S1, old: true }, { ...S2, old: true }, S3],

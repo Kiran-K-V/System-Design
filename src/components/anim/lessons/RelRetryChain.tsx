@@ -32,7 +32,7 @@ const steps: Step[] = [
   { caption: 'Each of those 3 calls to B makes 3 attempts at C. C receives 3 x 3 = 9 calls.', counts: [3, 9, 0, 0, 0], shown: 2, tone: 'warn' },
   { caption: 'Each layer multiplies the last. D receives 27 calls and E receives 81.', counts: [3, 9, 27, 81, 0], shown: 4, tone: 'bad' },
   {
-    caption: 'The database receives 3 x 3 x 3 x 3 x 3 = 243 calls for one user request. A database that was merely slow is now buried and cannot recover. The AWS Builders\' Library gives this same 243x.',
+    caption: 'The database receives 3 x 3 x 3 x 3 x 3 = 243 calls for one user request. A database that was merely slow is now buried and cannot recover. Amazon\'s engineering library gives this same 243x.',
     counts: [3, 9, 27, 81, 243],
     shown: 5,
     tone: 'bad',
@@ -60,7 +60,8 @@ export default function RelRetryChain() {
             y: 100,
             w: isDb ? 110 : 88,
             h: 56,
-            label: isDb ? 'Database' : NAMES[k].replace('Service ', 'Svc '),
+            label: isDb ? 'Database' : 'Service',
+            sub: isDb ? undefined : String.fromCharCode(65 + k),
             shape: isDb ? 'db' : 'box',
             tone: isDb ? 'bad' : k === 0 || reached ? 'default' : 'muted',
           };

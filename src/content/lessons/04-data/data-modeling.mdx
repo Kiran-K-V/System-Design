@@ -22,7 +22,7 @@ Both bugs have the same root. The schema was drawn from the **things** in the pr
 
 Four words you need first:
 
-- An **entity** is a kind of thing you store: User, Post. Each becomes a table (or a collection).
+- An **entity** is a kind of thing you store: User, Post. Each becomes a table (or a collection). A **table** is a grid of rows and columns, like a spreadsheet tab. A **row** is one record in it. A database that stores data this way is called a **relational** database, such as PostgreSQL.
 - An **attribute** is one fact about an entity: a user's name.
 - A **primary key** (PK) is the attribute that identifies one row. No two rows share it.
 - A **foreign key** (FK) is an attribute that holds another row's primary key. It is a pointer.
@@ -34,26 +34,28 @@ Step through the animation. A feature list becomes a schema, one feature at a ti
 Two rules came out of it:
 
 1. **One-to-many** (a user has many posts): put the FK on the "many" side. The post stores `user_id`.
-2. **Many-to-many** (users follow users, users like posts): you cannot store a list in one column. Make a **junction table**, one row per pair.
+2. **Many-to-many** (users follow users, users like posts): you cannot store a list in one column. Make a **junction table**, one row per pair. A pair is, for example, "user 7 follows user 9".
 
 The step with feature 4 matters most. A schema is not finished until you list the queries it must answer. These are the **access patterns**. For each one, write down three things: the query, how often it runs, and how fast it must be.
 
 | Access pattern | Frequency | Target | Shape it needs |
 |---|---|---|---|
-| Home timeline for one user | 5,000/s peak | < 50 ms | Index on `Post(user_id, created_at)` |
+| Home timeline for one user | 5,000/s peak | < 50 ms | Index on `Post(user_id, created_at)` (see below) |
 | Show one post with author name | 50,000/s peak | < 10 ms | One row read, no join |
 | Like a post | 500/s | < 100 ms | One insert |
 | Rename a user | 0.1/s | seconds | Any |
+
+An **index** is a separate sorted list of one or more columns that points back to the rows. Think of the index at the back of a book. You look up a word, then jump to the page. Without it, the database reads every row to answer the query. Lesson 4.3 shows how it works.
 
 Look at the ratio. Reads of the author name are 500,000 times more frequent than renames. That ratio is the whole argument for the next section.
 
 ## Naive: store every fact once, never look at the queries
 
-A textbook rule says: **normalize**. Store each fact in exactly one place. This is the standard defense against bugs, so it is right as a default.
+A textbook rule says: **normalize**. Store each fact in exactly one place. This is the standard defense against bugs, so it is right as a default. The strictest common form of this rule is called third normal form, often shortened to 3NF. In it, every column depends only on the row's key.
 
 Here is the failure it prevents. Suppose each post stores the author's name as text. A user renames themselves. You must update every post. If one update fails, some posts show the old name. This is an **update anomaly**: the same fact now has two values. Normalized, the name lives in `User.name` only, and posts point to it.
 
-Normalization has a cost, and it shows up at read time. To show a post with its author, the database must **join**: read the post row, then read the user row. Two lookups instead of one.
+Normalization has a cost, and it shows up at read time. To show a post with its author, the database must **join**: read the post row, find the user id in it, then read the matching user row. It is like looking up a name in one list, then using it to look up an address in another list. Two lookups instead of one.
 
 That is fine for one post. It hurts at scale. A home page shows 20 posts. That is 20 post rows and up to 20 user rows. At 50,000 page views per second, the join work is large.
 
@@ -82,9 +84,9 @@ An order line stores `price_at_purchase`. The product price will change later. T
 Estimate before you choose a store. Use lesson 1.4.
 
 - A Post row: 8 B id + 8 B user id + 8 B timestamp + ~280 B body, plus overhead. Call it ~300 B.
-- 1 billion posts × 300 B = ~300 GB. One machine holds that on SSD (lesson 1.5).
+- 1 billion posts × 300 B = ~300 GB. One machine holds that on an SSD (a fast flash disk, lesson 1.5).
 - A Follow row is two 8-byte ids: 16 B. A user following 500 accounts adds 8 KB. That is 100 million users × 500 follows = 50 billion rows, ~800 GB of raw ids before index overhead.
-- A timeline with no index: the database reads every post. 300 GB at ~3 GB/s sequential is ~100 s. With the index on `(user_id, created_at)`: one lookup per followed account, ~500 lookups. Lesson 4.3 shows why that costs milliseconds.
+- A timeline with no index: the database reads every post. 300 GB at ~3 GB/s is ~100 s. Sequential means reading the file from start to end in one pass, which is the fastest way a disk can read. With the index on `(user_id, created_at)`: one lookup per followed account, ~500 lookups. Lesson 4.3 shows why that costs milliseconds.
 
 The point: the **same data** costs 100 seconds or 50 milliseconds depending on the shape. Shape is a performance decision.
 
@@ -105,7 +107,7 @@ Begin every data model with the access patterns. Say: "Reads are X per second, w
 </Callout>
 
 <Callout type="mistake">
-Do not denormalize "for speed" before you have counted. Say what is read, how often, and what it costs to keep the copy correct. A schema full of copies with no plan to update them is a bug factory. The opposite mistake also fails: a pure third-normal-form schema for a feed that serves 50,000 reads per second.
+Do not denormalize "for speed" before you have counted. Say what is read, how often, and what it costs to keep the copy correct. A schema full of copies with no plan to update them is a bug factory. The opposite mistake also fails: a pure 3NF schema (every fact stored once) for a feed that serves 50,000 reads per second.
 </Callout>
 
 ## Check yourself
@@ -147,7 +149,7 @@ Do not denormalize "for speed" before you have counted. Say what is read, how of
         'Old orders show the new price; store price_at_purchase',
         'The Product table has too many columns for one row',
         'The join is too slow for an order screen with many lines',
-        'Prices should live in a cache with a 60 second TTL',
+        'Prices should live in a cache that throws entries away after 60 seconds',
       ],
       answer: 0,
       explain: 'A historic fact must freeze at the moment of the event. Fully normalizing it makes the past change when the present changes. This copy is correct design, not premature denormalization.',

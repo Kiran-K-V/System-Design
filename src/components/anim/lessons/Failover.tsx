@@ -33,7 +33,7 @@ const steps: Step[] = [
   {
     caption:
       'The leader stops answering. It may have crashed, or only the network to it is slow. A follower cannot tell which. Followers wait for a timeout. Short timeouts cause false alarms. Long ones extend the outage.',
-    l: { label: 'Leader', sub: 'no heartbeat', tone: 'bad' },
+    l: { label: 'Leader', sub: 'silent', tone: 'bad' },
     f1: { label: 'Follower 1', sub: 'log 42' },
     f2: { label: 'Follower 2', sub: 'log 41' },
     links: { appL: true },
@@ -61,7 +61,7 @@ const steps: Step[] = [
     active: ['f1'],
     packets: [
       { from: 'app', to: 'f1', label: 'x=6' },
-      { from: 'f1', to: 'f2', label: 'rec 42', delay: 0.9, tone: 'ok' },
+      { from: 'f1', to: 'f2', label: 'record 42', delay: 0.9, tone: 'ok' },
     ],
   },
   {

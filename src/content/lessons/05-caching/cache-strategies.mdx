@@ -32,6 +32,16 @@ Each caching pattern is a different answer to "who does these steps, and in whic
 
 ## Five patterns
 
+First, the words in the diagrams. `GET k` reads key `k` from the cache. `SET k = v` writes a value. `DEL k` deletes the key. `SELECT` and `UPDATE` are the database commands that read and change rows. A **TTL** (time to live) is a timer on a cache entry: `TTL 300s` means "forget this entry after 300 seconds". It is a safety net, because an old copy cannot stay for ever.
+
+Here is each pattern in one picture. Think of a shop with a shelf (the cache) in front and a warehouse (the database) behind it.
+
+- **Cache-aside.** The shopkeeper checks the shelf. If the item is missing, the shopkeeper walks to the warehouse, brings it, and puts a copy on the shelf. The app does all the walking.
+- **Read-through.** You only ever ask the shelf. If the item is missing, the shelf itself fetches it from the warehouse. The app never talks to the warehouse.
+- **Write-through.** When you change an item, you hand it to the shelf. The shelf updates the warehouse before it says "done". Both always match, but every change waits for the warehouse.
+- **Write-back.** The shelf says "done" at once and updates the warehouse later, in a batch. Changes are fast. If the shelf burns down before the batch, those changes are lost.
+- **Write-around.** Changes go straight to the warehouse and skip the shelf. The shelf learns about the item only when someone reads it.
+
 Pick a tab. Step through the reads and writes. At the end of each tab you will see what breaks.
 
 <CacheStrategies client:visible />
@@ -41,7 +51,7 @@ Pick a tab. Step through the reads and writes. At the end of each tab you will s
 | Pattern | Who talks to the database? | Read path | Write path | Main risk |
 |---|---|---|---|---|
 | **Cache-aside** | The app | App checks cache, loads on miss, fills cache | Write DB, then delete the cache key | Stale reads, races |
-| **Read-through** | The cache | Cache loads on a miss | (separate choice) | Stampede on misses, the loader is a dependency |
+| **Read-through** | The cache | Cache loads on a miss | (separate choice) | Stampede (many misses hit the database together), the loader is a dependency |
 | **Write-through** | The cache, in the write call | Always warm for written keys | Cache writes DB, then answers | Slower writes, cache full of unread data |
 | **Write-back** | The cache, later, in batches | Reads hit fresh data | Cache answers, flushes to DB later | **Lost writes** if the cache dies |
 | **Write-around** | The app, skipping the cache | Cache filled by reads only | Write to DB only | First read after write is a miss, stale if cached |
@@ -50,7 +60,7 @@ Real systems mix them. A common pair is read-through plus write-through: the cac
 
 ## Why "delete" beats "update" on a write
 
-In cache-aside, the write path deletes the cached key. It does not set the new value. Facebook's memcache paper gives the reason in one line: they delete instead of update because **deletes are idempotent**. Running a delete twice is the same as running it once. An update done twice, in a different order from the database writes, leaves the wrong value. This is the race from the naive solution.
+In cache-aside, the write path deletes the cached key. It does not set the new value. Facebook's memcache paper gives the reason in one line: they delete instead of update because **deletes are idempotent**. Idempotent means that doing it many times has the same effect as doing it once. Running a delete twice is the same as running it once. An update done twice, in a different order from the database writes, leaves the wrong value. This is the race from the naive solution.
 
 Deleting also wastes no work. If nobody reads the key again soon, you never rebuild it.
 
@@ -61,22 +71,22 @@ Even delete is not perfect. Step through this race. No server fails. Nothing is 
 The reader's *set* arrives after the writer's *delete*. The cache ends up with v1 forever (until the TTL). Three common defenses:
 
 - **Always set a TTL.** It turns "wrong forever" into "wrong for at most N seconds". Redis and Memcached both support it. The AWS ElastiCache guide recommends adding a TTL to either strategy to limit staleness.
-- **Leases.** Facebook's memcache gives a reader a 64-bit token when it misses. The reader must present the token when it fills the cache. A delete from a writer invalidates the token, so the late `SET` is refused. This works like load-link/store-conditional in CPUs.
+- **Leases.** Facebook's memcache gives a reader a token when it misses. The token is a 64-bit number, which is a unique ticket. The reader must present the ticket when it fills the cache. A delete from a writer cancels the ticket, so the late `SET` is refused. Think of a cloakroom: if the writer clears the shelf, your old ticket no longer works. CPUs use the same idea for safe updates to shared memory.
 - **Versioned values.** Store a version number with the data. The cache only accepts a set with a higher version than what it holds.
 
 <Callout type="deep" title="Why not make the cache part of the transaction?">
-You can approximate it. In the **transactional outbox** pattern, the write also records "invalidate key k" in a table inside the same database transaction. A separate process reads that table and deletes the cache key, retrying until it succeeds. Facebook does a version of this: a daemon on each database watches committed SQL and broadcasts cache deletes. Change data capture (lesson 6.5) is the general form. The cost is delay: the cache is stale until the daemon runs.
+You can approximate it. In the **transactional outbox** pattern, the write also records "invalidate key k" in a table inside the same database transaction. An outbox is like a tray of letters to send. A separate process reads that table and deletes the cache key, retrying until it succeeds. Facebook does a version of this: a **daemon** (a program that runs in the background all the time) on each database watches the committed changes and broadcasts cache deletes. **Change data capture** (lesson 6.5) is the general form: a feed of every change made to a database. The cost is delay: the cache is stale until the daemon runs.
 </Callout>
 
 ## Write-back in more depth
 
 Write-back is the only pattern that makes writes *faster* than the database. It also takes on the most risk.
 
-- **Why it is fast.** The app gets "ok" after a ~0.5 ms memory write. The database write moves off the critical path.
+- **Why it is fast.** The app gets "ok" after a ~0.5 ms memory write. The database write moves off the **critical path**, which is the chain of steps the user must wait for.
 - **Why it can lower database load.** Many writes to one key collapse into one flush (see the animation). A hot counter updated 10,000 times a second can become one write per second.
-- **What it costs.** Until a flush, the cache holds the **only** copy of those writes. If the node dies, they are gone, and the user was told they succeeded.
+- **What it costs.** A **flush** is the moment the cache writes its changed entries to the database. Data that is changed in the cache but not yet flushed is called **dirty**. Until a flush, the cache holds the **only** copy of those writes. If the node dies, they are gone, and the user was told they succeeded.
 
-If you need write-back, reduce the risk. Keep dirty data on replicated cache nodes, flush on a short interval, and write to a durable log first. At that point you are building a database, and you should ask if you wanted one. Use write-back for data you can lose or recompute: view counts, "last seen" times, metrics.
+If you need write-back, reduce the risk. Keep dirty data on replicated cache nodes (copies on several machines), flush on a short interval, and write to a durable log first. A durable log is an append-only file on disk that survives a crash. At that point you are building a database, and you should ask if you wanted one. Use write-back for data you can lose or recompute: view counts, "last seen" times, metrics.
 
 ## The numbers
 
