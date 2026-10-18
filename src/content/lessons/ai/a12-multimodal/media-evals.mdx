@@ -1,0 +1,239 @@
+---
+summary: 'No formula tells you whether a generated image or video is good. Automatic scores check narrow things and drift from what people prefer. Pairwise human votes, turned into a ranking, are the main tool. Check the scorer against votes by slice, and put a safety check on the output.'
+requires: ['ai/a12-multimodal/diffusion-serving', 'ai/a8-evals/judges']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai12MediaPair from '../../../../components/anim/lessons/Ai12MediaPair.tsx';
+import Ai12MediaArena from '../../../../components/anim/lessons/Ai12MediaArena.tsx';
+import Ai12MediaAgree from '../../../../components/anim/lessons/Ai12MediaAgree.tsx';
+
+## The problem
+
+You run an image and video feature. A new model version is ready. It is cheaper, and the vendor says it is better. You must decide: ship it, or keep the old one.
+
+For a text task with one right answer, you would run a test set and count matches. Here no answer key exists. "A red cube on a blue ball" has millions of valid images. Two people can disagree on which of two valid images is better, and both are right for their taste.
+
+So the question is not "is this output correct?" It is "is this version better, for our users, by enough to ship?" This lesson answers five questions:
+
+1. Which automatic scores exist, and what do they miss?
+2. What is the naive way to choose, and how does it fail?
+3. How do pairwise human votes become a ranking?
+4. When do model-based scores and human votes disagree?
+5. What safety check sits on the output?
+
+The three bars for this design. Quality bar: the new version wins a majority of pairwise votes on our own prompts, and loses on no important slice. Latency budget: an eval run takes hours to days, because people vote. It runs before release, not per request. Cost per request: the eval itself costs generation plus votes, worked out in the Numbers section.
+
+## Question 1: which automatic scores exist, and what do they miss?
+
+An **automatic metric** is a program that turns an image or clip into a number, with no person involved. It is cheap and repeatable. The risk is that it measures something close to quality, not quality itself. Here is the field, from the papers' own abstracts.
+
+**FID** (Frechet Inception Distance) compares a set of generated images with a set of real images. A vision network turns each image into a list of numbers, and FID measures how far apart the two sets' spreads are. Think of comparing two flocks of birds by their overall shape, not by one bird. It says something about a set, not about one image. The GenEval paper calls FID and CLIPScore "unsuited for fine-grained or instance-level analysis".
+
+**CLIPScore** measures how well an image matches its prompt. CLIP is a model trained on image and caption pairs. It puts both in one space, and CLIPScore is how close they sit. It works on captions, and the CLIPScore paper reports "highest correlation with human judgements" for captioning. For prompts with several objects, the VQAScore paper says it "fails to produce reliable scores for complex prompts involving compositions of objects, attributes, and relations". Plain version: it can tell that a "cube" and a "ball" appear, but may not notice that the colors are swapped.
+
+**Prompt-adherence checks** test specific claims. GenEval uses object detectors to check that the requested objects appear, with the right count, position, and color. T2I-CompBench covers attribute binding, relations, and counting. **VQAScore** asks a visual question-answering model whether the image shows the prompt text, and uses the probability of "yes" as the score. These catch the swapped colors. They check what you told them to check, and no more.
+
+**Learned preference scorers** are models trained on human choices, so that their score predicts which image a person would pick. PickScore trains on Pick-a-Pic, a web app where people generated images and recorded which they preferred. ImageReward reports 137,000 expert comparisons. HPSv2 fine-tunes CLIP on a dataset of 798,090 human choices on 433,760 image pairs. The authors of PickScore claim "superhuman performance" at predicting human preference. That is the authors' claim, on their own data.
+
+**VBench** is a benchmark suite for video. It splits video quality into 16 dimensions, each with its own prompts and method, and its authors collected human preference annotations to check that the scores match what people see.
+
+| Metric | What it measures | Known weakness |
+|---|---|---|
+| FID | Similarity of a set of images to real ones | Set-level; unsuited to fine-grained, per-image analysis |
+| CLIPScore | Image and prompt match | Unreliable on compositions of objects, attributes, relations |
+| GenEval, T2I-CompBench | Object, count, position, color, relations | Only the claims the benchmark tests |
+| VQAScore | Probability a question-answering model says the image fits the prompt | Prompt fit, not look and feel |
+| PickScore, ImageReward, HPSv2 | Predicted human preference | Trained on one crowd and one prompt style |
+| VBench | 16 video dimensions | A fixed list; a new failure may be none of the 16 |
+
+How well does each agree with people? None of the pages I read gave an agreement percentage, so this lesson quotes none. The next sections show how to measure it for your own traffic.
+
+## Question 2: the naive way, pick the higher automatic score
+
+The simple plan: score 1,000 prompts with one metric, average, and ship whichever version scores higher. It is fast and free.
+
+It fails in a specific way. The metric and the user do not look at the same thing. A text-match score does not see a melted hand. A preference scorer trained on one crowd's taste may not match your users'. Averages then hide slices.
+
+Try the chart. It shows, for three kinds of scorer, how often the scorer picks the same winner as human voters on four kinds of prompts. **All numbers are illustrative.** They are made up to show a pattern, not measured from a real model.
+
+<Ai12MediaAgree client:visible />
+
+Pick the text-match scorer. Traffic-weighted, it agrees with humans 61.3% of the time: 0.40 x 74 + 0.20 x 52 + 0.15 x 50 + 0.25 x 55 = 29.6 + 10.4 + 7.5 + 13.75 = 61.25. That sounds like "usually right". But look at the slices. On counts and positions it is at 52%, and on text in images 50%. A coin flip. If your new model improves exactly there, this scorer cannot tell. The VLM judge (a vision-language model that reads two images and picks one) is better on every slice in this made-up data, and still sits near 62% on text in images.
+
+The general lesson: a single agreement number is an average over slices. Break it down by slice, as in the evals lessons.
+
+## Question 3: how do pairwise votes become a ranking?
+
+### Why pairs
+
+Ask a person to rate an image from 1 to 10 and you get a personal scale. One person's 7 is another's 5. Ask "which of these two is better?" and the answer is easier and more stable. Chatbot Arena, a public site for comparing language models, is built on this. A user sees two anonymous answers, votes for one, and only then sees the model names. The paper reports over 240,000 votes from around 90,000 users as of January 2024, and that "the crowdsourced human votes are in good agreement with those of expert raters". The same design works for images and video.
+
+### From votes to a score
+
+A pair of votes cannot rank ten models directly. You need a model of what a vote means. The **Bradley-Terry model** gives each model m a strength, written s(m). The chance that A beats B in a vote is
+
+e^s(A) / (e^s(A) + e^s(B)).
+
+This is the form the Chatbot Arena paper uses for its ranking scores. The picture: each model has a number of tickets in a raffle, and e^s is its ticket count. If the strengths are equal, each side has half the tickets, so the win chance is 50%. A strength gap of 0.3 gives A e^0.3 = 1.35 tickets to B's 1, so A wins 1.35 / 2.35 = 57% of the time. Those are the numbers in the simulator below.
+
+Given many votes, you find the strengths that make the observed wins most likely. That is a **fit**. The arena paper fits all votes at once and puts a confidence interval on each score, so a rank is reported with its uncertainty. An older and simpler cousin is the **Elo** system from chess. It updates two scores after each game. The surprise is how far the result was from what the scores predicted, and each score moves by the step size times the surprise. Walk through it.
+
+<Ai12MediaPair client:visible />
+
+Check the third step by hand. After two wins, A = 0.44 and B = -0.44. The chance A wins is e^0.44 / (e^0.44 + e^-0.44) = 1.55 / (1.55 + 0.64) = 71%. B wins. The surprise is 0.71. The step size is 0.5, so B moves up 0.5 x 0.71 = 0.35, and A moves down 0.35. A = 0.08, B = -0.08.
+
+### How many votes?
+
+Votes cost people's time, so ask how many you need. Say the true chance that the new model beats the old one in a vote is 55%. You want to tell that apart from a coin flip. The log-odds of 55% is ln(0.55 / 0.45) = 0.20. The standard error of a log-odds from n votes is sqrt(1 / (n x 0.55 x 0.45)). A 95% interval is 1.96 times that. For the interval to clear zero, 1.96 x sqrt(1 / (n x 0.2475)) must be below 0.20. Solve: n is at least (1.96 / 0.20)^2 / 0.2475, about 386 votes on that pair.
+
+At a 60% win rate the same sum gives about 98 votes. At 52% it gives about 2,400. Small gaps need many votes. The assumptions: votes are independent, one fixed pair, no ties. Real arenas use more careful intervals and also choose which pairs to show, so that votes go where the ranking is least certain. The arena paper describes that sampling rule.
+
+Now try it. Click a card, or let the simulated crowd vote. The crowd's hidden strengths are A 0.3, B 0, C -0.3.
+
+<Ai12MediaArena client:visible />
+
+Add 10 crowd votes and the order is often wrong. Add 100 and it usually settles. The line under the table tells you whether the top two are separated yet. Gaps of 0.3 are small, which is why this needs hundreds of votes.
+
+I could not find the ranking method or vote counts on the Artificial Analysis arena page I read, so this lesson makes no claim about it.
+
+### What the vote set must look like
+
+The ranking is only as good as the prompts and the voters. Use prompts from your real traffic, sorted into slices. Hide model names. Swap left and right at random, because people lean toward one side. Keep voters who resemble your users. For video, a vote means watching two clips, so votes are slower and dearer than for images.
+
+## Question 4: when do model scores and human votes disagree?
+
+They disagree on exactly the slices your users notice. A model can raise its text-match score by getting objects right while its faces get worse. A new version can be tuned until a preference scorer likes it, without people liking it. When a measure becomes the target, it stops measuring.
+
+A model used as a judge has the same issue. The MLLM-as-a-Judge paper tested vision-language models as judges. It reports "remarkable human-like discernment in Pair Comparison", and "significant divergence from human preferences in Scoring Evaluation and Batch Ranking". So ask a VLM judge to pick between two outputs, not to rate one. I did not find a judge-to-human agreement number I could trust, so measure your own: have people label a few hundred pairs, then check the judge against them by slice. [Lesson A8.4](/learn/ai/a8-evals/judges/) shows how to test a judge with recall and precision, how to catch position and length bias, and how to pin the judge version. The same rules apply when the thing judged is an image.
+
+Use the automatic scores for what they do well: a fast filter in a loop, a smoke test on every build, and a check on one narrow behavior. Use votes to decide what ships.
+
+## Question 5: what safety check sits on the output?
+
+A generator can produce content you must not show. Your design needs a check on the output, as well as on the prompt. The threat-model lesson has the idea: put a checkpoint at every crossing, and enforce it in code ([A10.1](/learn/ai/a10-safety/threat-model/)). For media, that means:
+
+1. **A prompt filter before generation.** It saves the GPU cost of a blocked request.
+2. **An output classifier after generation.** A model that looks at the finished image or frame and labels it: allowed, blocked, or send to a person. Generation can pass a clean prompt and still make a bad image, so the prompt filter alone is not enough.
+3. **A red-team set.** A list of attacks you run on every release, as in [A10.4](/learn/ai/a10-safety/jailbreaks-redteam/). Track the share the classifier misses and the share of harmless requests it blocks, per slice. Both rates matter.
+
+Vendors run their own checks. Veo blocks some requests and does not charge for a blocked video ([Veo guide](https://ai.google.dev/gemini-api/docs/veo)). I did not verify what any specific open-source image pipeline enables by default, so check the filter in your stack and test it. Never assume it is on.
+
+**Provenance** is a record of where a file came from. C2PA, the Coalition for Content Provenance and Authenticity, describes itself as "an open technical standard for publishers, creators and consumers to establish the origin and edits of digital content". Its name for the label is Content Credentials. Think of a food label for a file. A label can say a file is generated. A missing label proves nothing, since anyone can strip metadata. I could not read the technical specification, so this lesson does not describe how the label is stored or checked.
+
+Safety checks are evals too. Score them with the same pairwise and slice habits: a block rate on a labeled set, not a hope.
+
+## Numbers
+
+- **Quality bar.** A convention for this lesson, not a standard: the new version ships if it wins at least 55% of at least 400 pairwise votes on prompts from our traffic, and on no slice with at least 100 votes does it win under 50%. 400 votes covers the 386 in the sum above.
+- **Latency budget.** Vote collection takes hours to days, so it runs before release. Automatic scores run on every build in minutes. A VLM judge sits between: seconds per pair.
+- **Cost per eval.** Generating 400 pairs, each with two 8-second clips on Veo 3.1 Fast at 720p ($0.10 per second, as of 2026-10-18, [pricing page](https://ai.google.dev/gemini-api/docs/pricing)), is 400 x 2 x 8 x $0.10 = $640. The voters' time comes on top. I found no published cost per vote, so price your own.
+- **Failure rate.** Say it as a rate. If the output classifier misses 2% of a red-team set, then 2 in 100 bad generations get through. Measure that rate, per slice, before you ship.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Automatic scores only | Free, instant, repeatable | Drifts from what people prefer; blind on some slices | A smoke test on every build |
+| Learned preference scorer | Cheap proxy for taste | Tuned to one crowd; can be gamed | A first filter before human votes |
+| VLM judge on pairs | Fast, scales to thousands | Needs its own agreement check; has biases | Between releases, calibrated on human labels |
+| Human pairwise votes | The closest thing to ground truth | Slow, costs money, needs hundreds of votes | A ship or no-ship decision |
+| Expert raters | Fewer, sharper labels | Narrow taste, higher cost per label | A high-stakes slice, such as faces or brand style |
+| Public arena rank | Shows how the field compares | Not your prompts, not your users | Picking which models to test, never the final call |
+
+## What experienced teams know
+
+1. **Use pairs, not scores, for VLM judges.** The [MLLM-as-a-Judge paper](https://arxiv.org/abs/2402.04788) reports good pair comparison and divergence on scoring and batch ranking.
+2. **Check compositions with object and attribute tests.** The [VQAScore paper](https://arxiv.org/abs/2404.01291) says CLIPScore is unreliable on compositions. Add count, color, and relation checks.
+3. **Report a rank with its error bar.** The [Chatbot Arena paper](https://arxiv.org/abs/2403.04132) fits scores from all votes and attaches confidence intervals. A 55% win rate needs about 386 votes to separate from a coin flip, by the sum above.
+4. **Crowds can match experts.** The same paper reports that crowd votes are "in good agreement with those of expert raters". Test that on your slice before you rely on it.
+5. **Validate every benchmark against people.** The [VBench authors](https://arxiv.org/abs/2311.17982) collected human preference annotations to check their 16 dimensions. Do the same for any metric you adopt.
+6. **A label is not a detector.** C2PA Content Credentials record origin and edits ([C2PA](https://c2pa.org/)). Use them to mark your own output. Do not treat a missing label as proof that a file is real.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "There is no exact answer, so I would use layers. Automatic scores run on every build as a smoke test. A VLM judge on pairs, calibrated on human labels by slice, runs between releases. The ship decision rests on pairwise human votes on prompts from our traffic, turned into a Bradley-Terry ranking with error bars, with a slice floor. I would add an output classifier and a red-team set, and report miss and false-block rates." That names the metric, the weakness, the decision tool, and the safety rate.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the new model has a higher CLIP score, so ship it". Do not quote one agreement number without saying on which slices. Do not ask a judge model for 1 to 10 scores and trust them. Do not stop at the prompt filter and skip the output check.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'The true chance that a new image model beats the old one in a vote is 55%. About how many votes on that pair separate it from a coin flip at 95% confidence?',
+      options: ['About 40 votes', 'About 100 votes', 'About 390 votes', 'About 10,000 votes'],
+      answer: 2,
+      explain: 'The log-odds is 0.20. The 95% bar is 1.96 x sqrt(1 / (n x 0.2475)). It falls below 0.20 at n of about 386. 100 votes gives a bar near 0.39, wider than the gap. A 60% win rate would need only about 98.',
+    },
+    {
+      q: 'You need a vision-language model to compare two generated images. Which way of using it matches what the MLLM-as-a-Judge paper reports?',
+      options: ['Ask it to pick the better of two outputs', 'Ask it to rate each output from 1 to 10, since scores tracked people closely', 'Ask it to rank a batch of ten outputs, since ranking tracked people closely', 'Ask it for a score and a rank, then average the two to cancel errors'],
+      answer: 0,
+      explain: 'The paper reports human-like discernment in pair comparison, and significant divergence in scoring and batch ranking. So pairs are the safer format. Averaging a good signal with a poor one dilutes it.',
+    },
+    {
+      q: 'Under a Bradley-Terry model, model A has strength 0.3 and model B has strength 0. What is the chance A wins one vote?',
+      options: ['50%, since one vote has only two outcomes', '30%, since the strength is 0.3', '65%, since the gap is about a third of a unit', '57%, since 1.35 / 2.35 is 0.57'],
+      answer: 3,
+      explain: 'A has e^0.3 = 1.35 tickets to B\'s 1, so A wins 1.35 out of 2.35 tickets, about 57%. A 50% answer would hold only if the strengths were equal. The strength is not a percent.',
+    },
+    {
+      q: 'In an online Elo-style update, the model the board favored loses a vote. Compared with the favorite winning, how do the two scores move?',
+      options: ['They move the same, since one vote is one vote', 'They move more, since the result was more surprising', 'They do not move, since an upset is treated as noise', 'They move less, since the favorite has more history'],
+      answer: 1,
+      explain: 'Each score moves by the step size times the surprise. An upset has a larger surprise, so the move is bigger. The same vote can move the scores 0.19 or 0.35 depending on what the board expected, as in the walkthrough.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai12-media-better-score-worse-votes"
+  title="Better score, worse votes"
+  scenario="You test a new image model against the current one. Its automatic text-match score is higher on an illustrative 1,000-prompt set. But 3,000 pairwise votes from your users show the new model winning only 42% of the time. Support tickets mention odd faces and hands."
+  facts={[
+    'text-match score: new model higher by a small margin (illustrative)',
+    'pairwise votes: 3,000 votes, new model wins 42%',
+    'noise on a 42% win rate from 3,000 votes: about plus or minus 2 points',
+    'votes not yet split by slice; the prompt set has plain subjects and counts, no faces or hands',
+  ]}
+  steps={[
+    {
+      prompt: 'Which eval gap explains this?',
+      options: [
+        'The votes are too few, so 42% is only noise',
+        'The score measures prompt match, and the test set had no face or hand prompts',
+        'The new model needs more denoising steps, so the score is wrong',
+        'The text-match score is broken and returns random numbers',
+      ],
+      answer: 1,
+      explain: 'The metric checks prompt match, not how faces and hands look. The prompt set also left those out. The votes are not noise: 42% is 8 points from 50%, and the error bar is about 2. Nothing says the metric returns random numbers, only that it measures something narrower.',
+    },
+    {
+      prompt: 'What is the best next step?',
+      options: [
+        'Ship the new model and use the higher score in the release note',
+        'Lower the vote threshold until the new model passes',
+        'Add face and hand slices, collect votes per slice, and read the losing pairs',
+        'Replace the text-match score with another single score and re-run',
+      ],
+      answer: 2,
+      explain: 'Slice the votes and add prompts where users complain, then read the pairs the new model lost to name the failure. Another single score repeats the proxy problem. Shipping or lowering the bar ignores the votes.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Chatbot Arena: An Open Platform for Evaluating LLMs by Human Preference](https://arxiv.org/abs/2403.04132) (pairwise votes and Bradley-Terry ranking)
+- [VBench: Comprehensive Benchmark Suite for Video Generative Models](https://arxiv.org/abs/2311.17982)
+- [MLLM-as-a-Judge](https://arxiv.org/abs/2402.04788)
+- [Pick-a-Pic and PickScore](https://arxiv.org/abs/2305.01569)

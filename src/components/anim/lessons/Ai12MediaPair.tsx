@@ -60,7 +60,7 @@ export default function Ai12MediaPair() {
       {(_, s) => (
         <SketchSvg width={720} height={240} label={`Model A strength ${f(s.a)}, model B strength ${f(s.b)}. Chance A wins ${pct(s.expect)}.`}>
           <HandText x={24} y={30} anchor="start" size={TEXT_SIZES.heading} color="var(--muted)">
-            Strength (log-odds). Event: {s.note}
+            {`Strength (log-odds). Event: ${s.note}`}
           </HandText>
           <SketchBox cx={X0} cy={120} w={560} h={4} r={2} seed={seedOf('mp-axis')} stroke="var(--muted)" />
           <HandText x={X0} y={150} size={TEXT_SIZES.note} color="var(--muted)">0</HandText>
