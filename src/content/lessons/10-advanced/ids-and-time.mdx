@@ -5,6 +5,7 @@ requires: ['04-data/sharding', '04-data/indexing', '04-data/consistency-models']
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
+import IncidentCard from '../../../components/lesson/IncidentCard.astro';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
 import IdSnowflake from '../../../components/anim/lessons/IdSnowflake.tsx';
 import IdLamport from '../../../components/anim/lessons/IdLamport.tsx';
@@ -17,6 +18,8 @@ Two needs hide inside every distributed system.
 2. **An order for events.** "Which write came last?" "Did the reply come after the question?"
 
 On one machine both are easy. A counter gives IDs. The machine's clock gives order. Across machines, neither the counter nor the clock is shared.
+
+Even one machine's clock can surprise you. On 1 January 2017 a clock that stepped back by one second broke part of Cloudflare's DNS. [The story](#incident) is in the section on clocks.
 
 ## Naive solution: auto-increment
 
@@ -86,6 +89,29 @@ Now use the clock to order two writes to the same key, with "last write wins" (l
 | B writes `x = 2` | 110 ms | 110 ms |
 
 B wrote **after** A. By stamps, A looks later. Last write wins keeps `x = 1`, and the newer write is silently lost. A 30 ms error is enough to flip two writes that are 10 ms apart.
+
+A clock can also jump **backward**. NTP may step a clock back to correct it. A **leap second** is one extra second that is added to official time now and then, to keep clocks in step with the Earth's rotation. On some systems the clock repeats a second to absorb it. A **monotonic clock** is the fix for measuring time spans. It only moves forward, so the difference of two readings is never negative.
+
+<IncidentCard
+  org="Cloudflare"
+  date="1 January 2017"
+  title="Time went back one second, and a duration came out negative."
+  cost="At peak about 0.2% of DNS queries to Cloudflare failed, and under 1% of web requests got an error. Only some customers were hit. The worst machines were patched in 90 minutes, and the impact ended at 06:45 UTC."
+  missing="Never measure a time span with the wall clock. Use a monotonic clock, or at least reject a negative difference. Cloudflare named the root cause as 'the belief that time cannot go backwards'. Its fix stopped negative values from being recorded."
+  source="https://blog.cloudflare.com/how-and-why-the-leap-second-affected-cloudflare-dns/"
+  sourceLabel="Cloudflare, How and why the leap second affected Cloudflare DNS"
+>
+
+Cloudflare's DNS server, RRDNS, is written in Go. For some customers it must look up an address through internal resolvers. It times how fast each resolver answers. Then it picks one by a weighted random choice that favors fast resolvers.
+
+1. Each time span was `time.Now()` minus a start time from the same clock. At the time, Go's `time.Now()` "does not guarantee monotonicity", in Cloudflare's words.
+2. At midnight UTC a leap second was added, and the clock went back one second. The resolvers answer in a few milliseconds. So some measured spans came out negative.
+3. RRDNS smooths many measurements into one average. After a few negative ones, the average went negative too.
+4. The weighted choice passed that number to Go's `rand.Int63n()`, which panics (crashes the call) on a negative argument. Those lookups failed.
+
+</IncidentCard>
+
+The bug was not about ordering events across machines. It was one machine, comparing two readings of its own clock. That is how little it takes.
 
 So do not use physical time to order events that can race. Use **logical time**.
 
@@ -231,3 +257,4 @@ Suppose transaction T1 commits with timestamp s1. Transaction T2 starts after T1
 - [Flickr: Ticket servers](https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/) (central counters with odd and even offsets)
 - [Kulkarni et al., "Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases"](https://cse.buffalo.edu/tech-reports/2014-04.pdf) (hybrid logical clocks)
 - [Corbett et al., "Spanner: Google's Globally-Distributed Database"](https://static.googleusercontent.com/media/research.google.com/en//archive/spanner-osdi2012.pdf) (TrueTime and commit wait)
+- [Cloudflare: How and why the leap second affected Cloudflare DNS (2017)](https://blog.cloudflare.com/how-and-why-the-leap-second-affected-cloudflare-dns/), the incident above, with the code.

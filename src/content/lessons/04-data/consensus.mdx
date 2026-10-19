@@ -5,6 +5,7 @@ requires: ['04-data/replication', '04-data/cap-pacelc', '04-data/consistency-mod
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
+import IncidentCard from '../../../components/lesson/IncidentCard.astro';
 import QuorumCalc from '../../../components/anim/lessons/QuorumCalc.tsx';
 import RaftWalk from '../../../components/anim/lessons/RaftWalk.tsx';
 
@@ -28,6 +29,8 @@ A consensus algorithm must give two kinds of promise.
 - **Liveness**: something good eventually happens. The group does decide.
 
 The FLP result (Fischer, Lynch, Paterson, 1985) shows why you cannot have both for free. In a fully asynchronous system, message delay has no bound. A crashed node also looks the same as a slow one. "Asynchronous" means there is no clock that tells you a message is late. In such a system, no consensus protocol can tolerate even one crash. The paper puts it this way: "no completely asynchronous consensus protocol can tolerate even a single unannounced process death". Real systems escape by adding timeouts. They stay **safe** always. They make progress only when the network behaves well enough.
+
+Consensus can also do its job perfectly and still hurt you. That happened at GitHub in 2018. [The story](#incident) comes after the section on what consensus is for.
 
 ## Naive attempts
 
@@ -122,6 +125,30 @@ So use it for **small, critical facts**:
 Do **not** push bulk data through it. The standard pattern is a small consensus group (3 or 5 nodes). It holds the metadata, such as who is leader of each shard. The data path uses ordinary leader-follower replication (lesson 4.6) and the leader is the one the consensus group named. That also answers lesson 4.6's open question.
 
 And consensus is a CP choice (lesson 4.9): it keeps answers correct and refuses to answer when it cannot. When a partition leaves fewer than a majority on one side, that side stops accepting writes. The side with the majority carries on.
+
+## A real outage: GitHub, 2018
+
+<IncidentCard
+  org="GitHub"
+  date="21 October 2018"
+  title="A 43-second network cut, a correct election, and 24 hours of degraded service."
+  cost="Service was degraded for 24 hours and 11 minutes. GitHub says no user data was lost. But a few seconds of writes that never reached the West Coast needed manual repair: one of the busiest clusters had 954 of them. About 200,000 queued webhook messages expired and were dropped during the catch-up."
+  missing="Consensus decides who leads. It does not check that the data can move safely, or that the apps can live with the new leader's location. GitHub's fix was to stop the tool from promoting a primary in another region. In GitHub's words, the tool 'behaved as configured'."
+  source="https://github.blog/news-insights/company-news/oct21-post-incident-analysis/"
+  sourceLabel="GitHub, October 21 post-incident analysis"
+>
+
+GitHub kept its metadata (issues, pull requests, logins) in MySQL clusters. Each cluster had one primary for writes and many read replicas. A tool called Orchestrator handled failover. Orchestrator uses Raft to agree on its decisions.
+
+1. At 22:52 UTC, maintenance on network equipment cut the link between GitHub's US East Coast network hub and its main East Coast data center. The link came back after 43 seconds.
+2. During the cut, the Orchestrator nodes on the West Coast and in a public cloud still had a majority. They did what they were configured to do. They failed the clusters over, so writes went to new primaries on the West Coast.
+3. When the link returned, the apps wrote to the West Coast primaries. But the old East Coast primaries held a few seconds of writes that had never been copied west. Each side now had writes the other lacked. GitHub could not safely fail back.
+4. The apps ran on the East Coast. Every write now crossed the country, and many apps could not cope with that delay.
+5. GitHub chose correct data over a fast recovery. It restored the East Coast clusters from backups, which took hours. It let them catch up, then failed back. It paused webhooks and GitHub Pages builds until then.
+
+</IncidentCard>
+
+Map it to this lesson. Raft did its job: the majority side picked a leader. The harm came from the parts consensus does not cover. The data path used asynchronous replication, so failover left the unsent writes behind, as in [lesson 4.6](/learn/04-data/replication/). And the new leader sat a cross-country round trip away, the cost in the "spread nodes across regions" row below.
 
 ## Numbers
 
@@ -226,3 +253,4 @@ Suppose a leader replicates an entry from an older term onto a majority. It look
 - [etcd FAQ](https://etcd.io/docs/v3.5/faq/) and [etcd tuning guide](https://etcd.io/docs/v3.5/tuning/), cluster size, quorum table, and timeouts.
 - [Fischer, Lynch, Paterson, "Impossibility of Distributed Consensus with One Faulty Process"](https://groups.csail.mit.edu/tds/papers/Lynch/jacm85.pdf)
 - [Google Spanner: replication](https://docs.cloud.google.com/spanner/docs/replication), Paxos groups in production.
+- [GitHub: October 21 post-incident analysis (2018)](https://github.blog/news-insights/company-news/oct21-post-incident-analysis/), the incident above, with a full timeline.

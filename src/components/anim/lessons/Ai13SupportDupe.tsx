@@ -3,25 +3,25 @@ import type { FlowEdge, FlowNode } from '../FlowDiagram';
 
 /** One duplicate webhook, two handlers: a naive one and one that dedupes by event id. */
 
-const nodes = (handler: string, sub: string): FlowNode[] => [
+const nodes = (handler: string, sub: string, withSeen: boolean): FlowNode[] => [
   { id: 'src', x: 100, y: 110, w: 130, label: 'Mail system', sub: 'sends events' },
   { id: 'h', x: 360, y: 110, w: 140, label: handler, sub },
-  { id: 'seen', x: 360, y: 250, w: 140, h: 80, label: 'Seen events', sub: 'unique event id', shape: 'db' },
-  { id: 'out', x: 625, y: 110, w: 130, label: 'Customer inbox', sub: 'auto-replies' },
+  ...(withSeen ? [{ id: 'seen', x: 360, y: 250, w: 140, h: 80, label: 'Seen events', sub: 'unique event id', shape: 'db' as const }] : []),
+  { id: 'out', x: 625, y: 110, w: 130, label: 'Inbox', sub: 'auto-replies' },
 ];
 
-const edges: FlowEdge[] = [
+const edges = (withSeen: boolean): FlowEdge[] => [
   { from: 'src', to: 'h', label: 'event', labelAt: [0, -18] },
   { from: 'h', to: 'out', label: 'reply', labelAt: [0, -18] },
-  { from: 'h', to: 'seen', label: 'insert', labelAt: [34, 0], dashed: true },
+  ...(withSeen ? [{ from: 'h', to: 'seen', label: 'insert', labelAt: [34, 0] as [number, number], dashed: true }] : []),
 ];
 
 const variants: CompareVariant[] = [
   {
     id: 'naive',
     label: 'Naive: run on every delivery',
-    nodes: nodes('Handler', 'slow, then 200'),
-    edges,
+    nodes: nodes('Handler', 'slow, then 200', false),
+    edges: edges(false),
     steps: [
       { notes: [{ x: 625, y: 172, text: 'replies: 0', anchor: 'middle', size: 18, tone: 'muted' }], caption: 'The mail system delivers event e-77 (a new support email). The handler reads it, runs the model, sends the reply, and only then returns 200.', packets: [{ from: 'src', to: 'h', label: 'e-77' }], active: ['h'] },
       { notes: [{ x: 625, y: 172, text: 'replies: 1', anchor: 'middle', size: 18, tone: 'ok' }], caption: 'The reply goes out. The model call was slow, so the 200 is still on its way.', packets: [{ from: 'h', to: 'out', label: 'reply' }], tones: { out: 'ok' } },
@@ -32,8 +32,8 @@ const variants: CompareVariant[] = [
   {
     id: 'dedupe',
     label: 'Better: insert id, then 200',
-    nodes: nodes('Handler', 'insert, queue, 200'),
-    edges,
+    nodes: nodes('Handler', 'insert, queue, 200', true),
+    edges: edges(true),
     steps: [
       { notes: [{ x: 625, y: 172, text: 'replies: 0', anchor: 'middle', size: 18, tone: 'muted' }], caption: 'Same event e-77. This handler first inserts the event id into a table with a unique key. It does nothing slow itself.', packets: [{ from: 'src', to: 'h', label: 'e-77' }], active: ['h'] },
       { notes: [{ x: 625, y: 172, text: 'replies: 0', anchor: 'middle', size: 18, tone: 'accent' }], caption: 'The insert succeeds, so e-77 is new. The handler puts the work on a queue and returns 200 at once. A worker does the slow part later.', packets: [{ from: 'h', to: 'seen', label: 'insert e-77' }], active: ['seen'] },

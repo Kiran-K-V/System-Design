@@ -5,6 +5,7 @@ requires: ['02-networking/ip-tcp-udp']
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
+import IncidentCard from '../../../components/lesson/IncidentCard.astro';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
 import DnsWalk from '../../../components/anim/lessons/DnsWalk.tsx';
 import DnsTtlSim from '../../../components/anim/lessons/DnsTtlSim.tsx';
@@ -20,6 +21,8 @@ This lesson covers the whole path from a name to a number. First, why one list o
 The system that does this job is the **Domain Name System**, or **DNS**. A **domain name** is the human-readable name, such as `example.com`. DNS is the internet's contacts app.
 
 One more point before we start. The mapping is not fixed. You move a service to a new data center (a building full of servers). A server dies. A company picks a closer machine for each user. So the list changes all day. A list that is huge and also alive needs a careful design.
+
+When that live list breaks, everything that uses the name breaks with it. In October 2025 one empty DNS record took DynamoDB offline in AWS's Northern Virginia region. [The story](#incident) comes after the section on TTL.
 
 ## The naive way: one big server
 
@@ -135,6 +138,30 @@ A name can have several A records. The resolver gives them out in rotating or sh
 
 But DNS is blind to load. It cannot see that one server is full. It cannot finish a half-done connection politely. And some resolvers and apps keep notes longer than your TTL asks. So DNS is good for choosing the front door: a region, or a load balancer. Something faster does the fine-grained spreading behind that door. That is lesson 2.4.
 </Callout>
+
+## A real outage: AWS DynamoDB, 2025
+
+<IncidentCard
+  org="Amazon Web Services, us-east-1 (Northern Virginia)"
+  date="19–20 October 2025"
+  title="Automation published an empty DNS record, and DynamoDB disappeared from the map."
+  cost="DynamoDB returned errors from 11:48 PM to 2:40 AM PDT. The knock-on effects lasted much longer. New EC2 virtual machines could not launch until 10:36 AM, and the whole event ended at 2:20 PM PDT, more than 14 hours after it began."
+  missing="Everything that connects by name depends on DNS, so the system that writes DNS records is just as critical. Our reading: never publish an empty answer for a live name, and check 'is my plan still the newest?' at the moment of the write, not minutes before. And the TTL decides how fast a fix reaches the clients."
+  source="https://aws.amazon.com/message/101925/"
+  sourceLabel="AWS, Summary of the Amazon DynamoDB Service Disruption"
+>
+
+DynamoDB is AWS's managed key-value database. Clients find it by name, `dynamodb.us-east-1.amazonaws.com`. Automation keeps that name's records up to date. A **Planner** writes plans: which load balancers to list, and with what weights. Three independent **Enactors** apply the plans to Route 53, AWS's DNS service.
+
+1. One Enactor was unusually slow. Before it started, it had checked that its plan was newer than the live one. By the time it wrote the plan, that check was stale.
+2. Meanwhile a second Enactor applied a much newer plan. Then the slow Enactor overwrote it with its old plan.
+3. The second Enactor then ran a clean-up that deletes very old plans. It deleted the old plan, which was now the live one. All IP addresses for the name were removed. AWS calls the cause a **race condition**: a bug that shows only when two processes act in an unlucky order.
+4. Every client that looked up the name got no address. That meant customers, and AWS's own services that depend on DynamoDB. The automation could not repair this state. Engineers had to fix it by hand.
+5. The DNS records were restored at 2:25 AM PDT. Clients recovered between 2:25 and 2:40 AM, "as cached DNS records expired".
+
+</IncidentCard>
+
+Map it to this lesson. The name was fine and the servers were fine. Only the list between them broke, and that was enough. Step 5 is the TTL dial from the section above: even after the fix, each client waited for its cached note to expire.
 
 ## Numbers
 
@@ -254,6 +281,8 @@ No lesson text covers these cases directly. Use what you learned.
 />
 
 ## Further reading
+
+- [AWS: Summary of the Amazon DynamoDB Service Disruption in the Northern Virginia (US-EAST-1) Region (2025)](https://aws.amazon.com/message/101925/), the incident above.
 
 The official specs. You do not need them for this course, but they are the final word on the details above.
 

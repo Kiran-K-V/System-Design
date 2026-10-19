@@ -80,7 +80,7 @@ export default function Ai13GatewayQuotaSim() {
           ))}
         </ul>
         <div className="grid gap-2 sm:grid-cols-3">
-          {res.surgeTotals.map((t, i) => (
+          {res.surgeTotals.map((t) => (
             <div key={t.id} className="rounded-lg border border-line bg-surface p-2.5">
               <div className="text-xs text-muted">Team {t.id}: turned away in the surge</div>
               <div className="text-lg font-semibold tabular-nums" style={{ color: t.rejectedShare > 0.005 ? (t.id === 'B' ? 'var(--warn)' : 'var(--bad)') : 'var(--ok)' }} data-testid={`a13q-rej-${t.id}`}>

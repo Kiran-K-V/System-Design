@@ -15,10 +15,10 @@ const nodes = (): FlowNode[] => [
 
 const edges: FlowEdge[] = [
   { from: 'pr', to: 'run' },
-  { from: 'run', to: 'judge', label: 'answers', labelAt: [0, -18] },
-  { from: 'judge', to: 'board', label: 'verdicts', labelAt: [0, -18] },
+  { from: 'run', to: 'judge' },
+  { from: 'judge', to: 'board' },
   { from: 'board', to: 'gate' },
-  { from: 'base', to: 'gate', label: 'compare', labelAt: [0, -18] },
+  { from: 'base', to: 'gate' },
   { from: 'gate', to: 'merge' },
 ];
 

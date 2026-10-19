@@ -58,7 +58,7 @@ export default function Ai13SupportHandoff() {
         </div>
         <div className="flex h-24 items-end gap-1" role="img" aria-label="Expected cost per ticket at each handoff threshold from 0.0 to 1.0">
           {rows.map((x, i) => (
-            <div key={i} className="flex flex-1 flex-col items-center justify-end" title={`Threshold ${(i / 10).toFixed(1)}: ${usd(x.cost)}`}>
+            <div key={i} className="flex h-full flex-1 flex-col items-center justify-end" title={`Threshold ${(i / 10).toFixed(1)}: ${usd(x.cost)}`}>
               <div
                 className="w-full rounded-t"
                 style={{

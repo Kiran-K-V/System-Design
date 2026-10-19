@@ -4,7 +4,7 @@ import DesignBuild, { type BuildEdge, type BuildNode, type BuildStep } from '../
 
 const nodes: BuildNode[] = [
   { id: 'cust', x: 90, y: 70, w: 120, label: 'Customer', step: 0 },
-  { id: 'gw', x: 250, y: 70, w: 130, label: 'Inbound gateway', sub: 'dedupe by id', step: 0 },
+  { id: 'gw', x: 250, y: 70, w: 130, label: 'Gateway', sub: 'dedupe by id', step: 0 },
   { id: 'router', x: 410, y: 70, w: 130, label: 'Intent router', sub: 'small model', step: 1 },
   { id: 'rag', x: 590, y: 70, w: 130, label: 'Policy answer', sub: 'RAG, cited', step: 1 },
   { id: 'kb', x: 590, y: 200, w: 130, h: 80, label: 'Policy index', sub: 'approved docs', shape: 'db', step: 1 },

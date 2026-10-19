@@ -1,0 +1,413 @@
+---
+summary: 'In a chat assistant the KV cache is the conversation, and GPU memory, not compute, is the limit. A cache miss re-reads the whole history, so routing, history edits, and launch spikes are all cache decisions. Size 10,000 chats, price a miss, and plan what to shed.'
+requires: ['ai/a2-inference-cost/kv-cache', 'ai/a3-llm-apis/streaming', '11-breakdowns/chatgpt']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai13ChatBuild from '../../../../components/anim/lessons/Ai13ChatBuild.tsx';
+import Ai13ChatRouting from '../../../../components/anim/lessons/Ai13ChatRouting.tsx';
+import Ai13ChatPrefix from '../../../../components/anim/lessons/Ai13ChatPrefix.tsx';
+
+## The problem
+
+A user has a 30-turn conversation with an assistant. Turn 31 is one short question. The model keeps no memory, so it must read all 30 earlier turns again. If the GPU still holds the work it did for them, the answer starts in about a tenth of a second. If not, the GPU repeats that work and the user waits ten times longer. The first case is a **cache hit**. The second is a **cache miss**.
+
+Evan Morikawa, who led applied engineering at OpenAI, said it plainly: "In practice, GPU RAM, not compute resource, is the most frequent bottleneck for LLM operations." An idle chat "may get evicted from the system (the GPU cache)", and then "we need to recompute a whole ChatGPT conversation again" ([Pragmatic Engineer](https://newsletter.pragmaticengineer.com/p/scaling-chatgpt), February 2024). This lesson has one axis: **in a chat, the KV cache is the conversation state, and it lives in scarce GPU memory.**
+
+<CrossTrackLink id="11-breakdowns/chatgpt">
+The backend lesson builds the chat app. Tokens stream over server-sent events. A queue and continuous batching keep GPUs busy. Token budgets keep users fair, and a run id lets a dropped stream resume. We do not repeat that. This lesson covers only serving, evals, and cost: what the GPU must remember between turns, and what to do when memory or GPUs run out.
+</CrossTrackLink>
+
+## Requirements and the quality bar
+
+**Functional.** Streaming chat with history: send a message, get tokens back, continue any old chat. **Out of scope:** tools and browsing, images and voice (lessons A12.1 and A12.2), sharing, and search over old chats.
+
+**Non-functional.** These numbers are our choices. No source we read publishes a latency or cost target for ChatGPT.
+
+- **TTFT** (time to first token, measured at the client with queue wait included): P95 under 1 second for chats up to 8,000 tokens. **P95** means 95 of 100 turns are faster.
+- **TPOT** (time per output token, lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)): P95 under 50 ms, which is 20 tokens per second per user.
+- **Quality:** pass bars on a golden set, and an unsafe-output rate under a bar you set.
+- **Capacity:** if load exceeds the GPUs, degrade in a planned order.
+
+The **bar** is the share of turns that meet both latency targets, at least 90%. We call that rate **goodput** [mid]. It is not raw tokens per second, and the drill shows how they split.
+
+## Eval plan
+
+Lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/) says to write the eval before the design. **Offline:** a golden set of chats with checked answers (lesson [A8.3](/learn/ai/a8-evals/golden-sets/)), run on every model, quantization, or prompt change, plus an attack set (lesson [A10.6](/learn/ai/a10-safety/jailbreaks-redteam/)). Add a **long-chat set**: chats of 8,000 to 32,000 tokens, each with a question that needs a fact from turn 3. It tests the history strategy in deep dive 2, because summaries lose detail.
+
+**Online:** thumbs, regenerate rate, and abandon rate, the share of users who close the stream before the first token. That is how slow TTFT shows up as lost users. Compare changes with an A/B test (lesson [A8.7](/learn/ai/a8-evals/online-evals-ab/)).
+
+**The slice that matters is chat length.** Report TTFT, hit rate, and quality for under 2K, 2K to 8K, and over 8K tokens. The average hides the problem, because miss cost grows faster than length. The Diagnose below is built on that.
+
+## Budgets
+
+### Time to first token: what a hit and a miss cost
+
+Lesson A2.2 gave the prefill work for p prompt tokens:
+
+<Math block tex="\text{FLOPs} \approx 2 N p + 4 p^2 d L" />
+
+N is 70 billion parameters, d is 8,192, L is 80 layers. One replica is 8 H100 cards sharing the model (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). Its peak is 8 x 989 TFLOPS = 7.9e15 FLOP/s, with 8 x 3.35 TB/s of memory bandwidth.
+
+**A miss on a 4,000-token chat.** Weights term: 2 x 70e9 x 4,000 = 5.6e14. Attention term: 4 x 4,000² x 8,192 x 80 = 4.2e13. Total 6.0e14, which takes 6.0e14 / 7.9e15 = **76 ms** at peak. We assume real kernels reach 40% of peak (lesson A2.2 cites 38% to 43% for Llama 3 training; we found no published serving figure). That gives **190 ms**.
+
+**A hit.** Only the new 100-token message needs prefill: 1.5e13 FLOPs, 1.9 ms. But any pass reads all 140 GB of weights once, and 140 GB / 26.8 TB/s = **5.2 ms**. At 40% that is **13 ms**. A hit is memory-bound. A miss is compute-bound.
+
+| History | Miss prefill | Hit prefill | Miss / hit |
+|---|---|---|---|
+| 2,000 tokens | 92 ms | 13 ms | 7x |
+| 4,000 tokens | 190 ms | 13 ms | 15x |
+| 8,000 tokens | 407 ms | 13 ms | 31x |
+| 16,000 tokens | 920 ms | 13 ms | 70x |
+| 32,000 tokens | 2,264 ms | 13 ms | 173x |
+
+Doubling the history more than doubles the miss time, because of the squared term: 16,000 to 32,000 tokens grows 2.5 times. A hit stays flat. The first-token budget follows. Only the prefill row is derived; the others are illustrative.
+
+| Stage | Hit | Miss, 4K | Miss, 32K |
+|---|---|---|---|
+| Network, API, prompt build, queue | 70 ms | 70 ms | 70 ms |
+| Prefill | 13 ms | 190 ms | 2,264 ms |
+| Output filter, first chunk | 50 ms | 50 ms | 50 ms |
+| **TTFT** | **133 ms** | **310 ms** | **2,384 ms** |
+
+A hit and a 4K miss meet the 1-second bar. A 32K miss is 2.4 times over it. A long prefill also stalls the decode steps of other chats on the replica, unless the engine cuts it into chunks (the drill).
+
+### Money: price per conversation
+
+Prices as of 2026-10-19:
+
+| Item | Price | Source |
+|---|---|---|
+| Claude Sonnet 5.5, input | $2 per 1M tokens | [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) |
+| Sonnet 5.5, 5-minute cache write | $2.50 per 1M | same page |
+| Sonnet 5.5, cache read | $0.10 per 1M | same page |
+| Sonnet 5.5, output | $10 per 1M | same page |
+| H100 SXM 80 GB, 8-GPU instance | $3.99 per GPU-hour, before tax | [Lambda pricing](https://lambda.ai/pricing) |
+
+Anthropic's default cache lifetime is 5 minutes, and each use refreshes it ([docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)). A 4,000-token history costs 4,000 x $0.10 / 1e6 = **$0.0004** to read from the cache and 4,000 x $2 / 1e6 = **$0.008** uncached, 20 times more.
+
+**Worked example: one 20-turn chat.** Illustrative: each turn adds 100 user tokens and 200 answer tokens, and every turn arrives inside 5 minutes of the last. Turn n sends (n - 1) x 300 + 100 tokens. Over 20 turns that is 59,000 input tokens and 4,000 output tokens.
+
+- No cache: 59,000 x $2 / 1e6 = $0.118, plus output 4,000 x $10 / 1e6 = $0.040. Total **$0.158**.
+- Cache: each turn reads what the last request held and writes the rest. Reads: 53,200 x $0.10 / 1e6 = $0.0053. Writes: 5,800 x $2.50 / 1e6 = $0.0145. Output $0.040. Total **$0.0598**.
+
+Caching saves 62%, and output is now two thirds of the bill. This ignores the 512-token cache minimum, which touches only the first two turns. A chat paused past 5 minutes pays the write price again for its whole history. On a self-hosted fleet, a 4K miss costs 8 cards x 0.190 s = 1.52 GPU-seconds, or 1.52 x $3.99 / 3,600 = **$0.0017**.
+
+## Core entities and API
+
+Entities: **Chat** (id, owner, tier), **Message** (chat, role, text, token count, append-only), **Summary** (chat, turn range, text, version), **Run** (one generation and the engine it ran on). The API is the backend lesson's, plus one rule: every turn carries the **chat id**, so the router can see which chat it is.
+
+## A naive design and where it breaks
+
+The naive design is the backend design with a plain load balancer: any engine takes any turn, round-robin, and each engine keeps every chat's cache until memory runs out. It fails twice.
+
+**It misses most turns.** With R engines, a turn lands where its cache lives with chance about 1 in R. At 4 engines, 3 of 4 turns miss. At 30 engines, 29 of 30. This is a first-order estimate; real fleets pile up copies.
+
+**It runs out of memory before it runs out of compute.** **Worked example: 10,000 concurrent 4,000-token chats on Llama 3.1 70B.** Facts: 80 layers, 8 KV heads, head width 128, BF16 (2 bytes), weights 140 GB, cards of 80 GB. vLLM keeps 92% of each card by default (`gpu_memory_utilization`, [engine args](https://docs.vllm.ai/en/latest/configuration/engine_args.html)). Formula: lesson [A2.3](/learn/ai/a2-inference-cost/kv-cache/).
+
+1. Bytes per token: 2 (K and V) x 80 x 8 x 128 x 2 = **327,680**.
+2. One 4,000-token chat: 4,000 x 327,680 = 1,310,720,000 bytes = **1.31072 GB**.
+3. 10,000 chats: 10,000 x 1.31072 = **13,107.2 GB**.
+4. With perfect pooling and free weights: 13,107.2 / 80 = 163.84, so **164 cards** for KV alone. This is a floor, not a plan.
+5. One real replica is 8 cards. Usable: 8 x 80 x 0.92 = 588.8 GB. Minus weights: 588.8 - 140 = **448.8 GB** for KV.
+6. Chats per replica: 448.8 / 1.31072 = 342.4, so **342**.
+7. Replicas: 10,000 / 342 = 29.2, so **30**. Cards: 30 x 8 = **240**.
+8. Cost: 240 x $3.99 = **$957.60 per hour**, or $699,048 per 730-hour month.
+
+Assumptions: every chat is resident, no prefix is shared, paging wastes almost nothing, the 8% reserve covers all non-weight, non-KV memory, and nothing is quantized (lesson [A2.6](/learn/ai/a2-inference-cost/quantization-small-models/) covers that lever).
+
+The gap between 164 and 240 is the weights: 30 replicas hold 30 copies of 140 GB. Smaller replicas copy them more often.
+
+| Cards per replica | KV room | Chats per replica | Replicas | Cards |
+|---|---|---|---|---|
+| 2 | 7.2 GB | 5 | 2,000 | 4,000 |
+| 4 | 154.4 GB | 117 | 86 | 344 |
+| 8 | 448.8 GB | 342 | 30 | 240 |
+
+Two cards leave 7.2 GB, which is 5 chats. The weights eat the card. This is why we size from KV first, not from compute.
+
+## High-level design
+
+Step through the design. Each step names the requirement it serves.
+
+<Ai13ChatBuild client:visible />
+
+The router is the new idea. A stateless balancer may pick any server. This one must pick the server that holds the chat's cache without overloading it.
+
+## Deep dive 1: session affinity and the cost of a miss
+
+**Session affinity** [mid] means the router sends every turn of one chat to the same engine. Picture a hospital that sends a patient back to the doctor who already has the file open. Only that engine holds the chat's KV, and a 4K miss is about 15 times the prefill of a hit.
+
+Affinity has a price. A few chats, such as one automated client, send far more turns than the rest. If their hash lands on one engine, that engine runs hot while the others idle. Round-robin has the opposite problem: perfect spread, wasted cache.
+
+A third router scores each engine for each turn. Our sketch: cost = (prefill time this engine needs, given what it has cached) + (how long the turn would wait in its queue), and the lowest cost wins. NVIDIA's Dynamo router documents a cost of this kind, "cost = prefill_load_scale * adjusted_prefill_blocks + decode_blocks", and says it "selects the worker with the lowest cost" ([Dynamo](https://docs.nvidia.com/dynamo/v1.3.0/design-docs/component-design/router-design)). The llm-d project describes a "prefix + load scorer" ([llm-d](https://llm-d.ai/blog/intelligent-inference-scheduling-with-llm-d)). The vLLM production stack lists round-robin and session-ID routing, with prefix-aware routing still marked work in progress ([README](https://github.com/vllm-project/production-stack)).
+
+Try it. The three routers see the same turns. The model is ours and all inputs are illustrative.
+
+<Ai13ChatRouting client:visible />
+
+Read three presets.
+
+- **Even traffic.** Round-robin reuses 37% of prompt tokens, with P95 TTFT of 1.42 s. Affinity reuses 95%, with P95 of 0.16 s, nine times better. Round-robin's busiest replica is 79% busy against 26%, because it recomputes work that affinity skips.
+- **Hot chats.** Set the hot share to 80%. Under affinity, 84% of turns hit one replica. It is 82% busy and its P95 wait is 1.41 s. Round-robin now wins on P95 (0.48 s), because a few hot chats fit in every pool. The cost-based router gets 0.30 s.
+- **Small cache.** Set 60 chats per replica, 16 turns per second, 40% hot. Round-robin's P95 is 3.6 s and affinity's is 3.1 s. Cost-based gets 0.7 s: it moves turns when a queue builds and otherwise keeps a chat in place. It needs a live view of each engine's cache and queue.
+
+Why does round-robin win on skew? Copies of a few hot chats fit everywhere. Why does it lose on even load? 400 chats times 4 copies need 1,600 slots, and the fleet has 600, so the copies evict each other. **A router that ignores the cache spends the fleet's memory on copies.**
+
+How do real systems fare? SGLang's docs claim "3x higher output throughput and 2x faster TTFT than round-robin load balancing (Llama 3.1 70B)" ([docs](https://docs.sglang.io/docs/advanced_features/llm-d)), a company claim with no stated GPUs or workload. The llm-d blog shows the failure of pure affinity: in a high-sharing workload a "prefix-only" scorer saw TTFT "exceeding 140s" at high request rates, while prefix plus load stayed near zero, again with no setup given. Use both as direction, not as numbers to reuse. Even a provider cache is only a rate: OpenAI says its cache keys "do not pin requests to a machine or guarantee a cache hit" ([guide](https://developers.openai.com/api/docs/guides/prompt-caching)).
+
+**Character.AI** reports "around 20,000 queries per second", "less than one cent per hour of conversation", and a cost cut of "at least 33X" since 2022 (company claims, [blog](https://blog.character.ai/optimizing-ai-inference-at-character-ai/)). The post names "inter-turn caching" but gives no mechanism, hit rate, or routing detail. Our reading: at that scale a chat's turns must reach the engine that holds its cache. How they do it is not published.
+
+## Deep dive 2: history, memory, and what to store
+
+The engine reuses a cached prefix only if the new prompt starts with exactly the same tokens (lesson [A4.5](/learn/ai/a4-context/cache-friendly-layout/)). So every history strategy is a cache strategy. Pick one and step through. Sizes are illustrative: a 500-token system prompt, 300-token turns, a 100-token new message.
+
+<Ai13ChatPrefix client:visible />
+
+- **Append only** reuses 97% of the prompt: about 13 ms of prefill.
+- **Editing an early turn** reuses only the text before the edit. Everything after it is recomputed, though it did not change. Editing turn 2 of 8 reuses 26%.
+- **Sliding the window every turn** shortens the prompt and kills the cache. The block after the system prompt differs each turn, so the match stops there. OpenAI's guide warns that compaction "can prevent reuse from the first changed token onward".
+- **Sliding in chunks** drops 4 turns at once, so only one turn in 4 misses.
+- **A summary** costs one miss and one extra model call, then joins the stable front.
+
+**When to summarize.** Anthropic's server-side compaction triggers at 150,000 input tokens by default, and "must be at least 50,000" ([docs](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold)). Those are defaults for long agent runs. A 4K chat never reaches them. For a chat service, trigger on memory. A 32,000-token chat takes 32,000 x 327,680 = 10.5 GB of KV, so a replica holds 448.8 / 10.486 = 42 of them, not 342. One long chat costs as much pool as eight short ones, and its miss costs 2.3 seconds. Set a length trigger, such as 16,000 tokens, and measure the quality loss on the long-chat set. Lesson [A4.4](/learn/ai/a4-context/compaction/) covers the quality side.
+
+**What compaction costs.** Take a 16,000-token chat and a 1,000-token summary on Sonnet 5.5. With the history cached, the call costs 16,000 x $0.10 / 1e6 + 1,000 x $10 / 1e6 = $0.0116. The next turn writes the new front: about 2,000 x $2.50 / 1e6 = $0.005. Each later turn reads 15,000 fewer tokens and saves 15,000 x $0.10 / 1e6 = $0.0015. Payback: (0.0116 + 0.005) / 0.0015 = 11 turns. So when turns hit the cache, compaction is a **memory and latency** win first and a dollar win slowly. When turns miss, payback is 1.4 turns ($0.042 for the call, $0.03 saved per turn).
+
+**What to store.** Keep three things apart:
+
+- The **transcript**: every message, append-only. It is the only way to rebuild a summary when the summarizer changes.
+- The **summaries**, each with its turn range and a version. The prompt is a view of transcript plus summaries.
+- **Memory** facts about the user (lesson [A6.7](/learn/ai/a6-agents/agent-memory/)). Place them after the system prompt and change them only at a chunk boundary or a new chat, since a mid-chat update changes every token after it, like an early edit. We found no primary source on how ChatGPT implements memory, so we say nothing about it.
+
+**Idle chats.** The engine evicts by memory pressure, least recently used first. Providers evict by time: Anthropic defaults to 5 minutes, and OpenAI's lifetime is at least 30 minutes on GPT-5.6 and later. A user who returns later gets a miss. Store the transcript and accept it. Keeping all 10,000 chats resident costs $957.60 an hour.
+
+## Deep dive 3: capacity under a launch spike
+
+Morikawa again: "There are simply no more GPUs to buy or rent, and therefore no GPUs to autoscale into." The backend track says to scale out under load. Here you cannot, so you walk down a written ladder, in a fixed order, before trouble starts.
+
+A real case. On 2026-02-10, from 8:03 to 9:48 AM PST, paid ChatGPT plans saw "elevated conversation error rates" for about 105 minutes. The write-up says "demand exceeded available capacity, resulting in conversation failures", links it to capacity not recovered after a "prior engine reallocation", and lists the fix as "enabled load shedding" and "provisioned additional serving engines" ([write-up](https://status.openai.com/incidents/01KH472QRYMZASAAXB8CE74QBY/write-up)). Our reading: moving GPUs between fleets has a recovery time.
+
+**Load shedding** [mid] means refusing or delaying some work on purpose, so the rest still meets its SLO. Our order, from least harm to most:
+
+| Rung | Action | What users feel | Trigger (illustrative) |
+|---|---|---|---|
+| 1 | Stop work nobody waits for: batch evals, background summaries | Nothing | KV pool above 85% |
+| 2 | Shorten free-tier answers (1,024 to 400 tokens) | Shorter answers | Pool above 90% |
+| 3 | Cap free-tier history, cut in chunks | Old context forgotten | Pool above 90% |
+| 4 | Free tier to a smaller model | Lower quality | Queue wait above 2 s |
+| 5 | Queue new chats with an honest wait | A wait | Queue wait above 5 s |
+| 6 | Spill to another region | Cold cache on arrival | A region loses GPUs |
+
+Trigger on KV pool use and queue wait, not GPU utilization. Morikawa: "The combination of batch size and KV cache utilization was the primary metric we focused on." Lesson A2.2 explains why the utilization percentage misleads for decode.
+
+**Rung 4 in numbers.** An 8B model (32 layers, 8 KV heads) takes 2 x 32 x 8 x 128 x 2 = 131,072 bytes per token, so a 4,000-token chat is 0.524 GB. One card has 73.6 GB usable and 16 GB of weights, so it holds (73.6 - 16) / 0.524 = 109 chats. The 70B replica holds 342 chats on 8 cards, 43 per card. The small model serves about 2.5 times more chats per card. Check its quality on the golden set first.
+
+**Rung 5: the honest wait.** Little's law (lesson [1.3](/learn/backend/01-one-machine/throughput-vs-latency/)): wait = queue length / completion rate. If 600 turns wait and the fleet finishes 12 per second, the wait is 600 / 12 = 50 seconds. Say "about a minute" and offer a retry. **Protect running chats first.** Their KV is already in memory, and finishing them frees memory sooner. Refusing a turn of an old chat forces a recompute later. Refuse new chats before old ones.
+
+**Rung 6: failover is not free.** Arriving chats have cold caches. In our simulator a hit turn takes 73 ms of replica time (13 ms prefill plus 60 ms decode share) and a 4K miss takes 250 ms. The destination needs about 3.4 times the GPU time for the same turns until it warms. Spill only into a region with that headroom.
+
+## Failure modes and an incident drill
+
+| Failure | What happens | Detect | Do |
+|---|---|---|---|
+| Miss storm after a deploy | A restart wipes an engine's KV. Its chats all miss, at about 3.4 times the GPU time per turn (our model). Happens at every deploy | Hit rate drops, prefill tokens per second jump | Roll one engine at a time, drain first, limit new chats during the roll |
+| Region loses GPUs | Traffic moves with cold caches, so the survivor gets load and a miss storm | Capacity alert, hit rate in the receiving region | Walk the ladder first, spill only with headroom |
+| Hot replica from affinity | One engine holds the busy chats and its queue grows | P95 wait per replica far above the median | Cost-based routing or bounded spill |
+| KV pool full | Engines preempt or evict running chats. Long chats suffer most | KV use above 90%, preemption count | Cap context, admit by KV room, compact |
+| Idle chat expires | The user returns after the cache lifetime, and the turn misses | Cached-token share by idle time | Accept it, or buy the 1-hour lifetime for chats that resume |
+
+<Diagnose
+  client:visible
+  id="ai13-chat-long-ttft"
+  title="TTFT doubles for long chats only"
+  scenario="A chat service on 70B replicas. Two days ago it launched a long-history mode that raised the history limit from 8K to 32K tokens. Since then P95 TTFT doubled, but only for long chats. Short chats look the same. GPU utilization looks fine."
+  facts={[
+    'P95 TTFT, history under 2K:  0.31s -> 0.33s',
+    'P95 TTFT, history 2K to 8K:  0.45s -> 0.62s',
+    'P95 TTFT, history over 8K:   1.1s -> 2.4s',
+    'Prompt tokens from cache, chats over 8K: 88% -> 41%',
+    'KV pool use per engine: 71% -> 99%, evictions per minute: 4x',
+    'Decode TPOT P95: 44 ms -> 47 ms (bar is 50 ms)',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The decode batch is too big, so every token is slow for all chats',
+        'Long chats fill the KV pool, so engines evict and then recompute them',
+        'The network got slower for large prompts between the API and the engines',
+        'The new mode made the model slower at generating each token',
+      ],
+      answer: 1,
+      explain: 'The hit rate fell only for long chats, and KV use hit 99% with 4x the evictions. A long chat costs the most to rebuild: a 32K miss is about 2.3 s of prefill. TPOT barely moved, so decode is not the cause, and a slow network would hurt short chats too.',
+    },
+    {
+      prompt: 'What should you do first?',
+      options: [
+        'Add GPUs to every region until utilization falls',
+        'Raise the decode batch size to get more throughput',
+        'Cap and compact long chats, and admit chats by KV room',
+        'Turn the prompt cache off so long chats stop being evicted',
+      ],
+      answer: 2,
+      explain: 'The pool is full and there may be no GPUs to add. Capping and compacting cut the KV per chat, and admission by KV room stops overfilling. A bigger batch needs more KV. Turning the cache off makes every turn a miss.',
+    },
+  ]}
+/>
+
+## Drill: Open-model inference platform
+
+**The task.** Serve an open model such as Llama 3.1 70B to many apps. Chat is the hardest tenant because it is stateful. We reuse the numbers above and add a goodput plan.
+
+**The bar.** Per tenant, at least 90% of turns meet the TTFT and TPOT targets. DistServe uses 90% as its example SLO attainment goal. Also **quality parity after quantization**: if you serve an FP8 or 4-bit copy, run the golden set per slice (lesson A2.6) and ship only if no slice drops past a margin you set before the run.
+
+**The design.**
+
+- **Router and engines.** The cost-based router from deep dive 1, over a pool of vLLM or SGLang engines. SGLang's paper describes a radix tree that maps token sequences to their KV tensors: the prefix cache that makes affinity pay.
+- **Prefill and decode pools.** Prefill is compute-bound and decode is memory-bound (lesson A2.2), so sharing GPUs makes them interfere. DistServe puts them on different GPUs, "hence eliminating prefill-decoding interferences", and reports "up to 7.4x more requests or 12.6x tighter SLO" at over 90% SLO attainment ([DistServe](https://arxiv.org/abs/2401.09670)). Sarathi-Serve instead splits each prefill into near-equal chunks added to the batch "without pausing ongoing decodes", for 2.6x the serving capacity of vLLM on Mistral-7B on one A100 ([Sarathi-Serve](https://arxiv.org/abs/2403.02310)). Both are research results on their own models. Splitting pools moves KV: a 4,000-token chat is 1.31 GB, or 26 ms on a 50 GB/s link (our assumed link).
+- **Autoscaling and cold start.** Scale on queue depth and KV use, and keep a **warm pool**, since new GPUs may not exist. Loading 140 GB of weights at an assumed 2 GB/s takes 70 seconds, so keep weights on local disk. Engine internals are in elective E3, which this lesson does not require.
+- **Quotas and metrics.** A token bucket per tenant. TTFT, TPOT, goodput, hit rate, and KV use per tenant.
+
+**The failure: goodput falls while throughput rises.** A team raises the batch size for more tokens per second. Throughput goes up and customers complain. Every stream in a batch shares one decode step, which reads the weights once and every chat's KV once: (140 GB + b x 1.31 GB) / (8 x 3.35 TB/s x 0.4), for 4,000-token chats. The TPOT target is 50 ms.
+
+| Batch b | Step time | Tokens per second | Meets 50 ms? | Goodput |
+|---|---|---|---|---|
+| 100 | 25 ms | 3,955 | yes | 3,955 |
+| 200 | 38 ms | 5,331 | yes | 5,331 |
+| 302 | 50 ms | 6,042 | yes | 6,042 |
+| 342 (memory limit) | 55 ms | 6,232 | no | 0 |
+
+From 302 to 342, throughput rises 3% and goodput falls to zero in this model. Real streams spread around the mean, so the drop is a slope. The sign is the point. **Choose the batch size from goodput, not tokens per second**, and alert on SLO attainment (lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/)).
+
+**Prove it.** Size a fleet at 20,000 queries per second, the rate Character.AI claims. We do not know what it counts as a query or which model it runs. Our assumptions: a query is one chat turn with a 4,000-token history and 150 output tokens, the replica is the 8-card 70B replica, kernels reach 40% of peak, the fleet runs at 70% busy, and decode and prefill share GPU time.
+
+<Ballpark
+  client:visible
+  title="GPUs and monthly cost at 20,000 QPS"
+  scenario="One replica is 8 H100 cards with 70B BF16 weights and 342 resident chats of 4,000 tokens. Decode step = (140 GB + 342 x 1.31072 GB) / (8 x 3.35 TB/s x 0.4) = 54.9 ms. A turn makes 150 output tokens. A hit prefills in 13 ms, a miss in 190 ms. Target busy share 70%. $3.99 per GPU-hour, 730 hours per month."
+  facts={['20,000 turns per second, 4,000-token history', 'Hit rate 90%, then 50%']}
+  steps={[
+    { prompt: 'How many replicas are busy decoding? One answer is 150 tokens x the step time, 54.9 ms. Streams in flight = 20,000 x that. Divide by 342 per replica.', unit: 'replicas', answer: 481, within: 1.15, explain: 'One answer takes 150 x 0.0549 = 8.24 s. 20,000 x 8.24 = 164,600 streams in flight (Little\'s law). 164,600 / 342 = 481 replicas.' },
+    { prompt: 'At a 90% hit rate, how many replicas of prefill work are there? Use 20,000 x (0.9 x 13 ms + 0.1 x 190 ms).', unit: 'replicas', answer: 615, within: 1.15, explain: '0.9 x 0.013 + 0.1 x 0.190 = 0.0307 s per turn. 20,000 x 0.0307 = 615 replica-seconds per second.' },
+    { prompt: 'Add decode and prefill, divide by the 70% target, and convert to GPUs. How many GPUs?', unit: 'GPUs', answer: 12536, within: 1.15, explain: '(481 + 615) / 0.7 = 1,567 replicas, or 12,536 GPUs. Monthly: 12,536 x $3.99 x 730 = $36.5 million.' },
+    { prompt: 'A router change drops the hit rate to 50%. How many GPUs now?', unit: 'GPUs', answer: 28736, within: 1.15, explain: 'Prefill per turn is 0.5 x 13 + 0.5 x 190 = 101.5 ms, so 2,030 replica-seconds. (481 + 2,030) / 0.7 = 3,592 replicas, or 28,736 GPUs and about $83.7 million a month. The hit rate is the biggest lever.' },
+  ]}
+/>
+
+Sanity check (our reading, not a claim about Character.AI): $36.5 million a month is $0.0007 per turn. "Under one cent per hour of conversation" fits only if an hour holds under about 14 turns, or their model is far smaller than 70B.
+
+## Staff answer vs senior answer
+
+| Question | Senior answer | Staff answer |
+|---|---|---|
+| Bottleneck? | "GPUs are scarce, so batch and queue" | KV memory: 13 TB for 10,000 chats, 342 chats per replica, 240 GPUs, $957.60 an hour |
+| Routing? | "Sticky sessions" | Cost-based: cache overlap against queue. Knows what affinity does under skew |
+| Long chats | "Truncate" | Chunked cuts, a length trigger set from KV and miss cost, versioned summaries |
+| Launch spike | "Autoscale" | Nothing to scale into: a written shed ladder, running chats protected, an honest wait |
+| Metric | Throughput | Goodput and hit rate per chat-length slice |
+
+## What experienced teams know
+
+1. **Memory comes first.** Morikawa's primary metric was "the combination of batch size and KV cache utilization" ([Pragmatic Engineer](https://newsletter.pragmaticengineer.com/p/scaling-chatgpt)). Size by KV before FLOPs.
+2. **Capacity moves have a recovery time.** The 2026-02-10 write-up ties an outage to a "prior engine reallocation". Our reading: treat any move of GPUs between fleets as a risk window.
+3. **A cache key is a hint.** OpenAI's keys "do not pin requests to a machine or guarantee a cache hit". Log cached tokens per request and alert on the share.
+4. **Goodput is the honest metric.** DistServe's gain is 7.4x more requests under the SLO, not 7.4x throughput.
+5. **Paging made the memory usable.** The vLLM paper found older systems used only 20.4% to 38.2% of KV memory for real tokens, and reports 2 to 4 times the throughput of FasterTransformer and Orca at the same latency ([paper](https://arxiv.org/abs/2309.06180)). Every number here assumes that waste is gone.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Round-robin | Even load | Misses most turns | Stateless traffic |
+| Session affinity | Hits | Hot replicas under skew | Even chats |
+| Cost-based routing | Hits and balance | A live view of cache and queue | Many engines |
+| Chunked window | Bounded prompt, one miss in N | Old context lost | Free tier |
+| Summary | Short prompt that still hits | A model call, lost detail | Long chats worth keeping |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "In a chat, the KV cache is the conversation state and GPU memory is the limit. 10,000 chats of 4,000 tokens on a 70B model is 13 TB of KV and about 240 GPUs. A miss re-reads the whole history, about 15 times a hit. So I route by chat with a cost-based router and cut history in chunks. For a spike I cannot autoscale, so I keep a shed ladder, and I measure goodput, not throughput." 
+</Callout>
+
+<Callout type="mistake">
+Do not say "add GPUs" first, because there may be none. Do not use round-robin for a stateful chat without saying what it does to the cache. Do not slide a window one turn at a time. Do not alert on GPU utilization, and do not quote a throughput gain without the latency target it was measured against.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="KV memory for 10,000 chats"
+  scenario="Llama 3.1 70B in BF16: 80 layers, 8 KV heads, head width 128. Weights are 140 GB. Cards have 80 GB and the engine uses 92% of each. A replica is 8 cards. 10,000 chats are open at once, each with 4,000 tokens, and nothing is shared."
+  facts={['KV bytes per token = 2 x layers x KV heads x head width x 2 bytes', '$3.99 per GPU-hour (Lambda, as of 2026-10-19)']}
+  steps={[
+    { prompt: 'How many GB of KV do all 10,000 chats need?', unit: 'GB', answer: 13107, within: 1.1, explain: '2 x 80 x 8 x 128 x 2 = 327,680 bytes per token. Times 4,000 is 1.31072 GB per chat. Times 10,000 is 13,107.2 GB.' },
+    { prompt: 'How many chats fit in the KV room of one 8-card replica?', unit: 'chats', answer: 342, within: 1.1, explain: '8 x 80 x 0.92 = 588.8 GB usable. Minus 140 GB of weights leaves 448.8 GB. 448.8 / 1.31072 = 342.4, so 342.' },
+    { prompt: 'What does the fleet cost per hour, in dollars?', unit: 'USD per hour', answer: 957.6, within: 1.1, explain: '10,000 / 342 = 29.2, so 30 replicas. 30 x 8 = 240 GPUs. 240 x $3.99 = $957.60 per hour.' },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A turn on a 70B replica with a 4,000-token chat misses the cache instead of hitting it. What changes most?',
+      options: [
+        'The model must read its weights twice, not once',
+        'Prefill must cover the whole history, not the new text',
+        'Decode becomes much slower for the user who sent it',
+        'The new message goes through the model in a second pass',
+      ],
+      answer: 1,
+      explain: 'A hit prefills only the new tokens. A miss prefills all 4,000, about 190 ms against 13 ms in our model. Weights are read once per pass either way.',
+    },
+    {
+      q: 'You shrink a 70B replica from 8 cards to 2 to save money. What happens to the KV room of one replica?',
+      options: [
+        'It falls to about a quarter, since there are a quarter of the cards',
+        'It rises, since each card holds a larger share of the weights',
+        'It stays the same, since KV lives in system memory',
+        'It nearly vanishes, since the weights fill most of the 2 cards',
+      ],
+      answer: 3,
+      explain: 'Two cards give 147.2 GB. The weights take 140 GB and leave 7.2 GB, room for 5 chats. Weights are a fixed cost per replica, so KV room does not scale with card count.',
+    },
+    {
+      q: 'A chat keeps its last 8 turns, and the app drops the oldest turn on every request. What happens to that chat\'s cache hit rate?',
+      options: [
+        'It collapses, since the text after the system prompt shifts',
+        'It stays high, since the newest turns are still in the prompt',
+        'It rises, since the prompt gets shorter and cheaper to match',
+        'It depends only on how long the chat sits idle between turns',
+      ],
+      answer: 0,
+      explain: 'A prefix cache matches from the first token. Dropping the oldest turn changes the text right after the system prompt, so the match stops there. Dropping 4 turns at once gives one miss in 4.',
+    },
+    {
+      q: 'In a launch spike with no spare GPUs, which action should come before refusing turns from chats that are already running?',
+      options: [
+        'Evict the longest running chats to free memory',
+        'Move all traffic to a second region with a cold cache',
+        'Delay new chats with a stated wait',
+        'Raise the batch size until throughput rises',
+      ],
+      answer: 2,
+      explain: 'Running chats already hold KV, and finishing them frees memory. Refusing them forces a recompute later. A cold region needs about 3.4 times the GPU time per turn.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Scaling ChatGPT, Pragmatic Engineer](https://newsletter.pragmaticengineer.com/p/scaling-chatgpt): the Morikawa interview. GPU RAM, cache eviction, and no GPUs to autoscale into.
+- [OpenAI status write-up, 2026-02-10](https://status.openai.com/incidents/01KH472QRYMZASAAXB8CE74QBY/write-up): a capacity shortfall, load shedding, and more engines.
+- [Optimizing AI inference at Character.AI](https://blog.character.ai/optimizing-ai-inference-at-character-ai/): 20,000 queries per second, and inter-turn caching named but not described.
+- [Intelligent inference scheduling with llm-d](https://llm-d.ai/blog/intelligent-inference-scheduling-with-llm-d): prefix-only against prefix plus load scoring.
+- [DistServe](https://arxiv.org/abs/2401.09670): goodput and separate prefill and decode GPUs. You do not need the paper to use the idea.

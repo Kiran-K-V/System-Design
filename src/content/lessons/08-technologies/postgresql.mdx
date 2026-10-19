@@ -5,6 +5,7 @@ requires: ['04-data/storage-engines', '04-data/indexing', '04-data/transactions'
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
+import IncidentCard from '../../../components/lesson/IncidentCard.astro';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
 import PgMvcc from '../../../components/anim/lessons/PgMvcc.tsx';
 import PgPooler from '../../../components/anim/lessons/PgPooler.tsx';
@@ -15,6 +16,8 @@ import ReplicationCommit from '../../../components/anim/lessons/ReplicationCommi
 PostgreSQL is an open-source relational database. You describe data as tables with typed columns, and you ask questions in SQL. It gives you transactions with ACID guarantees, joins, constraints, and many index types. A **transaction** is a group of changes that succeed or fail together. **ACID** is the name for the safety promises a transaction makes: all of it happens or none of it, the data stays valid, transactions do not trip over each other, and a committed change survives a crash. A **join** combines rows from two tables. A **constraint** is a rule the database enforces, such as "this column is never empty".
 
 In an interview, PostgreSQL is the safe default. If the data is relational and one primary machine can carry the writes, say "PostgreSQL" and move on. This lesson shows why it is a good default and where the default stops. Everything here builds on three earlier lessons: [how a database stores data](/learn/04-data/storage-engines), [indexing](/learn/04-data/indexing), and [transactions and isolation](/learn/04-data/transactions).
+
+One of PostgreSQL's limits is easy to miss until it stops you. In 2015 it stopped Sentry for most of a working day. [The story](#incident) is in the VACUUM section.
 
 ## The internal model
 
@@ -41,6 +44,27 @@ The cost of MVCC is **dead row versions**. A version becomes dead when no transa
 You rarely run VACUUM by hand. **Autovacuum** runs it in the background. Your job is to keep it able to finish. The usual blocker is a transaction that stays open for hours. The reason is that VACUUM cannot remove a version that an open snapshot may still read.
 
 Transaction IDs are a fixed-size counter, like a car odometer. When it runs out of numbers it wraps around, and old rows would look like they are from the future. That is **wraparound**, and it makes data invisible. VACUUM prevents it by marking old rows as safe. The docs say every table must be vacuumed "at least once every two billion transactions" to avoid wraparound. The setting `autovacuum_freeze_max_age` defaults to 200 million.
+
+<IncidentCard
+  org="Sentry"
+  date="20 July 2015"
+  title="The transaction counter ran low, and the database stopped taking writes."
+  cost="Sentry was down for most of the US working day. To recover, the team threw away its backlog of incoming events and emptied one large table. A later test vacuum of the same data, on older hardware in single-user mode, was still running after 24 hours."
+  missing="Wraparound protection is a hard stop, not a slowdown. Watch how close each table is to the limit, and alert long before it. Give autovacuum enough workers, memory, and speed for your write rate. Sentry's new settings included 6 autovacuum workers instead of the default 3, and no cost delay."
+  source="https://blog.sentry.io/transaction-id-wraparound-in-postgres/"
+  sourceLabel="Sentry, Transaction ID Wraparound in Postgres"
+>
+
+Sentry is an error-tracking service. It writes a lot, and it runs on PostgreSQL with some very large tables. The team knew about wraparound and had tuned autovacuum to avoid it.
+
+1. Autovacuum fell behind. The transaction ID counter got close to its limit. PostgreSQL did what it is built to do. It "will stop accepting commands when there are fewer than one million transactions left", in Sentry's words.
+2. The only way out without data loss is to stop writes and vacuum. The site ran read-only from replicas. Incoming events piled up in queues and Redis buffers, so the team flushed that backlog.
+3. The team let the running autovacuums finish, because a restart could make the outage longer. After nearly 3 hours, writes were still blocked.
+4. One huge table was still unfinished. It mapped events to their rollups and was not critical. The team truncated it (emptied it in one step). Five minutes later the system was fully restored.
+
+</IncidentCard>
+
+Note what PostgreSQL chose. It refused writes rather than let old rows look like the future. That hard stop is the safe failure. Your job is to never reach it.
 
 ### The write-ahead log
 
@@ -221,3 +245,4 @@ A counter row updated 1,000 times leaves 1,000 dead versions behind the live one
 - [PostgreSQL docs: System Columns (xmin, xmax)](https://www.postgresql.org/docs/current/ddl-system-columns.html)
 - [PostgreSQL docs: Limits](https://www.postgresql.org/docs/current/limits.html)
 - [PgBouncer: Features](https://www.pgbouncer.org/features.html)
+- [Sentry: Transaction ID Wraparound in Postgres (2015)](https://blog.sentry.io/transaction-id-wraparound-in-postgres/), the incident above.
