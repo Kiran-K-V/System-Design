@@ -102,9 +102,7 @@ export default function Ai13ChatRouting() {
             <div className="mb-1 text-xs text-muted">{NAMES[p]}: share of turns per replica</div>
             <div className="flex h-14 items-end gap-1" role="img" aria-label={`${NAMES[p]} turn share per replica: ${rs[p].share.map((s) => pct(s)).join(', ')}`}>
               {rs[p].share.map((s, i) => (
-                <div key={i} className="flex flex-1 flex-col items-center justify-end">
-                  <div className="w-full rounded-t" style={{ height: `${Math.max(4, s * 100)}%`, background: s > 0.4 ? 'var(--warn)' : 'var(--muted)', opacity: 0.8 }} />
-                </div>
+                <div key={i} className="flex-1 rounded-t" style={{ height: `${Math.max(3, Math.round(s * 56))}px`, background: s > 0.4 ? 'var(--warn)' : 'var(--muted)', opacity: 0.8 }} />
               ))}
             </div>
             <div className="flex gap-1 text-[11px] tabular-nums text-muted">

@@ -65,13 +65,13 @@ export default function Ai13RagPqWalk() {
             )}
             {st === 2 && (
               <>
-                <HandText x={24} y={30} anchor="start" size={TEXT_SIZES.heading} color="var(--muted)">One stored vector</HandText>
+                <HandText x={24} y={28} anchor="start" size={TEXT_SIZES.heading} color="var(--muted)">One stored vector</HandText>
                 {Array.from({ length: 8 }, (_, i) => (
-                  <SketchBox key={i} cx={80 + i * 80} cy={95} w={72} h={44} r={6} seed={seedOf(`pq-p${i}`)} stroke="var(--muted)" />
+                  <SketchBox key={i} cx={80 + i * 80} cy={105} w={72} h={44} r={6} seed={seedOf(`pq-p${i}`)} stroke="var(--muted)" />
                 ))}
-                <HandText x={360} y={95} size={TEXT_SIZES.label} color="var(--muted)">pieces of 8 numbers each (8 of 64 drawn)</HandText>
+                <HandText x={24} y={58} anchor="start" size={TEXT_SIZES.label} color="var(--muted)">64 pieces of 8 numbers each (8 drawn)</HandText>
                 {Array.from({ length: 8 }, (_, i) => (
-                  <SketchArrow key={i} points={[[80 + i * 80, 120], [80 + i * 80, 170]]} seed={seedOf(`pq-d${i}`)} stroke="var(--accent)" />
+                  <SketchArrow key={i} points={[[80 + i * 80, 132], [80 + i * 80, 170]]} seed={seedOf(`pq-d${i}`)} stroke="var(--accent)" />
                 ))}
                 {['17', '203', '4', '88', '251', '9', '130', '66'].map((v, i) => (
                   <g key={i}>
@@ -88,13 +88,13 @@ export default function Ai13RagPqWalk() {
                 <HandText x={24} y={30} anchor="start" size={TEXT_SIZES.heading} color="var(--muted)">Distance table for this query</HandText>
                 {Array.from({ length: 5 }, (_, r) =>
                   Array.from({ length: 8 }, (_, c) => (
-                    <SketchBox key={`${r}-${c}`} cx={110 + c * 56} cy={80 + r * 44} w={50} h={36} r={6} seed={seedOf(`pq-t${r}-${c}`)} stroke={c === 7 ? 'var(--muted)' : 'var(--accent)'} />
+                    <SketchBox key={`${r}-${c}`} cx={60 + c * 56} cy={80 + r * 44} w={50} h={36} r={6} seed={seedOf(`pq-t${r}-${c}`)} stroke={c === 7 ? 'var(--muted)' : 'var(--accent)'} />
                   )),
                 )}
-                <HandText x={560} y={120} size={TEXT_SIZES.label} color="var(--muted)">columns: 256 centroids</HandText>
-                <HandText x={560} y={150} size={TEXT_SIZES.label} color="var(--muted)">rows: 64 pieces</HandText>
-                <HandText x={560} y={200} size={TEXT_SIZES.label} mono color="var(--accent)">64 x 256</HandText>
-                <HandText x={560} y={228} size={TEXT_SIZES.label} mono color="var(--accent)">= 16,384</HandText>
+                <HandText x={500} y={120} anchor="start" size={TEXT_SIZES.label} color="var(--muted)">columns: 256 centroids</HandText>
+                <HandText x={500} y={150} anchor="start" size={TEXT_SIZES.label} color="var(--muted)">rows: 64 pieces</HandText>
+                <HandText x={500} y={200} anchor="start" size={TEXT_SIZES.label} mono color="var(--accent)">64 x 256</HandText>
+                <HandText x={500} y={228} anchor="start" size={TEXT_SIZES.label} mono color="var(--accent)">= 16,384</HandText>
                 <HandText x={360} y={300} size={TEXT_SIZES.note} color="var(--muted)">Built once per query. Each cell: distance from the query piece to that centroid.</HandText>
               </>
             )}
