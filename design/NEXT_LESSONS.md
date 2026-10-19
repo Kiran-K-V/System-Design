@@ -45,6 +45,7 @@ Imports use relative paths: `../../../components/lesson/Callout.astro`, `../../.
 4. **Numbers.** Latency, throughput, sizes. Link lesson 1.5.
 5. **Trade-offs.** A table: gain, pay, when to choose.
 6. **Interview lens.** `<Callout type="tip">` and `<Callout type="mistake">`. Optional `<Callout type="deep" title="...">`. These are the only three callout types.
+6b. **Real incident (optional, pilot).** `IncidentCard.astro` tells one public outage that this lesson's idea would have prevented. Props: `org`, `date`, `title`, `cost`, `missing`, `source`, `sourceLabel`; the body is a short numbered story. Add a one-line hook in "The problem" that links to `#incident`, and add the postmortem to Further reading. Use only a primary postmortem, check every quote against the raw page, and mark your own conclusions "Our reading". Pilot lessons: replication, invalidation-stampede, timeouts-retries.
 7. **Check yourself.** `Quiz` (3 to 5 questions). Add one `Diagnose` (a short incident puzzle) or one `Ballpark` (estimation practice) where it fits.
 8. **Further reading.** 2 to 4 links you fetched yourself and confirmed load.
 

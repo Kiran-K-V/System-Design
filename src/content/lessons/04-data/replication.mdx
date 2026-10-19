@@ -5,6 +5,7 @@ requires: ['04-data/storage-engines', '01-one-machine/latency-numbers']
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
+import IncidentCard from '../../../components/lesson/IncidentCard.astro';
 import DualWriteRace from '../../../components/anim/lessons/DualWriteRace.tsx';
 import ReplicationCommit from '../../../components/anim/lessons/ReplicationCommit.tsx';
 import ReplicaLagSim from '../../../components/anim/lessons/ReplicaLagSim.tsx';
@@ -24,6 +25,8 @@ The answer to all three is the same: **keep copies of the data on other machines
 Replication does three jobs. It keeps the system **alive** when a machine dies. It adds **read capacity**, because any replica can answer a read. And it can put data **near users**. A replica (say, in Frankfurt) answers European reads with a few ms of network time, not ~100 ms (lesson 1.2).
 
 It does **not** add write capacity. Every replica must apply every write. Seven replicas of a database that tops out at 15K writes per second still top out at 15K. Splitting writes is sharding, the next lesson.
+
+It does not replace a backup either. A follower copies a mistake as fast as it copies a good write. In 2017 GitLab lost hours of data that way. [The story](#incident) comes after the trade-offs.
 
 Here is how much copies help availability. Say one node is up 99.9% of the time. That is ~8.8 hours of downtime a year (0.001 × 8,760 h). With two nodes that fail **independently** and a **perfect, instant** failover, both are down together. That happens 0.001 × 0.001 = 0.0001% of the time. That is about 30 seconds a year. Neither assumption holds in real life. Failover takes time and failures are often correlated. But the direction is right: copies make downtime rarer by orders of magnitude.
 
@@ -144,6 +147,32 @@ Single-leader is the default. Two other layouts exist.
 | Multi-leader | Local writes in every region | Conflict resolution | Multi-region apps that tolerate merges |
 | Leaderless quorum | No failover step. High availability. | Conflicts, tuning `R` and `W` | Always-on key-value stores |
 
+## A real outage: GitLab, 2017
+
+Every idea in this lesson met in one night at GitLab. The company published a full postmortem: the public report a team writes after an outage, with what broke and why.
+
+<IncidentCard
+  org="GitLab.com"
+  date="31 January 2017"
+  title="A follower fell behind. The fix for it erased the leader."
+  cost="GitLab.com was down for about 18 hours. Database changes made between 17:20 and 00:00 UTC were lost for good. GitLab's estimate: about 5,000 projects, 5,000 comments, and 700 new user accounts. Git repositories were not affected."
+  missing="A follower is not a backup. It copies deletes as faithfully as writes. Keep the leader's log long enough for a slow follower, or archive it somewhere else. Then test a full restore on a schedule. GitLab's own finding: the restore was never tested because nobody owned it."
+  source="https://about.gitlab.com/blog/2017/02/10/postmortem-of-database-outage-of-january-31/"
+  sourceLabel="GitLab, Postmortem of database outage of January 31"
+>
+
+GitLab.com ran one PostgreSQL leader, `db1`, and one follower, `db2`. The follower existed only for failover.
+
+1. **Lag.** A spam attack raised the write load. At about 23:00 UTC the follower started to lag behind.
+2. **The follower breaks.** It needed log segments that the leader had already deleted. GitLab did not archive the log anywhere else. So the follower had to be rebuilt from zero. A rebuild starts by deleting the follower's data directory.
+3. **The wrong machine.** After several failed tries at the rebuild, an engineer ran the delete on `db1`, the leader. They stopped it after a second or two. About 300 GB was already gone.
+4. **The backups.** The follower could not help. It was empty, half way through its rebuild. The nightly export with `pg_dump` (PostgreSQL's export tool) had been failing without anyone knowing. It was version 9.2, and the database was 9.6. The failure emails were rejected by the mail server, so nobody saw them. Cloud disk snapshots were on for other servers, but not for the databases.
+5. **Luck.** An engineer had taken a manual disk snapshot about 6 hours earlier, for unrelated work. That copy saved most of the data. Copying it back over slow disks took about 18 hours.
+
+</IncidentCard>
+
+Map it to this lesson. Step 1 is replica lag under a write spike. Step 2 is the opposite of the slot problem in the deep dive below: here the leader kept too **little** log, not too much. Step 4 shows why a replica is not a backup.
+
 ## In practice
 
 <Callout type="tip">
@@ -215,4 +244,5 @@ A leader must keep log segments until every follower has them. PostgreSQL's repl
 - [PostgreSQL docs: log-shipping standby servers](https://www.postgresql.org/docs/current/warm-standby.html), streaming, sync, slots, promotion.
 - [MySQL docs: semisynchronous replication](https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html)
 - [Amazon Aurora replication](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Replication.html)
+- [GitLab: Postmortem of database outage of January 31 (2017)](https://about.gitlab.com/blog/2017/02/10/postmortem-of-database-outage-of-january-31/), the incident above, with a full timeline and a "5 whys" section.
 - [DeCandia et al., "Dynamo: Amazon's Highly Available Key-value Store"](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf), leaderless replication, quorums, hinted handoff.

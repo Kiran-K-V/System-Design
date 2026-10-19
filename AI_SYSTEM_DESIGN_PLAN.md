@@ -6,7 +6,7 @@ Date of research: 2026-10-14. Decisions applied: 2026-10-15 and 2026-10-16 (see 
 
 ## Summary: lessons per module
 
-Core path: **119 lessons** (A0 to A14). Electives: **28 lessons** (E1 to E3, optional). Total: **147**.
+Core path: **114 lessons** (A0 to A14). Electives: **28 lessons** (E1 to E3, optional). Total: **142**.
 
 | Part | Module | Title | Lessons |
 |---|---|---|---|
@@ -23,14 +23,14 @@ Core path: **119 lessons** (A0 to A14). Electives: **28 lessons** (E1 to E3, opt
 | Quality and trust | A10 | Safety and Security | 7 |
 | Customization and media | A11 | Fine-tuning and Post-training | 5 |
 | Customization and media | A12 | Multimodal and Voice | 5 |
-| Practice | A13 | Case Studies (12 deep cases with drills) | 12 |
-| Practice | A14 | In the Wild | 8 |
+| Practice | A13 | Case Studies (9 deep cases with drills) | 9 |
+| Practice | A14 | In the Wild | 6 |
 | Electives (optional) | E1 | Classic ML Systems | 13 |
 | Electives (optional) | E2 | Training at Scale | 7 |
 | Electives (optional) | E3 | Inference Systems Deep Dive | 8 |
-| | | **Core total** | **119** |
+| | | **Core total** | **114** |
 | | | **Electives total** | **28** |
-| | | **All lessons** | **147** |
+| | | **All lessons** | **142** |
 
 **ML share.** Count "ML infrastructure" as classic ML, training at scale, and deep inference serving, plus the cases and teardowns built on them.
 - Before (2026-10-15): 35 of 128 lessons (27%), all on the required path. They were A3 (9), A4 (10), A5 (11), A13.1 to A13.3 (3), A14.1 and A14.6 (2).
@@ -93,17 +93,15 @@ The 10 gaps come from section (b) of `1-platforms.md`.
 |---|---|---|---|
 | 1 | Eval-driven design | Eval plan is step 2 of the A0 method. Every case ends with an eval section. A8 teaches the full method, including agent trajectory evals and simulated users | A0.2, A8.1 to A8.9, all A13 |
 | 2 | Cost as a design constraint | Dollar-per-request model in A2 and A3.9. Cost levers in A2.5, A4, and A9.2. Every case has a cost table | A2.4, A2.7, A3.9, A9.2, all A13 |
-| 3 | Agent system design | Loop, graphs, tools, MCP, memory, durable runtime, loop control, approvals, sandboxes, identity, multi-agent, agent UX | A6.1 to A6.11, A7.1 to A7.10, A13.5 to A13.12 |
+| 3 | Agent system design | Loop, graphs, tools, MCP, memory, durable runtime, loop control, approvals, sandboxes, identity, multi-agent, agent UX | A6.1 to A6.11, A7.1 to A7.10, A13.4 to A13.9 |
 | 4 | LLM serving at scale | Intuition for builders in A2. Mechanisms in elective E3. A platform drill in A13.2 | A2.1 to A2.7, E3.1 to E3.8, A13.2 |
 | 5 | Rollout of AI features | A/B, shadow, canary, rollback, version pinning | A8.7, A8.8, A9.3, A9.6, E1.8 |
 | 6 | Feedback pipelines | Logs to evals to training data, with a build lesson | A8.9, A11.5, A13.1 (eval-platform drill) |
 | 7 | Retrieval beyond a demo | Freshness, ACLs, chunking at scale, filtered search, RAG eval | A5.1 to A5.10, A13.3 |
-| 8 | Generative media pipelines | Image, speech, video with latency budgets, cost, evals | A12.1 to A12.5, A13.11 (text-to-image drill) |
+| 8 | Generative media pipelines | Image, speech, video with latency budgets, cost, evals | A12.1 to A12.5, A13.8 |
 | 9 | Threat model for LLM apps | Indirect injection through tools, lethal trifecta, exfiltration, least privilege | A10.1 to A10.7, A7.4, A7.8 |
 | 10 | UX for probabilistic output | Progress, interrupt, undo, uncertainty display, correction flows | A7.10, A8.7, A8.9 |
-| 11 | Integration layer (added 2026-10-16) | LLM APIs, structured output, tool protocol, retries, gateways, metering, SaaS auth | A3.1 to A3.10, A7.8, A13.6, A13.12 |
-
-
+| 11 | Integration layer (added 2026-10-16) | LLM APIs, structured output, tool protocol, retries, gateways, metering, SaaS auth | A3.1 to A3.10, A7.8, A13.4 (workflow drill), A13.9 |
 
 ## 2. Teaching method
 
@@ -164,9 +162,9 @@ Any other overlap found by a writer follows the same rule. The writer adds a row
 
 ### Case study template (A13)
 
-Each of the 12 deep cases follows the A0.2 method as h2 sections: Requirements and quality bar, Eval plan, Budgets (latency and dollars, with live prices from `ai-prices.ts`), Core entities and API, High-level design, three staff-level Deep dives, Failure modes with an incident drill, and a "Staff answer vs senior answer" box. Drills from the first plan live inside the nearest new case, or in an elective. Where a drill sits, add a **Drill** h2 (10 to 15 min variant exercise with its own Prove it and sources). Then Trade-offs, Interview lens, Check yourself. Animation 1 uses `DesignBuild`. Animation 2 uses `DesignCompare` for one deep dive. The backend template in `NEXT_LESSONS.md` section 8 applies. If the case overlaps a Backend chapter, apply the overlap rule above.
+Each of the 9 deep cases follows the A0.2 method as h2 sections: Requirements and quality bar, Eval plan, Budgets (latency and dollars, with live prices from `ai-prices.ts`), Core entities and API, High-level design, three staff-level Deep dives, Failure modes with an incident drill, and a "Staff answer vs senior answer" box. Drills from the first plan live inside the nearest new case, or in an elective. Where a drill sits, add a **Drill** h2 (10 to 15 min variant exercise with its own Prove it and sources). Then Trade-offs, Interview lens, Check yourself. Animation 1 uses `DesignBuild`. Animation 2 uses `DesignCompare` for one deep dive. The backend template in `NEXT_LESSONS.md` section 8 applies. If the case overlaps a Backend chapter, apply the overlap rule above.
 
-The three classic ML cases (video recommendation, ad click prediction, fraud detection) are elective capstones in E1.10 to E1.12 and use the same template. Drill moves: search ranking and People You May Know stay in E1.10. ETA and dynamic pricing stay in E1.11. Bot and spam detection stay in E1.12. Content moderation moves to A13.6. Eval platform stays in A13.1. Open-model inference platform moves to A13.2. Visual and semantic search stays in A13.3. Code completion and Smart Compose move to A13.8. Answer engine stays in A13.9. Text-to-image moves to A13.11. Multi-tenant LoRA platform moves to A13.12.
+The three classic ML cases (video recommendation, ad click prediction, fraud detection) are elective capstones in E1.10 to E1.12 and use the same template. Drill moves: search ranking and People You May Know stay in E1.10. ETA and dynamic pricing stay in E1.11. Bot and spam detection stay in E1.12. Content moderation moves to A13.8 (with the text-to-image drill). Document extraction is a drill in A13.3. Browser and computer-use agent is a drill in A13.6. Code review bot is a drill in A13.6. Workflow automation is a drill in A13.4. Eval platform stays in A13.1. Open-model inference platform moves to A13.2. Visual and semantic search stays in A13.3. Code completion and Smart Compose move to A13.6. Answer engine stays in A13.7. Multi-tenant LoRA platform moves to A13.9.
 
 ---
 
@@ -978,7 +976,7 @@ _Twelve deep cases, agent- and integration-first. Order is easy to hard and by d
 - Src: [C1], [K2], [P5]
 
 **A13.3 enterprise-rag: Enterprise RAG over Company Docs with Permissions**
-- requires: A5.9, A5.10, A5.8
+- requires: A5.9, A5.10, A5.8, A3.3, A3.5, A3.7, A8.3
 - Requirements and quality bar: Answers with citations from company docs. Bar: zero permission leaks; retrieval recall and faithfulness above stated pass bars; freshness SLO.
 - Eval plan: Retrieval golden set; faithfulness and answer relevance [R15]; leak tests with canary documents; freshness probes.
 - Budgets: Latency by stage: embed, search, rerank, generate. Dollars per query with live embedding and model prices from `ai-prices.ts`; index cost and re-embed cost.
@@ -987,25 +985,12 @@ _Twelve deep cases, agent- and integration-first. Order is easy to hard and by d
 - Failure modes and incident drill: Stale ACL leak; deleted doc still answers; connector falls behind. Drill: a manager's doc leaks to an ex-member.
 - Staff vs senior: Senior builds a RAG pipeline. Staff owns the ACL consistency model, the freshness SLO, and the retrieval eval, and says what happens on partial failure.
 - Drill: Visual and semantic search. Embed images and text into one space. Index with ANN. Filters. Re-rank. Update path for new items. Eval: recall@k on labeled queries. Cost: index memory. Variants: street-view blurring, similar listings, entity linking, defect detection. Prove it: index size for 500M images at 512 dims in PQ. Src: [P4], [R2].
+- Drill: Document extraction pipeline (invoices, contracts, forms into typed records). Bar: field-level accuracy per field type, zero silent wrong values on money fields, human-review rate under a cap. Convert pages by text layer, OCR, or page images (A3.5). Extract with structured output (A3.3). Validate in code: sums, dates, cross-field rules. Abstain and route low confidence to review. Golden set sliced by layout, vendor, scan quality (A8.3). Batch for cost (A3.7). Decision: prompt or fine-tune (A11). Failure: an invented value for a missing field; accuracy drops for one vendor after a template change; injected text inside a document (A10.2). Prove it: cost and wall-clock for 2M pages per day at stated tokens per page and a live batch price. Src: [A1], [G11], [G14b], [A10]. Writer must source OCR and layout claims.
 - Animate: `DesignBuild`. Second: ACL-change leak window simulator. Drill visual: query-by-image neighbor demo.
 - Prove it: Diagnose. A manager's doc leaks to an ex-member.
 - Src: [R8], [R5], [R15], [C4], [P4], [R2]. Notion says its AI only surfaces what the user may access (marketing page only). No engineering post on Glean or Notion ACL sync is loaded; writer must source.
 
-**A13.4 document-extraction: Document Extraction Pipeline**
-- requires: A3.3, A3.5, A3.7, A8.3
-- Requirements and quality bar: Turn invoices, contracts, or forms into typed records. Bar: field-level accuracy per field type, zero silent wrong values on money fields, and a human-review rate under a stated cap.
-- Eval plan: Golden set of labeled documents, sliced by layout, vendor, scan quality, and language. Field-level exact match and normalized match. Calibration: does low confidence predict errors? Regression gate per prompt or model change (A8.1, A8.3).
-- Budgets: Latency per document is seconds to minutes; batch is fine (A3.7). Dollars per page: page tokens x live price from `ai-prices.ts`. Compare sync and batch. Page-count distribution drives the bill.
-- Core entities and API: Document, Page, Extraction (schema version, fields, confidences, source spans), ReviewTask. API: submit, status, result, review.
-- High-level design: Store the original. Classify the document type. Route to a versioned schema. Convert pages: text layer, OCR, or page images (A3.5). Extract with structured output (A3.3). Validate in code: sums, dates, checksums, cross-field rules. Low confidence or a failed check goes to human review. Export with source highlights. Shopify served fine-tuned open vision LLMs at 40M calls and about 16B tokens per day; median latency fell from 2 s to 500 ms; selective field prompting cut GPU use 40% [G11]. LinkedIn's output parser cut schema errors from about 10% to about 0.01% [G14b].
-- Deep dives: (1) Page conversion and layout: OCR vs native vision, tables, multi-page documents, long-document strategies (A4.6). (2) Validation and confidence: code checks first, cross-field rules, abstain and route to review, calibration. (3) Throughput and cost: batch APIs (A3.7), a queue per tenant, retries with idempotency (A3.6), selective field prompting [G11].
-- Failure modes and incident drill: The model invents a value for a missing field. A schema change breaks downstream systems. A document carries injected text (A10.2). Drill: field accuracy drops for one vendor after it changes its template.
-- Staff vs senior: Senior calls a model with a JSON schema. Staff validates in code, measures per-field accuracy by slice, sets the review threshold from the cost of each error, and versions schemas.
-- Animate: `DesignBuild`. Second: review-threshold slider vs error rate and review load.
-- Prove it: Ballpark. Cost and wall-clock for 2M pages per day at a stated tokens per page and a live batch price.
-- Src: [A1], [G11], [G14b], [A10]. UNVERIFIED in notes: OCR and layout model internals; no loaded primary source for a named document AI system. Writer must source.
-
-**A13.5 support-agent: Customer Support Agent**
+**A13.4 support-agent: Customer Support Agent**
 - requires: A7.1, A7.3, A13.3
 - Requirements and quality bar: Resolve tickets with RAG plus tools plus human handoff. Bar: resolution rate, escalation rate, and wrong-action rate at stated levels.
 - Eval plan: Task-level evals on real tickets; wrong-action audits; handoff quality; online resolution and CSAT.
@@ -1014,41 +999,28 @@ _Twelve deep cases, agent- and integration-first. Order is easy to hard and by d
 - Deep dives: (1) Tool permissions and confirmation for money-moving actions. (2) Injection through ticket text and the lethal trifecta (A10). (3) Handoff policy: when to escalate, and how to measure the cost of a wrong answer.
 - Failure modes and incident drill: Injected ticket triggers a refund; the agent loops on a failing tool. Drill: refunds rise 4x in a day.
 - Staff vs senior: Senior builds RAG plus tools. Staff defines the action budget, the human path, and the metric that counts wrong actions, not only resolutions.
+- Drill: Workflow automation agent (email and ticket triage across SaaS tools). Webhook and poll triggers with dedupe by item id (A3.6). Classify and route as a workflow, not a free agent (A6.2). Per-user OAuth with refresh mid-run (A7.8). Risk tiers: read, reversible write, irreversible write; approval on the last (A7.3). Shadow, then suggest, then auto (A8.8). Failure: a duplicate webhook sends an auto-reply twice. Prove it: cost per day for 50,000 items with a 90% cheap-model share, at live prices.
 - Animate: `DesignBuild`. Second: handoff-policy slider vs cost and risk.
 - Prove it: Ballpark. Cost per resolved ticket with a stated resolution rate.
 - Src: [G2], [G3], [G13], [A5], [S3]
 
-**A13.6 workflow-agent: Workflow Automation Agent (Email and Ticket Triage, SaaS Integrations)**
-- requires: A7.3, A7.8, A13.5
-- Requirements and quality bar: An agent triages email or tickets and acts across SaaS tools (CRM, helpdesk, calendar). Bar: correct routing rate, near-zero wrong writes, and a stated automation rate.
-- Eval plan: Labeled inbox sample per category. Action checks by state diff in a sandbox account. Roll out in three steps: shadow, suggest, then auto for low-risk actions (A8.8).
-- Budgets: Latency is minutes; the work runs in the background (A7.7). Dollars per item with a cascade: a small classifier first, a larger model on the uncertain band. Live prices from `ai-prices.ts`.
-- Core entities and API: Trigger (webhook or poll), Item, Run, Action (tool, arguments, risk tier), Approval, Connection (tenant and OAuth grant).
-- High-level design: Triggers from webhooks and polling; dedupe by item id (A3.6). Classify and route as a workflow, not a free agent (A6.2). Tool layer through MCP or direct SaaS APIs (A6.6). Per-user OAuth (A7.8). Risk tiers: read, reversible write, irreversible write; approval gates on the last (A7.3). Durable run state (A7.1). Audit log. Overlap: queues, rate limiting, and webhooks follow the backend lessons.
-- Deep dives: (1) Integration layer: SaaS rate limits, pagination, webhooks, retries, and idempotency per connector. (2) Action safety: risk tiers, approvals, undo, and injection through email text (A10.2, A10.3). (3) Automation rate vs error: thresholds per category from the cost of each error; shadow then canary.
-- Failure modes and incident drill: A duplicate webhook runs an action twice. A poisoned email triggers a forward. An OAuth token expires mid-run. Drill: auto-replies go to a customer thread twice after a retry.
-- Staff vs senior: Senior wires a model to a mailbox. Staff defines risk tiers, the approval policy, idempotency per connector, and the metric that counts wrong actions.
-- Drill: Content moderation with LLMs. Cascade: cheap classifier, then LLM, then human review. Class imbalance. Policy as a prompt; policy versioning. Eval: precision and recall per policy class; appeals. LLM only on the uncertain band (priced from `ai-prices.ts`). Failure: adversarial rewording. Discord Osprey (Dec 2025 scale): about 400M actions per day, 204 action types, 2,288 rules, about 500 rules per action; rules are written in a Python-based language and reach workers through etcd with no deploy; outputs go to Kafka and Druid for investigators, and investigation feedback becomes new rules [G8]. Llama Guard (Llama2-7B base) matches or exceeds other moderation tools on two public evals [G10]. OpenAI describes taxonomy-driven classifiers with active learning for rare events [G9]. No latency figures are loaded. Prove it: human reviews per day at a stated pass-through rate. Depends on A8.4, A3.6, A10.5. Src: [G8], [G9], [G10], [P3], [P4].
-- Animate: `DesignBuild`. Second: automation-rate slider vs wrong-action rate. Drill visual: cascade threshold vs review load and cost.
-- Prove it: Ballpark. Cost per day for 50,000 items with a 90% cheap-model share, at live prices.
-- Src: [A5], [A8], [S3], [G8], [G9], [G10], [P3], [P4]. UNVERIFIED in notes: no loaded primary source for a named triage or SaaS automation agent. Writer must source.
+**A13.5 text-to-sql: Text-to-SQL Analytics Agent**
+- requires: A5.6, A6.4, A10.4
+- Requirements and quality bar: Business users ask questions in plain English over a warehouse with thousands of tables. The agent writes SQL, runs it, and returns a table, a chart, and the SQL. Bar: execution accuracy on a golden set, a near-zero "plausible wrong number" rate, P95 latency in seconds, and a cap on warehouse cost per question. A refusal or a clarifying question is a correct answer when the question is ambiguous.
+- Eval plan: Golden set of (question, reference SQL, result) triples mined from real query logs per domain. Score by result-set match, not SQL string match (A8.3). An ambiguity set where the right output is a question back. Public benchmarks only as a reference point: BIRD top test execution accuracy 82.95 vs a human baseline of 92.96 (leaderboard, Sep 2026) [G20]; on Spider 2.0 enterprise schemas (often over 1,000 columns, queries often over 100 lines) GPT-4o scored 10.1% vs 86.6% on Spider 1.0 [G21]. Uber scores each golden question on intent accuracy, table overlap, runs, returns rows, and LLM similarity to the golden SQL, and warns that about 5% run-to-run change is noise [G19]. Online: share of answers the user accepts, edits, or reruns.
+- Budgets: Seconds, not milliseconds. Dollars per question = LLM tokens at live prices from `ai-prices.ts` plus warehouse compute. Staff point: warehouse scan cost can exceed model cost, so a dry run with a bytes-scanned cap runs before every query.
+- Core entities and API: Question, Domain (workspace), TableDoc (schema, column descriptions, sample values, sample queries), Metric (semantic-layer definition), CandidateSQL, Execution (bytes scanned, rows, error), Feedback.
+- High-level design: Route the question to a domain. Retrieve tables and columns from TableDocs and past queries (A5.5, A5.6). Prune columns to fit the context budget (A4). Few-shot from similar past queries. Prefer the semantic layer: generate against defined metrics ("revenue", "active user") before raw tables. Generate SQL as structured output (A3.3). Static checks: parse, read-only, allowlisted schemas, forced LIMIT. Dry run for cost. Execute under the user's own identity so row-level security applies (A7.8, A5.9). On an error, feed the error back and retry with a cap (generate-verify-fix, A6.4). Show the SQL and a plain-English explanation next to the result. Uber QueryGPT (Sep 2024): intent agent maps the question to curated workspaces (12 system workspaces), a table agent proposes tables the user confirms, a column prune agent cuts tokens, cost, and latency; about 1.2M interactive queries per month on the platform; authoring time about 10 min down to about 3 min; hallucination "not fully solved" [G19]. Snowflake: a verified-query repository skips reasoning for known questions (up to 3x faster), and the SQL model is trained with execution-based rewards [G23].
+- Deep dives: (1) Schema retrieval at 10,000 tables: metadata quality is the real bottleneck; column pruning; recall@k of the right tables as its own eval. (2) Correctness: semantic layer vs raw SQL; join-key mistakes that double a sum; ambiguity detection; when to refuse. (3) Safety and cost: user identity not a service account, read-only role, bytes-scanned guard, injection through column comments and data values (A10.2, A10.4).
+- Failure modes and incident drill: A query scans 40 TB. A wrong join doubles revenue and nobody notices. A renamed table breaks a domain. Drill: the agent's "weekly active users" disagrees with the official dashboard; find why.
+- Staff vs senior: Senior puts the schema and the question in a prompt. Staff builds on the semantic layer, scores by execution, runs as the user, caps scan cost, and treats a confident wrong number as the worst failure.
+- Drill: Data analysis agent over CSVs and spreadsheets. The agent writes Python in a sandbox (A7.4) instead of SQL. File upload (A3.5), code execution limits, chart output, and reproducibility. Prove it: sandbox cost per session at a stated CPU-seconds figure.
+- Animate: `DesignBuild`. Second: schema-retrieval k slider vs table recall vs prompt tokens.
+- Prove it: Ballpark. Tokens to paste a full schema of 2,000 tables x 30 columns x about 15 tokens per column (about 900,000 tokens), so retrieval is required.
+- Src: [G19], [G20], [G21], [G23]. Re-check leaderboard numbers before writing; they move.
 
-**A13.7 code-review-bot: Code Review Bot**
-- requires: A6.9, A7.4, A8.4
-- Requirements and quality bar: Review pull requests and comment inline. Bar: comment precision (share of comments developers act on), recall on seeded bugs, and comments per PR under a cap.
-- Eval plan: Seeded-bug set on real repos. Online acceptance rate of comments. False-positive rate by category. Judge validated on labeled comments (A8.4).
-- Budgets: Latency is minutes after a push. Dollars per PR by diff size: diff and context tokens x live price. Cache the repo context (A2.5).
-- Core entities and API: PullRequest, Hunk, Finding (file, line, severity, evidence), Comment, Feedback. A webhook starts a job; the bot posts a review through the host API.
-- High-level design: Webhook, then a queue (A7.7). Fetch the diff and context. Use agentic search first, an index if needed (A5.8). Run linters and tests as tool results. The model proposes findings with evidence. A verifier pass confirms each one (generate-verify-fix, A6.4). Dedupe against earlier comments, rank, cap, and post. Copilot shows how much context fits and why caching matters on the latency path [C3]. Codebase indexing is covered in [C4].
-- Deep dives: (1) Context: which files beyond the diff, the budget, and index freshness. (2) Precision: the verify pass, severity ranking, the comment cap, and learning from dismissed comments (A8.9). (3) Safety: repo content is untrusted, so a PR author can inject; use read-only permissions and keep secrets out of prompts (A10.2, A10.4).
-- Failure modes and incident drill: Noisy comments erode trust. Stale context flags deleted code. A PR description carries an injection. Drill: acceptance rate halves after a prompt change.
-- Staff vs senior: Senior sends the diff to a model. Staff measures precision on seeded bugs, caps comments, verifies each finding, and gates every prompt change.
-- Animate: `DesignBuild`. Second: comment-cap slider vs precision and recall.
-- Prove it: Ballpark. Cost per PR at a stated diff and context size, at live prices.
-- Src: [A11], [C3], [C4], [A6]. UNVERIFIED in notes: no loaded primary source for a named code review bot. Writer must source.
-
-**A13.8 coding-agent: AI Coding Agent**
-- requires: A7.4, A6.7, A9.6
+**A13.6 coding-agent: AI Coding Agent**
+- requires: A7.4, A6.7, A9.6, A7.5, A10.3
 - Requirements and quality bar: Complete repo tasks end to end. Bar: task pass rate on a repo suite with tests; no writes outside the repo; cost per task within a stated cap.
 - Eval plan: Pass rate on a held-out repo suite; trace review; regression gate per prompt or model change.
 - Budgets: Wall-clock per task. Dollars per task with live model prices and measured tokens.
@@ -1056,13 +1028,14 @@ _Twelve deep cases, agent- and integration-first. Order is easy to hard and by d
 - Deep dives: (1) Sandbox and permissions: file, network, and secret boundaries. (2) Context management: search strategy, compaction, subagents. (3) Verification loop: tests as the reward, and handling flaky tests and runaway loops.
 - Failure modes and incident drill: Edits outside the repo; infinite fix loop; leaked secret in a log. Drill: pass rate falls after a tool-output size change.
 - Staff vs senior: Senior describes the loop. Staff defines sandbox policy, the eval suite, per-task budgets, and the kill switch.
-- Drill: Smart Compose. Suggest the next words while typing. Latency under human typing speed. Small model, local or edge cache, speculative methods. Acceptance vs annoyance. Privacy. Prove it: QPS for 50M users at 10 suggestions per minute for 2 hours a day. Variants: search autocomplete, Translate-style system. Src: [P5], [C3].
-- Drill: Code completion (Copilot, Cursor Tab). Ghost text while typing. Bar: acceptance rate and retention up; latency under a typing-speed deadline. Design: Copilot builds the prompt from code and context; fill-in-the-middle added about 10% relative gain in accepted completions; neighbor tabs about 5%; about 6,000 characters fit; caching keeps context work off the latency path; a contextual filter runs before a model that generates n completions [C3]. Cursor apply reaches about 1000 tokens/s on a 70B fine-tune with deterministic speculation [C5]. Deep dives: context packing under a character budget; speculative decoding (elective E3.4, plain text); cancellation, debouncing, and caching. Incident: acceptance drops after a model upgrade. Prove it: latency budget from keystroke to ghost text. Src: [C3], [C5], [P5].
+- Drill: Code completion (Copilot, Cursor Tab). Ghost text while typing. Bar: acceptance rate and retention up; latency under a typing-speed deadline. Design: Copilot builds the prompt from code and context; fill-in-the-middle added about 10% relative gain in accepted completions; neighbor tabs about 5%; about 6,000 characters fit; caching keeps context work off the latency path; a contextual filter runs before a model that generates n completions [C3]. Cursor apply reaches about 1000 tokens/s on a 70B fine-tune with deterministic speculation [C5]. Deep dives: context packing under a character budget; speculative decoding (elective E3.4, plain text); cancellation, debouncing, and caching. Incident: acceptance drops after a model upgrade. Prove it: latency budget from keystroke to ghost text. Variant: Smart Compose and search autocomplete (QPS for 50M users at 10 suggestions per minute for 2 hours a day). Src: [C3], [C5], [P5].
+- Drill: Code review bot. A PR webhook starts a job (A7.7). Diff plus context by agentic search (A5.8). Linters and tests as tool results. The model proposes findings with evidence; a verifier pass confirms each one (A6.4). Dedupe, rank, cap comments per PR. Bar: comment precision and recall on seeded bugs (A8.4). Repo content is untrusted; read-only permissions (A10.2). Failure: acceptance rate halves after a prompt change. Prove it: cost per PR at a stated diff and context size.
+- Drill: Browser and computer-use agent. A task in a web UI with no API. Bar: task success on a suite, no unapproved purchase or submit, cost and time within a cap. Observe (screenshot plus page structure), decide, act, verify, in a sandbox per run (A7.4). Domain allow list; credentials from a scoped vault, never in the prompt; approval before irreversible clicks (A7.3). Eval: end-state checks, repeat each task k times (A8.5), a hostile-page injection suite (A10.2). Failure: a CAPTCHA, an infinite scroll, a hidden instruction, a page redesign that makes the agent buy the wrong item. Prove it: end-to-end success of 30 steps at 98% per step (about 55%). Src: [S2], [S3], [A8], [A6]. Writer must source computer-use docs.
 - Animate: `DesignBuild`. Second: agent loop with a failing test and a retry.
 - Prove it: Diagnose. The agent edits files outside the repo. Which control?
 - Src: [A11], [C4], [A6]
 
-**A13.9 deep-research: Deep Research Agent**
+**A13.7 deep-research: Deep Research Agent**
 - requires: A7.6, A7.1, A8.4
 - Requirements and quality bar: Long-form cited reports. Bar: claim-level citation precision; rubric score above a stated bar; cost per report within a cap.
 - Eval plan: Judge on a rubric plus human spot checks; citation check per claim; cost and latency tracking.
@@ -1072,26 +1045,13 @@ _Twelve deep cases, agent- and integration-first. Order is easy to hard and by d
 - Failure modes and incident drill: 50 subagents for a simple query [A6]; a poisoned page steers the report. Drill: cost per run triples in a week.
 - Staff vs senior: Senior draws lead plus subagents. Staff sets effort-scaling rules, a cost cap, resume semantics, and a citation gate.
 - Drill: Answer engine (Perplexity-style). Query rewrite, web search, fetch, chunk, rerank, cited answer. Latency budget across fetches. Citation check. Freshness. Source trust and injection from web pages (A10). Eval: citation precision and answer correctness by judge. Perplexity on Vespa (vendor case study): one engine does retrieval, ranking, filtering, real-time indexing, and model inference, which avoids network hops; hybrid keyword, semantic, and structured filters; vector databases could not reliably support even simple boolean filters; passage-level retrieval, then a light ranker, then neural rerank; 780M+ queries per month [G1]. No latency in ms is published. Prove it: budget for 6 parallel fetches with 1.2 s p95 each. Depends on A5.6, A2.5. Src: [G1], [R11], [S2].
+- Teardown inside this case (Anthropic multi-agent research system): Lead and 3 to 5 subagents; up to 90% less time; 4x and 15x chat tokens; 90.2% gain over single-agent on an internal eval; tool-testing agent cut task time 40%; checkpoints and rainbow deploys [A6].
 - Animate: `DesignBuild`. Second: effort-scaling rule table: query complexity vs subagents. Drill visual: latency Gantt of parallel fetches.
 - Prove it: Ballpark. Dollar cost of a run at 15x tokens of a stated chat.
 - Src: [A6], [A9], [G1], [R11], [S2]
 
-**A13.10 browser-agent: Browser and Computer-use Agent**
-- requires: A7.5, A7.3, A10.3
-- Requirements and quality bar: An agent finishes tasks in a web UI that has no API (book, fill forms, research). Bar: task success rate on a suite; no unapproved purchase or submit; cost and time within a cap.
-- Eval plan: Task suite on a sandbox site or a recorded web. Success by end-state check. Step counts. Injection suite of hostile pages (A10.2). Repeat each task k times (A8.5).
-- Budgets: Per step: screenshot tokens, model latency, and page load, so seconds per step. A 30-step task takes minutes. Dollars per task = steps x (screenshot + context tokens) x live price. Keep the prefix stable for caching (A2.5).
-- Core entities and API: Task, Session (browser profile), Step (observation and action), Approval, Artifact (screenshots, page snapshots).
-- High-level design: Task API, then a queue. An isolated browser sandbox per run (A7.4). The loop: observe (screenshot plus page structure), decide, act, verify. A domain allow list. Credentials from a scoped vault, never in the prompt. Approval gates before submit and pay (A7.3). A live view with user takeover. Trace and replay.
-- Deep dives: (1) Observation and action design: screenshot vs page structure, coordinates vs element ids, cost and reliability per step. (2) Injection and exfiltration: page text steers the agent; the lethal trifecta; domain allow list; no ambient logins (A10.3). (3) Reliability: p^n over long tasks, checkpoint and retry, stuck detection (A7.2), human takeover.
-- Failure modes and incident drill: A CAPTCHA or login wall. An infinite-scroll loop. A hidden instruction on a page. Drill: the agent buys the wrong item after a page redesign.
-- Staff vs senior: Senior wires a model to a headless browser. Staff budgets steps and dollars, isolates sessions, gates irreversible clicks, and measures success over repeat runs.
-- Animate: `DesignBuild`. Second: success rate vs number of steps.
-- Prove it: Ballpark. End-to-end success of 30 steps at 98% per step (about 55%).
-- Src: [S2], [S3], [A8], [A6]. UNVERIFIED in notes: computer-use provider docs and benchmarks; no loaded primary source for a named browser agent. Writer must source.
-
-**A13.11 voice-agent: Voice Agent**
-- requires: A12.2, A6.1, A3.10
+**A13.8 voice-agent: Voice Agent**
+- requires: A12.2, A6.1, A3.10, A12.3, A12.5, A3.7
 - Requirements and quality bar: Natural spoken conversation. Bar: P50 time to first audio under 800 ms and P95 under 1.5 s (vendor target [G6]); task success rate; low word error rate.
 - Eval plan: Task success; interruption handling; word error rate; latency percentiles from real calls.
 - Budgets: Use the ElevenLabs stage budget from A12.2 [G6]. Dollars per call minute from live STT, LLM, and TTS prices in `ai-prices.ts`, plus telephony.
@@ -1099,12 +1059,13 @@ _Twelve deep cases, agent- and integration-first. Order is easy to hard and by d
 - Deep dives: (1) Endpointing: the silence threshold is a main latency cost [G6]. (2) Barge-in and turn-taking state machine. (3) Tool calls with filler speech, and fallback when a stage fails.
 - Failure modes and incident drill: Echo triggers self-interrupt; a slow tool call creates dead air. Drill: P95 doubles on mobile networks.
 - Staff vs senior: Senior lists the stages. Staff budgets each stage, tunes endpointing, and plans the fallback path.
-- Drill: Text-to-image service. Async job queue, GPU pool, safety filters, storage and CDN delivery. Steps vs latency vs cost (A12.3). Prompt and output moderation. Eval: preference tests and safety rate. Failure: queue backlog. Prove it: GPUs for 20 images per second at a stated per-image time. UNVERIFIED: SDXL and Flux numbers. Src: [G7], [P5]. Text-to-video, headshots, and captioning are variants (A12.4).
+- Drill: Text-to-image service. Submit returns a job id; prompt moderation, then a priority queue per tier (A3.7, A7.7); GPU workers keep weights warm and batch jobs of the same resolution; output moderation before storage; signed CDN URLs. Bar: P50 and P95 time to image per tier, preference win rate (A12.5), unsafe-output rate, cost per image. Steps vs latency vs cost (A12.3); few-step distilled models for the fast tier. Anchors: FLUX.1-dev at 1024x1024 about 6.75 s per image at baseline bf16, GPU not named (Modal, Jun 2025) [G22]; Gemini 3.1 Flash Image $0.067 per 1K image, $0.034 batch, as of 2026-10-16 [G24]; put the price in `ai-prices.ts`. Failure: queue backlog after a viral launch; P95 jumps 5x while GPU use stays at 60% because odd resolutions fragment batches. Prove it: GPUs for 20 images per second at a stated per-image time. Src: [G7], [P5], [G22], [G24]. Variants: text-to-video (A12.4), headshots, captioning.
+- Drill: Content moderation with LLMs. Cascade: cheap classifier, then LLM, then human review. Class imbalance. Policy as a prompt; policy versioning. Eval: precision and recall per policy class; appeals. LLM only on the uncertain band (priced from `ai-prices.ts`). Failure: adversarial rewording. Discord Osprey (Dec 2025 scale): about 400M actions per day, 204 action types, 2,288 rules, about 500 rules per action; rules are written in a Python-based language and reach workers through etcd with no deploy; outputs go to Kafka and Druid for investigators, and investigation feedback becomes new rules [G8]. Llama Guard (Llama2-7B base) matches or exceeds other moderation tools on two public evals [G10]. OpenAI describes taxonomy-driven classifiers with active learning for rare events [G9]. No latency figures are loaded. Prove it: human reviews per day at a stated pass-through rate. Depends on A8.4, A3.6, A10.5. Src: [G8], [G9], [G10], [P3], [P4].
 - Animate: `DesignBuild`. Second: budget Gantt with tool-call filler.
 - Prove it: Ballpark. Cost per call minute from stage prices.
 - Src: [G6], [K2]
 
-**A13.12 agent-platform: Multi-tenant Agent Platform (MCP Marketplace, Per-tenant Tools and Auth)**
+**A13.9 agent-platform: Multi-tenant Agent Platform (MCP Marketplace, Per-tenant Tools and Auth)**
 - requires: A7.8, A6.6, A10.4
 - Requirements and quality bar: Many tenants build and run agents. The platform offers an MCP marketplace, per-tenant tools and auth, runs, and billing. Bar: zero cross-tenant data access, run success rate, and exact cost attribution.
 - Eval plan: Tenant isolation tests with canary data. Per-tenant eval suites (A8.1). Vetting tests for tool servers. Billing reconciled against provider invoices.
@@ -1121,7 +1082,7 @@ _Twelve deep cases, agent- and integration-first. Order is easy to hard and by d
 
 #### A14. In the Wild
 
-_Eight teardowns, each with a loaded primary source. Agent teardowns only where the notes hold the page._
+_Six teardowns, each with a loaded primary source. Agent teardowns only where the notes hold the page._
 
 **A14.1 characterai-inference: Character.AI Inference**
 - requires: A13.2
@@ -1130,50 +1091,37 @@ _Eight teardowns, each with a loaded primary source. Agent teardowns only where 
 - Prove it: Ballpark. Cost per million conversation hours.
 - Src: [C2]
 
-**A14.2 cursor-index: Cursor Codebase Indexing**
-- requires: A5.8, A5.9
-- Write: Merkle tree sync; 50,000 files about 3.2 MB of names and hashes; embeddings cached by chunk content; shared index via simhash with 92% average clone similarity; path proofs; first query median 7.87 s to 525 ms and p99 4.03 h to 21 s [C4].
-- Animate: Merkle sync step-through. Second: index-reuse before and after timeline.
-- Prove it: Diagnose. What leaks if the proof is skipped?
-- Src: [C4]
-
-**A14.3 cursor-apply: Cursor Instant Apply**
-- requires: A2.2, A13.8
-- Write: Full-file rewrite with deterministic speculation; about 1000 tokens/s on a 70B fine-tune; about 9x over the earlier GPT-4 speculative-edits setup; served on Fireworks [C5].
-- Animate: Speculation accepting copied lines. Second: tokens/s bar compare.
-- Prove it: Ballpark. Time to rewrite a 400-line file.
-- Src: [C5]
+**A14.2 cursor: Cursor Codebase Indexing and Instant Apply**
+- requires: A5.8, A5.9, A2.2, A13.6
+- Write: Indexing: Merkle tree sync; 50,000 files about 3.2 MB of names and hashes; embeddings cached by chunk content; shared index via simhash with 92% average clone similarity; path proofs; first query median 7.87 s to 525 ms and p99 4.03 h to 21 s [C4].
+  Apply: Full-file rewrite with deterministic speculation; about 1000 tokens/s on a 70B fine-tune; about 9x over the earlier GPT-4 speculative-edits setup; served on Fireworks [C5].
+- Animate: Merkle sync step-through. Second: index-reuse before and after timeline. Then: Speculation accepting copied lines. Second: tokens/s bar compare.
+- Prove it: Diagnose. What leaks if the proof is skipped? Second: Ballpark. Time to rewrite a 400-line file.
+- Src: [C4], [C5]
 - Note: speculative decoding is elective E3.4. Name it as plain text; do not require it.
 
-**A14.4 anthropic-research: Anthropic Multi-agent Research System**
-- requires: A7.6, A13.9
-- Write: Lead and 3 to 5 subagents; up to 90% less time; 4x and 15x chat tokens; 90.2% gain over single-agent on an internal eval; tool-testing agent cut task time 40%; checkpoints and rainbow deploys [A6].
-- Animate: System diagram step-through. Second: token-use vs score chart (80% variance).
-- Prove it: Diagnose. Spawning too many subagents: which rule fixes it?
-- Src: [A6]
-
-**A14.5 perplexity-vespa: Perplexity on Vespa**
-- requires: A5.6, A13.9
+**A14.3 perplexity-vespa: Perplexity on Vespa**
+- requires: A5.6, A13.7
 - Write: Vendor case study; label company claim vs our reading. One serving engine for retrieval, ranking, filtering, real-time indexing, and inference. Hybrid retrieval; passage-level retrieval; light ranker then neural rerank; 780M+ queries per month, 20%+ monthly growth. Boolean-filter limits of vector databases. The web index later moved to an internal system [G1].
 - Animate: Before and after: separate stores vs one engine, with network hops counted. Second: multi-stage ranking funnel.
 - Prove it: Diagnose. Which hops disappear when inference runs inside the serving layer?
 - Src: [G1]
 
-**A14.6 linkedin-genai: LinkedIn GenAI Product**
+**A14.4 linkedin-genai: LinkedIn GenAI Product**
 - requires: A8.1, A3.3
 - Write: 80% of the target in month one, four more months to pass 95%. Three-tier eval. Small model for routing and retrieval, larger model for generation. Internal APIs wrapped as skills with LLM-friendly schemas. Parser fix: errors about 10% to about 0.01%. Inter-token latency math [G14b].
 - Animate: Eval-tier timeline with feedback delay. Second: parser error before and after.
 - Prove it: Ballpark. Added seconds for +10 ms per token over 200 tokens (2 s).
 - Src: [G14b]
 
-**A14.7 claude-agent-sdk: Claude Agent SDK: The Agent Loop**
+**A14.5 claude-agent-sdk: Claude Agent SDK: The Agent Loop**
 - requires: A6.1, A6.9
 - Write: Label each item "company claim" or "our reading". Claim: the loop is gather context, act, verify, repeat [A11]. The post names agentic search (file tools such as grep) before semantic search, subagents to keep context small, compaction near the limit, and three ways to verify: rules, visual feedback, and an LLM judge, which it calls "not very robust" [A11]. Our reading: map each part to a lesson (A6.1, A6.9, A6.10, A4.4, A6.4). No latency or cost figures are published in the loaded page.
 - Animate: The loop with each stage expanded to its tools. Second: before and after for a task with and without a verify step.
 - Prove it: Diagnose. An agent declares done without running tests. Which stage of the loop was skipped?
 - Src: [A11]
 
-**A14.8 shopify-sidekick: Shopify Sidekick**
+**A14.6 shopify-sidekick: Shopify Sidekick**
 - requires: A6.5, A8.4, A4.5
 - Write: Label each item "company claim" or "our reading". Claims [G12]: tool tiers: 0 to 20 tools are easy to debug, 20 to 50 blur, 50+ are hard to reason about. Just-in-time instructions come back with tool data, which keeps prompts cache-friendly. Judge agreement (kappa) ranged from 0.02 to 0.61 against a human baseline of 0.69. Our reading: map to tool design (A6.5), judges (A8.4), and cache-friendly layout (A4.5).
 - Animate: Tool count vs debuggability. Second: judge kappa by criterion.
@@ -1288,11 +1236,11 @@ _Optional. For ML infrastructure roles. The old classic ML module, three classic
 - Deep dives: (1) Label delay and imbalance: how to train and evaluate when truth arrives in weeks. (2) Model choice and the explainability trade-off; reason codes for declines. (3) Adversarial drift: fraudsters adapt; retrain cadence and a rules layer for fast response.
 - Failure modes and incident drill: Feature outage fails open or closed; a wave of new fraud. Drill: block rate doubles after a feature-pipeline change.
 - Staff vs senior: Senior picks a model and a threshold. Staff sets the threshold from the cost of both errors, owns the label-delay plan, and defines the fail-open policy.
-- Drill: Bot detection, and spam and phishing detection, as variants of the cascade in the moderation drill (A13.6).
+- Drill: Bot detection, and spam and phishing detection, as variants of the cascade in the moderation drill (A13.8).
 - Animate: `DesignBuild`. Second: threshold slider with the cost of a false block vs a miss.
 - Prove it: Ballpark. Blocked good payments per day at 0.1% of 5M payments.
 - Src: [C8], [P6]
-- Note: the content moderation drill moved to the workflow automation agent case (A13.6).
+- Note: the content moderation drill moved to the text-to-image case (A13.8).
 
 **E1.13 michelangelo-monolith-radar: Teardown: Michelangelo, Monolith, and Radar**
 - requires: E1.9, E1.12
@@ -1423,9 +1371,9 @@ The notes list 26 prompts in `1-platforms.md` section (c), 11 more in `4-case-st
 | # | Prompt (source) | Case |
 |---|---|---|
 | 1 | Visual search (ByteByteGo, Grokking) | Drill in A13.3 |
-| 2 | Street View face and plate blurring (ByteByteGo) | Variant of the A13.3 drill plus the A13.6 moderation drill |
+| 2 | Street View face and plate blurring (ByteByteGo) | Variant of the A13.3 drill plus the A13.8 moderation drill |
 | 3 | YouTube video search (ByteByteGo) | Variant of the A13.3 drill and the E1.10 search drill |
-| 4 | Harmful content detection (ByteByteGo, Grokking, Hello Interview) | Drill in A13.6 (content moderation) |
+| 4 | Harmful content detection (ByteByteGo, Grokking, Hello Interview) | Drill in A13.8 (content moderation) |
 | 5 | Video recommendation (ByteByteGo, Educative, Hello Interview) | E1.10 |
 | 6 | Event recommendation (ByteByteGo) | Variant of E1.10 |
 | 7 | Ad click prediction (ByteByteGo, Educative, Grokking) | E1.11 |
@@ -1440,41 +1388,42 @@ The notes list 26 prompts in `1-platforms.md` section (c), 11 more in `4-case-st
 | 16 | Entity linking (Grokking) | Variant of the A13.3 drill |
 | 17 | Self-driving image segmentation (Grokking) | Out of scope. A12.1 covers the basics |
 | 18 | Movie or show recommendation (Grokking) | Variant of E1.10 |
-| 19 | Gmail Smart Compose (ByteByteGo) | Drill in A13.8 |
-| 20 | Google Translate-style system (ByteByteGo) | Variant of the A13.8 drill |
+| 19 | Gmail Smart Compose (ByteByteGo) | Drill in A13.6 |
+| 20 | Google Translate-style system (ByteByteGo) | Variant of the A13.6 drill |
 | 21 | ChatGPT-style assistant (ByteByteGo, Hello Interview) | A13.2 |
 | 22 | RAG system design (ByteByteGo, Aminian) | A13.3 |
-| 23 | Text-to-image, text-to-video, headshots (ByteByteGo) | Drill in A13.11, A12.3, A12.4 |
+| 23 | Text-to-image, text-to-video, headshots (ByteByteGo) | A13.8, A12.3, A12.4 |
 | 24 | LLM inference system design (calm.rocks) | Drill in A13.2 (open-model inference platform), A2.1 to A2.7, E3.1 to E3.8 |
-| 25 | Ask-the-web and deep-research agents (Aminian) | A13.9 (includes the answer-engine drill) |
+| 25 | Ask-the-web and deep-research agents (Aminian) | A13.7 (includes the answer-engine drill) |
 | 26 | Agent vs fixed pipeline; PAIR red-team loop (calm.rocks) | A6.2, A10.6 |
 | 27 | YouTube recommendations (C9) | E1.10 |
 | 28 | Instagram feed ranking (C9) | Variant of E1.10 |
-| 29 | Search autocomplete (C9) | Variant of the A13.8 drill |
+| 29 | Search autocomplete (C9) | Variant of the A13.6 drill |
 | 30 | Design ChatGPT (C9) | A13.2 |
-| 31 | Coding assistant (C9) | A13.8 (with the code-completion drill) |
+| 31 | Coding assistant (C9) | A13.6 (with the code-completion drill) |
 | 32 | Assistant over company documents (C9) | A13.3 |
 | 33 | Where would you add AI to our e-commerce platform (C9) | A0.4, A0.2 |
-| 34 | Support ticket overload (C9) | A13.5, A13.6 |
-| 35 | Agent that books travel (C9) | A7.3, A13.5, A13.10 |
+| 34 | Support ticket overload (C9) | A13.4 |
+| 35 | Agent that books travel (C9) | A7.3, A13.4, A13.6 |
 | 36 | Model takes actions for a user (C9) | A7.4, A10.4 |
 | 37 | "Our RAG is slow and wrong, fix it" (C9) | A5.10, A9.1 |
 | 38 | LLM gateway (not in notes; added by this plan) | A13.1 |
-| 39 | Eval platform, multi-tenant LoRA platform (added by this plan) | Drills in A13.1 and A13.12 |
-| 40 | Image captioning, realistic face generation, high-resolution synthesis, headshot generation (ByteByteGo GenAI intro [G15]) | Variants of the A13.11 drill, A12.1, A12.3 |
+| 39 | Eval platform, multi-tenant LoRA platform (added by this plan) | Drills in A13.1 and A13.9 |
+| 40 | Image captioning, realistic face generation, high-resolution synthesis, headshot generation (ByteByteGo GenAI intro [G15]) | Variants in A13.8, A12.1, A12.3 |
 | 41 | Design an agent harness and evaluation system (Prachub [G16]) | A6.1, A8.5, A13.1 (eval-platform drill) |
 | 42 | Scalable and safe agentic system (Prachub [G16]) | A7.4, A7.3, A10.4 |
 | 43 | E-commerce search ranking (Analytics Vidhya [G17]) | Drill in E1.10 (search ranking) |
-| 44 | Spam and phishing detection (G17) | Variant of the A13.6 moderation drill and E1.12 |
+| 44 | Spam and phishing detection (G17) | Variant of the A13.8 moderation drill and E1.12 |
 | 45 | Visual defect detection (G17) | Variant of the A13.3 drill, A12.1 |
 | 46 | Demand forecasting (G17) | Out of scope as a case. E1.1 to E1.7 cover the method |
 | 47 | End-to-end ML system; real-time feature store (Prachub ML [G18]) | E1.1 to E1.9; E1.3, E1.9, E1.13 |
 | 48 | Short-video, food-delivery, generic recommender; ranking service; personalized feed (G18) | E1.10, E1.11 (ETA drill) |
-| 49 | Document extraction pipeline (added 2026-10-16) | A13.4 |
-| 50 | Email or ticket triage agent with SaaS integrations (added 2026-10-16) | A13.6 |
-| 51 | Code review bot (added 2026-10-16) | A13.7 |
-| 52 | Browser or computer-use agent (added 2026-10-16) | A13.10 |
-| 53 | Multi-tenant agent platform, MCP marketplace (added 2026-10-16) | A13.12 |
+| 49 | Document extraction pipeline (added 2026-10-16) | A13.3 |
+| 50 | Email or ticket triage agent with SaaS integrations (added 2026-10-16) | Drill in A13.4 |
+| 51 | Code review bot (added 2026-10-16) | Drill in A13.6 |
+| 54 | Text-to-SQL analytics agent (added 2026-10-19) | A13.5 |
+| 52 | Browser or computer-use agent (added 2026-10-16) | A13.6 |
+| 53 | Multi-tenant agent platform, MCP marketplace (added 2026-10-16) | A13.9 |
 
 Merged lists: the 32 prompts in `5-case-gaps.md` section 13 (ByteByteGo GenAI intro, Prachub GenAI, Analytics Vidhya, Prachub ML). Duplicates of rows 1 to 39 were dropped: Smart Compose, Translate, ChatGPT, RAG, text-to-image, text-to-video, enterprise support agent, RAG with evaluation, enterprise RAG agent, feed ranking, ads CTR, fraud, ETA, dynamic pricing, RAG support assistant.
 
@@ -1607,7 +1556,7 @@ Only numbers present in the research notes. "Derived" means the notes show the a
 | `AiAnnGraph` | HNSW layered graph with greedy hops, filter greying | A5.2, A5.3 |
 | `AiRankMerge` | Two ranked lists merged by RRF | A5.5, A5.6 |
 | `AiTraceWaterfall` | Span waterfall for model calls and tools | A6.1, A9.1 |
-| `AiAgentLoop` | Agent loop with injectable failure and budgets | A6.1, A7.2, A13.8 |
+| `AiAgentLoop` | Agent loop with injectable failure and budgets | A6.1, A7.2, A13.6 |
 | `AiAgentGraph` | State, nodes, conditional edges, checkpoints, and interrupts on one agent graph | A6.3, A7.1, A7.2 |
 | `AiJudgeLab` | Answer pair with order swap and length toggles | A8.4 |
 | `AiChainReliability` | p^n chain with verifier and retry toggles | A0.3, A7.2 |
@@ -1637,8 +1586,8 @@ Only numbers present in the research notes. "Derived" means the notes show the a
 3. Phase 3: A6, A7 (21 lessons). Agent foundations, then agents in production. A6.3 (agents as graphs) and A7.1 (graph runtime) need the new `AiAgentGraph` component.
 4. Phase 4: A8, A9, A10 (23 lessons). The eval, ops, and security spine.
 5. Phase 5: A11, A12 (10 lessons).
-6. Phase 6: A13, 12 deep cases in table order, one or two per batch. A13.1 can start after A3 and A9. A13.3 can start after A5. The agent cases (A13.5 to A13.12) start after A7. Each deep case is larger than a normal lesson. Budget more writer and review time for it.
-7. Phase 7: A14 (8 teardowns). The two agent teardowns (A14.7, A14.8) use loaded primary sources only.
+6. Phase 6: A13, 9 deep cases in table order, one or two per batch. A13.1 can start after A3 and A9. A13.3 can start after A5. The agent cases (A13.4 to A13.9, all but the first three) start after A7. Each deep case is larger than a normal lesson. Budget more writer and review time for it.
+7. Phase 7: A14 (6 teardowns). The two agent teardowns (A14.5, A14.6) use loaded primary sources only.
 8. Phase 8 (optional): E1, E2, E3 (28 lessons). Write on demand. E3 comes first if a reader asks for serving depth. Do not block the core path on them.
 
 ### Routing
@@ -1797,6 +1746,12 @@ Case gaps (`5-case-gaps.md`):
 - [G14b] https://www.linkedin.com/blog/engineering/generative-ai/musings-on-building-a-generative-ai-product
 - [G15] https://bytebytego.com/courses/genai-system-design-interview/introduction-and-overview
 - [G16] https://prachub.com/resources/generative-ai-system-design-interview-questions-rag-agents-evals-and-guardrails
+- [G19] https://www.uber.com/en-CA/blog/query-gpt/ (Sep 2024)
+- [G20] https://bird-bench.github.io/
+- [G21] https://spider2-sql.github.io/
+- [G22] https://modal.com/blog/flux-3x-faster (vendor blog, Jun 2025)
+- [G23] https://www.snowflake.com/en/blog/engineering/real-time-text-to-sql-snowflake-intelligence/ (Nov 2025)
+- [G24] https://ai.google.dev/gemini-api/docs/pricing (as of 2026-10-16)
 - [G17] https://www.analyticsvidhya.com/blog/2026/06/system-design-for-ml-interviews-real-problems-solved/
 - [G18] https://prachub.com/resources/machine-learning-system-design-interview-questions-ranking-recommendation-training-and-serving
 
@@ -1824,7 +1779,7 @@ Writers must research each before use.
 - ReAct, computer use, sandbox designs, memory architectures.
 - PII handling patterns. Jailbreak taxonomy.
 - VLM token counts. SDXL and Flux serving costs (only SD v1.4 numbers from [G7]). Video generation costs. LiveKit, Pipecat, and OpenAI Realtime latency budgets (ElevenLabs budget is loaded [G6]).
-- New agent items without a loaded primary source: LangGraph or other graph-runtime docs, ReAct, Agent Skills spec, A2A spec, OAuth for agents, computer-use docs, user-simulation benchmarks, batch API discount and window, provider file and image docs, reinforcement fine-tuning product docs, extended-thinking docs. New cases A13.4, A13.6, A13.7, A13.10, A13.12 have no loaded primary source for a named system.
+- New agent items without a loaded primary source: LangGraph or other graph-runtime docs, ReAct, Agent Skills spec, A2A spec, OAuth for agents, computer-use docs, user-simulation benchmarks, batch API discount and window, provider file and image docs, reinforcement fine-tuning product docs, extended-thinking docs. New cases A13.3, A13.6, A13.9 have no loaded primary source for a named system.
 - Case-study primaries still missing: Glean and Notion ACL internals, DoorDash feature store, Netflix foundation model (403), YouTube paper full text, Instacart (403), OpenAI and Meta moderation blogs (403 and 404), Midjourney, a named LLM gateway design. Intercom Fin figures conflict (76% vendor claim vs 56% and 38 to 50% elsewhere); Klarna has no architecture detail.
 - Vendor-sourced figures (Vespa, Fin, ElevenLabs, Salad, Klarna) are company claims. Lessons must label them so.
 - Every price (API, GPU hour, embedding, STT, TTS) used in a worked example. Fetch it live, add a row to `ai-prices.ts` with provider, model, price, as-of date, and source URL. No assumed prices.
@@ -1840,5 +1795,7 @@ Writers must research each before use.
 5. **Case studies.** (Case list superseded by decision 6.) Quality over quantity. A13 has 12 deep cases in this order: video recommendation feed, ad click prediction, fraud detection, LLM gateway, ChatGPT-style assistant, LLM inference platform, enterprise RAG, code completion, customer support agent, voice agent, AI coding agent, deep research agent. The 10 dropped cases are Drill sections inside the nearest deep case. See A13 and section 4.
 
 6. **2026-10-16: agent-first restructure; classic ML, training, deep inference are electives.** The core path is now Foundations (A0 to A2), Building with models (A3 to A5), Agents (A6 to A7), Quality and trust (A8 to A10), Customization and media (A11 to A12), and Practice (A13 to A14). Electives E1 (classic ML), E2 (training at scale), and E3 (inference deep dive) come last and are optional. Core is 119 lessons. Electives are 28. Total is 147. A13 now has 12 agent- and integration-first cases. The three classic ML cases move to E1 as capstones. Old drills move to the nearest new case or to an elective. A14 keeps Character.AI, Cursor, Anthropic multi-agent research, Perplexity, and LinkedIn, and adds two agent teardowns with loaded primary sources: Claude Agent SDK [A11] and Shopify Sidekick [G12]. Llama 3 training, Uber Michelangelo, Monolith, and Stripe Radar move to electives. A0 and A1 slugs do not change.
+
+7. **2026-10-19: A13 cut from 12 to 9 deep cases; A14 from 8 to 6.** Test: a deep case needs a design axis no other case teaches and no A0 to A12 lesson already covers. Document extraction became a drill in A13.3, browser and computer-use a drill in A13.6, text-to-image a drill in A13.8 (with moderation). Workflow automation became a drill in A13.4; code review a drill in A13.6; text-to-SQL is new as A13.5. A14: Cursor index and apply merged; Anthropic research is now a teardown block inside A13.7. Core 114, total 142. Each deep case targets 4,000 to 5,000 words.
 
 No blocking open questions remain.

@@ -5,6 +5,7 @@ requires: ['01-one-machine/throughput-vs-latency', '03-api-design/idempotency', 
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
+import IncidentCard from '../../../components/lesson/IncidentCard.astro';
 import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import RelRetryChain from '../../../components/anim/lessons/RelRetryChain.tsx';
 import RelRetrySim from '../../../components/anim/lessons/RelRetrySim.tsx';
@@ -19,6 +20,8 @@ The third case is the dangerous one. [Lesson 7.1](/learn/07-reliability/failure-
 2. **If it failed, do I try again?** (the retry)
 
 Both decisions are easy to get wrong in a way that looks fine in testing and fails in production.
+
+AWS learned this in December 2021. Retries that did not back off kept its largest region, in Northern Virginia, impaired for most of a working day. [The story](#incident) comes after the backoff section.
 
 ## Naive solutions
 
@@ -107,6 +110,30 @@ What to notice:
 The AWS blog ran its own simulation of contending clients. It reports that jitter "reduced our call count by more than half" with 100 contending clients. It also reports that equal jitter does slightly more work than full jitter and takes much longer. Our model is different and smaller, so its numbers differ. The direction is the same.
 
 Jitter is useful beyond retries. The cache lesson used the same idea for expiry times ([lesson 5.5](/learn/05-caching/invalidation-stampede/)). A reconnect storm after a gateway dies is another case ([lesson 2.5](/learn/02-networking/real-time-transport/)). The AWS article adds one note. For scheduled jobs, it prefers a fixed offset per host over a fresh random value each time. That way, an overload is easy to reproduce.
+
+## A real outage: AWS us-east-1, 2021
+
+<IncidentCard
+  org="Amazon Web Services, us-east-1 (Northern Virginia)"
+  date="7 December 2021"
+  title="Clients that could not back off kept AWS's internal network jammed for hours."
+  cost="The network fully recovered at 2:22 PM PST, almost 7 hours after the start. EC2 (virtual machine) APIs, the AWS Console, CloudWatch, API Gateway, Amazon Connect, and other services had errors or delays. Some recovered later that afternoon. Machines that were already running kept running."
+  missing="Backoff must work in the exact failure it exists for. Here it did not, so retries kept the network full. Our reading: a retry budget is the second guard for this case. It caps retries even when the backoff code fails. And keep monitoring off the network it watches."
+  source="https://aws.amazon.com/message/12721/"
+  sourceLabel="AWS, Summary of the AWS Service Event in us-east-1"
+>
+
+AWS runs many of its own internal services on a separate internal network. Networking devices connect it to the main AWS network.
+
+1. At 7:30 AM PST an automated job added capacity to one AWS service. This "triggered an unexpected behavior from a large number of clients inside the internal network". They all opened connections at once.
+2. The surge overwhelmed the devices between the two networks. Calls across them became slow and failed.
+3. Slow and failed calls led to "even more connection attempts and retries". The congestion did not clear.
+4. The clients had tested backoff code. But "a latent issue prevented these clients from adequately backing off". That code path had run in production for years without showing the bug.
+5. The congestion also cut the operators' real-time monitoring, so they worked from logs. Their deploy tools ran on the same internal network, which slowed every fix.
+
+</IncidentCard>
+
+Map it to this lesson. The trigger was small: one scaling job. The retries made it large, and the missing backoff made it last. Step 5 adds one more lesson. The tools you use to fix an outage must not depend on the thing that is down.
 
 ## Numbers
 
@@ -230,5 +257,6 @@ Do not answer "add retries" to a flaky dependency. Ask what the operation does w
 
 - [AWS Builders' Library: Timeouts, retries, and backoff with jitter](https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter) covers choosing a timeout. It also covers the 243x example and the retry token bucket.
 - [AWS Architecture Blog: Exponential Backoff And Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/): full, equal, and decorrelated jitter, with a simulation.
+- [AWS: Summary of the AWS Service Event in the Northern Virginia (US-EAST-1) Region (2021)](https://aws.amazon.com/message/12721/). The incident above, in AWS's own words.
 - [Google SRE book: Handling Overload](https://sre.google/sre-book/handling-overload/): per-request and per-client retry budgets.
 - [Google SRE book: Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/): the 64 attempts example and the retry budget per process.
