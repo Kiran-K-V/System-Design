@@ -1,0 +1,567 @@
+---
+summary: 'A phone voice agent lives on a hard deadline: P50 under 800 ms to first audio, and silence is the failure. Budget every stage, tune the endpointing silence threshold, run a barge-in state machine that truncates what the model remembers, cover tool calls with filler speech, and plan a fallback for each stage. Two drills: a text-to-image service and LLM content moderation.'
+requires: ['ai/a12-multimodal/speech-pipeline', 'ai/a3-llm-apis/realtime-apis', 'ai/a12-multimodal/diffusion-serving']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai13VoiceBuild from '../../../../components/anim/lessons/Ai13VoiceBuild.tsx';
+import Ai13VoiceEndpoint from '../../../../components/anim/lessons/Ai13VoiceEndpoint.tsx';
+import Ai13VoiceTurn from '../../../../components/anim/lessons/Ai13VoiceTurn.tsx';
+import Ai13VoiceGantt from '../../../../components/anim/lessons/Ai13VoiceGantt.tsx';
+import Ai13VoiceCascade from '../../../../components/anim/lessons/Ai13VoiceCascade.tsx';
+
+## The problem
+
+In June 2024 the Associated Press reported that McDonald's would end its test of AI voice ordering with IBM at drive-thrus. The test began in 2021. The system was due off at test sites "no later than July 26, 2024". The story says it "received scores of complaints in recent years", and unnamed sources said it had trouble with accents and dialects. McDonald's declined to comment on accuracy, and the story gives no reason for the end of the test ([AP, via KSAT, 2024-06-18](https://www.ksat.com/business/2024/06/18/mcdonalds-is-ending-its-test-run-of-ai-powered-drive-thrus-with-ibm/)). This is a **secondary** source, and the reasons were not published. Our reading: a voice agent is judged one turn at a time, by a person who is waiting.
+
+People take turns fast. Stivers and colleagues measured the gap between one speaker's turn and the next in 10 languages. Per-language medians run "from 0 ms (English, Japanese, Tzeltal, and Yélî-Dnye) to +300 ms", and the paper gives an "overall cross-linguistic median +100 ms" ([PNAS 2009, via PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC2705608/)). A voice agent targets a median time to first audio under 800 ms, 8 times the human median. Every extra 100 ms is heard.
+
+Lesson [A12.2](/learn/ai/a12-multimodal/speech-pipeline/) built the stage budget, and this case assumes it. **Time to first audio** (TTFA) is the time from the moment the caller stops talking to the first sound of the reply. **P50** is the median turn. **P95** means 1 turn in 20 is slower. ElevenLabs, a voice vendor, says a natural agent "typically targets a P50 time-to-first audio under 800 ms and a P95 under 1.5 seconds" ([latency guide](https://elevenlabs.io/blog/voice-agent-latency-optimization), published 2026-06-23, updated 2026-10-09).
+
+What makes this case hard is one axis: **a hard real-time deadline where silence is the failure.** A late chat reply shows a spinner. A late voice reply sounds like a dropped call. This lesson answers five questions: What is the full budget with the phone line added? How does the agent decide the caller is done, and what does that cost? How does it stop when the caller cuts in, and what must it forget? How does it call a tool without dead air? What happens when a stage fails?
+
+## Requirements and the quality bar
+
+The product is an inbound phone agent that books tables for a restaurant chain. Traffic is **illustrative**: 20,000 calls a day, 3 minutes on average, so 60,000 call-minutes a day.
+
+**Functional**
+
+- FR1: answer a phone call and hold a spoken conversation.
+- FR2: let the caller interrupt at any moment.
+- FR3: look up and change bookings with tools.
+- FR4: recover when a provider fails, and transfer to a person when needed.
+
+**Out of scope.** Outbound dialing campaigns, voice cloning, and the internals of speech-to-speech models (lesson [A3.10](/learn/ai/a3-llm-apis/realtime-apis/) compares them). Text chat is lesson [A13.4](/learn/ai/a13-cases/support-agent/).
+
+**Non-functional.** Only the first row is a vendor target. The others are our bars. No source gives a standard value for them, so we set them and measure them.
+
+| Metric | Bar | How it is measured |
+|---|---|---|
+| P50 and P95 TTFA | Under 800 ms and under 1,500 ms (vendor target) | Per turn, from call logs, at the telephony edge |
+| Dead-air rate | At most 1% of turns with over 3 s of silence (our bar) | Gaps between agent audio, from the same logs |
+| Cut-off rate | At most 5% of turns where the agent starts while the caller is still talking (our bar) | Sampled turns, labeled by a listener |
+| Barge-in stop time | Playback silent within 300 ms of the caller starting to speak (our bar) | Log timestamps |
+| Task success | At least 85% of calls end with the right booking in the database (our bar) | Database end state |
+| Word error rate | Baseline first, then set a bar | Hand-typed transcripts of sampled calls |
+
+**Word error rate** (WER) is the standard score for speech to text:
+
+<Math block tex="\text{WER} = \frac{S + D + I}{N}" />
+
+S is words replaced, D is words missed, I is words added, and N is the number of words the caller said. The bar that decides a release is the pair TTFA percentiles plus task success. A fast agent that books the wrong table has not met the bar.
+
+## Eval plan
+
+Per lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/), the eval comes before the design.
+
+**Offline set.** 150 recorded calls with hand-typed transcripts, for WER and for task success. Add 30 scripted barge-in cases (a real interruption, a cough, a backchannel such as "mm-hm"), 20 cases where a tool is made slow, and 20 where a provider is made to fail. Grade the **end state** of a test booking database, as in lesson [Agent Trajectory Evals](/learn/ai/a8-evals/trajectory-evals/). Simulated callers (lesson [Simulated Users and Scenario Tests](/learn/ai/a8-evals/simulated-users/)) cover the long tail of conversations.
+
+**Online.** TTFA percentiles per network type (office wifi, mobile, phone line), the dead-air rate, the cut-off rate, and the share of calls transferred to a person. **The slice that matters:** turns that call a tool, calls on mobile or phone-line audio, and callers with accents. An average over easy desktop calls hides all three. WER on phone audio is measured on your own calls. A WER on clean read speech does not transfer, as the telephony section shows.
+
+## Budgets
+
+**Latency.** The stage budget from lesson [A12.2](/learn/ai/a12-multimodal/speech-pipeline/), in milliseconds. ElevenLabs calls these "illustrative ranges, not guarantees".
+
+| Stage | P50 | P95 |
+|---|---|---|
+| Capture and endpointing | 120 | 280 |
+| STT finalization | 60 | 150 |
+| Network (client to your server to the model APIs) | 60 | 160 |
+| LLM first token | 250 | 600 |
+| TTS first audio | 110 | 220 |
+| Player buffering | 80 | 150 |
+| **Total** | **680** | **1,560** |
+
+Check: 120 + 60 + 60 + 250 + 110 + 80 = 680, and 280 + 150 + 160 + 600 + 220 + 150 = 1,560. At P50 there are 800 - 680 = 120 ms of slack. At P95 the table is 60 ms over the 1,500 ms target already.
+
+A phone call adds a leg this table does not show: caller to carrier to the telephony service to your server. I found no published figure for it, so it stays a variable. Any phone leg over 120 ms breaks the P50 target, and at P95 there is no slack at all.
+
+**Dollars per call-minute.** Live prices, as of 2026-10-20. One minute is a sum over four vendors.
+
+| Piece | Provider and unit | Price | Source |
+|---|---|---|---|
+| Phone line | Twilio Voice, US, inbound local, per minute | $0.0085 (outbound local $0.0140) | [Twilio](https://www.twilio.com/en-us/voice/pricing/us), "current as of August 2026" |
+| STT | Deepgram Nova-3 monolingual streaming, pay as you go, per minute | $0.0048 | [Deepgram](https://deepgram.com/pricing) |
+| LLM | Claude Haiku 5.5, per million tokens (prompts up to 100,000) | $0.10 in, $0.50 out | [Anthropic](https://platform.claude.com/docs/en/about-claude/pricing) |
+| LLM | Claude Sonnet 5.5, per million tokens | $2 in, $10 out | same page |
+| TTS | ElevenLabs Flash or Turbo, per 1,000 characters | $0.04 | [ElevenLabs](https://elevenlabs.io/pricing/api), no date on page |
+
+Two warnings. Deepgram labels its streaming prices "Limited-time promotional rates" and shows no end date. The page also shows a crossed-out earlier price of $0.0077 a minute. And I read only Twilio's voice-minute page, not any separate fee for streaming audio to your server. Confirm it.
+
+The usage is the example of lesson [A12.2](/learn/ai/a12-multimodal/speech-pipeline/), so the two lessons agree. In one minute the caller talks for 60 s, the agent speaks 450 characters, and there are 4 LLM calls of 1,500 input tokens each with 100 output tokens in all. All of it is **illustrative**.
+
+- Phone line (inbound local): $0.0085.
+- STT: $0.0048.
+- LLM on Haiku 5.5: 6,000 x $0.10 / 1e6 + 100 x $0.50 / 1e6 = $0.0006 + $0.00005 = $0.00065. On Sonnet 5.5: $0.012 + $0.001 = $0.013.
+- TTS on Flash: 450 / 1,000 x $0.04 = $0.018.
+
+Totals: $0.0085 + $0.0048 + $0.00065 + $0.018 = **$0.03195** per call-minute with Haiku 5.5, and $0.0443 with Sonnet 5.5. That is $1.92 or $2.66 an hour of call. TTS is 56% of the Haiku bill, and phone line plus STT are another 42%. A cheaper model barely moves it. If Deepgram's promotion ended at the crossed-out price, STT would add $0.0029 a minute. Speculative generation (lesson [A12.2](/learn/ai/a12-multimodal/speech-pipeline/)) makes 1.3 to 2 LLM calls a turn, so it raises only the LLM line.
+
+For scale, assume a human agent costs $30 an hour fully loaded, or $0.50 per connected minute. That figure is **our assumption, with no source.** On it, the AI minute is 11 to 16 times cheaper. That ignores calls that escalate, so treat it as a ceiling on the saving. At 60,000 call-minutes a day, Haiku 5.5 costs about $1,917 a day.
+
+## Core entities and API
+
+**Entities.** `Call` (carrier id, region, start time), `Turn` (the time the caller stopped, the time of first audio, state, whether it was interrupted), `Utterance` (role, text, and `heard_ms`: how much of an agent reply the caller actually heard), `ToolCall` (name, arguments, idempotency key, duration), `ProviderAttempt` (stage, provider, deadline, outcome).
+
+**API.**
+
+- `POST /voice/incoming`: the telephony service calls this when a call arrives. We answer with an instruction to open an audio stream to us.
+- `WS /voice/stream/{call_id}`: audio frames both ways, plus markers that say how much audio has played.
+- `POST /tools/{name}`: internal. Every tool call carries an idempotency key made by code, as in lesson [Rate Limits, Retries, and Idempotency](/learn/ai/a3-llm-apis/limits-retries-idempotency/).
+- `GET /calls/{id}/timeline`: the per-stage timings of every turn. Support and the eval jobs both read it.
+
+## A naive design and where it breaks
+
+The first build chains the stages in a request and response style, with one fixed silence timer, one provider per stage, and a blocking tool call. Numbers are from the budget unless marked.
+
+| Break | What happens | Number |
+|---|---|---|
+| Stages in sequence | Each stage finishes before the next starts | 1,470 ms to first audio (lesson [A12.2](/learn/ai/a12-multimodal/speech-pipeline/)) |
+| Fixed 700 ms silence timer | A long wait on every turn, and still cuts people off | 1,260 ms P50; 6.0% of turns cut off (illustrative model below) |
+| Blocking tool call | Dead air while the tool runs | 700 + 60 + 60 + 250 + 100 + 900 + 250 + 110 + 80 = 2,510 ms of silence, with a 900 ms tool (illustrative) |
+| No barge-in | The agent keeps talking over the caller | 6.6 s of talk-over when a 9.0 s reply is interrupted at 2.4 s |
+| No truncation | History says the model said 22 words; the caller heard 6 | 16 words of false memory per interruption |
+| No deadline on a stage | A hung provider holds the call | With a 0.5% timeout chance per stage (illustrative), 14% of 10-turn calls hit at least one |
+
+The common cause: the design treats a call as a series of requests. A call is a clock.
+
+## High-level design
+
+A few words first, because the picture uses them. **Voice activity detection** (VAD) labels each slice of audio as speech or silence. **Endpointing** is deciding the caller has finished. **Barge-in** is the caller speaking while the agent talks. The **turn manager** is the code that owns both decisions. **Filler speech** is a short line, such as "Let me check that", spoken while a tool runs. A **warm transfer** hands the call to a person together with a summary. Phone audio is **narrowband**: 8,000 samples a second, which the telephony section explains. Step through the build. Each step names the requirement it meets.
+
+<Ai13VoiceBuild client:visible />
+
+Three rules. **Everything streams**, as in lesson [A12.2](/learn/ai/a12-multimodal/speech-pipeline/). **The turn manager is its own component.** It sees the audio, not only the transcript, so it can stop the speaker faster than a model call could. **Every external call has a deadline**, and a missed deadline triggers the fallback, not a wait. Keep the stages in one region: a far hop eats the 120 ms of P50 slack.
+
+### What the phone line changes
+
+<CrossTrackLink id="02-networking/real-time-transport">
+A call needs audio both ways at once. A WebSocket carries it over one TCP connection, so one lost packet holds up everything behind it. WebRTC sends media over UDP when it can, and old audio is not worth waiting for. That lesson explains the wire. Here we count the milliseconds.
+</CrossTrackLink>
+
+Three things change on a phone line.
+
+**The audio is narrow.** Twilio Media Streams says the encoding "is always `audio/x-mulaw`", the sample rate "is always `8000`", and the channel count "is always `1`" ([message reference](https://www.twilio.com/docs/voice/media-streams/websocket-messages)). **Mu-law** stores each sample in one byte. So the stream is 8,000 bytes a second, or 64 kilobits a second. Raw 16 kHz audio with 16-bit samples is 32,000 bytes a second, four times more. Sampling at 8,000 times a second keeps only sound below 4,000 Hz. That costs accuracy. The only controlled number I loaded is from a 2015 paper: on a read-speech task with a 20,000-word vocabulary, the word error rate was 8.67% on narrowband audio and 8.12% on wideband audio ([Li et al., Interspeech 2015](https://www.isca-archive.org/interspeech_2015/li15d_interspeech.pdf)). That is 6.8% more errors, relative. It is **clean, read speech** on an older system. Phone calls add noise, accents, and codecs, and I found no source with a number for those. Measure WER on your own calls. Our reading: the real penalty is larger.
+
+**Some models expect wideband audio.** The open Smart Turn model takes "16kHz mono PCM audio" ([project page](https://github.com/pipecat-ai/smart-turn)). Our reading: phone audio must be decoded and resampled first, and resampling cannot bring back the lost band.
+
+**Playback is buffered on the telephony side.** Twilio plays outbound media "in the order received", and the payload "can be of any size". So you can send speech faster than real time, and it waits in a buffer you do not control. That is why barge-in needs the next deep dive.
+
+## Deep dive 1: endpointing, the silence you pay for
+
+**What it is.** Endpointing is the decision "the caller is done". The simplest rule is a **silence threshold**: if the last T milliseconds were quiet, the turn is over.
+
+**Picture.** A waiter who must decide when you have finished ordering. Walk away too early and you are cut off mid-word. Wait too long and the table feels ignored.
+
+**Why it matters.** T is added to every turn. ElevenLabs puts it as "Endpointing is a tradeoff between responsiveness and interruption". Its advice is to use the smallest silence value that does not cut off natural pauses, then measure interruptions in production. The page does not say what mechanism gives its 120 ms P50 for capture and endpointing. Our reading: a plain timer that short would cut off many callers, so such a number needs a model that reads the words, a manual commit, or work started early.
+
+**The model behind the widget.** Everything in it is **illustrative**. A turn has 1.5 pauses on average. A pause lasts 220 ms on average, with an exponential spread. So the share of pauses longer than T is e^(-T/220), and a turn is cut off if at least one pause is longer than T:
+
+<Math block tex="\text{cut-off rate} = 1 - e^{-1.5 \, e^{-T/220}}" />
+
+At T = 700 ms: e^(-3.18) = 0.042, times 1.5 = 0.062, so 1 - e^(-0.062) = 6.0%. The other stages sum to 560 ms at P50 (60 + 60 + 250 + 110 + 80), so TTFA = 700 + 560 = 1,260 ms. That matches the 1,260 ms of lesson [A12.2](/learn/ai/a12-multimodal/speech-pipeline/). Two more terms. A **turn model** is a small classifier that reads the words as well as the silence. **Speculative** mode starts the LLM before the turn is confirmed. Now move the slider.
+
+<Ai13VoiceEndpoint client:visible />
+
+Try four settings.
+
+- **Timer only, T = 700 ms:** P50 is 1,260 ms, over target by 460 ms. 6.0% of turns are cut off. Over a 10-turn call, 1 - 0.94^10 = 46% of calls see at least one cut-off.
+- **Timer only, T = 240 ms:** the largest value that meets the P50 target. It cuts off 39.6% of turns. A timer alone cannot meet the latency bar at a sane cut-off rate.
+- **Add a turn model.** This is a classifier that reads the words, so "I'd like a table for..." gets a longer wait than "Thanks, that's all." Assume it recognises 70% of unfinished pauses and adds 50 ms. Pipecat's open Smart Turn model has about 8 million parameters, takes up to 8 seconds of audio, and "runs ... under 100ms on most cloud instances" (project page). LiveKit's turn detector is the default turn mode of its agents ([docs](https://docs.livekit.io/agents/build/turns/)). The cut-off rate at T = 700 drops to 1.9%, but P50 rises to 1,310 ms.
+- **Also start the LLM early.** This is speculative work, the preemptive generation of lesson [A12.2](/learn/ai/a12-multimodal/speech-pipeline/). At T = 600 with both on, P50 is 790 ms (under 800), P95 is 1,380 ms (under 1,500), and 2.9% of turns are cut off. The price: 1.29 LLM calls per turn instead of 1, because some speculative calls are thrown away.
+
+No setting meets every bar for free. Speculation turns waiting time into tokens, as the cost section said. Note the P95 line too. With a timer only, the P95 target of 1,500 ms is out of reach for any T above 60 ms. Endpointing alone cannot fix P95, which is mostly the LLM tail (600 ms) and the network tail.
+
+## Deep dive 2: barge-in and the turn state machine
+
+**What it is.** A **state machine** is a list of states plus rules for moving between them. A turn has four: **Listening** (the caller talks), **Thinking** (the model and TTS start), **Speaking** (audio plays), and **Interrupted** (the caller cut in, and playback is paused).
+
+**Picture.** Two polite people on a call. When one talks over the other, the second stops mid-sentence, and remembers where.
+
+**Why it matters.** The agent generates faster than it speaks. A model writes 9 seconds of speech in far less than 9 seconds, so most of it sits unplayed. If the caller cuts in at 2.4 s, the model's history must hold 2.4 s of speech, not 9. Otherwise it believes it told the caller things the caller never heard. Step through one barge-in and one false alarm. Words per second and times are illustrative.
+
+<Ai13VoiceTurn client:visible />
+
+The rules, in order.
+
+1. **Stop first, decide second.** When the VAD hears speech during Speaking, pause playback at once. Waiting for a transcript costs hundreds of milliseconds of talk-over.
+2. **Confirm with words.** If a transcript arrives, it is a real barge-in: cancel the model response, flush unplayed audio, and **truncate** the stored reply to what was heard.
+3. **Resume on a false alarm.** If no words arrive in a short window, it was a cough or noise. LiveKit calls this a false interruption and says "by default, the agent resumes speaking from where it left off" (turn docs).
+4. **A backchannel is not a barge-in.** "Mm-hm" means "go on". The agent should keep speaking. Distinguishing it from a real interruption is a classifier job.
+
+**Cancel and truncate on a phone line.** OpenAI's Realtime guide says on WebRTC "the server will automatically truncate unplayed audio", but on a WebSocket "the client manages audio playback, and thus must stop playback and handle truncation" ([guide](https://developers.openai.com/api/docs/guides/realtime-conversations)). A phone bridge is the WebSocket case. Twilio gives you two tools. A `mark` message, sent after a chunk of audio, comes back "when the audio ends", so you know how much has played. A `clear` message "empties all buffered audio" and returns marks for the audio that will not play ([message reference](https://www.twilio.com/docs/voice/media-streams/websocket-messages)). Our reading: send a mark after every chunk, record the last mark that came back, then on barge-in send `clear` and store `heard_ms` from that mark. Small chunks make `heard_ms` precise, because the error is at most one chunk.
+
+**Echo and self-interruption.** MDN defines echo cancellation as reducing crosstalk between the input and output devices. It says the browser "might apply a filter that negates the sound produced by the speakers from being included in the microphone's generated input track" ([MDN](https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackSettings/echoCancellation)). I found no vendor page that names the failure that follows when it is missing, so the rest is **our reading**.
+
+1. The agent speaks through a speaker. 2. The microphone hears it. 3. The VAD fires during Speaking. 4. STT transcribes the agent's own words, so a transcript does arrive, and rule 3 does not save us. 5. The agent cancels itself and answers its own sentence.
+
+Three defenses: turn echo cancellation on wherever you own the client; require a short stretch of continuous speech, such as 200 ms, before pausing (a design number, not measured); and drop a "caller" transcript that matches the text we are playing. On a phone call the caller's device is not yours. A speakerphone can echo the agent into the line, so the third defense matters most there.
+
+## Deep dive 3: tool calls without dead air, and fallback
+
+**What it is.** A **tool call** makes the agent do work, such as check a table. The time it takes is silence unless something fills it.
+
+**Picture.** A shop assistant who says "one moment, let me look" and walks to the back. The words cost nothing and tell you you were heard.
+
+**The numbers.** Take the stages above, plus a tool that takes 900 ms, 100 ms for the model to write the call, and a 1,100 ms filler clip. The tool time and the clip length are **illustrative**. Step through four cases.
+
+<Ai13VoiceGantt client:visible />
+
+Without filler, silence is 590 + 900 + 250 + 110 + 80 = 1,930 ms. With filler, the model's first words are the filler, so TTS speaks them at 120 + 60 + 60 + 250 + 110 + 80 = 680 ms, the same as a normal turn. The answer is ready at 1,930 ms, the filler ends at 1,780 ms, and 150 ms of gap remains.
+
+Two traps. A **slow tool** (3,000 ms) leaves 2,250 ms of silence after one filler line. A **fast tool** (300 ms) is worse with filler: the answer is ready at 1,330 ms but waits behind the clip until 1,780 ms, a cost of 450 ms. The answer is ready at 590 + tool + 440 ms, so filler pays only when the tool takes more than 750 ms. Keep a P50 per tool, and use filler only above that break-even.
+
+Rules for filler:
+
+- Make it a promise to look, never a result. "I've booked it" before the tool returns is a lie.
+- Put a deadline on the tool, such as 3 s. At the deadline, say so and offer a transfer.
+- Tools that change state need an idempotency key from code, because a deadline plus a retry can run the tool twice.
+
+### Fallback when a stage fails
+
+Each stage gets a **deadline**, set above its P95: LLM first token at 1,000 ms (P95 is 600), STT final at about 400 ms, TTS first audio at 500 ms. When the deadline passes, you have three moves: degrade, switch provider, or hand to a person.
+
+| Stage fails | Detect | Degrade | Switch | Hand off |
+|---|---|---|---|---|
+| STT: no final transcript | Deadline passes with audio but no text | Play a pre-recorded "Sorry, could you say that again?" | Send the buffered audio to a standby STT | After 2 failures in a row |
+| LLM: no first token | 1,000 ms with no token | A smaller model, or a shorter answer | Standby model on another provider | If the tool state is unknown |
+| TTS: no first audio | 500 ms with no audio | Play a pre-recorded line | Standby TTS voice | If TTS is down for the call |
+
+Numbers. If the LLM misses its deadline and the standby answers in 250 ms, the LLM line becomes 1,000 + 250 = 1,250 ms instead of 250. TTFA is 680 + 1,000 = 1,680 ms: over target, but far better than waiting with no limit. A cheaper trick is to **hedge**: send the same request to the standby after 600 ms, the P95. By the definition of P95, only about 5% of turns pay for a second request. That is our design, not a vendor figure. How often do timeouts happen? With a 0.5% chance per stage per turn (illustrative), 1 - 0.995^3 = 1.5% of turns time out, and over a 10-turn call 1 - 0.985^10 = 14%. So about 1 call in 7 meets a fallback. It has to be tested, not hoped for. Lesson [Provider and Region Failover](/learn/ai/a9-llmops/provider-failover/) covers switching, and lesson [A13.4](/learn/ai/a13-cases/support-agent/) covers handoff by cost of error. Also, OpenAI's guide says "The maximum duration of a Realtime session is 60 minutes", so a long call needs a reconnect path.
+
+## Failure modes and an incident drill
+
+| Failure | What happens | Detect | Do |
+|---|---|---|---|
+| Echo | The agent hears itself and interrupts itself | Barge-ins where the "caller" text matches agent text | Echo cancellation, min speech length, drop matching text |
+| Slow tool | Silence while the tool runs | Gap between turn end and next audio, by tool | Filler above the break-even, a tool deadline |
+| No truncation | The model refers to words the caller never heard | `heard_ms` far below the reply length, then confusion | Mark and clear, then truncate on every barge-in |
+| Provider timeout | A stage never answers | Deadline misses per stage | Degrade, hedge, switch, or transfer |
+| Cut-off | The agent answers a half sentence | Sampled turns where the caller continues | Raise T, add a turn model |
+| Mobile jitter | P95 doubles on cellular | TTFA percentiles by network type | See the puzzle below |
+| Session cap | A long call drops | Session end events at the limit | Reconnect and restore state |
+
+**Incident drill: P95 doubles on mobile networks.** Illustrative numbers. Work through it.
+
+<Diagnose
+  client:visible
+  id="ai13-voice-mobile-p95"
+  title="P95 doubles on mobile"
+  scenario="After a mobile app launch, support hears that the agent 'goes quiet' for a few seconds on cellular calls. The dashboard splits TTFA by client. Server-side stage timings come from the same turns. (Illustrative numbers.)"
+  facts={[
+    'desktop browser: P50 690 ms, P95 1,540 ms',
+    'mobile app on cellular: P50 720 ms, P95 3,100 ms',
+    'server-side P95 for STT final, LLM first token, TTS first audio: unchanged (150, 610, 225 ms)',
+    'client-measured network round trip, P95: 160 ms on desktop, 760 ms on cellular',
+    'player buffer P95: 150 ms on desktop, 1,050 ms on cellular',
+    'audio travels over a WebSocket on TCP; cellular packet loss 2 to 4%',
+    'the player buffer grows after a late packet and stays large for 30 seconds',
+  ]}
+  steps={[
+    {
+      prompt: 'Where does the extra P95 time come from?',
+      options: [
+        'The LLM is slower for mobile callers, so first tokens arrive late on those turns',
+        'The network leg and the player buffer, which grow with jitter and loss',
+        'TTS needs more time to make audio for a smaller screen',
+        'The endpointing timer waits longer on mobile microphones',
+      ],
+      answer: 1,
+      explain: 'The server-side stages did not change. The network P95 rose by 600 ms (160 to 760) and the buffer by 900 ms (150 to 1,050). That is 1,500 ms, which matches the P95 gap of 3,100 - 1,560 = 1,540 ms. A model or voice problem would show up in the server timings.',
+    },
+    {
+      prompt: 'Which change goes after the cause?',
+      options: [
+        'Switch to a faster LLM and a faster TTS voice to win back the lost 1,500 ms',
+        'Lower the silence threshold so the agent starts sooner',
+        'Send mobile audio over WebRTC and cap how far the buffer can grow',
+        'Add a second copy of the call server in the same region',
+      ],
+      answer: 2,
+      explain: 'A lost packet on TCP holds up everything behind it, so the loss turns into delay, and the buffer then grows to hide it. WebRTC over UDP skips old audio instead of waiting. A faster LLM saves tens of milliseconds, not 1,500. A lower threshold adds cut-offs. A second server does not touch the network leg.',
+    },
+    {
+      prompt: 'What should the dashboard show so this is caught in the first week?',
+      options: [
+        'The average TTFA across all clients and networks',
+        'The P50 TTFA for desktop calls only',
+        'The count of calls per day, split by country',
+        'P95 per budget line, split by network type',
+      ],
+      answer: 3,
+      explain: 'The P50 barely moved (690 to 720 ms), so a median or an average hides it. Splitting the P95 by budget line and network type shows both which line grew and which clients are hurt. A call count says nothing about delay.',
+    },
+  ]}
+/>
+
+The damage: 1 - 0.95^10 = 40% of 10-turn calls have at least one turn that slow if the tail is 5% of turns, and on cellular that turn takes 3.1 s. Callers on mobile hear that as a dropped call.
+
+## Drill: Text-to-image service
+
+**The task.** An app lets users type a prompt and get an image. Peak load is 20 images a second (illustrative). It has three tiers: free, paid, and fast. Budget 15 minutes. This drill builds on [Diffusion Serving Cost and Latency](/learn/ai/a12-multimodal/diffusion-serving/).
+
+**Bar (illustrative).** P50 and P95 time to image per tier, for example paid at 8 s and 15 s. Preference win rate against the current model at or above 50% in pairwise votes (lesson [A12.5](/learn/ai/a12-multimodal/media-evals/)). Unsafe-output rate measured on a red-team set. Cost per image under $0.02.
+
+**Design.**
+
+- **Submit returns a job id.** An image takes seconds, so it is a job, not a request ([Batch and Async APIs](/learn/ai/a3-llm-apis/batch-async-apis/)).
+- **Moderate the prompt first.** A blocked prompt costs a classifier call, not GPU time.
+- **A priority queue per tier** ([Background Agents and Queues](/learn/ai/a7-agents-prod/background-agents-queues/)). Paid jobs go first. Free jobs have an age limit, so they are not starved.
+- **GPU workers keep the model loaded** and batch jobs of the same resolution.
+- **Moderate the output before storage.** Then write to object storage and return a signed CDN URL that expires.
+
+**Derive the fleet.** Modal reports about 6.75 s for a 1024x1024 FLUX.1-dev image: "we can generate a 1024x1024 image in ~6.75 seconds" ([Modal, 2025-06-18](https://modal.com/blog/flux-3x-faster)). The post does not name the GPU or the step count, so treat it as one data point. If each GPU makes one image at a time, 20 images arrive each second and each holds a GPU for 6.75 s. On average 20 x 6.75 = **135 GPUs** are busy. At 70% target use for headroom, 135 / 0.7 = 193 GPUs.
+
+**Cost per image.** Assume an H100-class GPU (our assumption, since Modal did not name the GPU). Lambda lists H100 SXM at $3.99 to $4.29 per GPU-hour and H100 PCIe at $3.29 (as of 2026-10-20, [Lambda](https://lambda.ai/pricing), excluding tax). At $3.99, one image costs 6.75 / 3,600 x $3.99 = **$0.0075** with the GPU always busy. At 70% busy it is $0.0107. Google lists Gemini 3.1 Flash Image at $0.067 per 1K image, and $0.034 batch (price page "Last updated 2026-10-19 UTC", fetched 2026-10-20, [Google](https://ai.google.dev/gemini-api/docs/pricing)). That is a different model, so quality is not equal. On cost alone, $0.0075 / u equals $0.067 at u = 11% busy, so below about 11% use the API is cheaper per image, before you count engineers.
+
+**What batching and fewer steps do.** I have no timing for batching, or for FLUX.1 schnell, on this setup. Its model card says it "can generate high-quality images in only 1 to 4 steps" and was "Trained using latent adversarial diffusion distillation" ([model card](https://huggingface.co/black-forest-labs/FLUX.1-schnell)). It gives no seconds per image. So the table uses a speed-up factor k, not seconds. **Every k below is an assumption.**
+
+| Assumption | k | Busy GPUs (135 / k) | At 70% use |
+|---|---|---|---|
+| Baseline, one image at a time | 1 | 135 | 193 |
+| Batching of 4 gives 1.5 times the throughput | 1.5 | 90 | 129 |
+| Few-step model, 4 steps for a baseline of 28 (time scales with steps) | 7 | 19.3 | 28 |
+
+The 28 is a guess for the baseline step count. Fewer steps cost quality, so use the few-step model for the fast tier only, and check it with pairwise votes.
+
+**The failure: a viral launch.** Illustrative. The pool is sized at 90 GPUs with the batching gain. Traffic hits 20 images a second, but users ask for 40 different resolutions. A batch waits at most 2 s for a same-size partner. With 40 resolutions, each gets 0.5 jobs a second, so about 1 job arrives per window and batches have size 1. The 1.5 times gain is gone. Capacity is 90 / 6.75 = 13.3 images a second, against 20 arriving. The backlog grows by 6.7 a second. After 10 minutes there are 4,000 jobs, and a new job waits 4,000 / 13.3 = 300 s. P95 jumps from seconds to minutes, yet GPU use can read 60%, because workers sit idle while they hold a batch open. Fixes: snap requested sizes to a few buckets, send a batch when a worker is idle even if it is small, and scale on queue age, not GPU use.
+
+**Prove it.** Variants of this drill: text-to-video (lesson [A12.4](/learn/ai/a12-multimodal/video-gen/)), headshots, captioning.
+
+<Ballpark
+  client:visible
+  title="GPUs for 20 images per second"
+  scenario="A text-to-image service at peak: 20 images per second. One image takes 6.75 s on one GPU (Modal, FLUX.1-dev, 1024x1024, bf16, GPU not named). A GPU makes one image at a time. Plan for 70% use. Assume an H100 at $3.99 per GPU-hour (Lambda, as of 2026-10-20)."
+  steps={[
+    {
+      prompt: 'How many GPUs are busy on average?',
+      unit: 'GPUs',
+      answer: 135,
+      within: 1.1,
+      explain: '20 images a second x 6.75 s each = 135 GPUs in use on average.',
+    },
+    {
+      prompt: 'How many GPUs do you provision for 70% use?',
+      unit: 'GPUs',
+      answer: 193,
+      within: 1.1,
+      explain: '135 / 0.7 = 192.9, so 193 GPUs. The headroom pays for bursts.',
+    },
+    {
+      prompt: 'What does the fleet cost per hour, in USD?',
+      unit: 'USD',
+      answer: 770,
+      within: 1.1,
+      explain: '192.9 x $3.99 = $769.5 an hour, so about $770.',
+    },
+    {
+      prompt: 'What is the GPU cost per image, in USD?',
+      unit: 'USD',
+      answer: 0.0107,
+      within: 1.1,
+      explain: '20 images a second is 72,000 an hour. $770 / 72,000 = $0.0107 per image. At 100% busy it would be $0.0075.',
+    },
+  ]}
+/>
+
+## Drill: Content moderation with LLMs
+
+**The task.** A social app has 1 million posts and images a day (illustrative). Decide for each: allow, remove, or send to a person. Budget 15 minutes.
+
+**Bar.** Precision and recall **per policy class**, never one overall number. **Precision** is the share of removed items that were truly bad. **Recall** is the share of bad items that were removed. Add the share of removals overturned on appeal. Latency: Discord's post on its rule engine gives none, so set yours from the product.
+
+**Class imbalance.** Say 0.5% of items are harmful: 5,000 of 1,000,000. A classifier with 95% recall and a 1% false-positive rate (both illustrative) finds 4,750 bad items and wrongly flags 9,950 good ones: 995,000 x 0.01. Precision is 4,750 / (4,750 + 9,950) = 32%. Two flags in three are fine posts. So a flag is not a removal. That is why the design is a cascade.
+
+**Cascade.** Stage 1 is a cheap classifier or a rule. Stage 2 is an LLM that reads the item against the policy and answers allow, remove, or unsure. Stage 3 is a person for the unsure ones. The LLM runs only on the **uncertain band**, so it is priced on a small share of traffic. Pieces you can start from:
+
+- OpenAI's moderation endpoint is "free to use". Its `omni-moderation-latest` model takes text and images, returns scores for 13 categories, and some categories are text-only. The page says to treat scores "as signals for your application's policy, not as an automatic blocking decision", and warns that policies using scores "may need recalibration over time" ([guide](https://developers.openai.com/api/docs/guides/moderation)).
+- Llama Guard is a Llama2-7b model instruction-tuned as an input and output safeguard. Its authors say it "matches or exceeds" other tools on the OpenAI Moderation Evaluation set and ToxicChat ([paper](https://arxiv.org/abs/2312.06674)). That is the authors' claim.
+- OpenAI describes a pipeline with taxonomies and "an active learning pipeline to capture rare events" ([paper](https://arxiv.org/abs/2208.03274)). Active learning picks the items worth labeling next, which matters when only 0.5% are bad.
+
+**Policy as a prompt.** The LLM stage reads the written policy. Treat that text as code: give it a version, log the version with every decision, test a change against the labeled set per class, and roll it out as a canary (lesson [Shadow, Canary, and Rollback](/learn/ai/a8-evals/rollout/)). The LLM needs its own check, as in lesson [Code Checks and LLM Judges](/learn/ai/a8-evals/judges/). User text goes in a delimited data field, and the answer uses a fixed schema (lesson [Structured Output](/learn/ai/a3-llm-apis/structured-output/)).
+
+**A real system.** Discord open-sourced its rule engine, Osprey. As of December 2025 it handles about 400 million actions a day. That is 400,000,000 / 86,400 = about 4,630 a second (my arithmetic). It has 204 action types and 2,288 rules, and an average action triggers about 500 rules. Rules are written in SML, a language based on Python, and reach workers through etcd, so rule changes reach production without a deployment. Results go to Kafka and then Druid, which feeds the investigator tool ([Discord, 2026-02-19](https://discord.com/blog/osprey-open-sourcing-our-rule-engine)). The post gives no latency figure. Our reading: a rule layer is the fast, editable stage in front of the LLM. The LLM handles meaning. Rules handle known patterns, and a new pattern becomes a rule in minutes.
+
+**The numbers.** An LLM call of 1,700 tokens in and 30 out on Claude Haiku 5.5 costs 1,700 x $0.10 / 1e6 + 30 x $0.50 / 1e6 = $0.000185. A human review is assumed to cost $0.40 (no source). The score spreads and LLM behavior are illustrative.
+
+<Ai13VoiceCascade client:visible />
+
+Read it. At a slider value of 0.1, 11.8% of items (118,397) go to the LLM at $22 a day. The LLM says unsure on 7,487, which cost $2,995 a day in reviews, and recall is 92.5%. Move to 0.5: reviews fall to 722, but 1,298 harmful items a day stay online and recall drops to 74%. Move to 0.01: reviews rise to 39,719 a day, $15,888. The LLM is under 1% of the human cost at every setting. So the lever is the LLM's unsure rate and the band edge, not the model price.
+
+**The failure: adversarial rewording.** Posters change spelling ("k1ll"), add spaces, swap look-alike letters, or paraphrase. A classifier tuned on last month's phrasing loses recall on that slice, and the LLM can be told "ignore the policy" in the post itself (lesson [Jailbreaks and Red-Teaming](/learn/ai/a10-safety/jailbreaks-redteam/)). Detect it with recall per class on a red-team set at every release, a rise in appeals, and a rise in the unsure share. Fix it with a rule within minutes, then retrain the classifier from the reviewed items.
+
+**Prove it.** Human reviews per day at a stated pass-through rate.
+
+<Ballpark
+  client:visible
+  title="Human reviews per day"
+  scenario="A moderation cascade on 5,000,000 items a day. The classifier passes 92% automatically, so 8% go to the LLM. The LLM answers unsure on 4% of the items it sees, and those go to a person. A reviewer handles 50 items an hour for 7 hours a day (assumption). An LLM call costs $0.000185 (Claude Haiku 5.5, 1,700 in and 30 out, as of 2026-10-20)."
+  steps={[
+    {
+      prompt: 'How many items per day reach the LLM?',
+      unit: 'items',
+      answer: 400000,
+      within: 1.1,
+      explain: '8% of 5,000,000 is 400,000 items a day.',
+    },
+    {
+      prompt: 'How many human reviews per day?',
+      unit: 'reviews',
+      answer: 16000,
+      within: 1.1,
+      explain: '4% of 400,000 is 16,000 reviews a day. The pass-through rate to people, 16,000 of 5,000,000, is 0.32%.',
+    },
+    {
+      prompt: 'How many full-time reviewers does that need?',
+      unit: 'people',
+      answer: 46,
+      within: 1.1,
+      explain: 'One reviewer handles 50 x 7 = 350 items a day. 16,000 / 350 = 45.7, so about 46 reviewers.',
+    },
+    {
+      prompt: 'What does the LLM stage cost per day, in USD?',
+      unit: 'USD',
+      answer: 74,
+      within: 1.1,
+      explain: '400,000 x $0.000185 = $74 a day. At an assumed $0.40 a review, people cost $6,400 a day, about 86 times more.',
+    },
+  ]}
+/>
+
+## Staff answer vs senior answer
+
+| Topic | Senior answer | Staff answer |
+|---|---|---|
+| Latency | Lists the stages and says "stream everything" | Budgets each stage at P50 and P95, adds the phone leg, and shows that P95 is over target before any tuning |
+| Endpointing | "Use a silence threshold" | Prices the threshold in ms and in cut-offs, adds a turn model, and counts the tokens spent on speculation |
+| Barge-in | "Stop the audio" | A state machine with a false-interruption path, marks to learn `heard_ms`, and truncation of history |
+| Tools | "Say please wait" | Filler only above a break-even tool time, with a tool deadline and idempotent writes |
+| Failure | "Retry" | Deadlines per stage, hedging at P95, a standby provider, and a transfer rule, tested on a schedule |
+| Cost | One number per call | Per-line cost per minute, with sensitivity to promotional prices |
+
+## What experienced teams know
+
+1. **Humans are fast.** The cross-linguistic median gap between turns is +100 ms, with per-language medians from 0 to +300 ms ([Stivers et al.](https://pmc.ncbi.nlm.nih.gov/articles/PMC2705608/)). Our reading: 800 ms is a "tolerable" bar, not a "natural" one.
+2. **Tune endpointing by measuring cut-offs.** ElevenLabs says to use the smallest silence value that does not cut off natural pauses and then measure interruptions in production ([guide](https://elevenlabs.io/blog/voice-agent-latency-optimization)). Our reading: that needs a labeled sample.
+3. **Track played audio with marks.** Twilio's `mark` returns when audio ends, and `clear` empties the buffer ([reference](https://www.twilio.com/docs/voice/media-streams/websocket-messages)). Our reading: that is how a phone bridge learns `heard_ms`.
+4. **Do not trust a clean-audio WER.** One 2015 study measured 8.67% narrowband against 8.12% wideband on clean read speech ([Li et al.](https://www.isca-archive.org/interspeech_2015/li15d_interspeech.pdf)). Our reading: measure on your own calls, by accent and device.
+5. **Moderation scores are signals.** OpenAI says to treat them "as signals for your application's policy", and warns that custom score policies "may need recalibration over time" ([guide](https://developers.openai.com/api/docs/guides/moderation)). Our reading: re-run the labeled set when the model behind the endpoint changes.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Short silence threshold | Fast replies | More cut-offs | Short commands |
+| Turn model plus timer | Fewer cut-offs | Compute, and 8 kHz audio must be resampled | Open conversation |
+| Speculative LLM start | Hides the wait | About 1.3 to 2 LLM calls a turn | A tight P50 bar |
+| Filler speech | No dead air on slow tools | Delays fast answers | Tools slower than the break-even |
+| Standby provider per stage, with hedging | Survives an outage, cuts the tail | A second contract, about 5% extra requests | Calls that matter |
+| Cascade moderation | Cheap, with humans where unsure | Three stages to tune | Rare harm at high volume |
+| Self-host image models | Low cost per image at high use | Fleet operations | Busy above about 11% of the time (the API break-even) |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "A voice agent is a clock. My bar is P50 TTFA under 800 ms and P95 under 1.5 s, from call logs. I start from the vendor stage budget, add the phone leg, and note that P95 is already 60 ms over. Endpointing is the biggest knob: a timer plus a turn model, and an early LLM start if I can afford the tokens. On a barge-in I stop playback, cancel, and truncate history to what was heard. Filler covers tools above a break-even time. Every stage has a deadline and a standby. I cost it per call-minute at live prices."
+</Callout>
+
+<Callout type="mistake">
+Do not quote 200 ms as the human gap: the paper says +100 ms, in a range of 0 to +300 ms. Do not reuse a clean-audio WER for a phone line. Do not play filler before every tool call. Do not leave the model's history at the full reply after a barge-in. And do not plan on a median alone: a 10-turn call has at least one turn slower than P95 about 40% of the time.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Cost per call-minute"
+  scenario="A phone voice agent. One minute: 60 s of caller audio to STT, 4 LLM calls of 1,500 input tokens each, 100 output tokens in all, and 450 characters of TTS. Prices as of 2026-10-20: Twilio inbound local $0.0085 per minute, Deepgram Nova-3 streaming $0.0048 per minute (promotional), Claude Haiku 5.5 $0.10 per million input tokens and $0.50 per million output tokens, ElevenLabs Flash $0.04 per 1,000 characters."
+  steps={[
+    {
+      prompt: 'What do the phone line and STT cost per call-minute, in USD?',
+      unit: 'USD',
+      answer: 0.0133,
+      within: 1.1,
+      explain: '$0.0085 + $0.0048 = $0.0133.',
+    },
+    {
+      prompt: 'What does the LLM cost per call-minute on Haiku 5.5, in USD?',
+      unit: 'USD',
+      answer: 0.00065,
+      within: 1.1,
+      explain: 'Input: 6,000 x $0.10 / 1e6 = $0.0006. Output: 100 x $0.50 / 1e6 = $0.00005. Total $0.00065.',
+    },
+    {
+      prompt: 'What does TTS cost per call-minute, in USD?',
+      unit: 'USD',
+      answer: 0.018,
+      within: 1.1,
+      explain: '450 / 1,000 x $0.04 = $0.018. This is the largest line.',
+    },
+    {
+      prompt: 'What do 1,000 call-minutes cost, in USD?',
+      unit: 'USD',
+      answer: 31.95,
+      within: 1.1,
+      explain: '$0.0133 + $0.00065 + $0.018 = $0.03195 a minute, so $31.95 for 1,000 minutes. At an assumed $0.50 a human minute the same 1,000 minutes cost $500.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A voice agent has other stages summing to 560 ms at P50. The team sets a 400 ms silence threshold and adds a turn model that costs 50 ms. What is the new P50 time to first audio?',
+      options: ['1,010 ms', '960 ms', '1,060 ms', '610 ms'],
+      answer: 0,
+      explain: 'TTFA = silence threshold + model time + the other stages = 400 + 50 + 560 = 1,010 ms. It is over the 800 ms target. A 960 ms answer forgets the model time, and 610 ms forgets the threshold.',
+    },
+    {
+      q: 'The model wrote 22 words of a reply. The caller barged in after hearing 6 words, and a transcript of real words arrived. What should be stored in the history for that reply?',
+      options: [
+        'All 22 words, because the model wrote them',
+        'None of the reply, since it was interrupted',
+        'The 6 words the caller heard',
+        'The 16 words that were never played',
+      ],
+      answer: 2,
+      explain: 'History should match what was said out loud, so the reply is truncated to the 6 heard words. Keeping all 22 makes the model believe it said things the caller never heard. Dropping all of it loses context the caller did hear.',
+    },
+    {
+      q: 'A filler clip is 1,100 ms long. The answer is ready at 590 + tool time + 440 ms. For which tool time does the filler start to delay the answer?',
+      options: [
+        'Above 750 ms, since the answer would be ready after the filler',
+        'Below 750 ms, since the answer is ready before the filler ends',
+        'Above 1,100 ms, since the clip must be shorter than the tool',
+        'Never, because filler always plays in parallel',
+      ],
+      answer: 1,
+      explain: 'The filler ends at 1,780 ms. The answer is ready at 1,030 + tool time. They are equal at 750 ms. Below that, the answer is ready first and has to wait behind the clip, so the filler costs time. Above it, the filler hides silence.',
+    },
+    {
+      q: 'A moderation classifier has 95% recall and a 1% false-positive rate. The traffic is 1,000,000 items with 0.5% harmful. Roughly what share of the flagged items are truly harmful?',
+      options: ['95%', '5%', '50%', '32%'],
+      answer: 3,
+      explain: 'True positives: 5,000 x 0.95 = 4,750. False positives: 995,000 x 0.01 = 9,950. Precision = 4,750 / 14,700 = 32%. The 95% figure is recall. Rare harm makes false positives the majority of flags.',
+    },
+    {
+      q: 'Each of three stages in a voice turn times out with a 0.5% chance, independently. About what share of 10-turn calls hit at least one timeout?',
+      options: ['5%', '1.5%', '14%', '40%'],
+      answer: 2,
+      explain: 'One turn times out with chance 1 - 0.995^3 = 1.5%. Over 10 turns, 1 - 0.985^10 = 14%. The 1.5% figure is for one turn, and 5% is simply 10 x 0.5%.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [ElevenLabs, Voice agent latency optimization](https://elevenlabs.io/blog/voice-agent-latency-optimization): the stage budget, targets, and endpointing advice.
+- [Twilio, Media Streams WebSocket messages](https://www.twilio.com/docs/voice/media-streams/websocket-messages): audio format, `mark`, and `clear`.
+- [OpenAI, Realtime conversations](https://developers.openai.com/api/docs/guides/realtime-conversations): interruption, truncation, and the session limit.
+- [LiveKit, Turns](https://docs.livekit.io/agents/build/turns/): turn detection, interruptions, and false interruptions.
+- [Discord, Osprey rule engine](https://discord.com/blog/osprey-open-sourcing-our-rule-engine): the moderation rules system at scale.

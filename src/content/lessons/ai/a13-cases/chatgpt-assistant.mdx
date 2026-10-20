@@ -25,7 +25,7 @@ The backend lesson builds the chat app. Tokens stream over server-sent events. A
 
 ## Requirements and the quality bar
 
-**Functional.** Streaming chat with history: send a message, get tokens back, continue any old chat. **Out of scope:** tools and browsing, images and voice (lessons A12.1 and A12.2), sharing, and search over old chats.
+**Functional.** Streaming chat with history: send a message, get tokens back, continue any old chat. **Out of scope:** tools and browsing, images and voice (lessons [A12.1](/learn/ai/a12-multimodal/vlms/) and A12.2), sharing, and search over old chats.
 
 **Non-functional.** These numbers are our choices. No source we read publishes a latency or cost target for ChatGPT.
 
@@ -34,7 +34,7 @@ The backend lesson builds the chat app. Tokens stream over server-sent events. A
 - **Quality:** pass bars on a golden set, and an unsafe-output rate under a bar you set.
 - **Capacity:** if load exceeds the GPUs, degrade in a planned order.
 
-The **bar** is the share of turns that meet both latency targets, at least 90%. We call that rate **goodput** [mid]. It is not raw tokens per second, and the drill shows how they split.
+The **bar** is the share of turns that meet both latency targets, which are the **SLO** (service level objective, a stated target). At least 90% must. We call that rate **goodput** [mid]. It is not raw tokens per second, and the drill shows how they split.
 
 ## Eval plan
 
@@ -48,13 +48,13 @@ Lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/) says to write the eval
 
 ### Time to first token: what a hit and a miss cost
 
-Lesson A2.2 gave the prefill work for p prompt tokens:
+Lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) gave the prefill work for p prompt tokens:
 
 <Math block tex="\text{FLOPs} \approx 2 N p + 4 p^2 d L" />
 
 N is 70 billion parameters, d is 8,192, L is 80 layers. One replica is 8 H100 cards sharing the model (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). Its peak is 8 x 989 TFLOPS = 7.9e15 FLOP/s, with 8 x 3.35 TB/s of memory bandwidth.
 
-**A miss on a 4,000-token chat.** Weights term: 2 x 70e9 x 4,000 = 5.6e14. Attention term: 4 x 4,000² x 8,192 x 80 = 4.2e13. Total 6.0e14, which takes 6.0e14 / 7.9e15 = **76 ms** at peak. We assume real kernels reach 40% of peak (lesson A2.2 cites 38% to 43% for Llama 3 training; we found no published serving figure). That gives **190 ms**.
+**A miss on a 4,000-token chat.** Weights term: 2 x 70e9 x 4,000 = 5.6e14. Attention term: 4 x 4,000² x 8,192 x 80 = 4.2e13. Total 6.0e14, which takes 6.0e14 / 7.9e15 = **76 ms** at peak. We assume real kernels reach 40% of peak (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) cites 38% to 43% for Llama 3 training; we found no published serving figure). That gives **190 ms**.
 
 **A hit.** Only the new 100-token message needs prefill: 1.5e13 FLOPs, 1.9 ms. But any pass reads all 140 GB of weights once, and 140 GB / 26.8 TB/s = **5.2 ms**. At 40% that is **13 ms**. A hit is memory-bound. A miss is compute-bound.
 
@@ -145,7 +145,7 @@ The router is the new idea. A stateless balancer may pick any server. This one m
 
 Affinity has a price. A few chats, such as one automated client, send far more turns than the rest. If their hash lands on one engine, that engine runs hot while the others idle. Round-robin has the opposite problem: perfect spread, wasted cache.
 
-A third router scores each engine for each turn. Our sketch: cost = (prefill time this engine needs, given what it has cached) + (how long the turn would wait in its queue), and the lowest cost wins. NVIDIA's Dynamo router documents a cost of this kind, "cost = prefill_load_scale * adjusted_prefill_blocks + decode_blocks", and says it "selects the worker with the lowest cost" ([Dynamo](https://docs.nvidia.com/dynamo/v1.3.0/design-docs/component-design/router-design)). The llm-d project describes a "prefix + load scorer" ([llm-d](https://llm-d.ai/blog/intelligent-inference-scheduling-with-llm-d)). The vLLM production stack lists round-robin and session-ID routing, with prefix-aware routing still marked work in progress ([README](https://github.com/vllm-project/production-stack)).
+A third router scores each engine for each turn. Our sketch: cost = (prefill time this engine needs, given what it has cached) + (how long the turn would wait in its queue), and the lowest cost wins. NVIDIA's Dynamo router documents a cost of this kind, "cost = prefill_load_scale * adjusted_prefill_blocks + decode_blocks", and says it "selects the worker with the lowest cost" ([Dynamo](https://docs.nvidia.com/dynamo/v1.3.0/design-docs/component-design/router-design)). The llm-d project describes a "Prefix + Load scorer" ([llm-d](https://llm-d.ai/blog/intelligent-inference-scheduling-with-llm-d)). The vLLM production stack lists round-robin and session-ID routing, with prefix-aware routing still marked work in progress ([README](https://github.com/vllm-project/production-stack)).
 
 Try it. The three routers see the same turns. The model is ours and all inputs are illustrative.
 
@@ -185,7 +185,7 @@ The engine reuses a cached prefix only if the new prompt starts with exactly the
 - The **summaries**, each with its turn range and a version. The prompt is a view of transcript plus summaries.
 - **Memory** facts about the user (lesson [A6.7](/learn/ai/a6-agents/agent-memory/)). Place them after the system prompt and change them only at a chunk boundary or a new chat, since a mid-chat update changes every token after it, like an early edit. We found no primary source on how ChatGPT implements memory, so we say nothing about it.
 
-**Idle chats.** The engine evicts by memory pressure, least recently used first. Providers evict by time: Anthropic defaults to 5 minutes, and OpenAI's lifetime is at least 30 minutes on GPT-5.6 and later. A user who returns later gets a miss. Store the transcript and accept it. Keeping all 10,000 chats resident costs $957.60 an hour.
+**Idle chats.** Engines evict by memory pressure, least recently used first. Providers evict by time: Anthropic defaults to 5 minutes, and OpenAI's lifetime is at least 30 minutes on GPT-5.6 and later. A returning user gets a miss. Store the transcript and accept it, since keeping all 10,000 chats resident costs $957.60 an hour.
 
 ## Deep dive 3: capacity under a launch spike
 
@@ -204,7 +204,7 @@ A real case. On 2026-02-10, from 8:03 to 9:48 AM PST, paid ChatGPT plans saw "el
 | 5 | Queue new chats with an honest wait | A wait | Queue wait above 5 s |
 | 6 | Spill to another region | Cold cache on arrival | A region loses GPUs |
 
-Trigger on KV pool use and queue wait, not GPU utilization. Morikawa: "The combination of batch size and KV cache utilization was the primary metric we focused on." Lesson A2.2 explains why the utilization percentage misleads for decode.
+Trigger on KV pool use and queue wait, not GPU utilization. Morikawa: "The combination of batch size and KV cache utilization was the primary metric we focused on." Lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) explains why the utilization percentage misleads for decode.
 
 **Rung 4 in numbers.** An 8B model (32 layers, 8 KV heads) takes 2 x 32 x 8 x 128 x 2 = 131,072 bytes per token, so a 4,000-token chat is 0.524 GB. One card has 73.6 GB usable and 16 GB of weights, so it holds (73.6 - 16) / 0.524 = 109 chats. The 70B replica holds 342 chats on 8 cards, 43 per card. The small model serves about 2.5 times more chats per card. Check its quality on the golden set first.
 
@@ -226,7 +226,7 @@ Trigger on KV pool use and queue wait, not GPU utilization. Morikawa: "The combi
   client:visible
   id="ai13-chat-long-ttft"
   title="TTFT doubles for long chats only"
-  scenario="A chat service on 70B replicas. Two days ago it launched a long-history mode that raised the history limit from 8K to 32K tokens. Since then P95 TTFT doubled, but only for long chats. Short chats look the same. GPU utilization looks fine."
+  scenario="Illustrative dashboard. A chat service on 70B replicas. Two days ago it launched a long-history mode that raised the history limit from 8K to 32K tokens. Since then P95 TTFT doubled, but only for long chats. Short chats look the same. GPU utilization looks fine."
   facts={[
     'P95 TTFT, history under 2K:  0.31s -> 0.33s',
     'P95 TTFT, history 2K to 8K:  0.45s -> 0.62s',
@@ -265,14 +265,14 @@ Trigger on KV pool use and queue wait, not GPU utilization. Morikawa: "The combi
 
 **The task.** Serve an open model such as Llama 3.1 70B to many apps. Chat is the hardest tenant because it is stateful. We reuse the numbers above and add a goodput plan.
 
-**The bar.** Per tenant, at least 90% of turns meet the TTFT and TPOT targets. DistServe uses 90% as its example SLO attainment goal. Also **quality parity after quantization**: if you serve an FP8 or 4-bit copy, run the golden set per slice (lesson A2.6) and ship only if no slice drops past a margin you set before the run.
+**The bar.** Per tenant, at least 90% of turns meet the TTFT and TPOT targets. DistServe uses 90% as its example SLO attainment goal. Also **quality parity after quantization**: if you serve an FP8 or 4-bit copy, run the golden set per slice (lesson [A2.6](/learn/ai/a2-inference-cost/quantization-small-models/)) and ship only if no slice drops past a margin you set before the run.
 
 **The design.**
 
 - **Router and engines.** The cost-based router from deep dive 1, over a pool of vLLM or SGLang engines. SGLang's paper describes a radix tree that maps token sequences to their KV tensors: the prefix cache that makes affinity pay.
-- **Prefill and decode pools.** Prefill is compute-bound and decode is memory-bound (lesson A2.2), so sharing GPUs makes them interfere. DistServe puts them on different GPUs, "hence eliminating prefill-decoding interferences", and reports "up to 7.4x more requests or 12.6x tighter SLO" at over 90% SLO attainment ([DistServe](https://arxiv.org/abs/2401.09670)). Sarathi-Serve instead splits each prefill into near-equal chunks added to the batch "without pausing ongoing decodes", for 2.6x the serving capacity of vLLM on Mistral-7B on one A100 ([Sarathi-Serve](https://arxiv.org/abs/2403.02310)). Both are research results on their own models. Splitting pools moves KV: a 4,000-token chat is 1.31 GB, or 26 ms on a 50 GB/s link (our assumed link).
+- **Prefill and decode pools.** Prefill is compute-bound and decode is memory-bound (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)), so sharing GPUs makes them interfere. DistServe puts them on different GPUs, "hence eliminating prefill-decoding interferences", and reports "up to 7.4x more requests or 12.6x tighter SLO" at over 90% SLO attainment ([DistServe](https://arxiv.org/abs/2401.09670)). Sarathi-Serve instead splits each prefill into near-equal chunks added to the batch "without pausing ongoing decodes", for 2.6x the serving capacity of vLLM on Mistral-7B on one A100 ([Sarathi-Serve](https://arxiv.org/abs/2403.02310)). Both are research results on their own models. Splitting pools moves KV: a 4,000-token chat is 1.31 GB, or 26 ms on a 50 GB/s link (our assumed link).
 - **Autoscaling and cold start.** Scale on queue depth and KV use, and keep a **warm pool**, since new GPUs may not exist. Loading 140 GB of weights at an assumed 2 GB/s takes 70 seconds, so keep weights on local disk. Engine internals are in elective E3, which this lesson does not require.
-- **Quotas and metrics.** A token bucket per tenant. TTFT, TPOT, goodput, hit rate, and KV use per tenant.
+- **Quotas and metrics.** A token bucket per tenant, and TTFT, TPOT, goodput, hit rate, and KV use per tenant.
 
 **The failure: goodput falls while throughput rises.** A team raises the batch size for more tokens per second. Throughput goes up and customers complain. Every stream in a batch shares one decode step, which reads the weights once and every chat's KV once: (140 GB + b x 1.31 GB) / (8 x 3.35 TB/s x 0.4), for 4,000-token chats. The TPOT target is 50 ms.
 
@@ -294,9 +294,9 @@ From 302 to 342, throughput rises 3% and goodput falls to zero in this model. Re
   facts={['20,000 turns per second, 4,000-token history', 'Hit rate 90%, then 50%']}
   steps={[
     { prompt: 'How many replicas are busy decoding? One answer is 150 tokens x the step time, 54.9 ms. Streams in flight = 20,000 x that. Divide by 342 per replica.', unit: 'replicas', answer: 481, within: 1.15, explain: 'One answer takes 150 x 0.0549 = 8.24 s. 20,000 x 8.24 = 164,600 streams in flight (Little\'s law). 164,600 / 342 = 481 replicas.' },
-    { prompt: 'At a 90% hit rate, how many replicas of prefill work are there? Use 20,000 x (0.9 x 13 ms + 0.1 x 190 ms).', unit: 'replicas', answer: 615, within: 1.15, explain: '0.9 x 0.013 + 0.1 x 0.190 = 0.0307 s per turn. 20,000 x 0.0307 = 615 replica-seconds per second.' },
-    { prompt: 'Add decode and prefill, divide by the 70% target, and convert to GPUs. How many GPUs?', unit: 'GPUs', answer: 12536, within: 1.15, explain: '(481 + 615) / 0.7 = 1,567 replicas, or 12,536 GPUs. Monthly: 12,536 x $3.99 x 730 = $36.5 million.' },
-    { prompt: 'A router change drops the hit rate to 50%. How many GPUs now?', unit: 'GPUs', answer: 28736, within: 1.15, explain: 'Prefill per turn is 0.5 x 13 + 0.5 x 190 = 101.5 ms, so 2,030 replica-seconds. (481 + 2,030) / 0.7 = 3,592 replicas, or 28,736 GPUs and about $83.7 million a month. The hit rate is the biggest lever.' },
+    { prompt: 'At a 90% hit rate, how many replicas of prefill work are there? Use 20,000 x (0.9 x 13 ms + 0.1 x 190 ms).', unit: 'replicas', answer: 615, within: 1.15, explain: '0.9 x 0.013 + 0.1 x 0.190 = 0.0307 s per turn. 20,000 x 0.0307 is about 615 replica-seconds per second.' },
+    { prompt: 'Add decode and prefill, divide by the 70% target, and convert to GPUs. How many GPUs?', unit: 'GPUs', answer: 12536, within: 1.15, explain: '(481 + 615) / 0.7 is about 1,567 replicas (with unrounded inputs), or 12,536 GPUs. Monthly: 12,536 x $3.99 x 730 = $36.5 million.' },
+    { prompt: 'A router change drops the hit rate to 50%. How many GPUs now?', unit: 'GPUs', answer: 28736, within: 1.15, explain: 'Prefill per turn is 0.5 x 13 + 0.5 x 190 = 101.5 ms, so about 2,030 replica-seconds. (481 + 2,030) / 0.7 is about 3,592 replicas, or 28,736 GPUs and about $83.7 million a month. The hit rate is the biggest lever.' },
   ]}
 />
 
@@ -316,9 +316,8 @@ Sanity check (our reading, not a claim about Character.AI): $36.5 million a mont
 
 1. **Memory comes first.** Morikawa's primary metric was "the combination of batch size and KV cache utilization" ([Pragmatic Engineer](https://newsletter.pragmaticengineer.com/p/scaling-chatgpt)). Size by KV before FLOPs.
 2. **Capacity moves have a recovery time.** The 2026-02-10 write-up ties an outage to a "prior engine reallocation". Our reading: treat any move of GPUs between fleets as a risk window.
-3. **A cache key is a hint.** OpenAI's keys "do not pin requests to a machine or guarantee a cache hit". Log cached tokens per request and alert on the share.
-4. **Goodput is the honest metric.** DistServe's gain is 7.4x more requests under the SLO, not 7.4x throughput.
-5. **Paging made the memory usable.** The vLLM paper found older systems used only 20.4% to 38.2% of KV memory for real tokens, and reports 2 to 4 times the throughput of FasterTransformer and Orca at the same latency ([paper](https://arxiv.org/abs/2309.06180)). Every number here assumes that waste is gone.
+3. **Goodput is the honest metric.** DistServe's gain is 7.4x more requests under the SLO, not 7.4x throughput.
+4. **Paging made the memory usable.** The vLLM paper found older systems used only 20.4% to 38.2% of KV memory for real tokens, and reports 2 to 4 times the throughput of FasterTransformer and Orca at the same latency ([paper](https://arxiv.org/abs/2309.06180)). Every number here assumes that waste is gone.
 
 ## Trade-offs
 
@@ -328,7 +327,6 @@ Sanity check (our reading, not a claim about Character.AI): $36.5 million a mont
 | Session affinity | Hits | Hot replicas under skew | Even chats |
 | Cost-based routing | Hits and balance | A live view of cache and queue | Many engines |
 | Chunked window | Bounded prompt, one miss in N | Old context lost | Free tier |
-| Summary | Short prompt that still hits | A model call, lost detail | Long chats worth keeping |
 
 ## Interview lens
 

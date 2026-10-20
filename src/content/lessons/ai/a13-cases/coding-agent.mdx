@@ -1,0 +1,630 @@
+---
+summary: 'A coding agent runs a long loop that writes to a real filesystem and is graded by tests. Tests are the reward, so flaky tests and weak tests steer it wrong. Draw three boundaries (files, network, secrets), keep the history small, cap retries, and budget cost per task. Three drills: code completion, a review bot, and a browser agent.'
+requires: ['ai/a7-agents-prod/sandboxes-code-execution', 'ai/a6-agents/subagents', 'ai/a10-safety/tool-permissions']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai13CodeBuild from '../../../../components/anim/lessons/Ai13CodeBuild.tsx';
+import Ai13CodeLoop from '../../../../components/anim/lessons/Ai13CodeLoop.tsx';
+import Ai13CodeBudgetSim from '../../../../components/anim/lessons/Ai13CodeBudgetSim.tsx';
+
+## The problem
+
+The Claude Code docs say that across enterprise deployments the average cost is "around $13 per developer per active day and $150-250 per developer per month", and below $30 per active day for 90% of users ([Claude Code costs](https://code.claude.com/docs/en/costs)). The page gives no as-of date. People run coding agents all day, so the bill is a budget line.
+
+The work looks like this. The SWE-bench benchmark takes 2,294 problems from real GitHub issues in 12 Python repositories. The model gets the issue text and the codebase, and must edit the code. A run counts as resolved only if the patch applies and the tests pass ([SWE-bench paper](https://arxiv.org/abs/2310.06770), 2024).
+
+Three facts make this case different from the agents in earlier lessons.
+
+1. **It writes to a real filesystem.** A wrong step does not return a bad answer. It changes files, runs code, and can touch things outside the project.
+2. **It runs long.** Thirty or more model calls is normal. Every call re-sends the history, so cost and delay grow with each step.
+3. **Tests grade it.** A test is cheap and fast, which makes it a strong reward. It is also a weak spot. A flaky test sends the agent the wrong way. A weak test lets a bad fix through.
+
+The questions on the way: what is the bar, how do we keep the damage small, how does the agent find code with a small history, why are tests the reward and what goes wrong, how do we stop a loop that cannot succeed, and what does one task cost. Three short drills at the end reuse the ideas for code completion, a review bot, and a browser agent.
+
+The loop is taught in lesson [The Agent Loop](/learn/ai/a6-agents/agent-loop/), and the box in lesson [Sandboxes and Code Execution](/learn/ai/a7-agents-prod/sandboxes-code-execution/). We build on them and do not repeat them.
+
+## Requirements and the quality bar
+
+The product is a background coding agent. A developer files an issue or a prompt. The agent works in its own copy of the repo and opens a pull request. All numbers in this section are **illustrative bars we chose**, unless a source is named.
+
+**Functional**
+
+- FR1: take a task and run it with nobody watching.
+- FR2: search and read the repo.
+- FR3: edit files.
+- FR4: run tests and linters, and read the results.
+- FR5: open a pull request with a summary.
+
+**Out of scope.** Inline completion, review of other people's PRs, and browser tasks (all three are drills below). Also deploys to production and model training.
+
+**Non-functional, and the bar.**
+
+- **Task pass rate.** The share of tasks where the agent's patch passes the held-out tests in a clean checkout. Bar: at least 60% on one run, and at least 45% when 3 runs of the same task must all pass.
+- **Containment.** Zero writes outside the repo clone. Zero secrets in traces. These are counted, not sampled.
+- **Cost per task.** Median at most $1, p95 at most $5, and a hard stop at $10.
+- **Wall-clock.** p50 at most 10 minutes, p95 at most 30, hard stop at 60.
+- **Cap-ended runs.** At most 5% of runs end because a cap fired and not because the agent finished. This is a health metric. A rising share means a loop problem.
+
+Why two pass numbers? One run per task hides the tasks that work only half the time. The support case, lesson [Customer Support Agent](/learn/ai/a13-cases/support-agent/), used pass^k for refunds. Here a miss costs less, so the bar is looser.
+
+## Eval plan
+
+Per lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/), the eval comes before the design.
+
+**Build the offline set from your own repo.** SWE-bench shows the recipe. Take merged pull requests that resolve an issue and change test files. Apply the PR's tests to the old code, and keep a task only if at least one test goes from fail to pass (the paper calls it a fail-to-pass test). The paper adds that a median of 51 other tests run to check that old behavior still works. So each task has two test sets: the new tests the fix must pass, and the old tests it must not break.
+
+Each task is a commit, an issue text, and those hidden tests. Aim for 200 tasks, stratified by repo area and by files touched.
+
+**Grade the end state in a clean checkout.** Take the agent's patch, drop any edits to test files, apply it to a fresh clone, and run the held-out tests. Why drop test edits? The agent can turn a red test green by changing the test. Counting that as a pass rewards cheating. Also record **forbidden actions**: any write outside the clone, any call to a host not on the allow list. One of them fails the run, whatever the tests say.
+
+**Repeat each task, and use the right k.** Run every task 5 times. Two measures come from the same runs, as lesson [Agent Trajectory Evals](/learn/ai/a8-evals/trajectory-evals/) taught. **pass^k** is the chance that all k runs pass. **pass@k** is the chance that at least one passes. A coding agent has a twist. A harness can run k attempts and keep one that passes the visible tests. Then pass@k, measured with hidden tests, is the number that matters, at k times the cost.
+
+Here is a worked example with an **illustrative** mix of 100 tasks: 60 easy ones that pass 95% of runs, 25 flaky ones at 50%, and 15 hard ones at 5%.
+
+| Measure | How it is computed | Result |
+|---|---|---|
+| pass^1 | (60 x 0.95 + 25 x 0.5 + 15 x 0.05) / 100 | 70.3% |
+| pass^5 | (60 x 0.95^5 + 25 x 0.5^5 + 15 x 0.05^5) / 100 | 47.2% |
+| pass@5 | (60 x (1 - 0.05^5) + 25 x (1 - 0.5^5) + 15 x (1 - 0.95^5)) / 100 | 87.6% |
+| Naive guess for pass^5 | 0.703^5, as if every task were alike | 17.1% |
+
+One agent, three honest numbers: 70% on one try, 47% if all 5 tries must pass, and 88% if any of 5 will do. The 25 flaky tasks are where reading traces pays most.
+
+**Online signals.** PR merge rate, revert rate within 14 days, human edits before merge, cost per merged PR, and the share of runs ended by a cap. The slice that matters: tasks that touch more than 3 files, and repos with flaky suites.
+
+**Regression gate.** Every change to the prompt, a tool description, a tool output limit, or the model runs the suite 3 times first. The incident drill shows why the output limit is on that list. Lessons [Golden Sets](/learn/ai/a8-evals/golden-sets/) and [Shadow, Canary, and Rollback](/learn/ai/a8-evals/rollout/) cover the set and the rollout.
+
+## Budgets
+
+**Wall-clock per task.** Our assumptions, for a task with 30 model calls and 4 test runs:
+
+| Stage | Time (assumed) |
+|---|---|
+| Start the sandbox and clone the repo | 30 s |
+| 30 model calls at 10 s each | 300 s |
+| 30 tool actions (search, edit, install) at 1 s | 30 s |
+| 4 test runs at 90 s each | 360 s |
+| **Total** | **720 s, 12 minutes** |
+
+Test runs take as long as the model does. So run only the affected tests inside the loop, cache dependencies, and run the full suite once, at the end.
+
+**Dollars per task.** Prices are Anthropic list prices in USD per million tokens, as of 2026-10-20, from the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing). The page shows no date of its own, so 2026-10-20 is the day I read it.
+
+| Model | Input | 5 minute cache write | Cache read | Output |
+|---|---|---|---|---|
+| Claude Sonnet 5.5 | $2 | $2.50 | $0.10 | $10 |
+| Claude Opus 5.5 | $4 | $5 | $0.20 | $20 |
+| Claude Haiku 5.5 (prompt up to 100,000 tokens) | $0.10 | $0.125 | $0.01 | $0.50 |
+
+Now the worked example. Assumptions (illustrative): the first call sends 20,000 tokens (system prompt, tool list, repo notes, task). Each later call adds 2,500 tokens (the last answer plus a tool result) and writes 600. There are 30 calls. Every call lands inside the 5 minute cache lifetime, so the cache stays warm. The Claude Code docs say that on an API key the lifetime is five minutes by default.
+
+On call k the history is C(k) tokens, with C(1) = 20,000 and C(k) = C(k-1) + 2,500. Each call reads the old history from the cache, writes the new tokens, and writes the answer:
+
+<Math block tex="\text{cost}_k = C_{k-1} \, p_{\text{read}} + \Delta_k \, p_{\text{write}} + 600 \, p_{\text{out}}" />
+
+Add it up. The sum of C(k) over 30 calls is 30 x 20,000 + 2,500 x (0 + 1 + ... + 29) = 600,000 + 1,087,500 = 1,687,500 tokens. That is the input the model processes in total.
+
+- Cache reads: 1,595,000 tokens x $0.10 / 1,000,000 = $0.160.
+- Cache writes: 92,500 tokens x $2.50 / 1,000,000 = $0.231.
+- Output: 18,000 tokens x $10 / 1,000,000 = $0.180.
+- **Total on Sonnet 5.5, warm cache: $0.57.**
+
+With no cache, all 1,687,500 tokens cost $2 each per million, which is $3.38, plus $0.18 output: **$3.56**. The cache cuts the bill 6 times. On Opus 5.5 every line doubles, so the warm-cache task costs **$1.14**. On Haiku 5.5, the history never passes 100,000 tokens, so the low tier applies, and the task costs **$0.04**.
+
+At a 60% pass rate, the cost per resolved task is $0.57 / 0.6 = $0.95. A check against the docs: $13 a day divided by $0.57 is about 23 tasks of this small size. The docs average covers bigger contexts, Opus, and interactive sessions, so use it only as an order-of-magnitude check.
+
+## Core entities and API
+
+**Entities.** `Task` (repo, base commit, prompt, budget), `Run` (model, prompt version, state, stop reason), `Step` (tool call, result size, tokens, cost), `Sandbox` (policy version), `Artifact` (branch, PR URL).
+
+**API.** `POST /tasks` returns a run id at once. `GET /runs/{id}/events` streams steps. `POST /runs/{id}/cancel` is the kill switch for one run. `POST /runs/{id}/approve` lets a person approve a held action. Lesson [Background Agents and Queues](/learn/ai/a7-agents-prod/background-agents-queues/) covers the submit, queue, run, notify shape. The new part is what runs inside.
+
+## A naive design and where it breaks
+
+The first build is a script. It runs the model in a loop on a developer machine or a CI runner, with the developer's shell, the developer's keys, and no limits. Here is where it breaks. Numbers are illustrative unless a source is named.
+
+| Break | What happens | Number |
+|---|---|---|
+| Ambient access | The agent can read `~/.aws` and write `~/.bashrc`, because it runs as the developer. | Replit, July 2025 (secondary): an agent reportedly ignored an instruction not to change things and deleted a live production database. |
+| No loop limit | A test can never pass, and the agent keeps trying. | 300 calls cost $15.45 on a warm cache, $238 on a cold one. A fixable run costs $0.24. |
+| Whole repo in the prompt | The code does not fit, and every call re-sends it. | 100,000 lines at about 10 tokens a line is 1 million tokens, per call. |
+| Flaky red | A test fails for no reason, and the agent edits good code. | 300 tests, each 0.2% flaky: 45% of full runs show a false red. |
+| Long chain | Each step is 98% reliable. | 0.98^30 = 54.5% of 30-step tasks end with no error. |
+| Secrets in the environment | A command such as `env` prints keys into the history and the trace store. | One log line can sit in the trace store for its whole retention period. |
+
+The common cause is the same as in the support case. The model is the only guard. The rest of the lesson moves each control out of the model and into code.
+
+## High-level design
+
+Step through the build. Each step names the requirement it meets.
+
+<Ai13CodeBuild client:visible />
+
+Four rules sit behind the picture.
+
+1. **The model proposes. The tool runner decides.** Every file and shell action passes one runner that checks it against the sandbox policy.
+2. **The sandbox is one box per run.** One clone, one set of limits, thrown away after the run. State from one run cannot leak into the next.
+3. **The guard is outside the loop.** Counting calls, dollars, and repeats is not a job for the model that is looping.
+4. **The output is a pull request.** The agent never pushes to the main branch. A person merges.
+
+## Deep dive 1: three boundaries for a box that runs code
+
+**What it is.** The box from lesson [Sandboxes and Code Execution](/learn/ai/a7-agents-prod/sandboxes-code-execution/) is the container. Its **policy** says what is allowed inside. For a coding agent the policy has three parts: files, network, and secrets. Anthropic's sandboxing post says "effective sandboxing requires both" file and network isolation ([Anthropic](https://www.anthropic.com/engineering/claude-code-sandboxing)). Without network isolation, a compromised agent could leak files such as SSH keys. Without file isolation, it could escape and reach the network.
+
+**Picture.** A contractor in a client's building. The contractor may work in one room (files), may call only numbers on an approved list (network), and is never handed the master key (secrets).
+
+| Boundary | Policy | Enforced by | What the agent sees on a violation |
+|---|---|---|---|
+| Files | Read and write only in the clone and a temp folder. Deny reads of `~/.ssh` and `~/.aws`. Writes to `.git/hooks` and CI config need review. | The sandbox mounts, not the prompt. | An error result that names the rule. |
+| Network | No direct route out. A proxy outside the sandbox checks each host against an allow list: the package mirror and the git proxy. | A proxy and firewall rules. | An error result: host not allowed. |
+| Secrets | No cloud keys or SSH keys inside. Git pushes go through a proxy that adds the real token. Test databases hold fake data. | Credentials never enter the box. | Nothing to see. The key does not exist. |
+
+Anthropic describes the third row for Claude Code on the web. The design is meant "to ensure that sensitive credentials (such as git credentials or signing keys) are never inside the sandbox". The sandboxed git client holds a scoped credential. The proxy checks the request (for example, that a push targets the configured branch), then adds the real token.
+
+**Why a block is an error result and not a person.** Anthropic reports that in its own internal use, sandboxing "safely reduces permission prompts by 84%". This is a **company claim**, with no sample size or baseline. The idea is sound: in a small box, most actions need no question. If a developer saw 25 prompts a day, 84% fewer is 4 (illustrative arithmetic). Our reading: a blocked call should return a normal tool error, so the agent can adapt in the same loop. Watch it happen.
+
+<Ai13CodeLoop client:visible />
+
+The run is **illustrative**: two blocks, no damage, no person woken.
+
+**Two extra rules.**
+
+- **A leaked secret in a log.** Plant a **canary**: a fake secret with a unique string in the sandbox environment. Scan every tool output and trace for the string. If it appears, something printed the environment. Kill the run and alert. Also run a redaction pass for key-shaped strings before any output enters the history, because the history goes to the model provider and to your trace store.
+- **Task text is untrusted when it comes from an issue.** An attacker can file an issue. Lesson [Tool Permissions and Least Privilege](/learn/ai/a10-safety/tool-permissions/) covers the check-in-code idea. The review drill below has a real case.
+
+**The prompt is not the control.** In July 2025, press and the OECD incident monitor reported that an agent used by the founder of SaaStr ignored an instruction not to change things and deleted a live production database ([OECD summary](https://oecd.ai/en/incidents/2025-07-19-1eb1), secondary). Accounts differ on details, and I could not load a primary post, so I give no counts. Our reading: an instruction in a prompt is a request. A credential that cannot reach production is a rule.
+
+## Deep dive 2: context economics
+
+**How does the agent find code?** Two ways. In **agentic search** the model runs the search itself, with `grep`, `glob`, and file reads, the way a developer would. An **index** is built ahead of time: files are cut into chunks, each chunk becomes an embedding, and a query returns the nearest chunks (lessons in the RAG module cover this).
+
+Anthropic's agent SDK post says: "Semantic search is usually faster than agentic search, but less accurate, more difficult to maintain, and less transparent." It suggests starting with agentic search and adding an index only if you need speed or more query variety ([Anthropic](https://claude.com/blog/building-agents-with-the-claude-agent-sdk)).
+
+Our reading of why this fits a coding agent: the agent is changing the repo while it searches. An index built an hour ago is stale after the first edit. `grep` reads the live disk.
+
+**What the Cursor numbers measure.** Cursor builds an index and syncs it with a **Merkle tree**, a hash tree. Each file gets a hash, and each folder hash comes from its children. Only entries whose hashes differ are synced. Lesson [Freshness and Updates](/learn/ai/a5-rag/freshness-updates/) taught the idea. Take a worked example (illustrative): 10,000 files, 10 children per folder, 4 levels. To find one changed file, compare the root (1 hash), then the 10 children on the path at each of 4 levels: 1 + 10 x 4 = 41 comparisons, not 10,000. Cursor's post gives two numbers ([Cursor](https://cursor.com/blog/secure-codebase-indexing)), both **company claims**:
+
+- Semantic search "improved response accuracy by 12.5% on average" in Cursor's own evaluation, linked from the post. The post does not say how the evaluation works.
+- "For the median repo, time-to-first-query drops from 7.87 seconds to 525 milliseconds." This compares building an index from scratch with reusing a teammate's index. It is a start-up time. It is not search latency, and it is not for every repo.
+
+Neither number says an index beats grep for every query. The post gives no sync interval.
+
+**Why history size matters.** Each call re-reads the history, so one call costs more as the history grows. With our Sonnet 5.5 warm-cache numbers, a call that adds 2,500 tokens and writes 600 costs $0.0123 plus the read of the history at $0.10 per million:
+
+| History size | Cost of one call |
+|---|---|
+| 40,000 tokens | $0.016 |
+| 200,000 tokens | $0.032 |
+| 500,000 tokens | $0.062 |
+
+Delay grows too. Lesson [Compaction](/learn/ai/a4-context/compaction/) covers the quality side.
+
+**Compaction thresholds.** To **compact** is to replace old history with a summary. By our growth numbers a 200,000-token window fills at call 73: (200,000 - 20,000) / 2,500 + 1. The Claude Code docs say that by default it compacts when the conversation reaches the model's limit. For models with a native 1 million token window that is "about 967K tokens". You can set the window anywhere from 100K to 1M ([Claude Code model config](https://code.claude.com/docs/en/model-config#set-the-auto-compact-window)). The docs also warn that compacting a large context is itself a large request.
+
+Here is the arithmetic (illustrative). Compact at 200,000 tokens. Read 200,000 tokens from the cache: $0.020. Write a 3,000 token summary: $0.030. Re-write a 23,000 token new prefix (20,000 fixed plus the summary): $0.0575. Total $0.1075. After that, each call costs $0.0146, not $0.0323: a saving of $0.0177 a call. The compaction pays for itself in 0.1075 / 0.0177 = 6 calls. Our reading: for a cost-bound agent, compact well below the maximum window.
+
+**Subagents isolate. They do not save.** Lesson [Subagents](/learn/ai/a6-agents/subagents/) taught the mechanics. A search that reads 60,000 tokens in the main window rides along for the next 40 calls: a cache write of $0.15 plus reads of 60,000 x $0.10 / 1,000,000 x 40 = $0.24, about $0.39, and 60,000 tokens of window. A subagent returns perhaps 1,500 tokens, but its own calls still cost money: the Claude Code docs say "the subagent's own requests still draw on your usage". The gain is a clean window and better answers.
+
+**Coupled coding tasks and many agents.** Anthropic's multi-agent write-up says "most coding tasks involve fewer truly parallelizable tasks than research" ([Anthropic](https://www.anthropic.com/engineering/multi-agent-research-system)). It calls domains where agents "share the same context or involve many dependencies between agents" a poor fit, and says multi-agent systems use about 15 times more tokens than chats, against 4 times for one agent. The Claude Code docs put agent teams at "approximately 7x more tokens than standard sessions" in plan mode. Our reading: use subagents for read-only fan-out, such as searching or summarizing a test run. Never run two agents that edit the same files.
+
+## Deep dive 3: tests as the reward, and loops that must stop
+
+**Why tests?** Anthropic's agent SDK post says "The best form of feedback is providing clearly defined rules for an output, then explaining which rules failed and why." It names linting as one example. A test is the same shape: a rule, a pass or fail, and a message. Lesson [Loop Patterns](/learn/ai/a6-agents/loop-patterns/) showed that a code check beats the model's opinion of its own work. SWE-bench grades the same way: apply the patch, run the tests.
+
+**Weak spot 1: tests can be flaky.** A **flaky test** passes and fails on the same code. Google's testing blog gives numbers ([Flaky Tests at Google](https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html), 2016): about 1.5% of all test runs report a flaky result, almost 16% of tests have some flakiness, and about 84% of the pass-to-fail transitions in post-submit testing involve a flaky test. A project averages about 1,000 tests, so at 1.5% about 15 tests fail on a full run. Google mitigates with re-runs of failing tests, a flaky mark that fails a test only when it fails 3 times in a row, and quarantine of tests that are too flaky.
+
+For an agent the damage is direct. A red result means "your change is wrong", so the model edits good code. Our arithmetic: 300 tests, each failing by chance on 0.2% of runs. The chance of at least one false red in a full run is 1 - 0.998^300 = 45%. The fix belongs in the harness, not the model loop. Re-run a failing test twice, in the sandbox, at no token cost. Report "flaky, passed on re-run" if any re-run passes. Only a test that fails 3 times of 3 reaches the model. A real flake at 0.2% fails 3 times in a row with chance 0.002^3, about 8 in a billion. Keep a quarantine list, and log every flake.
+
+**Weak spot 2: tests can be weak.** An agent can pass visible tests by editing them or by special-casing the input. Our rules: the held-out grader drops test-file edits, and the PR flags any edit to an existing test for the reviewer.
+
+**Runaway loops.** A stuck loop spends money on every turn. Lesson [Loop Control](/learn/ai/a7-agents-prod/loop-control/) gave the stop conditions and the stuck detector. Here are the coding versions.
+
+- **Retry cap.** Stop after N fix attempts for one task. Choose N from real traces. It must be above the attempts that healthy runs need.
+- **No-progress detector.** Hash a failure signature: the failing test names, the normalized assertion text, and a hash of the diff. If the same signature repeats 3 times in a row, stop. A healthy retry changes the signature. A stuck loop does not.
+- **Kill switch.** Three layers. A cancel flag the loop checks between tool calls. A hard stop that destroys the sandbox and revokes its tokens. A global switch that stops new runs. The model cannot reach any of the three.
+
+A dollar cap alone is late: it is checked after a response arrives, so spend can pass it by one response.
+
+**The infinite fix loop, in numbers.** Use the simulator. The task is stuck: a test that cannot pass. The model is Sonnet 5.5 with a warm cache, and the history starts at 20,000 tokens and grows 2,500 per call. Try each control.
+
+<Ai13CodeBudgetSim client:visible />
+
+Results from the same model (you can reproduce them above):
+
+| Controls | Calls | Cost, warm cache | Cost, cold cache |
+|---|---|---|---|
+| A fixable run, for comparison | 13 | $0.24 | $0.99 |
+| Turn cap 300 only | 300 | $15.45 | $238 |
+| Retry cap 10 | 26 | $0.49 | $2.82 |
+| Same failure 3 times | 12 | $0.23 | $0.88 |
+
+A stuck run is about 63 times the cost of a healthy one ($15.45 / $0.24). The cost is not linear. Starting after call 12, the next 50 calls cost $1.16, and the next 200 cost $8.38. Four times the calls is 7.2 times the cost, because every call re-reads a longer history. The simulator ignores compaction, so a real tool costs less on very long runs. The cheapest stop is still the early one.
+
+## Failure modes and an incident drill
+
+| Failure | What happens | Detect | Do |
+|---|---|---|---|
+| Write outside the repo | The agent edits a global file or a sibling project. | Boundary denial log, by path | Deny, return an error, stop the run after 10 denials |
+| Infinite fix loop | Calls and spend rise with no new signature. | Same-failure counter, calls per run | Retry cap, no-progress stop, dollar cap |
+| Leaked secret | A command prints the environment into the history. | Canary string in output or traces | Kill the run, rotate the secret, redact before the model sees it |
+| Flaky test misleads | The agent edits correct code. | Disagreement between re-runs | Re-run in the harness, quarantine, report "flaky" |
+| Truncated tool output | The failing line is cut off, and the agent guesses. | Tool-result size and cut rate | Keep the head and the tail, and put failures first |
+| Injected issue or README | Text from outside steers the agent. | Forbidden-action rate on an attack suite | No secrets, allow-listed network, a person merges |
+
+**Incident drill: the pass rate falls after a tool-output size change.** Illustrative numbers. Work through it.
+
+<Diagnose
+  client:visible
+  id="ai13-code-pass-rate-tool-output"
+  title="Pass rate falls after a tool output change"
+  scenario="The weekly suite pass rate drops from 62% to 51%. The day before, a team cut the bash output limit from 30,000 characters to 8,000 to save tokens, keeping the first 8,000 characters. Nothing else shipped. (Illustrative numbers.)"
+  facts={[
+    'median size of a tool result: down 62%',
+    'median model calls per run: 31 before, 44 after',
+    'median cost per run: up 9%',
+    'median fix attempts per run: 3.1 before, 5.8 after',
+    'runs ended by a cap: 4% before, 15% after',
+    'of 200 failing test logs, 41% have the failing assertion after character 8,000',
+    'model, prompt, and sandbox policy: unchanged. Boundary denials: unchanged',
+    'flaky test re-run rate: unchanged',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'Truncation hides the failing assertion, so the agent guesses',
+        'The model changed and now fixes bugs less often',
+        'The sandbox became stricter and blocks more writes',
+        'The test suite became flakier over the same week',
+      ],
+      answer: 0,
+      explain: 'Boundary denials and the flaky re-run rate are unchanged, so the sandbox and flakiness are out. The model did not change. Tool results shrank 62%, and 41% of failing logs have the key line past the cut. The agent cannot see why a test fails, so attempts rise from 3.1 to 5.8 and cap-ended runs rise from 4% to 15%.',
+    },
+    {
+      prompt: 'What do you do first?',
+      options: [
+        'Raise the turn cap so runs have more room to finish',
+        'Switch to a larger model for the same tasks',
+        'Revert the limit, then keep the head and tail of output',
+        'Add a prompt line that says to read the whole log',
+      ],
+      answer: 2,
+      explain: 'Stop the loss first: revert. Then fix the cause by keeping the start and the end of the output and printing failures first. A higher turn cap makes the loops longer. A larger model cannot read text it never receives. A prompt line cannot restore cut text.',
+    },
+    {
+      prompt: 'Which control would have caught this before release?',
+      options: [
+        'A dashboard that shows tool result size',
+        'A hard cost cap per run at ten dollars',
+        'A boundary check on writes outside the repo',
+        'The held-out suite run on every tool setting change',
+      ],
+      answer: 3,
+      explain: 'Tool result size looked good, since it fell 62%. Cost per resolved task rose: 1.09 / 0.51 = 2.14 against 1 / 0.62 = 1.61, about 33% worse. Only the suite shows the 11 point loss. A cost cap does not see quality. The boundary check is unrelated to this change.',
+    },
+  ]}
+/>
+
+The saving was an illusion. Cost per run rose 9% even though each tool result got smaller, because runs were longer. Cost per resolved task is cost divided by pass rate, so it rose from 1.61 to 2.14 in relative units, about 33% worse, with 11 points of pass rate lost. A tool output limit is a model input, so it goes through the same gate as a prompt.
+
+## Drill: Code completion
+
+**The task.** Show gray "ghost text" as a developer types, and accept it with Tab (Copilot, Cursor Tab). Take 15 minutes.
+
+**Bar.** Acceptance rate (accepted divided by shown) and retention (the share of accepted characters still in the file a few minutes later, our definition). Both must rise. An accepted and then deleted completion is noise. The latency bar comes from typing speed. At 60 words a minute and 5 characters a word (the usual convention), a key arrives every 200 ms. At 100 words a minute it is 120 ms, at 40 it is 300 ms. Ghost text is stale once the next key disagrees with it. Our bar: p50 under 300 ms from keystroke to ghost text, p95 under 600 ms.
+
+**Design.** GitHub's post on Copilot ([GitHub, 2023](https://github.blog/ai-and-ml/github-copilot/how-github-copilot-is-getting-better-at-understanding-your-code/)) gives the shape.
+
+- The prompt holds the code before the cursor (the **prefix**) and after it (the **suffix**). **Fill-in-the-middle** lets the model see the suffix. In an A/B test it gave "a 10% relative boost in performance, meaning developers accepted 10% more of the completions that were shown to them". Relative means 10% of the old rate, not 10 points.
+- **Neighboring tabs** add snippets from other open files. The post says they "relatively increase user acceptance" by 5%.
+- "Transformers that are fast enough to power GitHub Copilot can process about 6,000 characters at a time." That is the context budget. Packing means ranking what fits: code near the cursor, the suffix, the path and imports, then neighbor snippets by similarity.
+- The prompt passes "through a contextual filter model and a GPT model" (the post's diagram caption). The post gives no filter detail and no latency number. It says the two features add no latency.
+
+**Latency budget.** Our assumptions:
+
+| Stage | Time (assumed) |
+|---|---|
+| Wait for a typing pause (debounce) | 40 ms |
+| Build the prompt from cached context | 20 ms |
+| Network round trip | 40 ms |
+| Gateway, auth, routing | 10 ms |
+| Model: queue and first token | 120 ms |
+| Model: 12 tokens at 8 ms each | 96 ms |
+| Filter and draw the text | 20 ms |
+| **Total** | **346 ms** |
+
+That is 46 ms over the p50 bar. Two fixes follow.
+
+1. **Cancel, debounce, cache.** To **debounce** is to wait for a short pause before sending. When the next key arrives, cancel the old request. If the key matches the next character of the ghost text, trim the text on the client and send nothing. Cache by prefix.
+2. **Cut decode time.** Show a short first chunk and stream the rest. Speculative decoding helps (elective E3.4 teaches it): a cheap guess at the next tokens, checked by the big model in one pass. Cursor uses the idea to apply an edit, with the old file as the guess. Their post claims "~1000 tokens (around 3500 char/s) on our 70b model", and speculative edits "up to 9x faster" than their previous GPT-4 speculative edits deployment ([Cursor](https://cursor.com/blog/instant-apply), company claim). That is applying an edit to a file, not tab completion.
+
+**Failure: acceptance drops after a model upgrade.** Offline tests say the new model is better. Illustrative cause: it raises p95 latency from 350 ms to 600 ms, so more completions land after the next key and are cancelled. Shown rate falls from 40% of triggers to 28%, and accepted-per-shown stays at 25%. Accepted per trigger falls from 10% to 7%. Split the metric into shown rate, accept rate when shown, retention, and latency percentiles. Canary the model and gate on accepted per trigger, not on offline pass rate.
+
+**Variant: Smart Compose and search autocomplete.** Take 50 million users, 10 suggestions a minute, 2 hours a day: 50M x 10 x 120 = 60 billion requests a day, about 694,000 a second on average. If all type in the same 2 hours, the peak is 50M x 10 / 60 = 8.3 million a second. That calls for a small model, prefix caches, and heavy debounce.
+
+**Prove it.**
+
+<Ballpark
+  client:visible
+  title="Keystroke to ghost text"
+  scenario="The stages are: debounce 40 ms, prompt build 20 ms, network 40 ms, gateway 10 ms, model queue and first token 120 ms, decode 12 tokens at 8 ms each, filter and draw 20 ms. Our p50 bar is 300 ms. A typist at 60 words a minute writes 5 characters per word."
+  steps={[
+    {
+      prompt: 'What is the total time from keystroke to ghost text, in ms?',
+      unit: 'ms',
+      answer: 346,
+      within: 1.05,
+      explain: '40 + 20 + 40 + 10 + 120 + 12 x 8 + 20 = 346 ms.',
+    },
+    {
+      prompt: 'How long is the gap between keystrokes at 60 words a minute, in ms?',
+      unit: 'ms',
+      answer: 200,
+      within: 1.05,
+      explain: '60 words x 5 characters = 300 characters a minute = 5 a second, so one key every 200 ms. A 346 ms completion is stale before it lands, unless the typist pauses or the keys match the ghost text.',
+    },
+    {
+      prompt: 'With the other stages unchanged, how many tokens can decode produce and still meet the 300 ms bar?',
+      unit: 'tokens',
+      answer: 6.25,
+      within: 1.15,
+      explain: 'The other stages total 346 - 96 = 250 ms. That leaves 50 ms. 50 / 8 ms is 6.25 tokens. So the first chunk is short, and the rest streams in.',
+    },
+  ]}
+/>
+
+## Drill: Code review bot
+
+**The task.** A pull request opens. The bot posts comments on likely bugs. Take 10 minutes.
+
+**Bar.** Two numbers. **Precision**: the share of posted comments that a maintainer marks valid. **Recall on seeded bugs**: the share of planted bugs the bot finds, on a set where you inserted known bugs into real PRs (lesson [Golden Sets](/learn/ai/a8-evals/golden-sets/) covers synthetic cases). Also a cap on comments per PR, 5 in our design, because a noisy bot gets muted. Acceptance rate is the online signal.
+
+**Design.**
+
+1. A PR webhook starts a background job (lesson [Background Agents and Queues](/learn/ai/a7-agents-prod/background-agents-queues/)).
+2. The reviewer reads the diff and gathers context by agentic search: who calls this function, what the tests expect. Linters and tests run as tool results.
+3. The model proposes **findings**. Each has a file, a line, a claim, and evidence quoted from the code.
+4. A **verifier pass** checks each finding on its own: does the quoted evidence exist, and does the claim follow? A cheap model can do it.
+5. Dedupe, rank by severity and confidence, keep the top 5, and post one review.
+
+**Permissions.** Read-only on code. The only write is a comment. Repo content is untrusted. In May 2025 Invariant Labs showed an attack on an agent that used the GitHub MCP server. An attacker files a malicious issue in a public repo. When the user asks the agent about that repo, it follows the issue text and writes private repo data into a pull request on the public repo ([Invariant Labs](https://invariantlabs.ai/blog/mcp-github-vulnerability)). The authors say "this is not a flaw in the GitHub MCP server code itself", and suggest least privilege, such as one repository per session. Our reading: PR text, code comments, and README files are attacker input, mainly on forks. Scope the token to one repo and give the bot no tool that sends data out. Lesson [Prompt Injection](/learn/ai/a10-safety/prompt-injection/) covers the pattern.
+
+**Why the verifier exists.** Illustrative numbers. The reviewer proposes 10 findings, and 3 are real bugs, so precision is 30%. The verifier keeps 90% of real findings and drops 70% of false ones. That leaves 2.7 real and 2.1 false: precision 2.7 / 4.8 = 56%, recall 90%. Each check is a small call, so it costs little.
+
+**Failure: acceptance halves after a prompt change.** A prompt that asks for "thorough" review raises the comment count, and the share marked valid falls. Detect it with the seeded set on every prompt change and a weekly valid-comment rate. Start in shadow mode, as in lesson [Shadow, Canary, and Rollback](/learn/ai/a8-evals/rollout/).
+
+**Prove it.** Assumptions: a diff of 400 changed lines is about 6,000 tokens (15 tokens a line, illustrative). The system prompt and tools add 8,000, so call 1 sends 14,000 tokens. Five more calls each add 3,000 tokens of files and results. The reviewer uses Sonnet 5.5 with a warm cache and writes 300 tokens on five calls and 1,500 on the last. The verifier runs on Haiku 5.5, uncached, with 5,000 tokens in and 200 out, once for each of 10 findings. Prices as of 2026-10-20.
+
+<Ballpark
+  client:visible
+  title="Review cost per pull request"
+  scenario="Reviewer on Claude Sonnet 5.5: 6 calls, history 14,000 tokens at call 1 and 3,000 more on each later call, warm cache ($0.10 read, $2.50 write per million), output 300 tokens on 5 calls and 1,500 on the last at $10 per million. Verifier on Claude Haiku 5.5: 10 calls with 5,000 input tokens at $0.10 per million and 200 output at $0.50 per million. Prices as of 2026-10-20."
+  steps={[
+    {
+      prompt: 'How many input tokens does the reviewer process across the 6 calls?',
+      unit: 'tokens',
+      answer: 129000,
+      within: 1.05,
+      explain: 'The history at each call is 14,000, 17,000, 20,000, 23,000, 26,000, 29,000. They sum to 129,000.',
+    },
+    {
+      prompt: 'What does the reviewer cost per PR, in USD?',
+      unit: 'USD',
+      answer: 0.1125,
+      within: 1.1,
+      explain: 'Reads: 100,000 tokens x $0.10 / 1e6 = $0.010. Writes: 29,000 x $2.50 / 1e6 = $0.0725. Output: 3,000 x $10 / 1e6 = $0.030. Total $0.1125.',
+    },
+    {
+      prompt: 'What do the 10 verifier calls cost, in USD?',
+      unit: 'USD',
+      answer: 0.006,
+      within: 1.15,
+      explain: 'One call: 5,000 x $0.10 / 1e6 = $0.0005 plus 200 x $0.50 / 1e6 = $0.0001, so $0.0006. Ten calls: $0.006.',
+    },
+    {
+      prompt: 'At 200 PRs a day, what is the daily cost, in USD?',
+      unit: 'USD',
+      answer: 23.7,
+      within: 1.1,
+      explain: '($0.1125 + $0.006) x 200 = $0.1185 x 200 = $23.70 a day. The verifier adds only 5% to the bill.',
+    },
+  ]}
+/>
+
+## Drill: Browser and computer-use agent
+
+**The task.** Finish a task in a web app that has no API, for example filing a request in a vendor portal. Take 10 minutes.
+
+**Bar.** Task success on a suite, checked by the **end state** (is the request in the portal?), not by what the agent says. Each task repeats k times, and we report pass^k. Zero unapproved irreversible actions, such as a purchase or a submit. Cost and time within a cap, for example 40 steps, $2, and 10 minutes (illustrative).
+
+**Design.** Lesson [Computer and Browser Use](/learn/ai/a7-agents-prod/computer-browser-use/) taught the loop. The pieces here:
+
+1. **Observe, decide, act, verify.** Send a screenshot, which the docs estimate at "roughly 1,000–1,800 input tokens" each, plus the page structure when you can. The model picks an action. Then verify. The docs warn that "Claude sometimes assumes outcomes of its actions without explicitly checking their results", and suggest a screenshot after each step.
+2. **A sandbox per run.** A dedicated VM or container with minimal privileges, a clean browser profile, and no logged-in sessions ([Anthropic computer use docs](https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool)).
+3. **A domain allow list, enforced at the network layer**, not in a flag the page can route around.
+4. **Credentials from a scoped vault.** The harness types them into the field. They never enter the prompt or the history.
+5. **Approval before irreversible clicks.** The docs say to ask a human to confirm "financial transactions" and "agreeing to terms of service". The approval prompt shows the item, the price, and the address read from the page, not the agent's description of them.
+
+**Why 30 steps is hard.** If each step succeeds 98% of the time and steps are independent, 30 steps succeed with chance 0.98^30 = e^(30 x ln 0.98) = e^(-0.606) = 0.545, about 55%. At 99% per step it is 74%. Now add a check after each step that catches 80% of wrong actions, and a retry that fixes them (assumptions). The undetected error per step is 2% x 20% = 0.4%, and 0.996^30 = 88.7%. The price is one more screenshot per step. To reach 90% over 30 steps, the per-step failure must be at most 1 - 0.9^(1/30) = 0.35%. For scale: the OSWorld paper (2024) built 369 computer tasks on real web and desktop apps. Humans did "over 72.36%" of them, and the best model then did "only 12.24%". That is a 2024 figure, not today's. Read a live leaderboard before you decide.
+
+**Failure: the page redesign.** A portal changes its layout. The "Order" button moves, and the agent clicks "Order again" on a different item. A hidden line on a page may also say to do something else. The docs say "Claude will follow commands found in content even when they conflict with your instructions". Controls: the approval gate above, an end-state check, and a hostile-page suite in the eval set (lesson [Prompt Injection](/learn/ai/a10-safety/prompt-injection/)). Also expect CAPTCHAs and endless scroll. The step cap is the stop.
+
+**Prove it.**
+
+<Ballpark
+  client:visible
+  title="Thirty browser steps"
+  scenario="A browser agent must complete 30 steps with no error. Steps succeed independently. Per-step success is 98%."
+  steps={[
+    {
+      prompt: 'What share of 30-step tasks finish with no error, in percent?',
+      unit: '%',
+      answer: 54.5,
+      within: 1.05,
+      explain: '0.98^30 = e^(30 x ln 0.98) = e^(-0.606) = 0.545, so about 55%.',
+    },
+    {
+      prompt: 'At 99% per step, what share finish, in percent?',
+      unit: '%',
+      answer: 74,
+      within: 1.05,
+      explain: '0.99^30 = 0.740. Halving the per-step error moves the result from 55% to 74%.',
+    },
+    {
+      prompt: 'What per-step failure rate allows 90% success over 30 steps, in percent?',
+      unit: '%',
+      answer: 0.35,
+      within: 1.15,
+      explain: 'Solve s^30 = 0.9, so s = 0.9^(1/30) = 0.99649. The failure rate is 1 - 0.99649 = 0.35%. Short tasks, checks, and API shortcuts are the levers.',
+    },
+  ]}
+/>
+
+## Staff answer vs senior answer
+
+| Topic | Senior answer | Staff answer |
+|---|---|---|
+| Loop | "Search, edit, run tests, repeat." | A guard outside the loop: retry cap, failure signature, dollar cap, kill switch |
+| Sandbox | "Run it in a container." | Three boundaries: files, network allow list, no secrets inside, with a canary and a denial log |
+| Quality bar | "It passes the tests." | Held-out tests in a clean checkout, pass^k and pass@k, forbidden actions fail the run |
+| Flaky tests | "Re-run CI." | Re-run in the harness, report "flaky", quarantine list, so the model never sees noise |
+| Context | "Use a bigger window." | Agentic search first, compaction well below the window, subagents for read-only fan-out |
+| Cost | "Use a cheaper model." | Cost per resolved task from tokens and live prices, cache assumptions stated, p95 cap |
+| Changes | "We tuned the prompt." | Every change, including tool output limits, passes the suite before release |
+
+## What experienced teams know
+
+1. **A test is only as good as its determinism.** About 84% of Google's pass-to-fail transitions involved a flaky test ([Google Testing Blog](https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html)). Our reading: an agent reads flakiness as "my change is wrong", so filter it in the harness.
+2. **Start with agentic search.** Anthropic says to add an index only if needed ([SDK post](https://claude.com/blog/building-agents-with-the-claude-agent-sdk)). Cursor's numbers are start-up time and an average accuracy gain, both company claims ([Cursor](https://cursor.com/blog/secure-codebase-indexing)). Our reading: the agent edits files, so a live search stays fresh.
+3. **A small box means fewer questions.** Anthropic reports 84% fewer permission prompts in internal use (company claim, [post](https://www.anthropic.com/engineering/claude-code-sandboxing)). Our reading: count your own prompts before you promise a number.
+4. **Many agents suit coupled code poorly.** Anthropic says most coding tasks have fewer parallel parts than research ([post](https://www.anthropic.com/engineering/multi-agent-research-system)). Our reading: fan out for reading, not for editing.
+5. **Budget the p90, not the mean.** The $13 a day average hides a tail: 90% of users stay under $30 ([docs](https://code.claude.com/docs/en/costs)). Our reading: set per-run caps from your own traces.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Agentic search only | No index to build, always fresh | More tool calls on big repos | Small and mid repos, changing files |
+| Add an index | Faster start and broad queries | Sync, staleness, extra cost | Huge repos, vague questions |
+| Compact early | Cheaper, sharper calls | A summary can drop a detail | Long runs, cost-bound |
+| Subagents | Clean main window | More total tokens | Wide read-only work |
+| Harness re-runs for flakes | The model never chases noise | Extra test time | Any suite with flaky tests |
+| Tight retry cap | Small worst case | Some fixable tasks stop early | Cost-bound, many parallel runs |
+| Strict sandbox | Small blast radius | Some tools need a proxy | Always, for code you did not write |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "My bar is held-out tests in a clean checkout, reported as pass^k and pass@k, with zero writes outside the repo and a cost cap per task. The loop is gather, act, verify. The sandbox has three boundaries: files, an allow-listed network, and no secrets inside. A guard outside the loop caps retries, spots a repeated failure signature, and has a kill switch. I search with grep first and compact early, because every call re-reads the history. I re-run flaky tests in the harness so the model never sees noise. Every change, even a tool output limit, runs the suite before it ships." That covers the bar, the box, the loop, the context, and the gate.
+</Callout>
+
+<Callout type="mistake">
+Do not grade on the agent's own tests. Do not trust a prompt line to keep it in the repo. Do not rely on a dollar cap alone, since it fires late. Do not use many agents to edit the same files. And do not quote a benchmark score without the date, the scaffold, and the test set.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Cost per coding task"
+  scenario="A coding agent on Claude Sonnet 5.5 with a warm cache ($0.10 per million cache reads, $2.50 per million cache writes, $10 per million output, as of 2026-10-20). 30 model calls. Call 1 sends 20,000 tokens. Each later call adds 2,500 tokens and writes 600."
+  steps={[
+    {
+      prompt: 'What is the sum of the history sizes across the 30 calls, in tokens?',
+      unit: 'tokens',
+      answer: 1687500,
+      within: 1.05,
+      explain: '30 x 20,000 = 600,000. Plus 2,500 x (0 + 1 + ... + 29) = 2,500 x 435 = 1,087,500. Total 1,687,500.',
+    },
+    {
+      prompt: 'What does the task cost in USD with the warm cache?',
+      unit: 'USD',
+      answer: 0.57,
+      within: 1.1,
+      explain: 'Reads 1,595,000 x $0.10 / 1e6 = $0.160. Writes 92,500 x $2.50 / 1e6 = $0.231. Output 18,000 x $10 / 1e6 = $0.180. Total $0.571.',
+    },
+    {
+      prompt: 'The same task on Claude Opus 5.5 costs how much, in USD?',
+      unit: 'USD',
+      answer: 1.14,
+      within: 1.1,
+      explain: 'Opus 5.5 prices are exactly twice Sonnet 5.5 on every line here ($0.20 read, $5 write, $20 output), so $0.571 x 2 = $1.14.',
+    },
+    {
+      prompt: 'How many Sonnet tasks of this size fit in the Claude Code docs average of $13 a day?',
+      unit: 'tasks',
+      answer: 22.8,
+      within: 1.1,
+      explain: '$13 / $0.571 = 22.8. The docs average includes bigger contexts and interactive sessions, so use this as a sanity check only.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A stuck coding agent already has 12 calls of history. Each further call adds 2,500 tokens, and the cache is warm. Roughly how does the cost of the next 200 calls compare with the next 50?',
+      options: [
+        'About 4 times, since there are 4 times as many calls',
+        'About 7 times, as each call re-reads more history',
+        'About the same, because the cache makes reads free',
+        'About 16 times, because cost grows with calls squared',
+      ],
+      answer: 1,
+      explain: 'The next 50 calls cost about $1.16 and the next 200 cost about $8.38, a ratio of 7.2. Cost per call rises as the history grows, so it is more than 4 times. Cached reads are cheap, not free, and the growth is not a full square.',
+    },
+    {
+      q: 'A coding agent harness sees one failing test. Google reports that about 1.5% of its test runs are flaky. What should the harness do before it tells the model?',
+      options: [
+        'Send the red result at once so the model can start fixing',
+        'Lower the temperature so the model reads errors more calmly',
+        'Ask the model to rewrite the test so that it passes',
+        'Re-run the test, and report flaky if any re-run passes',
+      ],
+      answer: 3,
+      explain: 'A re-run in the sandbox costs test time but no tokens, and it keeps noise away from the model. Sending the red result makes the agent edit good code. A lower temperature does not change a flaky result. Rewriting the test is test tampering.',
+    },
+    {
+      q: 'Cursor reports that for the median repo, time-to-first-query drops from 7.87 seconds to 525 milliseconds. What does that compare?',
+      options: [
+        'A fresh index build against reusing a teammate\'s index',
+        'Grep against semantic search for one query on a large repo',
+        'The agent\'s task time before and after a model upgrade',
+        'A full re-index against syncing one changed line',
+      ],
+      answer: 0,
+      explain: 'The post compares a fresh index build with reuse of an existing index, for the median repo. It is a start-up time and a company claim. It is not search latency, and it does not compare grep with semantic search.',
+    },
+    {
+      q: 'A browser agent succeeds on 99% of steps, and steps are independent. About what share of 30-step tasks finish with no error?',
+      options: ['90%', '97%', '74%', '55%'],
+      answer: 2,
+      explain: '0.99^30 = 0.740. A 90% guess assumes 3 errors a hundred steps are fine. The 55% figure is for 98% per step. Errors compound across steps, so the result falls fast.',
+    },
+    {
+      q: 'Inside a sandbox that allows writes only in the repo clone, the agent tries to append a line to ~/.bashrc. What should the agent receive?',
+      options: [
+        'A prompt that asks a person to approve the write',
+        'An error that names the rule, in the same loop',
+        'No reply at all, since the write is skipped silently',
+        'A crash, so the run stops and someone looks at it',
+      ],
+      answer: 1,
+      explain: 'A clear error lets the agent adapt, for example by setting the value inside the repo. A person prompt defeats the point of the box, a silent skip leaves the agent guessing, and a crash turns a small block into a lost run.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Claude Code: manage costs](https://code.claude.com/docs/en/costs): the $13 average, the $30 p90, and ways to keep context small.
+- [Anthropic: Making Claude Code more secure and autonomous with sandboxing](https://www.anthropic.com/engineering/claude-code-sandboxing): file and network isolation, the credential proxy, and the 84% claim.
+- [Anthropic: Building agents with the Claude Agent SDK](https://claude.com/blog/building-agents-with-the-claude-agent-sdk): the gather, act, verify loop, agentic search, and subagents.
+- [Google Testing Blog: Flaky Tests at Google and How We Mitigate Them](https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html): the flakiness numbers and the mitigations.
+- [GitHub: How GitHub Copilot is getting better at understanding your code](https://github.blog/ai-and-ml/github-copilot/how-github-copilot-is-getting-better-at-understanding-your-code/): prompt building, fill-in-the-middle, and neighboring tabs. You do not need the SWE-bench or OSWorld papers to follow this lesson.

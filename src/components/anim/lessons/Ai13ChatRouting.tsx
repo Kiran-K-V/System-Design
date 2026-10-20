@@ -69,12 +69,12 @@ export default function Ai13ChatRouting() {
       </div>
 
       <div className="overflow-x-auto" aria-live="polite">
-        <table className="w-full min-w-[34rem] text-left text-sm">
+        <table className="w-full text-left text-[13px] sm:text-sm">
           <thead>
             <tr className="border-b border-line text-xs text-muted">
-              <th className="py-1.5 pr-3 font-normal">Measure ({REPLICAS} replicas)</th>
+              <th className="py-1.5 pr-2 font-normal">Measure ({REPLICAS} replicas)</th>
               {POLICIES.map((p) => (
-                <th key={p} className="px-2 py-1.5 font-normal">{NAMES[p]}</th>
+                <th key={p} className="px-1 py-1.5 font-normal sm:px-2">{NAMES[p]}</th>
               ))}
             </tr>
           </thead>
@@ -83,9 +83,9 @@ export default function Ai13ChatRouting() {
               const w = best(rs, row.f, row.low);
               return (
                 <tr key={row.id} className="border-b border-line/60">
-                  <td className="py-1.5 pr-3 text-muted">{row.label}</td>
+                  <td className="py-1.5 pr-2 text-muted">{row.label}</td>
                   {POLICIES.map((p) => (
-                    <td key={p} className="px-2 py-1.5 tabular-nums" data-testid={`rt-${row.id}-${p}`} style={{ color: w === p ? 'var(--ok)' : undefined, fontWeight: w === p ? 600 : 400 }}>
+                    <td key={p} className="px-1 py-1.5 tabular-nums sm:px-2" data-testid={`rt-${row.id}-${p}`} style={{ color: w === p ? 'var(--ok)' : undefined, fontWeight: w === p ? 600 : 400 }}>
                       {row.show(rs[p])}
                     </td>
                   ))}

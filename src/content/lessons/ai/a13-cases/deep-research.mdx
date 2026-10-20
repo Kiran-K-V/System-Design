@@ -1,0 +1,562 @@
+---
+summary: 'A deep research agent spends minutes and many model calls in parallel, so the budget (tokens, tool calls, seconds) is the design. Scale effort to the query, checkpoint so a crash or deploy costs one step, gate every claim on its cited text, and treat fetched pages as hostile.'
+requires: ['ai/a7-agents-prod/multi-agent-orchestration', 'ai/a7-agents-prod/durable-graph-runtime', 'ai/a8-evals/judges']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import Ai13ResearchBuild from '../../../../components/anim/lessons/Ai13ResearchBuild.tsx';
+import Ai13ResearchEffort from '../../../../components/anim/lessons/Ai13ResearchEffort.tsx';
+import Ai13ResearchResume from '../../../../components/anim/lessons/Ai13ResearchResume.tsx';
+import Ai13ResearchGantt from '../../../../components/anim/lessons/Ai13ResearchGantt.tsx';
+
+## The problem
+
+In June 2025 Anthropic described how it built the Research feature of Claude ([engineering post](https://www.anthropic.com/engineering/multi-agent-research-system)). Two of its numbers frame this lesson. The post says "multi-agent systems use about 15× more tokens than chats". It also says that running subagents in parallel "cut research time by up to 90% for complex queries". Both are **company claims**. Read them together. The product is fast because it spends a lot, in parallel, all at once.
+
+So the main design object is the **budget**: tokens, tool calls, dollars, and seconds. A chat answer costs a fraction of a cent. A research run can cost several dollars and run for minutes. Every part of the design makes that spend safe and worth it. Effort rules limit it. Checkpoints keep a crash from doubling it. A citation gate keeps it from buying a report that looks right and is not.
+
+This lesson answers six questions:
+
+1. How many agents and tool calls should a query get, and what does each setting cost at live prices?
+2. What do tokens buy, and when does one more subagent stop paying?
+3. Why does a restart from zero double the bill, and how does a deploy avoid killing runs?
+4. How do you check a citation claim by claim, and what does a good check still miss?
+5. Why must a fetched web page be treated as hostile?
+6. How do you budget the latency of many parallel fetches (the answer-engine drill)?
+
+## Requirements and the quality bar
+
+The product takes a question and returns a cited report in a few minutes. Traffic numbers are **illustrative**: 4,000 runs a day, of which 60% are simple, 30% are comparisons, and 10% are complex.
+
+**Functional**
+
+- FR1: accept a question and return a run id at once. The report arrives later.
+- FR2: plan the work and pick the effort from the question.
+- FR3: search and read the web in parallel, with several subagents.
+- FR4: return a report in which every claim cites the page that supports it.
+
+**Out of scope.** Private company documents (lesson [A13.3](/learn/ai/a13-cases/enterprise-rag/), enterprise RAG), code execution, scheduled reports, and editing the report by chat.
+
+**Non-functional, and the bar.** These are our bars, not a standard. Each says how it is measured.
+
+| Metric | Bar | How measured |
+|---|---|---|
+| Claim-level citation recall | At least 95% of shipped claims supported by their cited text | An entailment check per claim, plus a weekly human audit |
+| Claim-level citation precision | At least 90% of citations relevant | The same check |
+| Rubric pass rate | At least 85% on a 100-query golden set | An LLM judge, plus human spot checks |
+| Cost per run | Mean at most $3, hard cap $20 per run | The budget meter, summed per run |
+| Wall-clock per run | P95 at most 10 minutes | Run store timestamps |
+
+Deep dive 3 defines the citation metrics. The cost bar has two parts on purpose: the mean says if the business works, and the cap bounds the worst bill one query can create.
+
+## Eval plan
+
+Per lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/), the eval comes before the design.
+
+**Offline set.** Anthropic says it began with "about 20 queries representing real usage patterns". We use 100, stratified by effort class: 60 simple, 30 comparisons, 10 complex. The simple ones have a known short answer, so a code check grades them with no judge. Each query runs 3 times, since an agent that passes once may fail next time (lesson [Agent Trajectory Evals](/learn/ai/a8-evals/trajectory-evals/)).
+
+**The rubric judge.** Reports are free text with no single right answer, so we use an LLM judge, as in lesson [Judges](/learn/ai/a8-evals/judges/). Anthropic grades with five criteria: "factual accuracy (do claims match sources?), citation accuracy (do the cited sources match the claims?), completeness (are all requested aspects covered?), source quality (did it use primary sources over lower-quality secondary sources?), and tool efficiency (did it use the right tools a reasonable number of times?)". It says a single call with a single prompt, scoring 0.0 to 1.0 and giving a pass or fail, "was the most consistent and aligned with human judgements". We copy the five criteria, but compute citation recall and precision in code, so the judge cannot be generous about them.
+
+**Human spot checks.** The same post reports what automation missed: "human testers noticed that our early agents consistently chose SEO-optimized content farms over authoritative but less highly-ranked sources". A content-farm page reads well and agrees with the report, so a judge can pass it. A person who knows the field sees the weak source. So people read a sample every week: runs the judge scored just above the pass line, and niche topics, where farms rank high. With the rule of three (zero failures in n checks bounds the true rate near 3 / n at 95% confidence), 100 reviewed reports with no source-quality failure support "at most 3%".
+
+**Online.** Cost per run by effort class, subagents and tool calls per run, wall-clock, resume count, and citation recall of shipped reports. The slice that matters is the complex class: 10% of runs and most of the money.
+
+## Budgets
+
+**Prices, live.** As of 2026-10-20, from the [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing), per million tokens, input then output.
+
+| Model | Input | Output | Cache hit |
+|---|---|---|---|
+| Claude Opus 5.5 | $4 | $20 | $0.20 |
+| Claude Sonnet 5.5 | $2 | $10 | $0.10 |
+| Claude Haiku 5.5 (prompts up to 100,000 tokens) | $0.10 | $0.50 | $0.01 |
+
+On the same page, web search costs "$10 per 1,000 searches, plus standard token costs for search-generated content", so one search is $0.01. Web fetch has "no additional charges beyond standard token costs". The page shows no date, so the date is the day I fetched it. For a search API outside the model, [Exa](https://exa.ai/docs/reference/pricing) lists search at $7 per 1,000 requests (auto and fast types), deep search at $12 to $15 per 1,000, and page contents at $1 per 1,000 pages.
+
+**Dollars per run, one worked example.** Take the simplest case, one agent with 6 tool calls on Sonnet 5.5. Our model, all sizes **illustrative**: the agent starts with 3,000 tokens (system prompt and brief). Each tool call adds a 3,000-token result and 300 tokens the agent wrote. Every model call re-sends the whole context. After 6 calls the agent writes a 1,500-token answer. That is 7 model calls.
+
+- Input per call: 3,000, then 6,300, 9,600, and so on, up by 3,300. Over 7 calls: 7 x 3,000 + 3,300 x (1 + 2 + ... + 6) = 21,000 + 69,300 = 90,300 tokens.
+- Output: 6 x 300 + 1,500 = 3,300 tokens.
+- Tokens: 90,300 x $2 / 1,000,000 = $0.181, plus 3,300 x $10 / 1,000,000 = $0.033. Total $0.214.
+- Searches: 6 x $0.01 = $0.06.
+- Citation pass (reads the report and 3 sources, 7,500 tokens in, 1,500 out): $0.015 + $0.015 = $0.03.
+- **Run total: $0.30.**
+
+A single chat answer on the same model, at 4,000 tokens in and 1,000 out, costs $0.008 + $0.010 = $0.018. So even this tiny run is about 17 chats. Deep dive 1 prices all three effort classes.
+
+**Time per run.** A model call plus its tool takes about 8 s (illustrative). Plan 10 s, merge 40 s, citation pass 20 s. The simple run takes 7 x 8 + 20 = 76 s. The complex run takes 16 x 8 + 10 + 40 + 20 = 198 s, because the subagents run in parallel. One by one, the same calls would take about 26 minutes. The P95 bar is 10 minutes, so the typical run leaves slack for retries and slow pages.
+
+## Core entities and API
+
+**Entities.** `Run` (query, effort class, state, caps, spent), `Plan`, `Step` (a checkpoint), `Finding` (subagent id, claim, exact quote, url), `Source` (url, text hash, trust tier), `Report` (claims, each with its citations).
+
+**API.** `POST /runs` with `{query, max_usd}` returns `{run_id}` at once. `GET /runs/{id}` returns state and progress, and `GET /runs/{id}/report` the report. `POST /runs/{id}/cancel` stops a run and keeps what it found. Lesson [Background Agents and Queues](/learn/ai/a7-agents-prod/background-agents-queues/) explains why a long run is submitted, queued, and polled. We use that pattern as given.
+
+## A naive design and where it breaks
+
+The first build in most teams is one agent loop with a long prompt: "Research this thoroughly and cite your sources". It has a search tool and a fetch tool, and no caps. It runs inside the web request. It reads each page straight into its context, and it cites the URLs it saw. Here is where it breaks. Numbers come from our cost model unless a source is named.
+
+| Break | What happens | Number |
+|---|---|---|
+| Overspend on an easy query | The lead fans out. Anthropic reports that early versions made "errors like spawning 50 subagents for simple queries". | 50 workers x 6 calls cost $14.55, against $0.30 for one agent: 48 times |
+| One agent does it all in a row | A complex query needs about 180 calls. One by one they take about 26 minutes, and the context overflows. | 12 x 16 x 8 s = 1,536 s |
+| Crash at 80% | The run restarts from zero. | 0.8 + 1.0 = 1.8 times the bill |
+| Deploy during runs | In-flight runs die when the workers restart. | Every run in flight, at once |
+| Plausible source, wrong claim | The cited page is on topic and does not say it. | A link check passes it. An entailment check fails it |
+| Page tells the agent what to do | A fetched page hides orders in its text. | One bad page among about 180 per complex run |
+
+The cause is the same each time: the model is the only control, and a prompt is a request, not a rule. The rest of the lesson moves each control into code.
+
+## High-level design
+
+Step through the build. Each step names the requirement it satisfies.
+
+<Ai13ResearchBuild client:visible />
+
+Three rules shape the picture. The lead plans and subagents read: each has a fresh context and a narrow brief, as in lesson [Subagents](/learn/ai/a6-agents/subagents/), and returns findings (claim, exact quote, url), not raw pages. Effort comes from a rule, and the budget meter, outside the model, enforces it. No claim ships on trust: the gate runs after the draft, and the judge and people run after that.
+
+## Deep dive 1: effort scaling and the cost of a run
+
+**What it is.** An **effort rule** maps the kind of query to the number of subagents and the number of tool calls each may use. Anthropic wrote its rules into the lead's prompt: "Simple fact-finding requires just 1 agent with 3-10 tool calls, direct comparisons might need 2-4 subagents with 10-15 calls each, and complex research might use more than 10 subagents with clearly divided responsibilities."
+
+**Picture.** An editor who sends one reporter to check a fact, a small team to compare two products, and a whole desk to investigate a company. The editor does not send the desk to check a fact.
+
+**Why it exists.** Anthropic gives the reason: "Agents struggle to judge appropriate effort for different tasks, so we embedded scaling rules in the prompts." Without the rules, "overinvestment in simple queries" was "a common failure mode". The model does not feel the bill, so someone must tell it.
+
+**The cost model.** A worker pays for every tool result again on every later call, because each call re-reads the whole context. So input grows with the square of the calls: for k calls it is (k + 1) x 3,000 + 3,300 x k(k + 1) / 2 tokens in our model. Lesson [Long-Running Agents and Context](/learn/ai/a6-agents/long-running-context/) shows the same growth. Pick a row below, then drag the sliders past the rule. Switch on caching and watch the worker line fall.
+
+<Ai13ResearchEffort client:visible />
+
+With an Opus 5.5 lead and Sonnet 5.5 workers and no caching, the rule defaults cost **$0.30**, **$2.48**, and **$13.64** a run, and take 76 s, 174 s, and 198 s. Hand-check the middle row. One worker with 12 calls reads 13 x 3,000 + 3,300 x 78 = 296,400 tokens and writes 5,100, which costs $0.593 + $0.051 = $0.644. Three workers: $1.93. Searches: 36 x $0.01 = $0.36. The Opus lead: $0.118. Citation pass on 18 sources: $0.075. Total $2.48. The 15 calls for complex research are our assumption, since the post says only "more than 10 subagents".
+
+Three things stand out. First, the classes differ by 45 times, so the mix sets the bill. Our 60/30/10 mix averages $2.29 a run, and the complex 10% is 60% of the money. Second, search fees are a fixed $0.01 a call that caching cannot touch. In the complex row they are $1.80. With caching on every call, worker tokens fall from $11.38 to $2.77, but the run still costs $5.03. Third, wall-clock time barely changes between 3 and 12 subagents (174 s and 198 s), because they run in parallel. Cost grows with subagents. Time does not.
+
+**Where the 15x goes.** Our three rows are 20, 190, and 1,100 times a 5,000-token chat. None is 15. Anthropic's 15x is an average over its own traffic, and we cannot see its mix, result sizes, or truncation. Do not plan from 15x. Measure tokens per run by effort class on your own traffic.
+
+**What tokens buy.** Anthropic reports: "three factors explained 95% of the performance variance in the BrowseComp evaluation... token usage by itself explains 80% of the variance, with the number of tool calls and the model choice as the two other explanatory factors." BrowseComp is a benchmark of hard web-search questions. Our reading: spend and success rise together across their runs. That does not show where the curve flattens on your queries. The product question is the **marginal value**: what does the next subagent add, against what it costs? Here is an **illustrative** curve. The pass rates are made up. The costs come from our model (15 calls each, Opus lead).
+
+| Subagents | Pass rate | Run cost | Extra cost | Extra points | Cost per extra point |
+|---|---|---|---|---|---|
+| 1 | 55% | $1.14 | | | |
+| 3 | 72% | $3.50 | $2.36 | 17 | $0.14 |
+| 6 | 80% | $6.88 | $3.38 | 8 | $0.42 |
+| 12 | 84% | $13.64 | $6.76 | 4 | $1.69 |
+| 24 | 85% | $27.16 | $13.52 | 1 | $13.52 |
+
+The rule: add a subagent while (pass-rate gain) x (value of a good report) exceeds the added cost. If a good report is worth $50, going from 6 to 12 subagents gains 4 points, worth $2, for $6.76. Stop near 6. If it is worth $500, the same step is worth $20 for $6.76, so go to 12, and stop before 24 ($5 for $13.52). The right effort depends on the value of the answer, so the effort table is a product decision.
+
+**Enforce the rule in code.** A prompt rule lowers the odds of overspend. A cap removes it. Keep maximum subagents, maximum calls, and a dollar cap per class, and check them before each spawn. A run can pass a cap by one call, since caps are checked after a response arrives (lesson [Loop Control](/learn/ai/a7-agents-prod/loop-control/)). The other risk is a wrong class: a complex query called "simple" under-delivers. Let the lead ask once to move up a class, and count the raise against the dollar cap.
+
+## Deep dive 2: durable execution and rainbow deploys
+
+**What it is.** **Durable execution** saves the state of a run after each step, so a crash resumes the run and does not restart it. Lesson [Durable Execution and Graph Runtimes](/learn/ai/a7-agents-prod/durable-graph-runtime/) taught the mechanism. Here is the cost view.
+
+**Picture.** A video game with a save point after every room. When the game crashes, you lose one room. With no saves, you lose the whole game.
+
+**Why it exists.** Anthropic: "When errors occur, we can't just restart from the beginning: restarts are expensive and frustrating for users. Instead, we built systems that can resume from where the agent was when the errors occurred." Temporal's service hands a crashed worker's job to another worker, "which replays the Event History and resumes at the line where execution stopped". LangGraph warns that in-memory checkpoints do not survive: "When the process restarts, all checkpoints are lost".
+
+**Number: why restart doubles the bill.** A complex run has 192 steps (12 subagents x 16 model calls). Say each step fails with chance q = 0.5%, from a crash, a timeout, or a rate-limit error that exhausts its retries. That rate is **our assumption**. I found no published figure. The chance that a 192-step run sees at least one failure is 1 - 0.995^192 = 1 - 0.382 = 62%. Most runs are hit.
+
+With no checkpoint, any failure sends the run back to step 1. Let p = 1 - q and let N be the steps. A run finishes with chance p^N, so you need 1 / p^N attempts. Each attempt bills steps until it fails or ends, (1 - p^N) / q on average. So the expected billed steps are
+
+<Math block tex="E = \frac{1}{q}\left(\frac{1}{(1-q)^{N}} - 1\right)" />
+
+For N = 192 and q = 0.005: 1 / 0.382 = 2.62, so E = (2.62 - 1) / 0.005 = 324 steps, **1.69 times** the 192 you wanted. At q = 0.7% it is 2.12 times, a doubled bill. If the checkpoint is per subagent (16 steps), a failure redoes only one subagent: 1.04 times. If it is per step, one step: 1.005 times. Move the sliders.
+
+<Ai13ResearchResume client:visible />
+
+**What resume must handle.**
+
+- Findings are stored under (run id, subagent id), so a resumed lead does not start finished subagents again.
+- Searches are reads, so repeating one costs $0.01. Tools that write need idempotency keys, as in the durable runtime lesson.
+- The plan is saved to the run store. Anthropic notes that past 200,000 tokens the lead's context "will be truncated".
+
+**Rainbow deploys.** A deploy changes code while runs are in flight, and a new version can break an old run's checkpoint. Anthropic: "We can't update every agent to the new version at the same time. Instead, we use rainbow deployments to avoid disrupting running agents, by gradually shifting traffic from old to new versions while keeping both running simultaneously."
+
+How many runs does a deploy touch? By Little's law, runs in flight equal the arrival rate times the run duration. At an illustrative 100,000 runs a day (69.4 a minute) and 4 minutes a run, about 278 runs are in flight. A deploy that kills the workers loses all 278. At the mean cost of $2.29, half done on average, that is 278 x $1.15 = about $320 wasted and 278 failed runs. Ten deploys a day is about $3,200. With a rainbow deploy, new runs go to the new version and the old fleet drains, staying up for at most the run time cap (say 30 minutes). You pay for two small fleets for half an hour and lose no runs.
+
+## Deep dive 3: the citation gate and source trust
+
+### Counting a citation claim by claim
+
+**What it is.** A **claim** is one statement in the report that can be true or false. The **citation gate** checks each claim against the exact text it cites.
+
+**Why a link check is not enough.** A report can cite a real, relevant page that does not say what the claim says: a plausible source for a wrong claim. Counting "claims with a citation" cannot see it. The ALCE benchmark paper gives two definitions that can. They use an **entailment** check (also called NLI, natural language inference): a model that answers yes if the cited text, taken as true, implies the claim.
+
+- **Citation recall** is per claim. "We calculate the citation recall of each statement (0 or 1) and average over all statements in the model response." A claim scores 1 only if it has at least one citation and the entailment check says the concatenated citations imply it.
+- **Citation precision** is per citation. A citation is "irrelevant" if (a) it cannot support the claim on its own and (b) removing it does not hurt the other citations' support. A citation scores 1 if its claim has recall 1 and it is not irrelevant. The paper says its precision "does not require citing a minimal set". Redundant citations are not penalized.
+
+Work an **illustrative** report: 8 claims, 10 citations.
+
+| Claim | Citations | Cited text implies the claim? | Recall | Citation precision |
+|---|---|---|---|---|
+| c1 | A | Yes | 1 | A: 1 |
+| c2 | B, C | Yes; B alone does, C alone does too | 1 | B: 1, C: 1 (redundant, not irrelevant) |
+| c3 | D | No: on topic, but it never gives the number | 0 | D: 0 |
+| c4 | E, F | Yes, from E; F says nothing relevant | 1 | E: 1, F: 0 |
+| c5 | none | No citation | 0 | no citation to score |
+| c6 | G, H | Yes, only the two together | 1 | G: 1, H: 1 |
+| c7 | I | Yes | 1 | I: 1 |
+| c8 | J | Yes | 1 | J: 1 |
+
+Recall is 6 / 8 = **75%**. Precision is 8 correct citations out of 10 = **80%**. A check that asks "does the claim have a citation?" would report 7 / 8 = 87.5%. The gap is c3. Below our 95% recall bar, the gate repairs the claim (look for a better span) or strikes it. A struck claim lowers completeness. That is the trade.
+
+**What the gate costs.** A report with 40 claims, 1,500 tokens read and 50 written per claim, is 60,000 tokens in and 2,000 out. On Haiku 5.5 that is $0.006 + $0.001 = $0.007. On Sonnet 5.5 it is $0.12 + $0.02 = $0.14. Against a $13.64 run, even the strong-model gate is about 1%. Use the stronger model: a wrong verdict here is expensive.
+
+Anthropic's system uses a separate citation agent: the lead "passes all findings to a CitationAgent, which processes the documents and research report to identify specific locations for citations". The [Anthropic Citations API](https://platform.claude.com/docs/en/build-with-claude/citations) says its citations are "guaranteed to contain valid pointers to the provided documents", and that `cited_text` "does not count toward output tokens". Our reading: a valid pointer means the span exists, not that it supports the claim. Keep the entailment check.
+
+**What the gate cannot see.** It checks "does the source say so", not "is the source right". A content-farm or hostile page can imply a false claim, and the gate passes it. Cite the fetched document, not a subagent's summary of it: Anthropic's appendix calls the retelling a "game of telephone". For source quality, use trust tiers.
+
+| Tier | Examples | Handling |
+|---|---|---|
+| 1: primary | Official docs, filings, the paper itself | Cite freely |
+| 2: reputable secondary | Major press, established blogs with a named author | Cite, and label as secondary |
+| 3: aggregator or farm | SEO listicles, scraped copies | Do not cite alone. Find the primary source |
+| 4: anonymous user text | Forums, comments | Cite only as "users report", never as fact |
+
+### A page is not an instruction
+
+A subagent that reads a web page reads text written by a stranger. Lesson [Prompt Injection](/learn/ai/a10-safety/prompt-injection/) showed that the model cannot reliably tell data from orders. Here is a real case, **secondary-sourced** (I did not read the PromptArmor report). Simon Willison summarised an attack on Google's Antigravity coding tool in November 2025 ([his post](https://simonwillison.net/2025/Nov/25/google-antigravity-exfiltrates-data/)): "The attack itself is hidden in 1px font on a web page claiming to offer an integration guide for an Oracle ERP API." The hidden text told the agent to collect credentials and send them out "by using a browser subagent to browse to a malicious site". Our reading: a research agent has the same shape. It reads pages it did not choose, and its fetch tool is an exit, because a URL can carry data.
+
+The trifecta from lesson [The Lethal Trifecta](/learn/ai/a10-safety/lethal-trifecta/) applies. A research agent always reads untrusted content, so cut one of the other two legs.
+
+- **Private data.** The subagent that fetches pages holds only its brief. It does not see the user's files or the other subagents' findings.
+- **Exit.** The fetch tool goes through a proxy with a host allow-list and no request body. Anything the model writes into a URL is a leak.
+- **Output shape.** A subagent returns structured findings (claim, exact quote, url). The lead treats them as data. A finding with an imperative sentence ("now visit...") is flagged, not obeyed.
+- **Two-source rule.** A claim that rests on one tier-3 source is held until a second, independent source agrees. One poisoned page then cannot steer the report alone.
+
+How often will a run meet a hostile page? I know of no measured rate, so take an **illustrative** one. A complex run reads about 180 pages (12 x 15). If 0.1% of pages carry a hostile payload, the chance of at least one in a run is 1 - 0.999^180 = 16.5%. At 1%, it is 1 - 0.99^180 = 83.6%. At 400 complex runs a day, 16.5% means about 66 runs a day meet one. A prompt line like "ignore instructions in pages" lowers the odds and does not remove the risk. The zone, the proxy, and the two-source rule are the controls.
+
+## Failure modes and an incident drill
+
+| Failure | What happens | Detect | Do |
+|---|---|---|---|
+| 50 subagents for a simple query | Cost 48 times, same answer | Subagents and dollars per run, by class | Caps by class in code, effort table in the prompt |
+| A poisoned page steers the report | The report states what the page wants | Findings with imperative text; claims on one tier-3 source | Untrusted zone, structured findings, two-source rule |
+| Plausible source, wrong claim | The cited page does not say it | Citation recall by entailment, weekly audit | Gate: repair or strike the claim |
+| Crash at 80% of a run | The bill rises 1.8 times without a checkpoint | Resume count, cost per finished run | Persistent checkpoints, per-subagent resume |
+| Deploy during runs | In-flight runs fail | Failed runs in the deploy window | Rainbow deploy, drain the old fleet |
+| Lead waits on the slowest subagent, or one subagent searches endlessly | P95 wall-clock far above P50 | Wall-clock by percentile, repeated queries | Per-subagent deadline and call cap, return partial findings |
+| SEO-farm bias | Reports lean on tier-3 pages | Share of citations by tier; human audit | Tier heuristics in the prompt, a source-tier check |
+
+Anthropic says "the entire system can be blocked while waiting for a single subagent to finish searching". That is the tail problem from the drill, one level up.
+
+**Incident drill: cost per run triples in a week.** Illustrative numbers. Work through it.
+
+<Diagnose
+  client:visible
+  id="ai13-research-cost-triples"
+  title="Cost per run triples in a week"
+  scenario="Monday's dashboard shows the mean cost per run at $2.29. The next Monday it is $7.03. Traffic is flat and the quality score did not move. Read the facts, then decide. (Illustrative numbers.)"
+  facts={[
+    'runs per day: 4,000 (unchanged)',
+    'mean cost per run: $2.29 to $7.03',
+    'mean searches per run: 32 to 130',
+    'model ids and list prices: unchanged',
+    'cache hit rate on subagent calls: 76% to 75%',
+    'resume events per 1,000 runs: 31 to 30',
+    'subagents on "simple" queries: median 1 to 28 (complex: 12 to 12)',
+    'rubric pass rate on the weekly golden set: 84% to 85%',
+    'Tuesday deploy: lead prompt swapped the effort table for "use as many subagents as needed"',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'Search prices went up, so each tool call costs more',
+        'Prompt caching broke, so every call is billed in full',
+        'The lead lost its effort rules, so easy queries fan out',
+        'Crashes now restart runs from zero, so work is billed twice',
+      ],
+      answer: 2,
+      explain: 'Prices and model ids are unchanged, and cache hits and resume counts barely moved, so those three are out. The only change in behavior is subagents on simple queries, 1 to 28, and the prompt diff that removed the effort table explains it. Complex queries still use 12.',
+    },
+    {
+      prompt: 'What do you do first, within the hour?',
+      options: [
+        'Roll back the lead prompt and cap subagents by class in code',
+        'Switch every subagent to a cheaper model and keep the same fan-out',
+        'Disable the citation gate to remove a cost center',
+        'Wait a week to see if the cost settles on its own',
+      ],
+      answer: 0,
+      explain: 'Stop the spend first, then fix the cause. The rollback restores the rule and the code cap makes it hold even if a later prompt edit drops it again. A cheaper model leaves 28 subagents on a one-agent job. The gate is about 1% of a run, so it is not the cost. Waiting costs about $19,000 a day.',
+    },
+    {
+      prompt: 'Which control would have blocked this before the deploy reached users?',
+      options: [
+        'A weekly human review of a random sample of 30 reports',
+        'A higher rubric pass bar applied to the same golden set',
+        'A longer lead prompt that restates every one of the rules',
+        'A golden-set run that fails the deploy on cost per class',
+      ],
+      answer: 3,
+      explain: 'The rubric score did not move, because 28 subagents give the same answer as one. Only a check on cost per class sees the change, and a pre-deploy gate sees it before users do. A weekly review is too slow and does not read cost. A higher quality bar passes the same reports. A longer prompt is the control that just failed. Extra spend: (7.03 - 2.29) x 4,000 = about $19,000 a day.',
+    },
+  ]}
+/>
+
+The loss is about $19,000 a day, and it bought nothing: the pass rate moved from 84% to 85%. This is the marginal-value table in practice. Past the point where an extra subagent adds no quality, every dollar is waste. The cost per run, split by effort class, belongs on the dashboard next to quality.
+
+## Drill: Answer engine (Perplexity-style)
+
+**The task.** Build the system behind a question box that answers in seconds, with citations. The user waits, so this is the fast cousin of deep research. Take 15 minutes.
+
+**Bar.** Ours: P95 time to the first answer token at most 3 s; citation precision at least 90% by the entailment check; answer correctness by an LLM judge on a golden set, with spot checks; pages fetched within a freshness window for time-sensitive questions.
+
+**Design.** Rewrite the query, search, fetch the top pages, chunk them into passages, rerank, then write the answer with citations and check them. Lesson [Reranking and Query Rewriting](/learn/ai/a5-rag/reranking-rewriting/) taught rewriting and reranking. What is new here is the **latency of many parallel fetches**, plus freshness and trust.
+
+- **Fetches.** Fetch 6 pages in parallel. Cache by URL with a short time to live (minutes for news, hours for stable pages). News queries skip the cache.
+- **Passages, not pages.** Keep passages so the answer prompt stays near 4,000 tokens.
+- **Trust.** The same tiers and untrusted zone as deep dive 3. A fetched page is data.
+- **Citation check.** Run the entailment check on each sentence, or mark unchecked sentences as such. A fast path may stream first, verify after, and retract.
+
+**Budget.** Stage times other than the fetch stage are **assumed**.
+
+| Stage | P50 (assumed) | Note |
+|---|---|---|
+| Rewrite (small model) | 300 ms | |
+| Search API call | 400 ms | |
+| 6 parallel fetches, wait for all | 910 ms | Derived below |
+| Chunk and rerank | 150 ms | |
+| Answer, first token | 600 ms | |
+| **First token** | **2.36 s** | |
+
+**Number: the slowest of six.** Say one fetch is slower than 1.2 s with chance 5%, that is, 1.2 s is its p95. The stage waits for all six, so it is as slow as the slowest. The chance that all six are under 1.2 s is 0.95^6 = 0.735. So the chance that at least one is over is 1 - 0.95^6 = **26.5%**. More than one run in four has a slow fetch.
+
+| Fetches in parallel | Chance at least one exceeds its p95 |
+|---|---|
+| 1 | 5% |
+| 3 | 14.3% |
+| 6 | 26.5% |
+| 10 | 40.1% |
+| 20 | 64.2% |
+| 100 | 99.4% |
+
+<CrossTrackLink id="01-one-machine/throughput-vs-latency">
+Tail latency multiplies with fan-out. A request that waits for 100 services, each with a 1% chance of being slow, is slow 1 - 0.99^100 = 63% of the time. That is arithmetic on a model, not a measurement of any system. The 6-fetch case uses the same formula with 5% and 6.
+</CrossTrackLink>
+
+What does it do to the stage percentiles? The stage is below time t when all six are. With the fetch time F, the stage is under t with chance F(t)^6. For the stage median, F(t)^6 = 0.5, so F(t) = 0.5^(1/6) = 0.891. The stage median is the **89th percentile of a single fetch**. For the stage p95, F(t)^6 = 0.95, so F(t) = 0.95^(1/6) = 0.9915. The stage p95 is about the **99th percentile of one fetch** (0.9915), well past the 95th that we were given.
+
+To turn those into seconds you need a shape for one fetch. Take a lognormal (a common model for latencies) with a median of 0.4 s and a p95 of 1.2 s. These are **assumptions**, not measurements. Then the stage median is 0.91 s and the stage p95 is 1.97 s. A single fetch has median 0.4 s, so six in parallel more than double the median, and the stage p95 is 1.64 times a single fetch's p95. Step through a made-up draw of six fetches.
+
+<Ai13ResearchGantt client:visible />
+
+A **hedged request** sends a copy when a fetch passes a deadline, and the first reply wins. With the deadline at 1.2 s, the same model gives a stage p95 of 1.62 s, down from 1.97 s, and a stage p99 of 1.93 s, down from 2.84 s. The median does not change, because most stages finish before the deadline. The cost is the copies: 5% of fetches pass 1.2 s, so about 0.3 extra fetches per query, 5% more requests. Stopping at the deadline and answering from five pages is the other choice, and it trades coverage for time.
+
+**Perplexity on Vespa (vendor case study).** The Vespa page about Perplexity is vendor marketing, so every figure is a **company claim**. It says Perplexity handles "780m+" queries a month, growing "20%+" a month, and that Vespa "brought these capabilities together in a single distributed serving engine, with support for continuous indexing and machine learning inference". It names hybrid retrieval with structured filtering, passage-level retrieval, and multi-stage ranking ("lightweight ranking, then... richer neural models"). It also says Perplexity "has moved its web index to a purpose-built internal search system and continues to use Vespa for other use cases". It gives no latency in milliseconds. Our reading: 780 million a month is about 780,000,000 / (30 x 86,400) = 300 queries a second. At Exa's $0.007 an auto search, renting search would cost 780,000,000 x $0.007 = $5.5 million a month, a reason to own retrieval (the page says in-house search "meant owning retrieval instead of renting it"). The $5.5 million is our inference, not Perplexity's.
+
+**The failure: one slow source stalls every answer.** At 6 fetches, 26.5% of answers wait on a tail fetch. Fix it with a deadline and a hedge. Watch the stage p95 on its own, since the end-to-end figure hides it.
+
+**Prove it.** Search and contents prices from Exa, as of 2026-10-20 ([pricing](https://exa.ai/docs/reference/pricing)): auto search $7 per 1,000 requests, contents $1 per 1,000 pages.
+
+<Ballpark
+  client:visible
+  title="Budget for 6 parallel fetches"
+  scenario="An answer engine fetches 6 pages in parallel for each query. Each fetch is slower than 1.2 s with chance 5%, and fetches are independent. The stage waits for all six. At the 1.2 s deadline the system sends a second copy of any open fetch. Retrieval prices as of 2026-10-20: one Exa auto search is $7 per 1,000 requests, and page contents are $1 per 1,000 pages."
+  steps={[
+    {
+      prompt: 'What is the chance that at least one of the 6 fetches is slower than 1.2 s, in percent?',
+      unit: '%',
+      answer: 26.5,
+      within: 1.1,
+      explain: 'All six are under 1.2 s with chance 0.95^6 = 0.735. At least one is over with chance 1 - 0.735 = 0.265, so 26.5%.',
+    },
+    {
+      prompt: 'How many fetches per query do you expect to pass the 1.2 s deadline?',
+      unit: 'fetches',
+      answer: 0.3,
+      within: 1.1,
+      explain: '6 x 0.05 = 0.3. Each is a hedge copy, so the hedge adds about 0.3 requests to every 6, which is 5%.',
+    },
+    {
+      prompt: 'Ignore any help from the original after the deadline. A fetch is still open at 2.4 s with chance at most 0.05 x 0.05 (open at 1.2 s, and its copy is slow too). What is the most chance that the stage of six runs past 2.4 s, in percent?',
+      unit: '%',
+      answer: 1.5,
+      within: 1.1,
+      explain: 'One fetch: 0.05 x 0.05 = 0.0025. Six fetches: 1 - 0.9975^6 = 0.0149, about 1.5%. This is an upper bound, because the original may still finish. The lognormal model gives 0.11%.',
+    },
+    {
+      prompt: 'What does retrieval cost per query: one Exa auto search plus the contents of 6 pages, in cents?',
+      unit: 'cents',
+      answer: 1.3,
+      within: 1.1,
+      explain: 'Search: $7 / 1,000 = $0.007. Contents: 6 x $1 / 1,000 = $0.006. Total $0.013, which is 1.3 cents, before the answer tokens.',
+    },
+  ]}
+/>
+
+## Teardown: Anthropic's multi-agent research system
+
+This section reads one company post against what we built. Every figure is a **company claim** from the [engineering post](https://www.anthropic.com/engineering/multi-agent-research-system) (published 2025-06-13). The post gives no raw data, so none can be checked from outside.
+
+| Claim, in their words | What it does not say (our reading) |
+|---|---|
+| "the lead agent spins up 3-5 subagents in parallel rather than serially", and a Claude Opus 4 lead with Claude Sonnet 4 subagents "outperformed single-agent Claude Opus 4 by 90.2% on our internal research eval" | 90.2% is a relative gain on an eval we cannot run, with models from 2025. It is not accuracy. The post says the system excels at "breadth-first queries" |
+| Parallel calls "cut research time by up to 90% for complex queries" | "Up to" is the best case, for complex queries. Our model gives 87% (198 s against 1,556 s), the same order |
+| "agents typically use about 4× more tokens than chat interactions, and multi-agent systems use about 15× more tokens than chats" | An average over their traffic. Our three effort classes run 20 to 1,100 times a chat. Measure your own mix |
+| "token usage by itself explains 80% of the variance" on BrowseComp | Spend and score rise together in their runs. It is not a law, and it is silent about where returns fall |
+| A tool-testing agent "resulted in a 40% decrease in task completion time for future agents using the new description" | A speedup for later agents from better tool text, measured by them. Cheap to try, not a general constant |
+| "we built systems that can resume from where the agent was"; "rainbow deployments" | Matches deep dive 2. The post gives no failure rate or checkpoint size |
+| "human testers noticed that our early agents consistently chose SEO-optimized content farms" | A failure the automatic evals missed. Keep people in the loop |
+
+Take-away: the design is not exotic. The hard parts are the budget rules, the saved state, and the checks around the loop.
+
+## Staff answer vs senior answer
+
+| Topic | Senior answer | Staff answer |
+|---|---|---|
+| Design | A lead and 3 to 5 subagents | The lead plus an effort table by class, enforced by caps in code |
+| Cost | "It costs about 15 times a chat" | Cost per run by effort class from live prices, with the search fee shown apart, and the marginal value of the next subagent |
+| Failure | "Retry on error" | Checkpoint per step, resume by run id, bill multiplier from the failure rate |
+| Quality | "An LLM judge scores reports" | Claim-level recall and precision by entailment, a gate that repairs or strikes, humans on the farm-bias slice |
+| Pages | "Sanitize the HTML" | An untrusted zone: no private data, no free exit, structured findings, a two-source rule |
+| Latency | "Parallel fetches are fast" | Stage p50 is the fetch p89 and stage p95 is the fetch p99. Deadline, hedge, and a partial-answer path |
+
+## What experienced teams know
+
+1. **The model cannot feel the bill, so write the rule.** Anthropic put scaling rules in the prompt because agents "struggle to judge appropriate effort" (company claim). Our reading: the prompt is layer one and a cap in code is layer two.
+2. **Tokens buy quality, with falling returns.** Token use "by itself explains 80% of the variance" on BrowseComp (company claim). Our reading: price the next subagent against the value of a good report, not against zero.
+3. **Restarts are the expensive path.** LangGraph's docs warn that in-memory checkpoints are lost when the process restarts ([durable execution](https://docs.langchain.com/oss/python/langgraph/durable-execution)). Our reading: at 0.5% step failure, a 192-step run bills 1.69 times without checkpoints.
+4. **A citation can be real and still not support the claim.** ALCE scores recall by entailment, not by presence ([paper](https://arxiv.org/abs/2305.14627)). Our reading: the gate costs about 1% of a run, so there is little reason to skip it.
+5. **A fetched page can carry orders.** PromptArmor's Antigravity attack hid them in 1px text (secondary, via [Willison](https://simonwillison.net/2025/Nov/25/google-antigravity-exfiltrates-data/)). Our reading: the page leg cannot be cut, so cut private data and the exit.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Many subagents, higher effort | Wall-clock cut, wide coverage | Token use far above a chat, merge errors | Broad, high-value questions |
+| Prompt caching | Large cut in worker tokens | Needs warm, stable prefixes. Real hit rates are below 100% | Long worker contexts with many calls |
+| Checkpoint every step | Resume costs one step | A write per step, state size | Runs are long or expensive |
+| Strict citation gate | Fewer unsupported claims | Struck claims lower completeness | A wrong claim costs more than a gap |
+| Rainbow deploys | No dropped runs | Two fleets for a short time | Runs last minutes |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "The budget is the design. Each query gets an effort class from a rule table, with caps on subagents, calls, and dollars enforced in code. I price a run bottom-up at live prices, since 15x is an average. I checkpoint every step and use rainbow deploys, so a crash or release costs one step. Every claim passes a citation gate by entailment, with recall and precision defined. Pages are hostile: a zone with no private data and no free exit. A judge scores a sample and people read the farm-prone slice. I watch cost per run by class."
+</Callout>
+
+<Callout type="mistake">
+Do not plan from "15x a chat". Do not trust a prompt to cap spend. Do not restart a failed run from zero. Do not count "claims with a link" as citation quality. Do not let a page-reading subagent hold private data or an open exit. And say a crash rate or injection rate is an assumption unless you have a source.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Dollar cost of a run at 15 times a chat"
+  scenario="A chat turn uses 4,000 input and 1,000 output tokens on Claude Sonnet 5.5 ($2 per million input tokens, $10 per million output tokens, as of 2026-10-20). A multi-agent research run uses about 15 times the tokens of that chat (Anthropic's ratio), and we keep the chat's input to output split. The run also makes 40 web searches at $10 per 1,000."
+  steps={[
+    {
+      prompt: 'What does the chat cost, in cents?',
+      unit: 'cents',
+      answer: 1.8,
+      within: 1.1,
+      explain: 'Input: 4,000 x $2 / 1e6 = $0.008. Output: 1,000 x $10 / 1e6 = $0.010. Total $0.018, which is 1.8 cents.',
+    },
+    {
+      prompt: 'How many tokens does the run use?',
+      unit: 'tokens',
+      answer: 75000,
+      within: 1.1,
+      explain: 'The chat is 5,000 tokens. 15 x 5,000 = 75,000, which is 60,000 in and 15,000 out.',
+    },
+    {
+      prompt: 'What do the run tokens cost, in USD?',
+      unit: 'USD',
+      answer: 0.27,
+      within: 1.1,
+      explain: 'Input: 60,000 x $2 / 1e6 = $0.12. Output: 15,000 x $10 / 1e6 = $0.15. Total $0.27, which is 15 times the chat.',
+    },
+    {
+      prompt: 'What is the run total with the 40 searches, in USD?',
+      unit: 'USD',
+      answer: 0.67,
+      within: 1.1,
+      explain: '40 x $10 / 1,000 = $0.40. Tokens $0.27 plus searches $0.40 is $0.67. Search results also arrive as input tokens, which the ratio already counts.',
+    },
+    {
+      prompt: 'What share of that total is search fees, in percent?',
+      unit: '%',
+      answer: 60,
+      within: 1.1,
+      explain: '$0.40 / $0.67 = 0.60. At these token prices a search call costs about as much as a medium model call, so the fee is the larger line. Caching cannot reduce it.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A report has 8 claims. Seven carry a citation, and an entailment check finds that the cited text implies 6 of them. What is the claim-level citation recall by the ALCE definition?',
+      options: [
+        '87.5%: 7 of the 8 claims have a citation',
+        '75%: 6 of the 8 claims are entailed',
+        '100%: every cited page loads and is on topic',
+        '60%: 6 of the 10 citations were relevant',
+      ],
+      answer: 1,
+      explain: 'Recall is per claim and needs both a citation and entailment, so it is 6 / 8 = 75%. A bare "has a citation" check gives 87.5% and hides the plausible source that does not support its claim. A page that loads and is on topic can still fail to say what the claim says. The 60% mixes up precision, which is per citation.',
+    },
+    {
+      q: 'A stage waits for the slowest of 6 independent parallel fetches. Its median time equals which percentile of a single fetch?',
+      options: [
+        'The 50th, because parallel fetches cost no more than one',
+        'The 75th, because parallel fetches share the work evenly',
+        'The 95th, because the slowest fetch alone decides the stage',
+        'About the 89th, because 0.5 to the power one sixth is 0.89',
+      ],
+      answer: 3,
+      explain: 'The stage is under t only when all six are, so its chance is F(t) to the 6th power. Set that to 0.5 and F(t) = 0.891. The stage median is the single fetch p89. The 50th would need the six to be perfectly correlated. Sharing load is not part of the model, and the single-fetch 95th is only the 73rd percentile of the stage (0.95^6 = 0.735).',
+    },
+    {
+      q: 'A complex run has 192 model calls and each call fails with chance 0.5%. Which change cuts the extra billed work the most?',
+      options: [
+        'Checkpoint after each step and resume from it',
+        'Raise the retry limit on each search call from 2 to 5',
+        'Move the subagents to a cheaper model',
+        'Cap the run at 10 minutes of wall-clock time',
+      ],
+      answer: 0,
+      explain: 'Without checkpoints a failure restarts the run, so about 62% of runs repeat work and the bill is 1.69 times. A checkpoint per step redoes one step, 1.005 times. More search retries help only one kind of failure. A cheaper model lowers the unit price, not the repeated work. A time cap ends runs and does not save them.',
+    },
+    {
+      q: 'Anthropic reports that token use alone explains 80% of the variance in BrowseComp performance. What is the right product reading?',
+      options: [
+        'Give every query the largest token budget',
+        'Cut tokens, since spend barely affects the answer',
+        'Price the next subagent against the quality it adds',
+        'Ignore it, because 80% means the model is irrelevant',
+      ],
+      answer: 2,
+      explain: 'Spend and success rise together across their runs, but the figure does not say where returns flatten, and the same post lists model choice as a factor. So the useful question is the marginal one: what the next subagent adds against what it costs. Maximum budgets burn money on easy queries. Cutting tokens ignores the link. The model still matters.',
+    },
+    {
+      q: 'A fetched page hides text in a 1-pixel font that tells a research subagent to open a URL containing the user\'s notes. Which control stops the loss even if the model obeys?',
+      options: [
+        'A prompt line telling the model to ignore page text',
+        'No private data and a host allow-list in the zone',
+        'A bigger model that is better at spotting tricks',
+        'A judge that scores the final report afterwards',
+      ],
+      answer: 1,
+      explain: 'If the subagent holds no private data and cannot reach unlisted hosts, obeying the page leaks nothing. A prompt line lowers the odds and is not a rule. A bigger model also only changes the odds. A judge runs after the request has already left.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic, How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system): the effort rules, token figures, resume, rainbow deploys, the judge rubric, and the SEO-farm finding.
+- [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing): model prices, cache prices, and the per-search fee.
+- [Enabling Large Language Models to Generate Text with Citations (ALCE)](https://arxiv.org/abs/2305.14627): the claim-level recall and per-citation precision definitions. You do not need the full paper to follow this lesson.
+- [LangGraph, Durable execution](https://docs.langchain.com/oss/python/langgraph/durable-execution): why checkpoints must persist, and how a run resumes by thread id.
+- [Simon Willison, Google Antigravity Exfiltrates Data](https://simonwillison.net/2025/Nov/25/google-antigravity-exfiltrates-data/): the 1px-font page attack, secondary-sourced from PromptArmor.
