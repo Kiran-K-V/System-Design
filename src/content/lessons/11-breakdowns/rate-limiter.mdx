@@ -6,7 +6,6 @@ requires: ['07-reliability/rate-limiting', '08-technologies/redis', '04-data/con
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import RateLimiterBuild from '../../../components/anim/lessons/RateLimiterBuild.tsx';
 import RateLimiterAtomic from '../../../components/anim/lessons/RateLimiterAtomic.tsx';
 
@@ -35,41 +34,7 @@ This case study is about three parts the algorithm lesson skipped. Part one is w
 - Peak of 1 million requests a second across all clients. Every request needs one check.
 - One Redis instance (a fast in-memory store that many servers can share) sustains about 50,000 limiter calls a second. Lesson [8.2](/learn/08-technologies/redis/) warns that no single ops-per-second number is universal, and a script costs more than a plain `GET`. So this is a planning number. Benchmark your own hardware.
 
-Derive the shard count. A shard is one Redis instance that holds a slice of the clients' buckets. At 1M checks a second and 50K per shard, you need enough shards just to carry the load. The math is 1,000,000 ÷ 50,000 = 20 shards. Redis near 100% busy has no room for a burst. Many designs aim for about half load. That gives 40 shards. Say "20 at the minimum, about 40 for headroom". The exact number matters less than showing the division.
-
-<Ballpark
-  client:visible
-  title="Size the limiter fleet"
-  scenario="Peak traffic is 1 million requests a second, and each needs one Redis call. One shard handles 50,000 limiter calls a second. You want shards to run at about half load."
-  steps={[
-    { prompt: 'Shards needed if each runs at 100% of 50,000 a second', unit: 'shards', answer: 20, within: 1.1, explain: '1,000,000 ÷ 50,000 = 20. This is the floor, with no spare room.' },
-    { prompt: 'Shards needed if each runs at half load', unit: 'shards', answer: 40, within: 1.1, explain: 'At half load each shard serves 25,000 a second, so 1,000,000 ÷ 25,000 = 40. Headroom absorbs bursts and a failover.' },
-    { prompt: 'Calls per second one shard sees at half load', unit: 'per s', answer: 25000, within: 1.1, explain: '50,000 × 0.5 = 25,000 a second per shard.' },
-  ]}
-/>
-
-## Core entities
-
-- **Rule:** `rule_id`, a match (which clients and routes), `capacity`, and `refill_rate`.
-- **Bucket:** the state for one client under one rule. It holds `tokens` and `last_refill_time`. It is stored under a key such as `rl:{rule}:{client}`.
-
-Buckets are small and disposable. If one is lost, the client simply starts with a full bucket. That makes Redis a good home for them, even though Redis can lose recent writes ([lesson 8.2](/learn/08-technologies/redis/)).
-
-## API
-
-The limiter has no public API. Gateways call it inside the request path.
-
-- `allow(client_id, rule_id)` returns `{ allowed, remaining, retry_after }`.
-- A rejected call becomes `429 Too Many Requests` with `Retry-After`. Lesson [7.4](/learn/07-reliability/rate-limiting/) covers the headers.
-- Admin: `PUT /rules/{rule_id}` changes a limit.
-
-## High-level design
-
-Step through it. Each step adds one box for one requirement.
-
-<RateLimiterBuild client:visible />
-
-**Where does the check run?** You can place it in the client, in each service, or at the gateway. Never rely on the client, since callers can lie or skip it. Per-service checks repeat the same code and drift. The usual answer is the API gateway ([lesson 8.10](/learn/08-technologies/api-gateway/)), or a sidecar (a small helper process that runs beside each service and handles its traffic). The gateway already knows the caller, so it can pick the key. Keep a coarse per-IP limit before login and a per-user limit after it.
+Two facts decide the shard count. A shard is one Redis instance that holds a slice of the clients' buckets. The first fact is the total check rate. The second is how many calls one shard can carry. Divide the first by the second and you get the floor, which is a few dozen shards (~20 at 100% load). A Redis near 100% busy has no room for a burst or a failover. So real designs add headroom and run roughly twice the floor. The exact number matters less than saying why.
 
 ## Deep dive 1: the check must be atomic
 
@@ -102,14 +67,14 @@ Read it in order. It reads the stored state. It adds `elapsed × rate` tokens, c
 Details that matter:
 
 - **The script reads the clock inside Redis**, with `TIME`. All gateways then share one clock, so clock skew (two servers disagreeing about the time) between gateway servers cannot give one client extra tokens. The Redis docs say that since version 5, scripts replicate by their effects, so calling `TIME` is allowed.
-- **The key expires after twice the refill time.** An idle bucket refills to full after `cap ÷ rate` seconds. A full bucket is the same as a missing key. So deleting it after that is lossless, and idle keys do not pile up. With capacity 100 and rate 10 a second, the expiry is 2 × 10 = 20 seconds.
+- **The key expires after twice the refill time.** An idle bucket refills to full after `cap ÷ rate` seconds. A full bucket is the same as a missing key. So deleting it after that is lossless, and idle keys do not pile up. 
 - **Pass only the key in `KEYS`.** The Redis docs require every key a script touches to be given as a key argument. That is what lets Redis Cluster route the call.
 - **Load the script once** with `SCRIPT LOAD` and call it by its fingerprint (a hash of its text) with `EVALSHA`, so the full text is not sent each time. The script cache is lost on restart and failover, so the client must reload on a `NOSCRIPT` error. Most clients do this for you.
 - **Keep the script short.** A script blocks the whole instance while it runs. This one does a few hash operations.
 
 ## Deep dive 2: scale and keys
 
-Twenty to forty shards need a rule that sends every call for one client to one shard. Redis Cluster does this with 16,384 hash slots, which are numbered buckets that keys fall into. The slot is `CRC16(key) mod 16384`, where CRC16 is a fixed function that turns any key into a number. Each primary owns a range of slots ([lesson 8.2](/learn/08-technologies/redis/)). Because each script touches one key, it never spans two shards. Resizing moves whole slots, in the spirit of [lesson 4.8](/learn/04-data/consistent-hashing/).
+Dozens of shards need a rule that sends every call for one client to one shard. Redis Cluster does this with 16,384 hash slots, which are numbered buckets that keys fall into. The slot is `CRC16(key) mod 16384`, where CRC16 is a fixed function that turns any key into a number. Each primary owns a range of slots ([lesson 8.2](/learn/08-technologies/redis/)). Because each script touches one key, it never spans two shards. Resizing moves whole slots, in the spirit of [lesson 4.8](/learn/04-data/consistent-hashing/).
 
 Latency has two parts. The gateway keeps a pool of open connections to Redis, so no call pays for a new connection setup (the TCP handshake from module 2). The shard sits in the same region as the gateway, so one round trip is short. Our 10 ms budget covers the round trip and a script that does a few hash operations.
 
@@ -142,7 +107,7 @@ Set a short timeout on the Redis call, around a few milliseconds. When it expire
 | Regions | Per-region limits | No cross-ocean call | A client can exceed the global limit |
 
 <Callout type="tip">
-Say the race out loud. "If I read the count, add one, and write it back, two gateways can both read 1. And both can pass. So the refill, check, and take run in one Lua script inside Redis. Redis runs one script at a time." Then give the shard math: "1M checks a second, 50K per shard, so 20 shards, about 40 with headroom."
+Say the race out loud. "If I read the count, add one, and write it back, two gateways can both read 1. And both can pass. So the refill, check, and take run in one Lua script inside Redis. Redis runs one script at a time." Then give the sizing idea: "One shard carries tens of thousands of checks a second, so a million a second needs dozens of shards, with headroom."
 </Callout>
 
 <Callout type="mistake">
@@ -181,15 +146,15 @@ If each gateway sent its own clock reading, a gateway whose clock runs 2 seconds
       explain: 'A gateway with a fast clock would grant extra refill to its clients. One shared clock removes that error. Speed is not the reason, the refill math still runs, and the script must still receive its key.',
     },
     {
-      q: 'A bucket has capacity 60 and refills 2 tokens a second. After how many idle seconds can its key be safely deleted?',
+      q: 'An idle bucket refills to full. Why can its Redis key be deleted after that without changing any limit?',
       options: [
-        '2 seconds, the refill rate',
-        '120 seconds, capacity times the rate',
-        '60 seconds, the capacity',
-        '30 seconds, capacity over rate',
+        'A full bucket behaves the same as a missing key',
+        'A full bucket has no tokens left, so it is not needed',
+        'The next request creates a fresh bucket with a lower limit',
+        'The gateway keeps its own copy of every idle bucket',
       ],
-      answer: 3,
-      explain: 'An idle bucket is full after 60 ÷ 2 = 30 seconds. A full bucket equals a missing key, so deletion loses nothing. The script uses twice that time for margin. Multiplying instead of dividing gives a nonsense 120.',
+      answer: 0,
+      explain: 'The script treats a missing key as a full bucket. So deleting a full bucket loses nothing, and idle keys do not pile up. A full bucket has all its tokens, not none. A new bucket starts at the same capacity.',
     },
     {
       q: 'The limiter guards a payment API that is easy to overload. Redis goes down. Which policy fits, and why?',
@@ -203,15 +168,26 @@ If each gateway sent its own clock reading, a gateway whose clock runs 2 seconds
       explain: 'When the guarded system is fragile, letting all traffic in risks a larger outage. Fail open suits cases where the limit is about fairness and the backend can take a spike. Outage length is not part of the rule.',
     },
     {
-      q: 'You need 1M checks a second and one shard does 50,000 a second. At half load per shard, how many shards do you run?',
+      q: 'The check rate needs 20 shards at full load. Why run about twice that many?',
       options: [
-        '20 shards, because 1M ÷ 50K = 20',
-        '10 shards, because half load needs half the shards',
-        '80 shards, because half load needs four times the shards',
-        '40 shards, because each carries 25K a second',
+        'Redis refuses to run above half of its rated speed',
+        'Each shard needs twice the memory for its token buckets',
+        'Spare room absorbs bursts and a failover without overload',
+        'Twice the shards halves the latency of each single call',
       ],
-      answer: 3,
-      explain: 'Half load means 25,000 calls per shard. 1,000,000 ÷ 25,000 = 40. Twenty shards run at full load with no room to spare. Half load needs more shards, not fewer.',
+      answer: 2,
+      explain: 'A shard at full load has no room for a traffic burst, or for the load of a failed neighbor. Headroom keeps checks fast in those moments. Redis can run at full speed, and extra shards do not speed up one call.',
+    },
+    {
+      q: 'Which two facts set the minimum number of Redis shards the limiter needs?',
+      options: [
+        'The total checks per second and the calls one shard can carry',
+        'The number of API keys and the size of each token bucket',
+        'The number of gateways and the timeout of each Redis call',
+        'The number of regions and the length of each Lua script',
+      ],
+      answer: 0,
+      explain: 'Shards exist to carry load, so load over per-shard capacity gives the floor. Key count matters little, since each bucket is tiny. Gateways, timeouts, and script length do not set total capacity.',
     },
   ]}
 />

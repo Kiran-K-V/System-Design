@@ -39,14 +39,14 @@ requires: ['04-data/replication']
 Imports use relative paths: `../../../components/lesson/Callout.astro`, `../../../components/lesson/Quiz.tsx`, `../../../components/anim/lessons/<Name>.tsx`. Use `client:visible` on every React component that has state.
 
 ### Sections (h2), in this order. Names may vary.
-1. **The problem.** A concrete pain, with numbers.
+1. **The problem.** A concrete pain, told as a short story.
 2. **Naive solution** and where it fails. Animate the failure when you can.
 3. **The mechanism.** Build the real solution step by step from earlier lessons.
-4. **Numbers.** Latency, throughput, sizes. Link lesson 1.5.
+4. **Scale feel (optional).** One or two order-of-magnitude anchors in words, only when they change the design. No arithmetic. Link lesson 1.5.
 5. **Trade-offs.** A table: gain, pay, when to choose.
 6. **Interview lens.** `<Callout type="tip">` and `<Callout type="mistake">`. Optional `<Callout type="deep" title="...">`. These are the only three callout types.
 6b. **Real incident (optional, pilot).** `IncidentCard.astro` tells one public outage that this lesson's idea would have prevented. Props: `org`, `date`, `title`, `cost`, `missing`, `source`, `sourceLabel`; the body is a short numbered story. Add a one-line hook in "The problem" that links to `#incident`, and add the postmortem to Further reading. Use only a primary postmortem, check every quote against the raw page, and mark your own conclusions "Our reading". Done: replication (GitLab 2017), invalidation-stampede (Facebook 2010), timeouts-retries (AWS 2021), failure-modes (S3 2017), consensus (GitHub 2018), ids-and-time (Cloudflare leap second 2017), postgresql (Sentry 2015), dns (AWS DynamoDB 2025). Use each incident in one lesson only.
-7. **Check yourself.** `Quiz` (3 to 5 questions). Add one `Diagnose` (a short incident puzzle) or one `Ballpark` (estimation practice) where it fits.
+7. **Check yourself.** `Quiz` (3 to 5 questions). Add one `Diagnose` (a short incident puzzle) where it fits. `Ballpark` only in number lessons (see Numbers policy).
 8. **Further reading.** 2 to 4 links you fetched yourself and confirmed load.
 
 Length: set by the number of ideas, not a word limit. A lesson with about 10 ideas needs about 3,000 words. If a lesson needs much more than 4,000 words, split it into two lessons.
@@ -55,21 +55,20 @@ Length: set by the number of ideas, not a word limit. A lesson with about 10 ide
 - Plain, direct English. One idea per sentence. Short sentences. Active voice. No filler, no hype.
 - **Audience: the reader can code and has shipped a web service, but knows nothing about networks, databases, or infrastructure.** Never write for someone who already knows the topic. A term that feels obvious to you is the term that loses the reader.
 - **Teach every term inside the text, before you use it, at the moment the reader needs it.** Never put a glossary or word list at the top of a lesson. Do not assume a reader has met a term in another lesson unless that lesson taught it. When you are unsure, define it again in one clause.
-- **Give every idea four parts:** what it is, an everyday picture (an analogy), why it exists, and one number or example. Three short sentences is too little for an idea.
+- **Give every idea four parts:** what it is, an everyday picture (an analogy), why it exists, and one concrete example. Three short sentences is too little for an idea.
 - A question-first structure is allowed but not required. Use whatever form teaches each idea best: a story, a worked example, a before and after, a table, a step-by-step walk. Use plain descriptive headings, not a chain of question headings.
 - **Specs and RFC numbers go only in "Further reading"**, with one line that says the reader does not need them. Never put them in lesson text, tables, quiz text, or diagram captions.
 - **Diagrams follow the same rule.** Every acronym or term in a diagram label or caption must be explained in the lesson text before the diagram appears. Place the diagram after the section that defines its terms.
 - Reference lesson for this style: `src/content/lessons/02-networking/ip-tcp-udp.mdx`.
-- Teach why, then how, then numbers. Show a failing naive design before the fix.
-- Teach why, then how, then numbers. Show a failing naive design before the fix.
-- Concrete numbers. Mark rough ones with `~`. Use only numbers you verified from a source or derived and showed.
+- Teach why, then how. Show a failing naive design before the fix.
+- **Numbers policy (2026-10-20).** Teach concepts, not arithmetic. Numbers bore readers and do not stick. Only these number lessons may have calculation drills (`Ballpark`), arithmetic quiz questions, or worked math: `01-one-machine/estimation`, `01-one-machine/throughput-vs-latency`, `ai/a2-inference-cost/gpu-memory-math`, `ai/a2-inference-cost/kv-cache`, `ai/a2-inference-cost/self-host-vs-api`, `ai/a3-llm-apis/cost-metering`, `ai/a4-context/context-budgeting`, `ai/a9-llmops/cost-engineering`. Everywhere else: no step-by-step arithmetic in prose, no `Ballpark`, no quiz that asks the reader to compute. A single order-of-magnitude anchor is fine when it explains a design choice ("a disk read is about 1,000 times slower than RAM, so we cache"). Mark it with `~` and source it.
 - Original text. Hello Interview and other sites are for checking topic coverage only. Never copy their sentences, structure, or diagrams.
 - Cite only what you read. If a claim has no source, say it without a number or leave it out. Never invent numbers.
 
 ### Quiz rules (a script reads them)
 - `/review` and `src/pages/questions.json.ts` extract every `questions={[...]}` from the raw MDX and run it as JavaScript. So each quiz must be a **plain literal**: no imports, variables, template-literal expressions, or function calls inside it.
 - Question text must be **unique across all lessons**. A duplicate fails the build ("Duplicate question id"). You may set a stable `id: 'slug'` on a question.
-- Shape: `{ q, options: string[], answer: index, explain }`. Test understanding (predict, compute, choose). `explain` says why the right answer is right and why a tempting wrong one is wrong.
+- Shape: `{ q, options: string[], answer: index, explain }`. Test understanding (predict, explain, choose). No compute questions outside number lessons. `explain` says why the right answer is right and why a tempting wrong one is wrong.
 - Spread the correct `answer` index across questions (positions 0 to 3 about equally). Make the right option no longer than the others: the correct option must not be the single longest, and must not be more than 1.5 times the average wrong option. Run `python3 scripts/quiz-audit.py` before you report; `--strict` exits 1 on any flag.
 - `Diagnose` needs a unique `id`. `Ballpark` takes `answer` and `within` (factor tolerance; use 1.1 to 1.3 for small exact integers).
 
@@ -138,7 +137,7 @@ Work module by module, in syllabus order. Lessons in a module can be written in 
 Follow the six steps from `00-orientation/design-method.mdx` as h2 sections: Requirements (functional, below the line, non-functional with numbers), Core entities, API, Data flow (only if the problem needs it), High-level design, Deep dives. Then Trade-offs, Interview lens, Check yourself, Further reading.
 - Animation 1: the high-level design **builds up step by step**, one box per requirement, each step naming which requirement it satisfies. Use `DesignBuild` from `src/components/anim/DesignBuild.tsx`: give each node and edge a `step` (when it appears) and each step a `req` label such as `FR1: shorten a URL`. New nodes highlight and new edges draw in accent automatically. Wrap it in a small per-lesson component (e.g. `BitlyBuild.tsx`) that holds the data.
 - Animation 2 or interactive: one deep dive (for example ID generation, fan-out, or the hot key) with a toggle between a naive design and the improved one. Use `DesignCompare` from the same file (variants, each with its own nodes, edges, and steps; per-step `tones` recolor nodes).
-- Include a `Ballpark` for the scale numbers and one `Diagnose` for a failure.
+- Include one `Diagnose` for a failure. No `Ballpark` (see Numbers policy).
 - Each case study adds 1 or 2 new ideas and **links back** to the lessons that taught the parts (`requires` and inline links). Do not re-teach a mechanism. Point to it.
 - Order and "new ideas" per case study are in section 2 of the plan: `/home/ll-kv-kirababu/.claude/plans/i-need-to-create-delightful-crescent.md`.
 

@@ -38,11 +38,11 @@ The model writes its answer one **token** at a time. A token is a small piece of
 
 Why two clocks and not one? Because the model does two different jobs. First it reads your whole prompt in one big pass. Then it writes the answer one token at a time. [Lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/) explains why the first job is limited by compute and the second by memory speed. Each job breaks in its own way.
 
-The two clocks combine into one formula, from the same Databricks post: the whole request takes TTFT + TPOT x (number of output tokens). With a TTFT of 0.5 s, a TPOT of 30 ms, and a 400-token answer, the whole answer takes 0.5 + 0.03 x 400 = 12.5 s. Look at the shares. Only 0.5 s of the 12.5 s is the wait for the start. The other 12 s is the writing.
+The two clocks combine into one idea, from the same Databricks post: the whole request takes TTFT, plus TPOT for every output token. For a long answer, the start is a small part of the total. Most of the time is the writing.
 
 That points to a surprising fact. Databricks tested MPT models and reports: "The addition of 512 input tokens increases latency less than the production of 8 additional output tokens." Output tokens are the expensive ones for time. So an answer that grows from 200 to 400 tokens costs you more time than a prompt that grows by a few hundred tokens. Watch the length of answers.
 
-You also need to read these numbers as **percentiles**. Sort 100 request times from fastest to slowest. The **p95** is the 95th one: 95 of 100 requests are faster than it. It shows how bad the slow tail is. An average hides the tail. Say 94 requests take 1 s and 6 take 20 s. The average is (94 x 1 + 6 x 20) / 100 = 2.14 s, which looks fine. The p95 is 20 s. Users in the slow tail are very unhappy, and the average does not show it.
+You also need to read these numbers as **percentiles**. Sort 100 request times from fastest to slowest. The **p95** is the 95th one: 95 of 100 requests are faster than it. It shows how bad the slow tail is. An average hides the tail. If most requests are fast and a few are very slow, the average still looks fine. The p95 shows the slow ones. Users in the slow tail are very unhappy, and the average does not show it.
 
 ## Question 2: when does a request count as "good"?
 
@@ -52,9 +52,9 @@ LLM serving has the same idea. **Throughput** is how many requests the system fi
 
 Why does this exist? Because you can raise throughput in a way that hurts every user. The server can group requests into a **batch**: several requests processed in one pass of the GPU. A bigger batch uses the GPU better, but each request waits longer.
 
-Databricks measured this on one A100 GPU with a 7B-parameter model. At batch size 1, it handled 0.9 requests per second. At batch size 64, it handled 12.5 per second. That is about 14 times the throughput. Databricks states: "if we maximize throughput with a batch size of 64, latency increases by 4x while throughput increases by 14x."
+Databricks measured this on one A100 GPU with a 7B-parameter model. They state: "if we maximize throughput with a batch size of 64, latency increases by 4x while throughput increases by 14x."
 
-If your target says "no slower than 2 times the batch-1 request time", then at batch 64 almost every request misses it. Throughput looks great. Goodput approaches zero. This is simplified: real requests vary, so the fall is less sharp. The direction holds.
+If your target is strict, then at that batch size almost every request misses it. Throughput looks great. Goodput approaches zero. This is simplified: real requests vary, so the fall is less sharp. The direction holds.
 
 ## Question 3: why does GPU utilization mislead?
 
@@ -68,7 +68,7 @@ The mismatch is real. One engineering write-up reports that a single kernel on o
 
 For model serving, the better number is **MBU**, model bandwidth utilization. Start with the problem. To write each token, the GPU must read the model's whole set of weights from its memory, plus the saved context. Reading memory is the bottleneck, not arithmetic. **Memory bandwidth** is how many bytes per second the memory can deliver. MBU asks: of the bytes per second the memory could deliver, how many did we use? Databricks gives the formula: achieved bandwidth is (model size + saved context size) divided by TPOT. MBU is that divided by the peak bandwidth.
 
-A worked example from Databricks: a 7B model at 16 bits per weight is 14 GB. At a TPOT of 14 ms, the GPU reads 14 GB / 0.014 s = 1 TB/s. If the GPU peaks at 2 TB/s, MBU is 50%. Now you know how close the decode phase is to its real limit. `nvidia-smi` would likely say "100%" in the same case. This is also covered in [lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/). If you rent the model from an API provider, you do not see any of this. Skip this question, and watch the first two.
+MBU tells you how close the decode phase is to its real limit. `nvidia-smi` could say "100%" while MBU is only about half. This is also covered in [lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/). If you rent the model from an API provider, you do not see any of this. Skip this question, and watch the first two.
 
 ## Question 4: how can cost double while nothing errors?
 
@@ -78,7 +78,7 @@ Each API reply says how many tokens were read from the cache. Anthropic's usage 
 
 Why does the hit rate matter on a dashboard? It can fall to zero without any error. Anthropic's docs say a block shorter than the model's minimum is not cached and "no error is returned". The minimum differs by model: 512 tokens for Sonnet 5.5, 1,024 for Sonnet 4.6, 4,096 for Haiku 4.5. A model switch, a failover, or a slightly shorter prompt can drop you below it.
 
-Example: a prompt with an 800-token repeated block costs $0.00468 per request on Sonnet 5.5 and $0.0093 on Sonnet 4.6, with 300 new tokens and 400 output tokens. The cost per request doubles. The error rate stays at 0%. Only the hit rate and the cost per request show it.
+Example: a prompt with an 800-token repeated block is cached on a model with a low minimum. On a model with a higher minimum, the same block is not cached. The cost per request about doubles. The error rate stays at 0%. Only the hit rate and the cost per request show it.
 
 ## The naive way: the dashboard everyone builds first
 
@@ -100,7 +100,7 @@ Scene 1 shows long prompts. TTFT breaks while GPU busy stays flat and TPOT stays
 
 **Why it exists.** These are the numbers you promise. If they are green, the product is working, whatever the machines say. If they are red, you act.
 
-**Number.** The OpenTelemetry project, which defines standard names for telemetry, has names for these in its generative AI conventions: `gen_ai.server.time_to_first_token` and `gen_ai.server.time_per_output_token`, both in seconds. The page marks them "Development", so names may change. Use the standard names to avoid a rename later, and pin the version.
+**Example.** The OpenTelemetry project, which defines standard names for telemetry, has names for these in its generative AI conventions: `gen_ai.server.time_to_first_token` and `gen_ai.server.time_per_output_token`, both in seconds. The page marks them "Development", so names may change. Use the standard names to avoid a rename later, and pin the version.
 
 ### Idea 2: money metrics
 
@@ -110,7 +110,7 @@ Scene 1 shows long prompts. TTFT breaks while GPU busy stays flat and TPOT stays
 
 **Why it exists.** Cost is a first-class output of an LLM system, and it moves without errors. The split tells you where it moved.
 
-**Number.** Cache writes cost 1.25 times the input price, reads 0.1 times (0.05 times on Sonnet 5.5). A prefix that is written and never read costs more than one that is never cached.
+**Example.** Cache writes cost a little more than normal input, and reads cost far less. A prefix that is written and never read costs more than one that is never cached.
 
 ### Idea 3: provider and agent health
 
@@ -120,7 +120,7 @@ Scene 1 shows long prompts. TTFT breaks while GPU busy stays flat and TPOT stays
 
 **Why it exists.** The causes need different fixes. The Anthropic error docs say a 529 means high traffic across all users, and a spend-cap 429 "keeps failing until access resumes". One total cannot tell you which.
 
-**Number.** An agent loop with a 95% chance of success per step finishes a 20-step run about 36% of the time (0.95 to the 20th power). So the steps-per-run chart is a quality chart in disguise.
+**Example.** Even a step that works nearly every time can fail a long run, because small risks add up over many steps. So the steps-per-run chart is a quality chart in disguise.
 
 ### Idea 4: saturation, if you host the model
 
@@ -130,7 +130,7 @@ Scene 1 shows long prompts. TTFT breaks while GPU busy stays flat and TPOT stays
 
 **Why it exists.** These show a server heading toward trouble *before* TTFT breaks. A queue grows first. Then TTFT rises.
 
-**Number.** Databricks' example above: 14 GB read per token in 14 ms is 1 TB/s, 50% of a 2 TB/s GPU.
+**Example.** MBU shows how close decode is to the memory limit, which a busy-light cannot.
 
 ### Idea 5: alert on burn, not on level
 
@@ -140,9 +140,9 @@ Scene 1 shows long prompts. TTFT breaks while GPU busy stays flat and TPOT stays
 Metrics, logs, and traces answer different questions. A target says what "good enough" means. A burn-rate alert pages you only when the error budget is truly at risk. It uses a long window to show the problem matters, and a short window to stop the alert soon after the problem ends.
 </CrossTrackLink>
 
-Apply the same idea to money. A monthly token budget is a budget like any other. Burn rate 1 means the budget lasts exactly the month. The SRE workbook's pairs for error budgets are: burn 14.4 over 1 hour (2% of the month used), burn 6 over 6 hours (5%), and burn 1 over 3 days (10%). Using them on dollars is our own extension, not something the workbook says.
+Apply the same idea to money. A monthly token budget is a budget like any other. A burn rate of 1 means the budget lasts exactly the month. A higher burn rate means it runs out sooner. The SRE workbook pairs a fast, high burn rate with a short window, and a slow, low burn rate with a long window. Using this on dollars is our own extension, not something the workbook says.
 
-An example. Budget: $9,000 a month. You spend $180 in one hour. That is 2% of the month in 1 hour. A month has 720 hours, so an even spend is 1/720 of the budget per hour, and your burn rate is 2% / (1/720) = 14.4. At that pace the budget lasts 9,000 / 180 = 50 hours. A loop with a bug would look exactly like this. Try other numbers.
+For example, a loop with a bug can spend a big share of the month's budget in one hour. That is a very high burn rate, and it should page you. Try different spend levels.
 
 <Ai9DashBurn client:visible />
 
@@ -150,7 +150,7 @@ An example. Budget: $9,000 a month. You spend $180 in one hour. That is 2% of th
 
 **Why it exists.** A fixed threshold either pages all night or misses the slow leak. A burn rate scales with your target.
 
-**Number.** The SRE workbook says the short window should be 1/12 of the long one. With a 1-hour window, that is 5 minutes. After errors stop, the short window drops below the threshold in 5 minutes, and the 1-hour window needs 60 minutes. So the alert clears quickly.
+**The rule.** The SRE workbook says the short window should be much shorter than the long one, about a twelfth. After errors stop, the short window recovers fast, so the alert clears quickly.
 
 Here is the full set as a cheat sheet.
 
@@ -158,16 +158,13 @@ Here is the full set as a cheat sheet.
 
 ## Numbers
 
-| Item | Number | Source |
+| Item | Takeaway | Source |
 |---|---|---|
-| Whole answer, TTFT 0.5 s, TPOT 30 ms, 400 tokens | 12.5 s | derived from Databricks' formula |
-| 8 more output tokens vs 512 more input tokens | the 8 output tokens add more time | Databricks, MPT models |
-| Batch 1 to batch 64, one A100, 7B model | 0.9 to 12.5 req/s, latency 4x, throughput 14x | Databricks |
-| MBU example | 14 GB / 14 ms = 1 TB/s, 50% of 2 TB/s | Databricks |
-| GPU utilization sample period | 1/6 s to 1 s | NVIDIA NVML docs |
-| Cache minimums | 512 / 1,024 / 4,096 tokens (Sonnet 5.5 / Sonnet 4.6 / Haiku 4.5) | Anthropic caching docs |
-| Page rule: burn, long and short window | 14.4, 1 h and 5 min, 2% of budget | Google SRE workbook |
-| Budget example | $180 in 1 h on $9,000: burn 14.4, empty in 50 h | derived |
+| Output tokens vs input tokens | A few output tokens add more time than hundreds of input tokens | Databricks, MPT models |
+| Batch size up | Throughput rises a lot, and latency rises too | Databricks |
+| GPU utilization | Only says a kernel ran in the sample period | NVIDIA NVML docs |
+| Cache minimums | Differ by model, and a block below the minimum is not cached | Anthropic caching docs |
+| Burn-rate pages | A fast burn with a short window, a slow burn with a long window | Google SRE workbook |
 
 Name your targets. These are examples to adapt, not rules: TTFT p95 under 1 s, TPOT p95 under 50 ms, and 99% of requests meeting both. The cost line: report cost per successful task each day, and alert on burn.
 
@@ -207,10 +204,15 @@ Do not say "I would alert when GPU utilization passes 90%". It is a busy light, 
   questions={[
     {
       id: 'ai9-dash-latency-formula',
-      q: 'A call has TTFT 0.5 s and TPOT 30 ms, and writes a 400-token answer. How long does the whole answer take?',
-      options: ['0.53 s', '12 s', '12.5 s', '15.5 s'],
+      q: 'A chat feature streams long answers. Users say it feels slow, yet TTFT looks healthy. Which clock should you check next, and why?',
+      options: [
+        'TTFT again, since it is the only clock users feel',
+        'Uptime, since a slow answer means the service is down',
+        'TPOT, since long answers spend most of their time in the writing',
+        'GPU utilization, since a busy GPU always means slow answers',
+      ],
       answer: 2,
-      explain: 'Whole time = TTFT + TPOT x tokens = 0.5 + 0.03 x 400 = 12.5 s. The writing is 12 of those seconds. Dropping the 0.5 s start gives 12, and mixing up ms and s gives the other wrong values.',
+      explain: 'Whole time is TTFT plus TPOT for every output token. For long answers, the writing dominates, so a slow TPOT or a long answer makes it feel slow. A healthy TTFT does not cover that.',
     },
     {
       id: 'ai9-dash-goodput',
@@ -238,15 +240,15 @@ Do not say "I would alert when GPU utilization passes 90%". It is a busy light, 
     },
     {
       id: 'ai9-dash-budget-burn',
-      q: 'The monthly token budget is $9,000. The system spends $270 in one hour. The month has 720 hours. What is the burn rate, and does a "burn 14.4 over 1 hour" page rule fire?',
+      q: 'A bug makes an agent loop and spend a big share of the monthly token budget in one hour. Which alert catches it best?',
       options: [
-        'Burn 7.2, so no page',
-        'Burn 21.6, so it pages',
-        'Burn 14.4, so it pages',
-        'Burn 3.0, so no page',
+        'A fixed threshold on average daily spend',
+        'A burn-rate alert with a short and a long window',
+        'An alert on GPU utilization above a set level',
+        'An alert on the error rate, since a loop always errors',
       ],
       answer: 1,
-      explain: '$270 is 3% of $9,000. An even spend is 1/720 of the budget per hour, so burn = 3% x 720 = 21.6. That is above 14.4, so the rule fires. At that pace the budget is gone in 9,000 / 270, about 33 hours.',
+      explain: 'A burn-rate alert pages when money is spent much faster than the budget allows, and the short window lets it clear soon after the fix. A daily average reacts too late. A loop can spend heavily with no errors.',
     },
     {
       id: 'ai9-dash-baseline',

@@ -5,7 +5,6 @@ requires: ['ai/a1-model-function/forward-pass']
 
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import Math from '../../../../components/lesson/Math.astro';
 import Ai1ScaleWalk from '../../../../components/anim/lessons/Ai1ScaleWalk.tsx';
 import Ai1ScaleFrontier from '../../../../components/anim/lessons/Ai1ScaleFrontier.tsx';
@@ -25,17 +24,17 @@ For you, the reader, the rules answer two questions. Why do small models today m
 
 <Math block tex="C \approx 6\,N\,D" />
 
-**Serving: about 2 FLOPs per parameter per token.** Serving runs only the forward pass. A 70B model costs 2 × 70e9 = 140 GFLOPs per generated token. These are floor estimates. They ignore attention over long prompts, which lesson [A1.4](/learn/ai/a1-model-function/attention-cost/) covers, and Kaplan notes the same for training (their model width is much larger than the context length divided by 12).
+**Serving: about 2 FLOPs per parameter per token.** Serving runs only the forward pass. A bigger model costs more per generated token in direct proportion to its size. These are floor estimates. They ignore attention over long prompts, which lesson [A1.4](/learn/ai/a1-model-function/attention-cost/) covers, and Kaplan notes the same for training (their model width is much larger than the context length divided by 12).
 
-Check the rules on a real model. Llama 3 405B trained on 15.6T tokens. So C = 6 × 405e9 × 15.6e12 = 3.79e25 FLOPs, about 3.8e25. Serving one token costs 2 × 405e9 = 810 GFLOPs.
+Together the two rules explain the economics: training is a big one-time bill, and serving is a smaller bill paid on every token for the life of the product.
 
 ## Naive solution: build the biggest model you can afford
 
-Early scaling work (Kaplan et al., 2020) found smooth power laws. Loss falls as a power of N (exponent about 0.076) and of D (about 0.095). Their advice for a fixed compute budget: put most of it into model size. The optimal N grows as C to the power 0.73, so each 10x in compute should give about 5.4x more parameters and only 1.9x more data.
+Early scaling work (Kaplan et al., 2020) found smooth power laws. Loss falls as a power of N (exponent about 0.076) and of D (about 0.095). Their advice for a fixed compute budget: put most of it into model size. The optimal N grows as C to the power 0.73, so most of each increase in compute should go into more parameters and only a little into more data.
 
 Chinchilla (Hoffmann et al., 2022) tested the advice and found it wrong. Their three fitting methods agree. N and D should grow at close to the same rate. Their exponents for N are 0.50, 0.49, and 0.46. Kaplan's 0.73 is the outlier. The paper names a cause. Kaplan et al. used a fixed number of training tokens and a fixed learning-rate schedule for all models. Small-data runs were then judged on an unfinished schedule. The unfinished schedule "contributes to the conclusion that model size should increase faster than training data size". Chinchilla matched the schedule to the data.
 
-The proof was a head-to-head. Chinchilla used the same compute as Gopher (280B parameters). But Chinchilla was 4 times smaller, 70B. It was also trained on 4 times more data. It scored 67.5% on MMLU, a 57-subject knowledge test. The paper says it "uniformly and significantly outperforms" Gopher. As a bonus, a 4x smaller model has a smaller memory footprint and a lower inference cost.
+The proof was a head-to-head. Chinchilla used the same compute as Gopher (280B parameters). But Chinchilla was 4 times smaller, 70B. It was also trained on 4 times more data. It scored higher on MMLU, a 57-subject knowledge test. The paper says it "uniformly and significantly outperforms" Gopher. As a bonus, a 4x smaller model has a smaller memory footprint and a lower inference cost.
 
 ## The mechanism: split the budget
 
@@ -49,7 +48,7 @@ Fix C. Then C = 6ND leaves one free choice. Chinchilla's Table 3 lists, for each
 | 175B | 3.7T | 21.1 |
 | 280B | 5.9T | 21.1 |
 
-The paper does not state a ratio. We derived it: dividing each row gives 20 to 22. So "about 20 tokens per parameter" is our reading of Table 3, a handy rule and not an exact law. Set D = 20N and C = 6N × 20N = 120 N², so N = √(C / 120). Walk through the Chinchilla budget.
+The paper does not state a ratio. We derived it: dividing each row gives 20 to 22. So "about 20 tokens per parameter" is our reading of Table 3, a handy rule and not an exact law. Set D = 20N, and for a given budget the best model size follows directly. Walk through the Chinchilla budget.
 
 <Ai1ScaleWalk client:visible />
 
@@ -59,34 +58,36 @@ Now try your own budget. The calculator shows the Chinchilla split. For comparis
 
 What to notice:
 
-1. **Check the table.** Pick "Chinchilla row: 1B". The calculator gives 1.00B parameters and 20.1B tokens. Table 3 says 1B and 20.2B.
-2. **The two rules split apart.** At 5.76e23 FLOPs, Chinchilla gives about 69B parameters and 1.39T tokens. Kaplan's rule gives about 804B parameters and 119B tokens, which is 0.15 tokens per parameter.
-3. **Why it matters for model choice.** Following the Kaplan rule, you would build a model about 12 times larger. Every request would pay for 12 times more weights. That model would have seen too little data.
+1. **Check the table.** Pick a Chinchilla row. The calculator matches the paper's Table 3.
+2. **The two rules split apart.** At one large budget, Chinchilla picks a mid-size model with lots of data. Kaplan's rule picks a far bigger model with far less data.
+3. **Why it matters for model choice.** Following the Kaplan rule, you would build a model many times larger. Every request would pay for all those extra weights. That model would also have seen too little data.
 4. **The red dot is real.** Llama 3 8B sits far below the optimal line for its own budget. That choice was deliberate.
 
 ## Training once, serving forever
 
 Chinchilla answers "which model gives the lowest loss for a training budget?" Most teams ask a different question. Their question is "which model gives a given quality for the lowest total cost, training plus serving?" Training is paid once. Serving is paid for every token, for the whole life of the product.
 
-Meta trained Llama 3 8B on over 15T tokens. The Chinchilla-optimal amount for an 8B model is about 200B tokens (Meta's own figure), and our 20-per-parameter rule gives 160B. So Llama 3 8B saw 75 to 94 times more data than compute-optimal. That is 15e12 / 8e9 = 1,875 tokens per parameter. Meta reports that the 8B and 70B models "continued to improve log-linearly" up to 15T tokens. So the extra data kept paying off. The 405B model is much closer to the rule, at 15.6e12 / 405e9 = 38.5 tokens per parameter.
+Meta trained Llama 3 8B on over 15T tokens. That is far more data than the compute-optimal amount for its size, by roughly two orders of magnitude (our estimate from the 20-per-parameter rule). Meta reports that the 8B and 70B models "continued to improve log-linearly" up to 15T tokens. So the extra data kept paying off. The 405B model is much closer to the rule.
 
-Why train a small model so long? Because every served token costs 2N. An 8B model costs 16 GFLOPs per token, and a 70B model costs 140 GFLOPs, 8.75 times more. Extra training buys quality, and a small N keeps the serving bill small. Playing with the chart below shows where this pays back.
+Why train a small model so long? Because every served token costs 2N. A small model is several times cheaper to serve on every token. Extra training buys quality, and a small N keeps the serving bill small. Playing with the chart below shows where this pays back.
 
 <Ai1ScaleTrade client:visible />
 
-With the Chinchilla fit (Eq. 10 of the paper), the two models land at almost the same loss. The 70B model reaches 1.937 on 1.4T tokens. The 8B model reaches 1.949 on 15T tokens. That is an extrapolation far outside the data the fit was made from. Real models differ in data quality. So read it as "similar, by this fit", not as a measured result. The cost difference is plain arithmetic. The 8B model costs more to train, 7.2e23 against 5.9e23 FLOPs. It breaks even after (7.2e23 − 5.9e23) / (2 × (70e9 − 8e9)) = 1.06e12, about a trillion, served tokens. Past that, the small model costs less, and the gap grows with traffic. A product that serves 1M requests per day with 1,000 tokens each uses 1e9 tokens per day. So it reaches 1e12 tokens in about 1,000 days. A busy product gets there far sooner.
+With the Chinchilla fit (Eq. 10 of the paper), the 70B model on 1.4T tokens and the 8B model on 15T tokens land at almost the same loss. That is an extrapolation far outside the data the fit was made from. Real models differ in data quality. So read it as "similar, by this fit", not as a measured result.
+
+The cost story is the point. The small model costs more to train, but each served token is cheaper. After enough served tokens (roughly a trillion, our estimate), the small model has paid back the extra training, and the gap grows with traffic. A busy product gets there fast.
 
 ## Numbers
 
-| Model | Parameters | Training tokens | Tokens per parameter | Training FLOPs (6ND) | Serving FLOPs per token (2N) |
-|---|---|---|---|---|---|
-| Llama 3 8B | 8B | 15T | 1,875 | 7.2e23 | 16 GFLOPs |
-| Llama 3 70B | 70B | 15T | 214 | 6.3e24 | 140 GFLOPs |
-| Llama 3 405B | 405B | 15.6T | 38.5 | 3.8e25 | 810 GFLOPs |
+| Model | Parameters | Training tokens | Tokens per parameter |
+|---|---|---|---|
+| Llama 3 8B | 8B | 15T | far above 20 |
+| Llama 3 70B | 70B | 15T | well above 20 |
+| Llama 3 405B | 405B | 15.6T | closer to 20 |
 
-Parameters and token counts are from Meta's blog and the Llama 3 paper. The FLOPs columns are our derivations from 6ND and 2N. One note on the source: our fact sheet had 70B at 6.4e24, but 6 × 70e9 × 15e12 is 6.3e24.
+Parameters and token counts are from Meta's blog and the Llama 3 paper. The last column is our reading of the ratio.
 
-FLOPs are not dollars. A provider's price is set by hardware, utilization, and margin. But the direction is clear. On the Anthropic model overview page (as of 2026-10-15), input prices per million tokens are listed. Haiku 5.5 starts at $0.10 ("from"). Sonnet 5.5 costs $2, and Fable 5.1 costs $10. Output prices run from $0.50 to $10 to $50. A request with 2,000 input and 500 output tokens costs about $0.00045 on Haiku. The same request costs $0.009 on Sonnet and $0.045 on Fable. The arithmetic is 2,000 × price_in + 500 × price_out, per million. At 1M requests a day that is $450, $9,000, and $45,000 per day. Anthropic does not publish parameter counts, so we cannot say the price follows size. The [models overview page](https://platform.claude.com/docs/en/models/overview) is the source for these numbers, and [lesson A0.4](/learn/ai/a0-orientation/build-buy-finetune/) shows when renting a GPU for a small model beats the API.
+FLOPs are not dollars. A provider's price is set by hardware, utilization, and margin. But the direction is clear. On the Anthropic model overview page (as of 2026-10-15), the smaller models list much lower prices per million tokens than the larger ones, and output costs more than input. At high volume, that gap decides which model you can afford. Anthropic does not publish parameter counts, so we cannot say the price follows size. The [models overview page](https://platform.claude.com/docs/en/models/overview) is the source for these numbers, and [lesson A0.4](/learn/ai/a0-orientation/build-buy-finetune/) shows when renting a GPU for a small model beats the API.
 
 ## Trade-offs
 
@@ -103,11 +104,11 @@ Distillation, from Hinton et al. (2015), aims to "compress the knowledge in an e
 ## Interview lens
 
 <Callout type="tip">
-Tie size to money in one line: "Serving costs 2N FLOPs per token. So an 8B model is about 9 times cheaper per token than a 70B one. At 1M requests a day I would start with the small model, measure it on my golden set, and move up only for the requests where it fails." Then route easy requests to the small model.
+Tie size to money in one line: "Serving costs 2N FLOPs per token. So an 8B model is several times cheaper per token than a 70B one. At a million requests a day I would start with the small model, measure it on my golden set, and move up only for the requests where it fails." Then route easy requests to the small model.
 </Callout>
 
 <Callout type="mistake">
-Do not say "bigger is always better". And do not quote "20 tokens per parameter" as if it were a law of nature. It is a rule for the cheapest training run at a given loss. It ignores the cost of serving, which is why new models break it on purpose. Also do not claim the Chinchilla rule is exact. Table 3 gives 20 to 22. Meta quotes about 25 for the 8B size.
+Do not say "bigger is always better". And do not quote "20 tokens per parameter" as if it were a law of nature. It is a rule for the cheapest training run at a given loss. It ignores the cost of serving, which is why new models break it on purpose. Also do not claim the Chinchilla rule is exact. Table 3 gives about 20 to 22.
 </Callout>
 
 ## Check yourself
@@ -116,26 +117,26 @@ Do not say "bigger is always better". And do not quote "20 tokens per parameter"
   client:visible
   questions={[
     {
-      q: 'A lab has 1.2e22 FLOPs and uses C = 6ND with D = 20N. What model does it train?',
+      q: 'A lab has a fixed training budget. According to Chinchilla, how should it split the budget?',
       options: [
-        'About 1B parameters on 20B tokens, since 1B is the nearest round size',
-        'About 100B parameters on 2T tokens, since larger is better at this budget',
-        'About 10B parameters on 200B tokens, since N = sqrt(1.2e22 / 120)',
-        'About 10B parameters on 20B tokens, since D is 20 and N is 10B',
+        'Grow model size and training data together, at close to the same rate',
+        'Put almost all of it into model size, and train briefly',
+        'Put almost all of it into data, and keep the model tiny',
+        'Match the model size to the largest GPU it can rent',
       ],
-      answer: 2,
-      explain: 'C = 120 N squared, so N = sqrt(1.2e22 / 120) = sqrt(1e20) = 1e10, which is 10B. Then D = 20 N = 200B tokens. The Chinchilla Table 3 row for 10B is 205B tokens, which agrees. Option 4 mixes up the units: 20 tokens per parameter is 20 x 10B.',
+      answer: 0,
+      explain: 'Chinchilla found that N and D should grow at close to the same rate, near 20 tokens per parameter. Putting almost all into size was the older Kaplan advice, and the paper shows it is wrong. GPU size does not set the split.',
     },
     {
-      q: 'A 70B model generates a reply of 500 tokens. About how many FLOPs does the forward computation take?',
+      q: 'Which part of a model\'s life does the 2N rule describe, and why does the cost differ from training?',
       options: [
-        'About 2.1e14 FLOPs, since each token costs 6N',
-        'About 7e13 FLOPs, since each token costs 2N',
-        'About 7e10 FLOPs, since the cost is N for the whole reply',
-        'About 1.4e11 FLOPs, since only the last token needs the weights',
+        'Serving: it runs only the forward pass, so it is cheaper per token than training',
+        'Training: it runs the forward pass twice per token',
+        'Serving: it runs the backward pass, which is the cheap part',
+        'Training: it skips the weights and reads the cache',
       ],
-      answer: 1,
-      explain: 'Serving costs about 2N per token: 2 x 70e9 = 1.4e11 per token. Over 500 tokens that is 7e13. The factor 6 is for training, which adds the backward pass. Every token reads all the weights, not only the last one.',
+      answer: 0,
+      explain: 'Serving runs only the forward pass. Training adds a backward pass that costs about twice as much more. So training costs about three times the serving cost for each token. The backward pass is only part of training.',
     },
     {
       q: 'Kaplan et al. said the optimal model size grows as C to the 0.73. Chinchilla found about 0.5. According to the Chinchilla paper, what contributed to Kaplan\'s higher number?',
@@ -149,44 +150,26 @@ Do not say "bigger is always better". And do not quote "20 tokens per parameter"
       explain: 'The Chinchilla paper says Kaplan used the same number of training tokens and learning rate schedule for all models. That underestimated how well models do on less data, which pushed the rule toward bigger models. Nothing in the paper blames data type, serving cost, or batch size.',
     },
     {
-      q: 'A team expects to serve 5e13 tokens. Model A is 70B trained on 1.4T tokens. Model B is 8B trained on 15T tokens. Using 6ND plus 2N per served token, which costs less in total FLOPs?',
+      q: 'A product will serve a very large number of tokens. Which choice usually gives the lowest total cost of training plus serving?',
       options: [
-        'Model A, because it needs fewer training FLOPs, 5.9e23 against 7.2e23',
-        'They tie, because both models reach about the same loss',
-        'Model A, because a larger model needs fewer tokens to serve',
-        'Model B, about 1.5e24 against 7.6e24 for Model A',
+        'A smaller model trained far past the compute-optimal point',
+        'A compute-optimal model, because it gives the best loss per training FLOP',
+        'The largest model, because it needs fewer tokens to answer',
+        'A tiny model trained on the compute-optimal amount of data',
       ],
-      answer: 3,
-      explain: 'Model A: 5.9e23 + 2 x 70e9 x 5e13 = 5.9e23 + 7e24 = 7.6e24. Model B: 7.2e23 + 2 x 8e9 x 5e13 = 7.2e23 + 8e23 = 1.5e24. Training is a small part of the bill at this volume. A wins only on training, and serving size is not related to the tokens needed.',
-    },
-  ]}
-/>
-
-<Ballpark
-  client:visible
-  title="Llama 3 compute check"
-  scenario="Meta trained Llama 3 405B on 15.6 trillion tokens. Use 6 FLOPs per parameter per token for training and 2 for serving."
-  steps={[
-    {
-      prompt: 'How many FLOPs does it take to train the 405B model?',
-      unit: 'FLOPs',
-      answer: 3.79e25,
-      within: 1.1,
-      explain: '6 x 405e9 x 15.6e12 = 3.79e25, about 3.8e25.',
+      answer: 0,
+      explain: 'Training is paid once and serving is paid on every token. At high volume, a small model that kept training gets the quality of a bigger one and is cheaper to serve. Compute-optimal only minimizes the training bill. A larger model does not need fewer tokens to answer.',
     },
     {
-      prompt: 'How many FLOPs does one generated token cost to serve?',
-      unit: 'FLOPs',
-      answer: 8.1e11,
-      within: 1.1,
-      explain: '2 x 405e9 = 8.1e11, or 810 GFLOPs per token.',
-    },
-    {
-      prompt: 'Llama 3 8B saw 15 trillion tokens. How many FLOPs did its training take?',
-      unit: 'FLOPs',
-      answer: 7.2e23,
-      within: 1.1,
-      explain: '6 x 8e9 x 15e12 = 7.2e23. That is about 53 times less than the 405B run, from 50 times fewer parameters and similar data.',
+      q: 'Why did Meta train the 8B Llama 3 on far more data per parameter than the 405B one?',
+      options: [
+        'A small model that serves a lot is cheaper to run, so extra training pays back',
+        'The 405B model could not accept more data because it was too large',
+        'Small models need more data to fit in GPU memory',
+        'The compute-optimal rule says small models need less data',
+      ],
+      answer: 0,
+      explain: 'Serving cost scales with model size, so a small model trained long gives good quality at a low serving bill. Large models can take more data, and memory is not what sets the token count. The compute-optimal rule gives the same ratio at every size.',
     },
   ]}
 />

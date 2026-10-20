@@ -4,16 +4,14 @@ requires: ['ai/a4-context/context-budgeting']
 ---
 
 import Callout from '../../../../components/lesson/Callout.astro';
-import Math from '../../../../components/lesson/Math.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import Ai4CompactWalk from '../../../../components/anim/lessons/Ai4CompactWalk.tsx';
 import Ai4CompactSim from '../../../../components/anim/lessons/Ai4CompactSim.tsx';
 
 ## The problem
 
-A coding agent has worked for two hours on a refactor. It has read 40 files and run the tests 15 times. The context holds 150,000 tokens and the window is 200,000. At 6,000 tokens a turn it has about 8 turns left. The refactor needs 30 more.
+A coding agent has worked for two hours on a refactor. It has read 40 files and run the tests 15 times. The context holds 150,000 tokens and the window is 200,000. It has room for only a few more turns. The refactor needs many more.
 
 Lesson [A4.3](/learn/ai/a4-context/context-budgeting/) listed the choices: append forever, drop old turns, or shrink the history. This lesson is about shrinking it well. The goal is to keep what the task needs and drop what it does not, at a cost you can state.
 
@@ -54,7 +52,7 @@ That is the quality risk. A summary is lossy compression. Typical losses are an 
 
 - Put rules and facts that must survive into a file that is re-read. Examples are CLAUDE.md or a memory file. Do not leave them only in the chat.
 - Give the summarizer instructions on what to keep. The compaction API has an `instructions` parameter, and Claude Code reads a "summary instructions" section in CLAUDE.md.
-- Test it. After a compaction, ask a question that needs an early fact. Count how often the agent gets it right on your task set. A fact that is lost 1 time in 10 is a real bug in a task with 10 compactions.
+- Test it. After a compaction, ask a question that needs an early fact. Count how often the agent gets it right on your task set. A fact that is lost now and then is a real bug in a task with many compactions.
 
 ## Compaction and the prompt cache
 
@@ -62,39 +60,13 @@ A cached prefix works only if the start of the prompt is unchanged. Compaction r
 
 ## Numbers
 
-The window is 200K and compaction fires at 150K. The history of 150K tokens becomes an 8K summary. How many turns fit before the window fills again, at 6K per turn?
+After compaction, the history shrinks to a short summary, and the window has room again. But the trigger fires before the window is full, so the next compaction comes sooner than a full window would suggest. A long task is a saw-tooth: climb, drop, climb.
 
-<Math block tex="\text{turns} = \left\lfloor \frac{200{,}000 - 8{,}000}{6{,}000} \right\rfloor = \left\lfloor 32.0 \right\rfloor = 32" />
-
-In words: the room left after the summary, divided by tokens per turn. But the trigger fires at 150K, not at 200K, so the next compaction comes sooner. The calculation is (150,000 - 8,000) / 6,000 = 23.7, after about 24 turns. A long task is a saw-tooth: climb, drop, climb. Over 24 turns you also pay the summary call once.
-
-What does that call cost? It reads about 150,000 input tokens and writes 8,000 output tokens. At Claude Sonnet 5.5 prices of $2 per million input and $10 per million output (as of 2026-10-16, [pricing](https://platform.claude.com/docs/en/about-claude/pricing)), that is 150,000 / 1,000,000 × $2 = $0.30 plus 8,000 / 1,000,000 × $10 = $0.08, so about $0.38, ignoring cache. In return, every later turn reads 142K fewer tokens.
+The summary call is an extra model call that reads the whole old history and writes a short summary. It costs real money once per compaction. In return, every later turn reads far fewer tokens. Prices are on the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing).
 
 The simulator below uses these round numbers. Its model is ours: each turn adds a fixed number of tokens. A share of them is tool results. Clearing removes tool results from all but the last 3 turns. Compaction replaces everything with the summary. A cleared result counts as zero tokens, while the real placeholder costs a few. Turn clearing on, and watch the compaction events become rarer.
 
 <Ai4CompactSim client:visible />
-
-<Ballpark
-  client:visible
-  title="After compaction"
-  scenario="A 150,000-token history is compacted into an 8,000-token summary. The window is 200,000 tokens. Each new turn adds 6,000 tokens. Prices: $2 per million input tokens and $10 per million output tokens."
-  steps={[
-    {
-      prompt: 'How many new turns fit before the window fills again, if no trigger fires?',
-      unit: 'turns',
-      answer: 32,
-      within: 1.1,
-      explain: '(200,000 - 8,000) / 6,000 = 32. With a trigger at 150,000 the next compaction would come after about 24 turns instead.',
-    },
-    {
-      prompt: 'The summary call reads 150,000 input tokens and writes 8,000 output tokens, with no cache. What does it cost?',
-      unit: 'dollars',
-      answer: 0.38,
-      within: 1.1,
-      explain: 'Input: 150,000 / 1,000,000 x $2 = $0.30. Output: 8,000 / 1,000,000 x $10 = $0.08. Total $0.38.',
-    },
-  ]}
-/>
 
 ## Trade-offs
 
@@ -108,7 +80,7 @@ The simulator below uses these round numbers. Its model is ours: each turn adds 
 ## Interview lens
 
 <Callout type="tip">
-Describe the order: "At 100K I clear old tool results, keeping the last 3. At 150K I compact into an 8K summary and keep the last few turns verbatim. Rules and decisions live in a memory file that is re-read, and the raw log goes to storage." Then say how you test it: a question per early fact after each compaction.
+Describe the order: "First I clear old tool results and keep the latest few. Later I compact into a short summary and keep the last few turns verbatim. Rules and decisions live in a memory file that is re-read, and the raw log goes to storage." Then say how you test it: a question per early fact after each compaction.
 </Callout>
 
 <Callout type="mistake">
@@ -121,26 +93,26 @@ Do not say "we summarize when the window is full". At the limit there is no room
   client:visible
   questions={[
     {
-      q: 'Context editing is on with the default tool-result clearing rule. The prompt reaches 104,000 tokens and holds 20 tool results. How many tool results stay, and what happens to the rest?',
+      q: 'Context editing is on with the default tool-result clearing rule, and the prompt has passed its trigger. Which tool results stay, and what happens to the rest?',
       options: [
-        'The 3 most recent stay and the other 17 become placeholder text',
-        'The 3 oldest stay and the other 17 are deleted without any trace',
-        'All 20 stay, because 104,000 is under the 150,000 default trigger',
+        'The latest few stay and the older ones become placeholder text',
+        'The oldest few stay and the newer ones are deleted without a trace',
+        'All stay, because only compaction ever removes tool results',
         'None stay, because the rule clears every result once it fires',
       ],
       answer: 0,
-      explain: 'The default trigger is 100,000 input tokens and the default keeps the 3 most recent tool uses. Older results are replaced with placeholder text so that the model knows they were removed. The 150,000 figure belongs to compaction, a different feature.',
+      explain: 'Once the trigger passes, the rule keeps the most recent tool uses. Older results are replaced with placeholder text so that the model knows they were removed. Compaction is a different feature, and it is not the only way to cut tool results.',
     },
     {
-      q: 'A 150,000-token history becomes an 8,000-token summary in a 200,000-token window. At 6,000 tokens per turn and no trigger, how many turns fit before the window fills?',
+      q: 'After a compaction, a task keeps running. Why does the next compaction come before the window is completely full?',
       options: [
-        '24 turns',
-        '28 turns',
-        '32 turns',
-        '33 turns',
+        'The trigger fires at a set size below the limit, to leave room',
+        'The summary grows by itself until it fills the window again',
+        'The API compacts after every turn once it has done so once',
+        'The model refuses to write past half of the window size',
       ],
-      answer: 2,
-      explain: '(200,000 - 8,000) / 6,000 = 32. The 33 option forgets the summary tokens. The 24 option divides the room below the 150,000 trigger, (150,000 - 8,000) / 6,000, which is when the next compaction would fire.',
+      answer: 0,
+      explain: 'Compaction fires at a trigger below the window limit, so the summary call itself has room to run. Waiting for a full window leaves no space for it. The summary does not grow alone, and compaction is not run on every turn.',
     },
     {
       q: 'The user said in turn 1: "Always run unit tests with make test-unit." After two compactions the agent runs a different command. What is the best structural fix?',

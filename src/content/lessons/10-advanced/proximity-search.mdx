@@ -18,13 +18,9 @@ The query reads like this: `WHERE lat BETWEEN a AND b AND lng BETWEEN c AND d`. 
 
 You can build a composite index on `(lat, lng)`, one index that sorts by lat first and then by lng. The first range condition narrows the search. The second one can only filter what the first one already read. That is rule 2 in lesson 4.3.
 
-Do the numbers. Assume the 1 billion places are spread evenly over the Earth. That is false, but it keeps the arithmetic honest. A degree (°) of latitude is about 111 km. A km² is a square 1 km on each side.
+Picture the search box: a small square, a couple of kilometers on a side. It holds only a handful of places. But the index can only narrow by latitude. It finds a thin band that runs all the way around the planet. That band holds a huge number of rows, and the database must read all of them to keep the few that fall in the box.
 
-- The search box is 2 km by 2 km, at latitude 51.5. That is 0.018° of latitude and 0.029° of longitude.
-- It holds about 4 km² / 510 million km² × 1 billion = **~8 places**.
-- The index finds a thin band: 2 km tall, all the way around the planet. At this latitude the band is about 25,000 km long, so it covers about 50,000 km². It holds about **~100,000 rows**.
-
-The database reads about 100,000 rows to return 8. It reads about 12,000 times too much. The B-tree is not the problem. The question has two dimensions and the index has one.
+The database reads tens of thousands of times too much. The B-tree is not the problem. The question has two dimensions and the index has one.
 
 ## Naive solution: two indexes
 
@@ -48,18 +44,17 @@ Step through the point at latitude 10, longitude 20.
 
 <ProxGeohash client:visible />
 
-Each character adds 5 bits, so it cuts the cell by a factor of 32. Longitude gets the extra bit when the count is odd, so cells alternate between shapes. Here are the sizes at the equator. They are computed from the bit counts, with 111.32 km per degree.
+Each character adds 5 bits, so it cuts the cell into 32 smaller pieces. Longitude gets the extra bit when the count is odd, so cells alternate between shapes. Here are rough sizes at the equator.
 
-| Length | Bits (lng + lat) | Cell width × height |
-|---|---|---|
-| 1 | 3 + 2 | ~5,000 km × ~5,000 km |
-| 2 | 5 + 5 | ~1,250 km × ~626 km |
-| 4 | 10 + 10 | ~39 km × ~20 km |
-| 5 | 13 + 12 | ~4.9 km × ~4.9 km |
-| 6 | 15 + 15 | ~1.2 km × ~0.6 km |
-| 8 | 20 + 20 | ~38 m × ~19 m |
+| Length | Cell size |
+|---|---|
+| 1 | a continent |
+| 4 | a large town and its surroundings |
+| 5 | a city district (~5 km) |
+| 6 | a few city blocks (~1 km) |
+| 8 | a building (tens of meters) |
 
-These agree with the error column on [Wikipedia's Geohash page](https://en.wikipedia.org/wiki/Geohash). The maximum error is half a cell. For example, that error is 2.4 km at length 5 and 19 m at length 8.
+The sizes agree with the precision table on [Wikipedia's Geohash page](https://en.wikipedia.org/wiki/Geohash). The maximum error is about half a cell.
 
 Lesson [4.3](/learn/04-data/indexing/) rule 1 now works for us. Store the hash in a column and index it. "Everything in cell `gcpuz`" becomes `WHERE geohash LIKE 'gcpuz%'`. That is a range scan on a B-tree.
 
@@ -71,9 +66,9 @@ The fix is simple. Pick a cell at least as large as the search radius. Then quer
 
 <ProxNeighbors />
 
-Count the work for our 1 km radius. Use length 5 cells (4.9 km). Nine cells cover 14.7 km × 14.7 km = 216 km². That holds about 216 / 510 million × 1 billion = **~420 rows**. The exact filter keeps about 6 of them. We read 420 rows instead of 100,000. The cost: 9 range scans instead of 1.
+Take a 1 km radius. Use length 5 cells (~5 km). Nine of them cover a neighborhood a few times wider than the circle. That holds hundreds of rows, not tens of thousands. The exact filter keeps only the few that are truly near. The cost: 9 range scans instead of 1.
 
-Wrong choice of cell size breaks the guarantee. With length 6 cells, each cell is 1.2 km × 0.6 km. The 3 × 3 block reaches only 0.6 km north and south of the middle cell. A 1 km radius can have places outside it. They are silently missed.
+Wrong choice of cell size breaks the guarantee. With length 6 cells, each cell is about 1 km wide. The 3 × 3 block reaches only about half a kilometer north and south of the middle cell. A 1 km radius can have places outside it. They are silently missed.
 
 ## Quadtree: cells that follow the data
 
@@ -95,17 +90,6 @@ A geohash is a table column and a B-tree. A quadtree is a structure you maintain
 - **H3** (Uber). It tiles the sphere with hexagons (six-sided cells, like a honeycomb). Each cell has 7 children, the smaller cells inside it. At every resolution, 12 cells are pentagons (five-sided), because hexagons alone cannot cover a sphere.
 
 All of these are the same idea. Turn two dimensions into a cell ID, then use an ordinary index or sorted set on the ID.
-
-## Numbers
-
-| Fact | Value | Source |
-|---|---|---|
-| Composite `(lat, lng)` index, 2 km box, 1 billion places spread evenly | reads ~100,000 rows for ~8 results | Derived above |
-| Geohash length 5 cell | ~4.9 km × ~4.9 km | Derived from bit counts |
-| 9 cells at length 5 | 216 km², ~420 rows | Derived |
-| Geohash base32 characters | 5 bits each | Wikipedia |
-| Redis GEO score | 52-bit geohash, ~0.5% worst-case error | Redis docs |
-| S2 level 12 average cell | ~5 km² | S2 statistics page |
 
 ## Trade-offs
 
@@ -137,10 +121,10 @@ A geohash walks the grid in a "Z" pattern. The walk jumps at some cell borders. 
   client:visible
   questions={[
     {
-      q: 'A geohash has 5 characters. About how big is its cell at the equator?',
-      options: ['About 4.9 km by 4.9 km', 'About 38 m by 19 m', 'About 156 km by 156 km', 'About 1.2 km by 0.6 km'],
+      q: 'You add one more character to every geohash in your index. What happens to the cells?',
+      options: ['Each cell splits into smaller cells, and a shared prefix means a smaller shared area', 'Each cell grows larger, because the hash holds more detail', 'The cells stay the same size, and only the key gets longer', 'Cells with the same prefix move far apart on the map'],
       answer: 0,
-      explain: '5 characters are 25 bits: 13 for longitude and 12 for latitude. 360 / 2^13 is 0.044 degrees, about 4.9 km. 180 / 2^12 is the same. 38 m by 19 m is length 8. 1.2 km by 0.6 km is length 6.',
+      explain: 'Each extra character cuts every cell into smaller pieces. Places that share a longer prefix are in a smaller rectangle. The cells do not grow, and a shared prefix always means the same rectangle.',
     },
     {
       q: 'Two shops are 140 m apart but their 6-character geohashes share no first character. What is the most likely reason?',
@@ -165,7 +149,7 @@ A geohash walks the grid in a "Z" pattern. The walk jumps at some cell borders. 
       explain: 'A split makes four children. If all five points land in one child, that child is over capacity too, so it splits. This repeats. A depth limit stops it when points share the same location.',
     },
     {
-      q: 'You need all drivers within 3 km. You use 9 geohash cells of length 6 (about 1.2 km by 0.6 km). What goes wrong?',
+      q: 'You need all drivers within 3 km. You use 9 geohash cells that are each about 1 km wide. What goes wrong?',
       options: [
         'Nothing goes wrong, because nine cells always cover any search radius',
         'It returns too many drivers, so the app must filter them by true distance',
@@ -173,7 +157,7 @@ A geohash walks the grid in a "Z" pattern. The walk jumps at some cell borders. 
         'It misses drivers, because the 3 × 3 block reaches under 3 km',
       ],
       answer: 3,
-      explain: 'The block covers the middle cell plus one cell on each side. At length 6 that is ±0.6 km north-south and ±1.2 km east-west at best. A cell must be at least as big as the radius. Use length 4 (about 39 km by 20 km) or a larger block.',
+      explain: 'The block covers the middle cell plus one cell on each side. The block reaches only about one cell in each direction, which is less than the radius. A cell must be at least as big as the radius. Use a shorter hash, with bigger cells.',
     },
   ]}
 />

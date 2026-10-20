@@ -13,22 +13,22 @@ import InvertedIndexBuild from '../../../components/anim/lessons/InvertedIndexBu
 
 ## The problem
 
-Lesson 4.2 ended with a two-line database: append on write, scan on read. A scan is fine for 1,000 rows. Now take a table of **1 billion orders** at ~200 B per row. That is 200 GB.
+Lesson 4.2 ended with a two-line database: append on write, scan on read. A scan is fine for 1,000 rows. Now take a table of **1 billion orders**. That is hundreds of gigabytes.
 
-Your app asks: `SELECT * FROM orders WHERE order_id = 7351902264`. The answer is one row. To find it without help, the database reads the whole table. A fast SSD (an NVMe disk) reads 3 to 7 GB/s in a straight line (lesson 1.2). So the scan takes about **30 to 70 seconds**. Your target is a few milliseconds.
+Your app asks: `SELECT * FROM orders WHERE order_id = 7351902264`. The answer is one row. To find it without help, the database reads the whole table. A fast SSD (an NVMe disk) reads a few gigabytes per second in a straight line (lesson 1.2). So the scan takes about **a minute**. Your target is a few milliseconds.
 
 An **index** is the fix. It is a second structure, built from one or more columns, that lets the database jump to the right rows. The index costs disk space and slows every write. You must know how much, and when it is worth it.
 
 ## Naive: a sorted file and binary search
 
-Suppose the keys sit in a file, sorted. You find a key by **binary search**: look at the middle, discard half, repeat. For 1 billion keys that is log2(10^9) = ~30 steps.
+Suppose the keys sit in a file, sorted. You find a key by **binary search**: look at the middle, discard half, repeat. For 1 billion keys that is about 30 steps.
 
-Each step lands on a different place in the file. Each is a separate page read. (A **page** is the fixed-size block, here 8 KB, that a database reads from disk in one go. A disk cannot hand you one byte, only a whole page.) Page reads from SSD cost ~100 µs, so 30 steps cost ~3 ms. That is far better than 50 seconds. But two things are wrong.
+Each step lands on a different place in the file. Each is a separate page read. (A **page** is the fixed-size block, here 8 KB, that a database reads from disk in one go. A disk cannot hand you one byte, only a whole page.) Each page read is fast on an SSD, so 30 steps take a few milliseconds. That is far better than a full scan. But two things are wrong.
 
 1. **30 page reads is too many.** Each read returns an 8 KB page, and we use one key from it. Waste.
-2. **A sorted file cannot take inserts.** A new key belongs in the middle. Making room means shifting about half the file, ~100 GB.
+2. **A sorted file cannot take inserts.** A new key belongs in the middle. Making room means shifting about half the file.
 
-The first problem has a direct fix. Make each step of the search consume a whole page. If one page holds 400 keys, one step discards 399/400 of the data, not 1/2. This is the idea behind the B-tree.
+The first problem has a direct fix. Make each step of the search consume a whole page. If one page holds hundreds of keys, one step discards almost all of the data, not just half. This is the idea behind the B-tree.
 
 ## The mechanism: the B-tree
 
@@ -36,32 +36,17 @@ A **B-tree** is a tree where every node is exactly one page. A node holds sorted
 
 Most databases use the **B+tree** variant. Only leaves hold row pointers. Leaves are also chained to their neighbors in key order, each leaf pointing to the next. So a range query (`BETWEEN`, for example all orders from 100 to 200) finds the first key and then walks along the leaves. The tree is **balanced**: every leaf is at the same depth. That is the property that keeps lookups predictable.
 
-### Height: do the arithmetic
+### Height: why the tree stays shallow
 
-The cost of a lookup is the tree's **height**, because each level is one page read. Height depends on the **fan-out** F: how many children a node has. If every node has F children, a tree of height H holds about F^H keys.
+The cost of a lookup is the tree's **height**, because each level is one page read. Height depends on the **fan-out**: how many children a node has. A node is one 8 KB page, so it can hold several hundred keys and pointers. Each level multiplies the number of keys the tree can reach by several hundred.
 
-Derive F for PostgreSQL. A page is 8 kB. The first 24 bytes are a header, and each entry needs a 4-byte slot (both from the PostgreSQL page-layout docs). Assume an entry of an 8-byte key plus an 8-byte entry header, 16 bytes. The entry header size is my assumption, not a number from the docs. Then each entry costs 20 bytes:
-
-```text
-F = (8192 - 24) / 20 = ~408   ->  use F = 400
-400^3 = 64 million        < 1 billion
-400^4 = 25.6 billion     >= 1 billion   ->  height 4
-```
-
-Count the pages level by level, from the leaves up:
-
-```text
-leaves   : 1,000,000,000 / 400 = 2,500,000 pages   (20 GB)
-level 3  :     2,500,000 / 400 =     6,250 pages   (50 MB)
-level 2  :         6,250 / 400 =        16 pages
-root     :                           1 page
-```
+That growth is fast. Three levels reach tens of millions of keys. Four levels reach tens of billions. So a table of 1 billion keys needs a tree only about 4 levels tall. The top levels are tiny compared with the leaves, because each level is hundreds of times smaller than the one below.
 
 <BTreeHeight />
 
-Read the figure from the bottom. The leaves hold 99.75% of the pages. This agrees with the PostgreSQL docs ("typically, over 99% of all pages are leaf pages"). The three upper levels total 6,267 pages, ~51 MB. That fits in RAM on any server, and it is the part every lookup touches. So a real lookup does **no disk reads for the top three levels**. It does one SSD read for the leaf and one for the table page: 2 × ~100 µs, **~0.2 ms**. Against ~50 s for the scan, that is about 250,000 times faster.
+Read the figure from the bottom. The leaves hold almost all of the pages. This agrees with the PostgreSQL docs ("typically, over 99% of all pages are leaf pages"). The upper levels are small enough to stay in RAM on any server, and they are the part every lookup touches. So a real lookup does **no disk reads for the upper levels**. It does one SSD read for the leaf and one for the table page. That is well under a millisecond, against about a minute for the scan.
 
-How sensitive is the answer to my guess of F? Height stays 4 for any F from 178 up to 999, because 178^4 is about 10^9 and 1,000^3 is 10^9. Halve the entry size or double it: still 4. Drop F to 100 and it becomes 5 (100^4 = 10^8 is too small). Use The Index Luke says real indexes on millions of rows have a depth of 4 or 5, which matches.
+The answer is not sensitive to the exact node size. Halve the entry size or double it: the height barely moves. Use The Index Luke says real indexes on millions of rows have a depth of 4 or 5, which matches.
 
 ### Insert: the split
 
@@ -71,7 +56,7 @@ Try it. The nodes below hold 3 keys so splits are easy to see. Insert 10, 20, 30
 
 <BTreeSim client:visible />
 
-Notice how rare a split is. In a real index with F = 400, a leaf that just split is half full. It takes about 200 more inserts into that leaf before it splits again. A root split happens only a handful of times in the life of a table.
+Notice how rare a split is. In a real index, a leaf that just split is half full. It takes many more inserts into that leaf before it splits again. A root split happens only a handful of times in the life of a table.
 
 ### What an index costs on write
 
@@ -101,11 +86,11 @@ Step through it. Watch the read in steps 7 and 8.
 
 <LsmFlow client:visible />
 
-A read must check the memtable, then files from newest to oldest. To avoid useless disk reads, each file carries a **Bloom filter**. It is a small in-memory summary that can say "this key is definitely not in this file". It never says "not here" wrongly, but it can say "maybe here" wrongly. RocksDB documents the exchange: 9.9 bits per key gives a 1% false-positive rate, and 15.5 bits gives 0.1%. At 1% and 20 files, a read for a missing key wastes about 20 × 0.01 = 0.2 disk reads on average.
+A read must check the memtable, then files from newest to oldest. To avoid useless disk reads, each file carries a **Bloom filter**. It is a small in-memory summary that can say "this key is definitely not in this file". It never says "not here" wrongly, but it can say "maybe here" wrongly. RocksDB documents the exchange: 9.9 bits per key gives a 1% false-positive rate, and 15.5 bits gives 0.1%. With many files, each wrong "maybe" costs a disk read, but most reads for a missing key cost none.
 
-The memory cost is real. At 9.9 bits per key, 1 billion keys need 9.9 × 10^9 bits, ~1.2 GB of filters.
+The memory cost is real. Filters for a billion keys take on the order of a gigabyte of RAM.
 
-The bill moves, it does not vanish. Compaction rewrites the same data many times. This is called **write amplification**: the ratio of bytes the disk writes to bytes your app wrote. The RocksDB docs say it is "often larger than 10" for leveled compaction. Every byte you write may be written to disk ten times or more, in the background. At 20 MB/s of app writes, that is 200 MB/s of disk writes.
+The bill moves, it does not vanish. Compaction rewrites the same data many times. This is called **write amplification**: the ratio of bytes the disk writes to bytes your app wrote. The RocksDB docs say it is "often larger than 10" for leveled compaction. Every byte you write may be written to disk ten times or more, in the background. The disk can become the bottleneck long before your app looks busy.
 
 ## Two more index shapes
 
@@ -122,11 +107,10 @@ Location search is a third need. A B-tree sorts one dimension, so a range on lat
 | Fact | Value | Source |
 |---|---|---|
 | Page size: PostgreSQL / InnoDB (MySQL's default storage engine) | 8 kB / 16 KB | Their docs |
-| Fan-out, 8 KB page, 20 B entry | ~400 (assumed entry size) | Derived above |
-| B-tree height, 1 billion keys | 4 (any F from 178 to 999) | Derived above |
-| Upper 3 levels of that tree | ~51 MB | Derived above |
-| Lookup, top levels cached | ~0.2 ms (2 SSD reads) | Lesson 1.2 latencies |
-| Full scan of 200 GB | ~30 to 70 s | Lesson 1.2 throughput |
+| Fan-out, 8 KB page | several hundred | Derived |
+| B-tree height, 1 billion keys | about 4 | Derived |
+| Lookup, upper levels cached | well under 1 ms (2 SSD reads) | Lesson 1.2 latencies |
+| Full scan of 200 GB | about a minute | Lesson 1.2 throughput |
 | Bloom filter, 1% false positives | 9.9 bits per key | RocksDB wiki |
 | Leveled compaction write amplification | often above 10 | RocksDB wiki |
 
@@ -161,10 +145,15 @@ A binary search tree has 2 children per node. On disk each node would be its own
   client:visible
   questions={[
     {
-      q: 'A B-tree has fan-out 100. About how many levels does it need for 1 billion keys?',
-      options: ['3', '5', '4', '9'],
-      answer: 1,
-      explain: '100^4 = 100 million, which is below 1 billion. 100^5 = 10 billion, which is enough. So 5 levels. With fan-out 400 it was 4. Fan-out matters, but only a little: a 4x change moved the height by one level.',
+      q: 'A B-tree index holds 1 billion keys, and each node is one page. Why does a lookup need only a handful of page reads?',
+      options: [
+        'Each node holds many keys, so each level cuts the search a lot',
+        'The whole index is held in RAM, so no page reads are needed at all',
+        'The database checks every key in each node, then picks the best one',
+        'Each node holds exactly two keys, so the tree halves the data each step',
+      ],
+      answer: 0,
+      explain: 'A wide node multiplies the reach of the tree at every level, so the tree stays very shallow. Two keys per node would be a binary tree, about 30 levels deep. The index does not need to fit in RAM. Only the small upper levels do.',
     },
     {
       q: 'You have an index on (city, age). Which query reads the fewest index entries?',
@@ -178,16 +167,26 @@ A binary search tree has 2 children per node. On disk each node would be its own
       explain: 'With two equality conditions, both columns narrow the range, so only matching entries are read (1 in the lab). The range on city in "city > Lima" stops the narrowing, so every entry with city above Lima is read (75 in the lab). The query with no condition on city reads all 200. An OR cannot narrow the index range, so it reads far more than the equality query.',
     },
     {
-      q: 'A table has 6 indexes. About how many pages does one ordinary insert write, if no page splits?',
-      options: ['1', '2', '12', '7'],
-      answer: 3,
-      explain: 'One table page plus one leaf page in each of the 6 indexes: 7. This is why each extra index slows writes, and why you drop indexes that no hot query uses.',
+      q: 'A table has 6 indexes. What does one ordinary insert cost, compared with a table that has none?',
+      options: [
+        'The same, because indexes are built in the background',
+        'Only the table page is written, because indexes are rebuilt on read',
+        'The table page plus one page in each index, so writes get slower',
+        'It is cheaper, because indexes spread the writes out',
+      ],
+      answer: 2,
+      explain: 'Each index is its own tree, and the new row needs an entry in every one. So each extra index adds a page write to every insert. That is why you drop indexes that no hot query uses.',
     },
     {
-      q: 'An LSM store holds 20 SSTables. Bloom filters use 9.9 bits per key. You read a key that does not exist. How many wasted disk reads do you expect?',
-      options: ['About 0.2', 'Exactly 0', 'About 2', 'Read all 20 files'],
-      answer: 0,
-      explain: 'A Bloom filter has no false negatives, so a present key is never skipped. For an absent key each file has a 1% chance of a false "maybe". 20 files x 0.01 = 0.2 wasted reads on average. Without filters you would read all 20.',
+      q: 'An LSM store keeps many SSTables, each with a Bloom filter. You read a key that does not exist. What do the filters do?',
+      options: [
+        'They skip every file, because a Bloom filter is never wrong at all',
+        'They read every file, since a missing key cannot be ruled out',
+        'They skip files at random, so cost varies from read to read',
+        'They skip nearly all files, with a rare wasted read',
+      ],
+      answer: 3,
+      explain: 'A Bloom filter has no false negatives, so a present key is never skipped. For an absent key it can say "maybe" by mistake, which costs one wasted disk read. That is rare. It is not "never wrong". Without filters you would read every file.',
     },
     {
       q: 'A service ingests 200,000 small events per second and reads them back rarely, by key. Which storage structure fits, and why?',

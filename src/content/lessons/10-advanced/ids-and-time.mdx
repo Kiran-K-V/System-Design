@@ -33,7 +33,7 @@ We want IDs that each machine can make **alone**, that are unique, and ideally s
 
 A **UUID** (universally unique identifier) is a 128-bit ID that machines generate on their own. It is usually written as 32 hex digits, such as `018bcfe5-6800-7...`. Two versions matter.
 
-**UUIDv4** is random. Of 128 bits, 6 are fixed (4 for the version, 2 for the variant), so **122 bits are random**. A collision is possible but absurdly unlikely. The **birthday bound** (the maths of how fast repeats appear among random picks) says a 50% chance of one collision needs about 1.18 × 2^61 = 2.7 × 10^18 IDs. At 1 billion IDs per second that takes about 86 years.
+**UUIDv4** is random. Of 128 bits, 6 are fixed (4 for the version, 2 for the variant), so **122 bits are random**. A collision is possible but absurdly unlikely. The **birthday bound** (the maths of how fast repeats appear among random picks) says you would need to make an astronomical number of IDs, about a billion per second for decades, before one collision becomes likely. In practice you can ignore it.
 
 **UUIDv7** puts time first. The layout is:
 
@@ -47,9 +47,9 @@ A **UUID** (universally unique identifier) is a 128-bit ID that machines generat
 
 Take 1,700,000,000,000 ms (2023-11-14 22:13:20 UTC). In hex it is `018bcfe56800`. The UUID starts `018bcfe5-6800-7...`. The `7` is the version. Later UUIDs start with larger hex numbers, so they sort by time.
 
-Why does the order matter? Look at the index (lesson [4.3](/learn/04-data/indexing/)). A B-tree keeps keys sorted in pages. For 1 billion keys, lesson 4.3 counted about 2.5 million leaf pages. A **random** key lands on a random leaf page. Most of them are not in memory, so each insert may read a page from disk. The insert may then write that page back later. Pages also split at random places.
+Why does the order matter? Look at the index (lesson [4.3](/learn/04-data/indexing/)). A B-tree keeps keys sorted in pages. A big table has millions of leaf pages. A **random** key lands on a random leaf page. Most of them are not in memory, so each insert may read a page from disk. The insert may then write that page back later. Pages also split at random places.
 
-A **time-ordered** key lands on the **rightmost** leaf page every time. That one page stays hot in memory. One page, not 2.5 million candidates. This is the same pattern as an auto-increment key.
+A **time-ordered** key lands on the **rightmost** leaf page every time. That one page stays hot in memory. One page, not millions of candidates. This is the same pattern as an auto-increment key.
 
 The price of v7: it shows when the ID was made. UUIDs are 16 bytes against 8 for a counter. And its order is only as good as the machine's clock. The UUID rules warn that clock rollback, leap seconds, and counter overflow can break it, so implementations should check.
 
@@ -68,7 +68,7 @@ Step through one.
 
 <IdSnowflake client:visible />
 
-The numbers: 4,096 IDs per millisecond is 4,096,000 per second **per machine**. With 1,024 machines the cluster can issue 4.19 billion IDs per second. Twitter's source uses the epoch 1288834974657, which is 2010-11-04 01:42:54.657 UTC. An epoch close to "now" spends none of the 41 bits on years before your system existed.
+One machine can issue millions of IDs per second, and a cluster of them far more. An epoch close to "now" spends none of the 41 bits on years before your system existed.
 
 Snowflake has two hard parts.
 
@@ -134,19 +134,7 @@ The price of the vector is size: one entry per process.
 
 **Hybrid logical clock** (HLC, Kulkarni et al. 2014). A timestamp is a pair (l, c). The first value, l, follows the largest physical time the node has seen. The second value, c, breaks ties when l does not move. It stays close to real time, so you can still read it as a date, and it fits in 64 bits. Example: a node has (100, 0) and its clock reads 100. A message arrives stamped (105, 2) from a node whose clock runs ahead. The new l is max(100, 105, 100) = 105. It matches the message's l, so c = 2 + 1 = 3. The node now says (105, 3), later than the message, with no clock change.
 
-**TrueTime** (a clock service inside Google's Spanner database, 2012) takes the opposite route: fix the clock with GPS receivers and atomic clocks and **admit the error**. `TT.now()` returns an interval [earliest, latest] that contains the true time. The paper reports the error bound ε as a sawtooth between about 1 and 7 ms. The bound is 4 ms most of the time. The sawtooth comes from a 30 s poll interval and a drift rate of 200 µs per second. The product is 30 × 200 µs = 6 ms. To commit, Spanner picks a timestamp and then does **commit wait**. Spanner holds the result until `TT.after(s)` says the time has surely passed. Two transactions then get timestamps in the true order.
-
-## Numbers
-
-| Fact | Value | Source |
-|---|---|---|
-| UUIDv4 random bits | 122 of 128 | UUID standard |
-| UUIDv7 | 48-bit ms timestamp, 4-bit ver, 12-bit rand_a, 2-bit var, 62-bit rand_b | UUID standard |
-| Snowflake fields | 41 / 10 / 12 bits | Twitter snowflake README |
-| Snowflake timestamp life | 2^41 ms = 2,199,023,255,552 ms ≈ 69.7 years | Derived |
-| Snowflake rate | 4,096,000 IDs per second per machine | Derived |
-| NTP accuracy | tens of ms over the internet, under 1 ms on a good LAN | Wikipedia |
-| TrueTime error ε | about 1 to 7 ms, about 4 ms most of the time | Spanner paper |
+**TrueTime** (a clock service inside Google's Spanner database, 2012) takes the opposite route: fix the clock with GPS receivers and atomic clocks and **admit the error**. `TT.now()` returns an interval [earliest, latest] that contains the true time. The paper reports the error bound as a few milliseconds, which grows between clock checks and shrinks at each check. To commit, Spanner picks a timestamp and then does **commit wait**. Spanner holds the result until `TT.after(s)` says the time has surely passed. Two transactions then get timestamps in the true order.
 
 ## Trade-offs
 
@@ -155,7 +143,7 @@ The price of the vector is size: one entry per process.
 | Central counter or ticket server | Exact, dense sequence | A round trip per ID, a single point of failure | Low rate, you need gap-free numbers |
 | UUIDv4 | No coordination, no clock, no setup | 16 bytes, random index inserts, no order | Public tokens, low insert rate |
 | UUIDv7 | No coordination, time order, B-tree friendly | 16 bytes, leaks time, relies on a good clock | Primary keys in a B-tree table |
-| Snowflake | 8 bytes, sorts by time, 4 million per second per machine | Machine ID assignment, clock rollback risk | Large, sharded, high rate |
+| Snowflake | 8 bytes, sorts by time, millions per second per machine | Machine ID assignment, clock rollback risk | Large, sharded, high rate |
 | Lamport clock | One small number, cheap | Cannot tell concurrent from ordered | Total order of events, tie-break |
 | Vector clock | Detects concurrent writes | One entry per process | Conflict detection in leaderless stores |
 | HLC | Close to real time, 64 bits, causality kept | Needs reasonably synced clocks | Timestamps that must read as dates |

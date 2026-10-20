@@ -6,7 +6,6 @@ requires: ['ai/a3-llm-apis/api-anatomy', 'ai/a1-model-function/sampling-decoding
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import Ai3StructMask from '../../../../components/anim/lessons/Ai3StructMask.tsx';
 import Ai3StructRepair from '../../../../components/anim/lessons/Ai3StructRepair.tsx';
 
@@ -14,7 +13,7 @@ import Ai3StructRepair from '../../../../components/anim/lessons/Ai3StructRepair
 
 Your code needs a label, a date, or a list of line items, not a paragraph. So you write "Reply with JSON only" in the prompt. In testing it works. In production, one reply in a few hundred starts with "Sure! Here is the JSON:", wraps the JSON in a code fence, calls the field `Label` instead of `label`, or stops in the middle of an object. `JSON.parse` throws and the pipeline stops.
 
-The cause is the one from [lesson A1.5](/learn/ai/a1-model-function/sampling-decoding/). The model draws each token from a probability list. A prompt makes the right token likely. It does not make a wrong token impossible. At 100,000 calls per day, a failure rate of 0.5% is 500 broken replies every day. This is a **probabilistic component** ([lesson A0.3](/learn/ai/a0-orientation/probabilistic-components/)) sitting inside a strict pipeline.
+The cause is the one from [lesson A1.5](/learn/ai/a1-model-function/sampling-decoding/). The model draws each token from a probability list. A prompt makes the right token likely. It does not make a wrong token impossible. At high volume, even a small failure rate means broken replies every day. This is a **probabilistic component** ([lesson A0.3](/learn/ai/a0-orientation/probabilistic-components/)) sitting inside a strict pipeline.
 
 ## Naive solution: ask nicely and parse
 
@@ -76,7 +75,7 @@ Watch what the mask does at each token. The probabilities here are illustrative,
 
 <Ai3StructMask client:visible />
 
-Look at how this connects to sampling. Temperature, top-k, and top-p still work on the tokens that remain. The mask only removes options. In the walk, "negative" went from 45% to 69.2%. The reason is that the 35% that belonged to invalid tokens was shared among the valid ones. That means the model still picks the label itself. You only took away the ways to be malformed.
+Look at how this connects to sampling. Temperature, top-k, and top-p still work on the tokens that remain. The mask only removes options. In the walk, "negative" gained probability. The reason is that the share that belonged to invalid tokens was spread among the valid ones. That means the model still picks the label itself. You only took away the ways to be malformed.
 
 A backend engineer can think of this as a compiler front end. The schema is the grammar. Here, the model is a very fast typist who keeps hitting wrong keys. The grammar is a keyboard that locks the wrong keys.
 
@@ -116,7 +115,7 @@ Each repair is an extra call, so count it in your cost model. Try each failure, 
 The loop has a built-in limit. It fixes shape problems. It does not fix a refusal, and it does not fix a confidently wrong label. Those need a fallback route and an eval. This is also why you should log the failure rate for each class. The classes are truncation, refusal, validation error, and repaired. Track each one as a metric.
 
 <Callout type="deep" title="Does the mask slow generation?">
-It adds work at every token, because the grammar state must be checked and the vocabulary filtered. Hosted providers do not publish the overhead, so measure it on your own calls. The arithmetic is simple. If the mask added 10 ms per token (an assumption, not a measured figure), a 200-token reply would take 10 ms x 200 = 2 s longer. The SGLang result above points the other way for long fixed stretches. For those stretches, skipping forced tokens can make constrained output faster, not slower.
+It adds work at every token, because the grammar state must be checked and the vocabulary filtered. Hosted providers do not publish the overhead, so measure it on your own calls. The cost grows with reply length, because the check runs once per token. The SGLang result above points the other way for long fixed stretches. For those stretches, skipping forced tokens can make constrained output faster, not slower.
 </Callout>
 
 ## Numbers
@@ -127,8 +126,6 @@ It adds work at every token, because the grammar state must be checked and the v
 | Grammar compile timeout (Anthropic) | 180 seconds | same |
 | Strict tools per request | 20 | same |
 | Optional parameters, union-type parameters | 24 and 16 | same |
-| Failures a broken-JSON prompt gives at 0.5% and 100,000 calls/day | 500 per day | derived, 0.5% assumed |
-| Added time if the mask cost 10 ms per token on a 200-token reply | 2 s | derived, 10 ms assumed |
 
 ## Trade-offs
 
@@ -156,15 +153,15 @@ Do not say "structured output means the answer is correct". It means the answer 
   client:visible
   questions={[
     {
-      q: 'Before the mask, the next-token probabilities are 0.50 for an invalid token, 0.30 for allowed token A, and 0.20 for allowed token B. What does token A get after masking and rescaling?',
+      q: 'The mask sets invalid tokens to zero. What happens to the probability of the tokens that stay allowed?',
       options: [
-        '0.30, because the mask does not change the allowed tokens',
-        '0.50, because A takes all the mass the invalid token lost',
-        '0.60, because 0.30 / (0.30 + 0.20) after the mask',
-        '0.80, because 0.30 plus the 0.50 that was masked off',
+        'They stay the same, and the leftover share is thrown away',
+        'They are rescaled, so each allowed token gains share',
+        'They all become equal, so the model picks at random',
+        'They drop, because the mask makes the model less sure',
       ],
-      answer: 2,
-      explain: 'Masked tokens go to zero, and the rest is rescaled to sum to 1. The kept mass is 0.30 + 0.20 = 0.50, so A is 0.30 / 0.50 = 0.60 and B is 0.40. Adding the whole 0.50 to A would ignore B.',
+      answer: 1,
+      explain: 'After masking, the remaining probabilities are rescaled to sum to one, so allowed tokens gain share and keep their order. They do not become equal, so the model still picks the label. Discarding the leftover would leave probabilities that do not sum to one.',
     },
     {
       q: 'A call with a strict JSON schema returns stop_reason "max_tokens". The text is {"items": [{"name": "pen", "qty". What should the code do?',
@@ -199,27 +196,16 @@ Do not say "structured output means the answer is correct". It means the answer 
       answer: 1,
       explain: 'The grammar is compiled from the schema on the provider side and cached for 24 hours from last use. A new structure each time means a cache miss and a compile each time. Dynamic schemas are allowed within the limits, and the mask removes only invalid tokens.',
     },
-  ]}
-/>
-
-<Ballpark
-  client:visible
-  title="Failures you ship"
-  scenario="A prompt-only JSON pipeline makes 100,000 calls a day. Assume 0.5% of replies fail to parse. Each failure is retried once, and each retry is a full call that costs $0.004."
-  steps={[
     {
-      prompt: 'How many broken replies per day?',
-      unit: 'replies',
-      answer: 500,
-      within: 1.1,
-      explain: '100,000 x 0.005 = 500 broken replies per day.',
-    },
-    {
-      prompt: 'What do the retries cost per 30-day month, in dollars?',
-      unit: 'dollars',
-      answer: 60,
-      within: 1.2,
-      explain: '500 retries x $0.004 = $2 per day. Over 30 days that is $60. Small in dollars, but each retry also adds a full call of latency to 0.5% of your users.',
+      q: 'A prompt-only JSON pipeline fails to parse a small share of replies. Why does a plain retry not fix the problem for good?',
+      options: [
+        'Retries are blocked by the API after the first parse error',
+        'A retry always returns the exact same text as the first call',
+        'Each retry is a full extra call, and systematic errors repeat',
+        'A retry turns on the grammar, which then removes the valid tokens',
+      ],
+      answer: 2,
+      explain: 'A retry costs a full call and adds delay. If the cause is systematic, such as a field name the model keeps changing, the same failure comes back. Sampling means the text can differ, and retries are not blocked.',
     },
   ]}
 />

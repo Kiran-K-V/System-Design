@@ -6,7 +6,6 @@ requires: ['09-patterns/contention', '04-data/transactions', '05-caching/cache-s
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import TicketmasterBuild from '../../../components/anim/lessons/TicketmasterBuild.tsx';
 import TicketmasterHold from '../../../components/anim/lessons/TicketmasterHold.tsx';
 
@@ -32,51 +31,10 @@ Lesson [9.4](/learn/09-patterns/contention/) taught the general ideas for fights
 
 **Scale.** These are assumptions for the interview.
 
-- 10 million fans want one event with 50,000 seats. That is 10,000,000 ÷ 50,000 = **200 fans for every seat**.
+- 10 million fans want one event with 50,000 seats. That is hundreds of fans for every seat (~200).
 - A hold lasts 10 minutes.
-- If all fans arrive in the first minute, that is 10,000,000 ÷ 60 ≈ **167,000 requests a second** for the seat map alone.
-- With a waiting room that admits 2,000 fans every 30 seconds, the booking service sees 2,000 ÷ 30 ≈ **67 new fans a second**. The crowd is bounded by a rule we choose, not by the crowd.
-
-<Ballpark
-  client:visible
-  title="Size a sale"
-  scenario="10 million fans want one event with 50,000 seats. All of them arrive in the first 60 seconds. A waiting room admits 2,000 fans every 30 seconds."
-  steps={[
-    { prompt: 'Fans per seat', unit: 'fans', answer: 200, within: 1.1, explain: '10,000,000 ÷ 50,000 = 200. Most fans will not get a seat, so the system must refuse most people politely and quickly.' },
-    { prompt: 'Requests per second if every fan loads the seat map in the first minute', unit: 'per s', answer: 166667, within: 1.3, explain: '10,000,000 ÷ 60 ≈ 166,700 a second. No booking database should face this directly.' },
-    { prompt: 'New fans per second reaching the booking service through the waiting room', unit: 'per s', answer: 67, within: 1.3, explain: '2,000 ÷ 30 ≈ 67 a second. That rate is set by the room, so it does not grow with the crowd.' },
-  ]}
-/>
-
-## Core entities
-
-- **Event:** `event_id`, venue, start time, status.
-- **Seat:** `event_id`, `seat_id`, `status` (available, held, or sold), `held_by`, `hold_expires_at`.
-- **Booking:** `booking_id`, user, event, seats, status, created time.
-- **User.**
-
-The Seat row is the hot one. Every fan competes for these rows. Everything else is easy to scale.
-
-## API
-
-| Call | Purpose |
-|---|---|
-| `GET /events?query=...` | Search events |
-| `GET /events/{id}` | Event details |
-| `GET /events/{id}/seats` | A snapshot of the seat map |
-| `POST /events/{id}/holds` with `{ seat_ids }` | Try to hold seats. Returns `{ hold_id, expires_at }` or 409 |
-| `POST /holds/{id}/confirm` with payment details | Pay and book. Returns `{ booking_id }` |
-| `GET /events/{id}/seats/stream` | A live stream of seat changes (SSE) |
-
-## High-level design
-
-Step through it. Early steps are easy reads. The hard part appears at step 4.
-
-<TicketmasterBuild client:visible />
-
-**Reads and bookings are separate paths.** Browsing and search are read-heavy, so they use the standard tools: a cache ([lesson 5.3](/learn/05-caching/cache-strategies/)), a search index fed by change data capture, which copies each database change into another system ([lesson 6.5](/learn/06-async/cdc/) and [lesson 8.5](/learn/08-technologies/elasticsearch/)), and replicas. Staleness here is harmless. If a new event appears in search three seconds late, nobody is hurt.
-
-**The seat table is one source of truth.** All booking writes go to one primary. You cannot scale the booking path by adding read replicas. The reason is that a replica may not yet know a seat was just taken. The table is also small: 50,000 rows for one event. The problem is contention, not size.
+- If all fans arrive in the first minute, the seat map alone sees hundreds of thousands of requests a second.
+- With a waiting room that admits a small batch every few seconds, the booking service sees only a few dozen new fans a second. The crowd is bounded by a rule we choose, not by the crowd.
 
 ## Deep dive 1: claiming a seat
 
@@ -109,11 +67,11 @@ If the statement reports 1 row changed, the fan holds the seat. If it reports 0,
 
 ## Deep dive 2: a crowd of ten million
 
-With 200 fans per seat, most fans will lose. The question is how to fail them gracefully and cheaply.
+With hundreds of fans per seat, most fans will lose. The question is how to fail them gracefully and cheaply.
 
 A **virtual waiting room** puts fans in a queue before the booking path. A fan who arrives gets a place in line, and the page shows their position. A sorted set ([lesson 8.2](/learn/08-technologies/redis/)), a Redis structure that keeps items ordered by a number, can hold the line. The number is the arrival time. A controller admits a batch at a fixed rate. The controller gives each admitted fan a signed token with an expiry time. A signed token is a short string that only our servers can create, like a stamped wristband. Anyone can check the stamp, and nobody can forge it. The booking service refuses any request without a valid token. The token check is cheap and needs no database call.
 
-The admission rate is the control knob. Choose it from what booking can handle, such as 67 new fans a second above. Raise it as seats stay available, and lower it when holds pile up.
+The admission rate is the control knob. Choose it from what booking can handle, such as the few dozen new fans a second above. Raise it as seats stay available, and lower it when holds pile up.
 
 A queue does not remove the seat fight. Admitted fans still compete for seats, so the conditional hold stays. The queue protects the system. The conditional update protects the data.
 
@@ -180,7 +138,18 @@ The check and the write must be one indivisible step. A condition in the applica
         'It removes the need to check the hold at payment time',
       ],
       answer: 1,
-      explain: 'The hold protects the data but cannot stop 167,000 requests a second from reaching the booking service. The room limits arrivals to a rate we pick. It does not replace the hold or the confirm check.',
+      explain: 'The hold protects the data but cannot stop a flood of requests from reaching the booking service. The room limits arrivals to a rate we pick. It does not replace the hold or the confirm check.',
+    },
+    {
+      q: 'A waiting room admits a fixed batch of fans every few seconds. What happens to the booking load when the crowd grows from 1 million to 10 million fans?',
+      options: [
+        'It grows ten times, because every fan eventually reaches booking',
+        'It stays about the same, because the room sets the admit rate',
+        'It falls, because a bigger crowd gives up and leaves the queue',
+        'It moves to the seat map, which then takes the full crowd',
+      ],
+      answer: 1,
+      explain: 'The booking service sees only the fans the room lets in, and the admit rate is a rule we choose. A bigger crowd only means a longer wait. The seat map is streamed only to admitted fans, so it is not hit by the crowd either.',
     },
     {
       q: 'A fan pays successfully but the seat UPDATE at confirm matches 0 rows. What is the correct handling?',

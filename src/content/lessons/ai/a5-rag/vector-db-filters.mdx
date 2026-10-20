@@ -24,7 +24,7 @@ Backend lesson 10.4 already showed the trap. In pgvector, the scan uses the appr
 
 This is **post-filtering**. Ask the index for its nearest candidates, then drop those that fail the filter. The pgvector README states it plainly: "With approximate indexes, filtering is applied after the index is scanned." Its example: "If a condition matches 10% of rows, with HNSW and the default hnsw.ef_search of 40, only 4 rows will match on average."
 
-The expected count is simple. Rows kept = ef_search x share of matching rows = 40 x 0.10 = 4. A tenant that owns 1% of the data would see 0.4 rows. The failure is silent. The query runs, returns fewer rows than asked, and no error appears. The model downstream answers from less context than you planned.
+The idea is simple. The index returns a fixed number of candidates. Only the share that matches the filter survives. A tenant that owns 1% of the data would see almost nothing. The failure is silent. The query runs, returns fewer rows than asked, and no error appears. The model downstream answers from less context than you planned.
 
 Step through the failure, then the first fix.
 
@@ -34,7 +34,7 @@ Step through the failure, then the first fix.
 
 **Pre-filtering.** Find the rows that match the filter first, then search only those. If the match set is small, you can compare the query with every one of them. That is an exact search over a subset, so recall is perfect and the answer always has min(k, matches) rows. The cost is work in proportion to the number of matching rows. The pgvector README says exact indexes "work well for conditions that match a low percentage of rows". Otherwise, the README says approximate indexes "can work better." In Postgres, the start it gives is a B-tree index on the filter column.
 
-**Post-filtering with iterative scans.** Keep the approximate index and let the scan continue when too few rows pass. Version 0.8.0 of pgvector added iterative index scans. You turn them on with `hnsw.iterative_scan`, set to `strict_order` or `relaxed_order`. Strict keeps results in exact order by distance. Relaxed allows them slightly out of order for better recall. The scan stops at `hnsw.max_scan_tuples`, 20,000 by default. At a 10% match it needs about 10 / 0.10 = 100 candidates for 10 rows. At 0.01%, it would need 100,000. That is past the cap. So you get about 20,000 x 0.0001 = 2 rows.
+**Post-filtering with iterative scans.** Keep the approximate index and let the scan continue when too few rows pass. Version 0.8.0 of pgvector added iterative index scans. You turn them on with `hnsw.iterative_scan`, set to `strict_order` or `relaxed_order`. Strict keeps results in exact order by distance. Relaxed allows them slightly out of order for better recall. The scan stops at `hnsw.max_scan_tuples`, 20,000 by default. At a 10% match it needs only a few hundred candidates for 10 rows. At a very rare match, it would need far more than the cap. The scan stops early, so you get only a couple of rows.
 
 **Filterable HNSW.** Check the filter while walking the graph, and only keep matching points. This sounds ideal, but it has a trap. If most points are skipped, the walk can lose its path through the graph.
 
@@ -80,7 +80,7 @@ The docs of Pinecone and turbopuffer do not say whether their filters apply befo
 
 | Fact | Value | Source |
 |---|---|---|
-| Post-filter rows, 10% match, ef_search 40 | about 4 | pgvector README; 40 x 0.10 |
+| Post-filter rows, 10% match, ef_search 40 | about 4 | pgvector README |
 | Iterative scan | from pgvector 0.8.0; cap 20,000 tuples | pgvector README |
 | Filterable-HNSW experiment | precision@10 0.85 to 0.05, m = 16 | Qdrant article, author's 2019 Python test |
 | turbopuffer, 1M docs | p50 874 ms cold, 14 ms cached | turbopuffer docs |
@@ -129,7 +129,7 @@ Do not claim a filter "just works" on a vector index. Do not quote the 0.85 to 0
         'The embedding model changed and old vectors no longer match',
       ],
       answer: 0,
-      explain: '40 x 0.07 = 2.8 rows on average, close to the 3 seen. The filter runs after the scan. Tenant 42 owns about 140,000 rows, so it is not a small tenant, and LIMIT is a cap, not a hint.',
+      explain: 'The index gives 40 candidates and only about 7% pass, so a handful survive, close to the 3 seen. The filter runs after the scan. Tenant 42 owns about 140,000 rows, so it is not a small tenant, and LIMIT is a cap, not a hint.',
     },
     {
       prompt: 'Which change fixes it with the least new machinery?',
@@ -140,7 +140,7 @@ Do not claim a filter "just works" on a vector index. Do not quote the 0.85 to 0
         'Cut the vectors to 256 dimensions',
       ],
       answer: 2,
-      explain: 'Iterative scan keeps scanning until 10 rows pass: about 10 / 0.07 = 143 candidates, well under the 20,000 cap. A bigger m changes the graph, not the post-filter. A separate database is heavy, and fewer dimensions do not change selectivity.',
+      explain: 'Iterative scan keeps scanning until 10 rows pass. At a 7% match that is a few hundred candidates, well under the cap. A bigger m changes the graph, not the post-filter. A separate database is heavy, and fewer dimensions do not change selectivity.',
     },
   ]}
 />
@@ -149,15 +149,15 @@ Do not claim a filter "just works" on a vector index. Do not quote the 0.85 to 0
   client:visible
   questions={[
     {
-      q: 'A filter matches 2% of rows. A post-filtered HNSW query uses ef_search 100. About how many rows come back?',
+      q: 'A filter matches only 2% of rows. A post-filtered HNSW query asks for 10 results. What is the likely outcome?',
       options: [
-        'About 98, the share that fails the filter',
-        'About 20, one fifth of the candidates',
-        'About 2, which is the expected count',
-        'About 100, since ef_search sets the result size',
+        'Ten rows return, as the index applies the filter first',
+        'Far fewer than ten rows return, with no error',
+        'The query fails with an error about the filter',
+        'The query returns the ten nearest rows, ignoring the filter',
       ],
-      answer: 2,
-      explain: 'Rows kept = ef_search x selectivity = 100 x 0.02 = 2. The candidate list holds 100 rows, but only the matching 2% survive the filter.',
+      answer: 1,
+      explain: 'The index returns its candidates first, and the filter then drops most of them. The query still succeeds, so the shortfall is silent. Ten rows would need the filter applied during the search.',
     },
     {
       q: 'What is the cleanest reason to pre-filter and scan exactly for a tiny tenant?',

@@ -6,7 +6,6 @@ requires: ['04-data/transactions', '09-patterns/contention', '09-patterns/real-t
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import AuctionBuild from '../../../components/anim/lessons/AuctionBuild.tsx';
 import AuctionRace from '../../../components/anim/lessons/AuctionRace.tsx';
 
@@ -68,46 +67,9 @@ Three details are worth saying aloud.
 
 ## Numbers
 
-Assume 1M new auctions a day and 10 bids per auction on average.
+Assume about a million new auctions a day, with a handful of bids each. The total write load is modest in this model: a few hundred bids a second at peak (~1,000). A single database handles that, and the bid log stays small.
 
-| Quantity | Math | Result |
-|---|---|---|
-| Bids per day | 1M x 10 | 10M |
-| Average bid rate | 10M / 100,000 s | ~100 per second |
-| Peak bid rate, 10x | 100 x 10 | ~1,000 per second |
-| Bid log, one year | 10M x 100 B x 365 | ~365 GB |
-| One hot auction, pushes | 20 bids/s x 5,000 viewers | 100,000 per second |
-
-The total write load is modest in this model. Two things are large. The first is **per-auction contention**: the last minute of one popular auction has many bids on one row. The second is **fan-out**: each bid must reach every viewer of that auction. Notice that the fan-out is the bigger number. Sizing is about one hot auction, not the total.
-
-<Ballpark
-  client:visible
-  title="One hot auction"
-  scenario="Assume 1M auctions a day with 10 bids each. Treat a day as 100,000 seconds. In its last minute one popular auction gets 20 bids per second and has 5,000 viewers. A bid row is 100 bytes."
-  steps={[
-    {
-      prompt: 'How many bids per second across all auctions, on average?',
-      unit: 'bids per second',
-      answer: 100,
-      within: 1.3,
-      explain: '1M x 10 = 10M bids a day. 10,000,000 / 100,000 = 100 per second.',
-    },
-    {
-      prompt: 'How many WebSocket pushes per second does the hot auction need?',
-      unit: 'pushes per second',
-      answer: 100_000,
-      within: 1.3,
-      explain: 'Each bid is sent to each viewer. 20 x 5,000 = 100,000 pushes per second, from one auction. Spread over gateway servers, each holds a share of the 5,000 viewers.',
-    },
-    {
-      prompt: 'How many GB of bid log do we store in one year?',
-      unit: 'GB',
-      answer: 365,
-      within: 1.3,
-      explain: '10M x 100 B = 1 GB a day. 1 GB x 365 = 365 GB. Small enough for one replicated database or a few shards.',
-    },
-  ]}
-/>
+Two things are large. The first is **per-auction contention**: the last minute of one popular auction has many bids on one row. The second is **fan-out**: each bid must reach every viewer of that auction. One bid becomes thousands of pushes. Notice that the fan-out is the bigger load. Sizing is about one hot auction, not the total.
 
 ## Deep dive: the highest-bid race
 
@@ -141,7 +103,7 @@ Do not lock the whole table. That makes every auction wait for every other aucti
 
 ## Deep dive: telling everyone
 
-Each viewer wants the new price. The first idea is to poll. With 5,000 viewers polling once a second, one auction row takes 5,000 reads a second. A viewer sees a new price up to a second late.
+Each viewer wants the new price. The first idea is to poll. With thousands of viewers polling once a second, one auction row takes thousands of reads a second. A viewer sees a new price up to a second late.
 
 Push is better. After a bid commits, the service publishes it to a **channel** for that auction, using pub/sub (lesson [6.2](/learn/06-async/pubsub-logs/)). **Gateway** servers hold the viewers' WebSocket connections (lesson [9.3](/learn/09-patterns/real-time-updates/)). Each gateway subscribes to the channels of the auctions its viewers watch, and pushes each message to those viewers.
 
@@ -203,15 +165,26 @@ Do not say "use a distributed lock" before you have tried a conditional write. A
       explain: 'The timer is stale. A conditional close that checks end_at affects 0 rows because end_at is now 18:02:00, and the service reschedules. Checking status alone closes the auction early. A read followed by a write has the same race as the naive bid.',
     },
     {
-      q: 'A hot auction gets 30 bids per second and has 2,000 viewers on WebSockets. How many pushes per second must the gateways send for this one auction?',
+      q: 'A hot auction has a few bids a second and thousands of viewers on WebSockets. Which load is the larger one for this auction?',
       options: [
-        'About 30 per second, since there is one push for each bid',
-        'About 2,000 per second, since there is one push for each viewer',
-        'About 60,000 per second, since each bid reaches each viewer',
-        'About 32,000 per second, as the sum of both numbers',
+        'Writing bids, since each bid needs a database update',
+        'Pushing prices, since each bid goes to every viewer',
+        'Storing the bid log, since every bid row is kept',
+        'Reading the auction page, since viewers now use the push path',
+      ],
+      answer: 1,
+      explain: 'Fan-out multiplies. Each bid becomes one push per viewer, so pushes far outnumber bids. Bid writes are modest because the conditional update is cheap. This is why the push path, not the bid path, sets the size of the gateway fleet.',
+    },
+    {
+      q: 'Total bids across all auctions are modest. What should capacity planning for this system focus on?',
+      options: [
+        'The average bid rate across all auctions in the system',
+        'The size of the bid log after a full year of storage',
+        'One hot auction in its last minute, with its viewers',
+        'The number of new auctions that sellers create each day',
       ],
       answer: 2,
-      explain: 'Fan-out multiplies. 30 bids a second times 2,000 viewers is 60,000 pushes a second. Adding the two numbers has no meaning. This is why the push path is the larger load.',
+      explain: 'The average is small, but one popular auction concentrates many bids on one row and many viewers on one channel. That peak is what breaks a design. The log and the daily listing count are small by comparison.',
     },
     {
       q: 'You shard the auctions table across 50 databases by auction id. What does this change for the highest-bid race?',

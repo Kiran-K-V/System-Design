@@ -1,18 +1,17 @@
 ---
-summary: 'At a billion vectors the index, not the search, is the problem: flat storage is 6.1 TB. Compare flat, IVF, PQ, HNSW and DiskANN by memory per vector, then tune nprobe and efSearch against recall that you measure.'
+summary: 'At a billion vectors the index, not the search, is the problem: flat storage is terabytes. Compare flat, IVF, PQ, HNSW and DiskANN by what each one cuts, then tune nprobe and efSearch against recall that you measure.'
 requires: ['ai/a5-rag/embedding-models', '10-advanced/vector-databases']
 ---
 
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
 import Ai5AnnHops from '../../../../components/anim/lessons/Ai5AnnHops.tsx';
 import Ai5AnnCalc from '../../../../components/anim/lessons/Ai5AnnCalc.tsx';
 
 ## The problem
 
-Lesson [A5.1](/learn/ai/a5-rag/embedding-models/) priced one embedding: 6,144 bytes at 1,536 dimensions. Now scale it. A company that indexes every paragraph of its documents, tickets and code can reach a billion vectors. One billion times 6,144 bytes is 6.1 TB. The FAISS guide says that "all Faiss indexes are stored in RAM." A machine with 6 TB of memory is not a normal machine. Every query would still read all of that memory.
+Lesson [A5.1](/learn/ai/a5-rag/embedding-models/) priced one embedding: 6,144 bytes at 1,536 dimensions. Now scale it. A company that indexes every paragraph of its documents, tickets and code can reach a billion vectors. That is about 6 TB for a billion vectors. The FAISS guide says that "all Faiss indexes are stored in RAM." A machine with 6 TB of memory is not a normal machine. Every query would still read all of that memory.
 
 So the question changes from "which vectors are close?" to "how do we find them without holding or scanning everything?"
 
@@ -24,7 +23,7 @@ Exact search compares the query with every stored vector, which costs N x d work
 
 A **flat** index stores every vector as it is and compares the query to all of them. The FAISS wiki gives its memory as 4 x d bytes per vector. It has perfect recall. It also has no tuning, and it is the right answer up to a modest size (backend lesson 10.4 gives about 100,000 vectors as a rough line).
 
-At 1 billion vectors of 1,536 dimensions, one vector takes 4 x 1,536 = 6,144 bytes. Across 10^9 vectors, that is 6.144 TB. Each query reads all of it. Even at a memory bandwidth of 50 GB/s, one pass takes over two minutes. That is the number to beat.
+At a billion vectors, a flat index needs terabytes of RAM, and each query reads all of it. A full pass takes minutes. That is the cost to beat.
 
 ## The mechanism: four ways to cut
 
@@ -37,24 +36,17 @@ Each family cuts a different cost. The FAISS wiki lists bytes per vector for the
 | PQ | ceil(M x nbits / 8) | Memory. Each vector becomes a short code. |
 | HNSW | 4 x d + M x 2 x 4 | Work per query. Adds graph links to the vectors. |
 
-**IVF** scans only a few clusters. It saves time but not memory: it still stores the full vectors. **PQ** (product quantization) [senior] cuts each vector into M pieces. Each piece gets replaced by the id of its nearest entry in a small learned table. PQ stores only those ids. With M = 96 and 8 bits per piece, a vector is 96 bytes. The FAISS wiki allows nbits of 8, 12 or 16. The price is lost precision: distances from codes are estimates. **HNSW** is fast and accurate, but it keeps full vectors and adds links on top.
+**IVF** scans only a few clusters. It saves time but not memory: it still stores the full vectors. **PQ** (product quantization) [senior] cuts each vector into M pieces. Each piece gets replaced by the id of its nearest entry in a small learned table. PQ stores only those ids. With 96 pieces of 8 bits each, a vector becomes a code of about 100 bytes, a small fraction of the original. The FAISS wiki allows nbits of 8, 12 or 16. The price is lost precision: distances from codes are estimates. **HNSW** is fast and accurate, but it keeps full vectors and adds links on top.
 
-### Worked example: 1 billion x 1,536
+### Worked example: a billion vectors
 
-| Index | Bytes per vector | Total |
-|---|---|---|
-| Flat | 6,144 | 6.144 TB |
-| IVFFlat | 6,152 | 6.152 TB |
-| HNSW, M = 16 | 6,144 + 128 = 6,272 | 6.272 TB |
-| PQ, M = 96, 8 bits | 96 | 96 GB |
-
-The PQ code is 6,144 / 96 = 64 times smaller than the float vector. That code, at 96 GB, fits on one large server. But those 96 bytes are only the codes. You also keep the codebooks, and usually the full vectors on cheaper storage. That way you can re-score the best few hundred candidates. Try other values in the calculator.
+Flat, IVFFlat and HNSW all keep the full float vectors, so they sit near the same terabytes of memory. HNSW adds a little for its links. Only PQ changes the order of magnitude: its codes are many times smaller, and fit on one large server. But those codes are only part of the cost. You also keep the codebooks, and usually the full vectors on cheaper storage. That way you can re-score the best few hundred candidates. Try other values in the calculator.
 
 <Ai5AnnCalc client:visible />
 
 ### DiskANN: keep the graph on the SSD
 
-HNSW needs the whole graph and all vectors in RAM. **DiskANN** [senior] (NeurIPS 2019) keeps most of the index on an SSD and a compressed copy in memory. The abstract reports one workstation with 64 GB of RAM and an inexpensive SSD. That workstation can index and search SIFT1B, a billion-point benchmark. On a 16-core machine, that workstation served more than 5,000 queries per second. Mean latency stayed under 3 ms, and 1-recall@1 was 95% or better. The paper says FAISS and a similar system with a like memory footprint plateau at about 50% 1-recall@1. It also claims 5 to 10 times more points per node than HNSW or NSG at high recall.
+HNSW needs the whole graph and all vectors in RAM. **DiskANN** [senior] (NeurIPS 2019) keeps most of the index on an SSD and a compressed copy in memory. The abstract reports one workstation with modest RAM and an inexpensive SSD. That workstation can index and search SIFT1B, a billion-point benchmark, with low latency and high recall. The paper says FAISS and a similar system with a like memory footprint plateau at much lower recall. It also claims many more points per node than HNSW or NSG at high recall.
 
 Read this with care. It is one benchmark on one dataset, from the authors, in 2019. SIFT vectors are not 1,536-dimension text embeddings. Treat it as proof that the approach works, not as your latency.
 
@@ -99,31 +91,20 @@ for ef in (16, 40, 100, 200):
     print(ef, recall)
 ```
 
-## Numbers
-
-| Fact | Value | Source |
-|---|---|---|
-| Flat, 1B x 1,536 | 6.144 TB | Derived: 4 x 1,536 x 10^9 |
-| HNSW M=16, 1B x 1,536 | 6.272 TB | Derived: (6,144 + 128) x 10^9 |
-| PQ M=96 8-bit, 1B | 96 GB, 64x smaller | Derived: 96 x 10^9 |
-| DiskANN, SIFT1B | 64 GB RAM, over 5,000 QPS, under 3 ms, 95%+ 1-recall@1 | DiskANN abstract |
-| pgvector HNSW | m 16, ef_construction 64, ef_search 40 | pgvector README |
-| Milvus IVF | nlist 128, nprobe 8 | Milvus docs |
-
 ## Trade-offs
 
 | Choice | You gain | You pay | Choose when |
 |---|---|---|---|
 | Flat | Exact results, no tuning | N x d work per query | Under about 100,000 vectors |
 | IVFFlat | Fast build, tunable work | Full vectors in RAM; recall depends on nprobe | Data changes slowly |
-| PQ | 64x less memory in our example | Estimated distances, lost recall | RAM is the limit |
+| PQ | Far less memory | Estimated distances, lost recall | RAM is the limit |
 | HNSW | Best speed for a given recall | Vectors plus links in RAM | Millions of vectors, live updates |
 | DiskANN | A billion points on one box | SSD reads, a more complex build | Billions of vectors, RAM-limited |
 
 ## Interview lens
 
 <Callout type="tip">
-Lead with the memory math: "A billion 1,536-dimension float vectors is 6.1 TB flat. PQ with 96 one-byte codes is 96 GB. I would keep codes in RAM and full vectors on SSD to re-score the top few hundred." Then say how you tune: "I sweep efSearch against recall on a labelled query set and pick the cheapest setting that meets the bar."
+Lead with the memory math: "A billion 1,536-dimension float vectors is terabytes flat. PQ codes are many times smaller and fit on one big server. I would keep codes in RAM and full vectors on SSD to re-score the top few hundred." Then say how you tune: "I sweep efSearch against recall on a labelled query set and pick the cheapest setting that meets the bar."
 </Callout>
 
 <Callout type="mistake">
@@ -135,35 +116,6 @@ PQ replaces each piece of a vector by its nearest table entry. Two different vec
 </Callout>
 
 ## Check yourself
-
-<Ballpark
-  client:visible
-  title="Memory for a billion vectors"
-  scenario="You index 1 billion vectors of 1,536 dimensions, float32. Use the FAISS bytes-per-vector formulas."
-  steps={[
-    {
-      prompt: 'Flat index memory, in TB?',
-      unit: 'TB',
-      answer: 6.144,
-      within: 1.1,
-      explain: '4 x 1,536 = 6,144 bytes per vector. Times 10^9 vectors = 6.144 x 10^12 bytes = 6.144 TB.',
-    },
-    {
-      prompt: 'PQ with M = 96 and 8 bits per code: memory in GB?',
-      unit: 'GB',
-      answer: 96,
-      within: 1.1,
-      explain: 'ceil(96 x 8 / 8) = 96 bytes per vector. Times 10^9 = 96 GB, 64 times less than flat.',
-    },
-    {
-      prompt: 'HNSW with M = 32: bytes per vector?',
-      unit: 'bytes',
-      answer: 6400,
-      within: 1.1,
-      explain: '4 x 1,536 + 32 x 2 x 4 = 6,144 + 256 = 6,400 bytes. The links add about 4% here, so the vectors dominate.',
-    },
-  ]}
-/>
 
 <Quiz
   client:visible
@@ -180,15 +132,15 @@ PQ replaces each piece of a vector by its nearest table entry. Two different vec
       explain: 'nprobe is a query-time setting: more clusters scanned means better recall and slower queries. No rebuild is needed. Dropping vectors loses data, and nlist of 1 turns IVF into a flat scan.',
     },
     {
-      q: 'Why does PQ with M = 96 and 8-bit codes shrink 1,536-dimension float32 vectors by 64 times?',
+      q: 'Product quantization shrinks each vector into a short code. What do you give up in return?',
       options: [
-        'It stores 96 bytes where float32 needed 6,144',
-        'It drops 63 of every 64 dimensions at random',
-        'It stores only the vector ids and rebuilds them later',
-        'It halves the bits in each number six times over',
+        'Precision: distances from codes are estimates',
+        'Speed: code lookups are slower than float math',
+        'Coverage: some vectors are dropped from the index',
+        'Updates: codes cannot be added after the build',
       ],
       answer: 0,
-      explain: '96 bytes against 6,144 bytes is a ratio of 64. PQ keeps one small code per piece of the vector, not a subset of dimensions. The loss is precision, not missing data.',
+      explain: 'Each piece of a vector is replaced by its nearest table entry, so distances become estimates. No vectors are dropped. Code lookups are usually fast. That is why systems re-score the best candidates with full vectors.',
     },
     {
       q: 'Which index family keeps the full float vectors and also adds graph links in RAM?',
@@ -211,6 +163,17 @@ PQ replaces each piece of a vector by its nearest table entry. Two different vec
       ],
       answer: 2,
       explain: 'It shows the approach works on one benchmark, with 128-dimension SIFT vectors, on a 16-core machine. Your data, dimensions and hardware differ, so you must measure your own latency.',
+    },
+    {
+      q: 'A team must index a billion vectors, but flat storage would need far more RAM than one machine has. Which problem is this?',
+      options: [
+        'Query code is slow, so only a faster language will help',
+        'The index is too big to hold, so memory per vector must shrink',
+        'The embeddings are poor, so a new model would fix it',
+        'Recall is too low, so nprobe must be raised first',
+      ],
+      answer: 1,
+      explain: 'At this scale the index itself is the problem. Compression such as PQ, or keeping the graph on SSD, cuts memory per vector. Tuning recall or changing the model does not shrink the index.',
     },
   ]}
 />

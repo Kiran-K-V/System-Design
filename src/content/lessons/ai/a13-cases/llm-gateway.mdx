@@ -6,8 +6,6 @@ requires: ['ai/a3-llm-apis/multi-provider-gateway', 'ai/a3-llm-apis/limits-retri
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
-import Math from '../../../../components/lesson/Math.astro';
 import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
 import Ai13GatewayBuild from '../../../../components/anim/lessons/Ai13GatewayBuild.tsx';
 import Ai13GatewayQuotaSim from '../../../../components/anim/lessons/Ai13GatewayQuotaSim.tsx';
@@ -34,15 +32,9 @@ Lesson [A3.8](/learn/ai/a3-llm-apis/multi-provider-gateway/) built a gateway for
 
 **The bar that justifies a shared platform is isolation.** A gateway can be fast, cheap, and exact and still fail it.
 
-**Scale (illustrative).** Peak 50 requests per second, each with 3,000 input and 500 output tokens. Provider limits are from the Anthropic [rate limits page](https://platform.claude.com/docs/en/api/rate-limits), Sonnet 5.5, Scale tier, as of 2026-10-19: 10,000 RPM, 10,000,000 input tokens per minute (ITPM), 2,000,000 output tokens per minute (OTPM).
+**Scale (illustrative).** Peak traffic is tens of requests per second, each with a long prompt and a short answer. Provider limits are from the Anthropic [rate limits page](https://platform.claude.com/docs/en/api/rate-limits), Sonnet 5.5, Scale tier, as of 2026-10-19: they cap requests per minute (RPM), input tokens per minute (ITPM), and output tokens per minute (OTPM).
 
-| Limit | Our peak | Provider limit | Used |
-|---|---|---|---|
-| Requests per minute | 50 x 60 = 3,000 | 10,000 | 30% |
-| Input tokens per minute | 3,000 x 3,000 = 9,000,000 | 10,000,000 | 90% |
-| Output tokens per minute | 3,000 x 500 = 1,500,000 | 2,000,000 | 75% |
-
-Input binds first. A request-count quota sees 30% and stays quiet while the input bucket empties. That is how the 03:10 job got through.
+At this traffic, input tokens run closest to their limit. A request-count quota sees a quiet system while the input bucket empties. That is how the 03:10 job got through.
 
 ## Eval plan
 
@@ -56,21 +48,21 @@ Online signals: 429 rate per team, share of calls that fell back, escalation rat
 
 ## Budgets
 
-**Latency.** LiteLLM, an open-source gateway, publishes its own benchmark on a [benchmarks page](https://docs.litellm.ai/docs/benchmarks): overhead of 2 ms at the median (p50) and 8 ms at p95 with 4 instances of 4 vCPUs and 8 GB, and 12 ms and 29 ms with 2 instances. The page gives no date or version (company claim). It shows that a few milliseconds are possible, not that your build will reach them. Our illustrative plan: key lookup 0.3 ms, quota take 2.0 ms (one round trip to the shared store), cache lookup 2.0 ms, route pick 0.2 ms, proxying 3.0 ms, ledger write off the path. The sum is 7.5 ms, under the 10 ms bar.
+**Latency.** LiteLLM, an open-source gateway, publishes its own benchmark on a [benchmarks page](https://docs.litellm.ai/docs/benchmarks): overhead of a few milliseconds at the median and under 30 ms at p95, depending on instance count. The page gives no date or version (company claim). It shows that a few milliseconds are possible, not that your build will reach them. In our plan, the quota take and the cache lookup each cost one round trip to a shared store, and the rest is small. The ledger write stays off the request path. That keeps the total under the 10 ms bar.
 
-Failover costs more. With a 3 s first-token timeout, one extra try on the primary gives 6 s and breaks the 5 s bar. So the bar sets the retry count: one attempt on the primary, then the backup.
+Failover costs more. If the first-token timeout is a few seconds, one extra try on the primary breaks the 5 s bar. So the bar sets the retry count: one attempt on the primary, then the backup.
 
-**Dollars.** USD per million tokens, as of 2026-10-19, from [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) and [OpenAI pricing](https://developers.openai.com/api/docs/pricing) (standard text, under 272K tokens). Reference request: 3,000 in, 500 out.
+**Dollars.** Prices are USD per million tokens, as of 2026-10-19, from [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) and [OpenAI pricing](https://developers.openai.com/api/docs/pricing) (standard text, under 272K tokens).
 
-| Model | Input | Output | Reference request |
+| Model | Input | Output | Relative cost of a request |
 |---|---|---|---|
-| Anthropic Opus 5.5 | $4 | $20 | $0.0220 |
-| Anthropic Sonnet 5.5 | $2 | $10 | $0.0110 |
-| Anthropic Haiku 5.5 (prompts up to 100,000 tokens) | $0.10 | $0.50 | $0.00055 |
-| OpenAI gpt-6.1-sol | $2.00 | $10.00 | $0.0110 |
-| OpenAI gpt-6-luna | $0.10 | $0.50 | $0.00055 |
+| Anthropic Opus 5.5 | $4 | $20 | Highest |
+| Anthropic Sonnet 5.5 | $2 | $10 | Mid |
+| Anthropic Haiku 5.5 (prompts up to 100,000 tokens) | $0.10 | $0.50 | About 20 times cheaper than Sonnet |
+| OpenAI gpt-6.1-sol | $2.00 | $10.00 | Mid, like Sonnet |
+| OpenAI gpt-6-luna | $0.10 | $0.50 | Cheapest, like Haiku |
 
-Sonnet 5.5: 3,000 x 2 / 1M + 500 x 10 / 1M = $0.006 + $0.005 = $0.011. From the same pages: a Sonnet 5.5 cache read is $0.10, Haiku 5.5 costs five times more per token above 100,000 prompt tokens, and the Batch API takes 50% off.
+From the same pages: a Sonnet 5.5 cache read is far cheaper than normal input, Haiku 5.5 costs five times more per token above 100,000 prompt tokens, and the Batch API takes 50% off.
 
 ## Core entities and API
 
@@ -90,7 +82,7 @@ A quota 429 may be retried after the wait. A 402 must not be, the same rule as t
 
 One proxy, one shared provider key, no quota, three retries at every layer, a cache keyed by a hash of the body, cost estimated from prompt length. Each part fails with a number.
 
-1. **No quota.** In the simulator below, team B surges to 6 times its load for 30 s against a limit of 50 requests per second. With one shared bucket every team loses 26.7% of its requests, including team A (160 of 600) and team C (64 of 240), both inside their share.
+1. **No quota.** In the simulator below, team B surges to several times its load for 30 s against a shared limit. With one shared bucket every team loses the same share of its requests, including teams A and C, both inside their own share.
 2. **Retries everywhere.** Three layers of three tries make 27 provider calls per user action (lesson [A3.6](/learn/ai/a3-llm-apis/limits-retries-idempotency/)).
 3. **A body-hash cache.** If the key drops part of the context, one tenant can read an answer built for another.
 4. **Estimated cost.** The estimate breaks when the tokenizer changes or streaming hides usage.
@@ -115,9 +107,9 @@ Providers face this too, and answer it differently. Anthropic says ITPM "rate li
 
 The gateway protects teams from each other, so it should be strict in the safe direction. It **reserves, then refunds**. At admission it takes input tokens plus a reserve for output. When the call ends, it puts back the unused part.
 
-**Worked example.** A request has 3,000 input tokens and `max_tokens` of 1,000. The model writes 250. The gateway takes 3,000 + 1,000 = 4,000. It refunds 1,000 - 250 = 750. The final charge is 3,250, which is 3,000 + 250 exactly. The refund makes the charge exact. The reserve matters only in between.
+**Worked example.** A request has a few thousand input tokens and a `max_tokens` of 1,000. The model writes only 250. The gateway takes the input plus the full 1,000 at the door. When the call ends it refunds the 750 the model did not use. The final charge is the input plus the real output. The refund makes the charge exact. The reserve matters only in between.
 
-**What the reserve costs.** Tokens stay held while the call runs. Team A sends 20 requests per second and each call takes 8 s. Its guarantee is 87,500 tokens per second and its bucket is 10 s deep, so it holds 875,000 tokens. A deploy sets `max_tokens` to 8,000 while the model still writes 500. Each request takes 3,000 + 8,000 = 11,000. The bucket drains at 20 x 11,000 - 87,500 = 132,500 tokens per second and is empty after 875,000 / 132,500 = 6.6 s. The first refunds return at 8 s. For about 1.4 s, team A gets 429s while inside its guarantee: about 29 of 1,600 requests, 1.8%. The simulator reproduces this.
+**What the reserve costs.** Tokens stay held while the call runs. Say a deploy raises `max_tokens` from 1,000 to 8,000 while the model still writes about the same. Now every request holds far more tokens for the full duration of the call. The bucket empties before the first refunds return. For a short time, team A gets 429s while it is inside its guarantee. The simulator reproduces this.
 
 Two rules follow. Reserve the p95 of the route's output length, not the model maximum. And let the bucket go a little negative when an answer runs over, then refuse new calls until it recovers. Azure's token-limit policy has the same weakness: "concurrent or near-concurrent requests can temporarily exceed the configured token limit". Plan for overshoot.
 
@@ -125,9 +117,9 @@ A call must also pass a request bucket, which stops a flood of tiny calls. Only 
 
 ### Fair share and burst credit
 
-**Guarantee.** Each team gets a share of the provider limit. Keep the sum below the limit, or the guarantee is a lie. We allocate 9,000,000 of 10,000,000 ITPM (90%) and keep 1,000,000 as headroom. In total tokens the guarantees are 87,500, 52,500, and 35,000 per second for teams A, B, and C: 25, 15, and 10 requests per second at 3,500 tokens each.
+**Guarantee.** Each team gets a share of the provider limit. Keep the sum below the limit, or the guarantee is a lie. We allocate most of the provider limit and keep some as headroom. In the simulator, teams A, B, and C have guarantees in a 5 to 3 to 2 ratio.
 
-**Depth.** A bucket holds guarantee x depth: burst credit that a quiet team banks. At 10 s, team B can send 525,000 tokens at once. Keep the sum of depths well under the provider's own bucket. Here it is 175,000 x 10 = 1,750,000 tokens.
+**Depth.** A bucket holds guarantee x depth: burst credit that a quiet team banks. A deeper bucket lets a team send a larger burst at once. Keep the sum of depths well under the provider's own bucket.
 
 **Borrowing.** A strict per-team bucket wastes capacity: when A's bucket is full, its refill is thrown away. Fair sharing lends that overflow, and only the overflow, to teams that still want more, in proportion to their guarantees. The lender loses nothing. This is weighted max-min fairness: nobody gets more than it asks for, and spare capacity goes to those still asking.
 
@@ -135,13 +127,13 @@ A call must also pass a request bucket, which stops a flood of tiny calls. Only 
 
 Try the three policies at the default settings (depth 10 s, `max_tokens` 1,000, surge 6x). Results over the 30 s surge:
 
-| Policy | Team A turned away | Team B turned away | Team C turned away |
+| Policy | Team A | Team B (surging) | Team C |
 |---|---|---|---|
-| One shared bucket | 160 of 600 (26.7%) | 480 of 1,800 (26.7%) | 64 of 240 (26.7%) |
-| Bucket per team | 0 | 1,221 of 1,800 (67.8%) | 0 |
-| Per team + burst credit | 0 | 1,049 of 1,800 (58.3%) | 0 |
+| One shared bucket | Loses requests, though inside its share | Loses the same share as the others | Loses requests, though inside its share |
+| Bucket per team | Untouched | Turned away most of the time | Untouched |
+| Per team + burst credit | Untouched | Turned away a bit less | Untouched |
 
-The shared bucket spreads the pain by demand, so the loudest team wins. The per-team bucket confines the damage to B. Burst credit gives B 172 more requests from capacity A and C did not use. B is still turned away most of the time, since 6 times its demand is more than the platform can serve. Quotas do not create capacity. They decide who waits.
+The shared bucket spreads the pain by demand, so the loudest team wins. The per-team bucket confines the damage to B. Burst credit gives B some extra requests from capacity A and C did not use. B is still turned away often, since a surge of that size is more than the platform can serve. Quotas do not create capacity. They decide who waits.
 
 **Priority.** When the provider itself is short, drain batch and eval traffic first.
 
@@ -153,35 +145,27 @@ Lesson [A3.8](/learn/ai/a3-llm-apis/multi-provider-gateway/) gave a formula for 
 
 The check can be a code check (valid structure, valid tool arguments), a small judge model, or both. Its dangerous error is the **false accept**: it keeps a wrong answer and the user sees it.
 
-### The cost, derived
+### The cost, in words
 
-Haiku 5.5 costs c_h = $0.00055 and Sonnet 5.5 costs c_s = $0.011 per reference request. Let e be the escalation share and c_j the check cost.
+A cascade costs the cheap call and the check on every request. The escalated share also pays for the strong call. So the cost is the cheap call, plus the check, plus the escalation share times the strong call.
 
-<Math block tex="c_{\text{cascade}} = c_h + c_j + e \cdot c_s" />
+| Setup | Relative cost |
+|---|---|
+| All Sonnet 5.5 | Highest |
+| All Haiku 5.5 | Lowest, about 20 times cheaper than Sonnet |
+| Cascade, a third escalate, free check | Far below all-Sonnet |
+| Same, with a Haiku judge as the check | A little more than the free check |
+| Router that predicts, no double pay | A little below the cascade |
 
-Every request pays the cheap call and the check. The share e also pays the strong call. At 30% escalation with a free check: 0.00055 + 0.3 x 0.011 = $0.00385. A request has 3,500 tokens, so the blended price is 0.00385 / 3,500 x 1,000,000 = **$1.10 per million tokens**.
-
-| Setup | Per request | Per million tokens |
-|---|---|---|
-| All Sonnet 5.5 | $0.0110 | $3.14 |
-| All Haiku 5.5 | $0.00055 | $0.16 |
-| Cascade, 30% escalate, free check | $0.00385 | $1.10 |
-| Same, with a Haiku judge as the check | $0.004125 | $1.18 |
-| Router that predicts, 70/30, no double pay | $0.003685 | $1.05 |
-
-The Haiku judge reads 2,000 tokens and writes 150: $0.0002 + $0.000075 = $0.000275. The cascade costs 0.3 x $0.00055 = $0.000165 more than a perfect router, because escalated requests also paid for the cheap call. It needs no predictor, only a check.
+A judge check adds a small cost to every request. A cascade costs a little more than a perfect router, because escalated requests also paid for the cheap call. It needs no predictor, only a check.
 
 ### The break-even escalation rate
 
-Set the cascade cost equal to all-strong and solve:
-
-<Math block tex="e^{*} = 1 - \frac{c_h + c_j}{c_s}" />
-
-With a free check, e* = 1 - 0.00055 / 0.011 = 95%. With the Haiku judge, e* = 1 - 0.000825 / 0.011 = 92.5%. The 20-times price gap gives a wide margin, so **cost is rarely the limit. Quality is.** The margin shrinks when the cheap price jumps. A 150,000-token prompt puts Haiku 5.5 in its long tier: 150,000 x 0.50 / 1M + 500 x 2.50 / 1M = $0.07625, against Sonnet at $0.305. Then e* = 1 - 0.07625 / 0.305 = 75%.
+There is an escalation rate above which the cascade costs more than sending everything to the strong model. With a 20-times price gap between the cheap and strong model, that rate is very high, so **cost is rarely the limit. Quality is.** The margin shrinks when the cheap price jumps. A very long prompt puts Haiku 5.5 in its long-context price tier, the gap narrows, and the break-even rate falls.
 
 ### Quality decides
 
-Say, illustratively, all-Sonnet passes 95% of the eval. In the cascade, Haiku keeps 70% and 97% of those pass. Sonnet passes 90% of the harder 30%. Overall: 0.7 x 0.97 + 0.3 x 0.90 = 94.9%. Cost per passing answer is $0.00385 / 0.949 = $0.00406, against $0.011 / 0.95 = $0.01158. That is 65% less for 0.1 point of pass rate. If Haiku's accepted pass rate were 90%, the total would be 0.7 x 0.90 + 0.27 = 90.0% and the cascade would fail the bar. The eval gates the cascade, not the price table.
+Say, illustratively, all-Sonnet passes 95% of the eval. In the cascade, Haiku keeps most requests and nearly all of those pass. Sonnet handles the harder rest at a slightly lower pass rate. Overall the cascade matches the pass rate and costs much less per passing answer. But if Haiku's accepted answers passed less often, the total would fall below the bar and the cascade would fail. The eval gates the cascade, not the price table.
 
 Two practical points (our reading). A cascade cannot stream the cheap answer while the check runs, or an escalated request would show text and then replace it, so buffer it. That adds the check time to every request. And the escalated path sets p95 latency: cheap call, check, strong call.
 
@@ -197,9 +181,9 @@ Lesson [A9.5](/learn/ai/a9-llmops/provider-failover/) taught which errors justif
 
 ### The retry budget
 
-When a provider fails, every client retries. With three attempts each, 1,000 requests per second become 3,000 attempts per second at a provider that is already down. Google's SRE book sets "a per-request retry budget of up to three attempts" and a per-client rule: "A request will only be retried as long as this ratio is below 10%". The first rule alone lets traffic grow "to somewhere just below 3X". Adding the ratio "reduces the growth to just 1.1x in the general case". The book warns that if several layers retried, "we'd have a combinatorial explosion".
+When a provider fails, every client retries. With three attempts each, one failing call becomes three at a provider that is already down. Google's SRE book sets "a per-request retry budget of up to three attempts" and a per-client rule: "A request will only be retried as long as this ratio is below 10%". The first rule alone lets traffic grow "to somewhere just below 3X". Adding the ratio "reduces the growth to just 1.1x in the general case". The book warns that if several layers retried, "we'd have a combinatorial explosion".
 
-**Worked example.** 1,000 first attempts per second reach provider A, which returns 529 on every call. No budget: 3 x 1,000 = 3,000 attempts per second. A 10% budget: 1,000 + 100 = 1,100.
+**Worked example.** Provider A returns 529 on every call. With no budget, load on A triples. With a 10% budget, load rises only a little.
 
 Build it as a token bucket that requests fill. Each first attempt adds 0.1 token. Each retry spends 1. An empty bucket means no retry: the call goes to the fallback or fails fast. Retry in one layer, the gateway. Give apps a fast error with `retry-after`. Never retry a spend-cap 429 or a 402. A fallback is a first attempt at B, but B has limits too, and a sharp rise can trigger an acceleration-limit 429 (the Anthropic page says to ramp up gradually). So B gets its own budget and ramp.
 
@@ -207,7 +191,7 @@ Build it as a token bucket that requests fill. Each first attempt adds 0.1 token
 
 Walk down a list. The order is a product decision.
 
-1. **Same quality, second provider**, one that passed the route's golden set. Its cache is cold: a Sonnet 5.5 cache read is $0.10 against $2, so the cached part costs up to 20 times more at first.
+1. **Same quality, second provider**, one that passed the route's golden set. Its cache is cold: a cache read costs a small fraction of normal input, so the cached part costs far more at first.
 2. **Lower quality:** a smaller model, a lower `max_tokens`, a lower reasoning budget (lesson [A4.7](/learn/ai/a4-context/reasoning-budgets/)). Mark it in `x-gw-model`.
 3. **Stale cache**, labeled.
 4. **Queue** work that can wait, through the batch path.
@@ -237,7 +221,7 @@ Put `tenant_id` in. Use the resolved model id, not the alias, so a route change 
 
 **Poisoning.** A cache also stores bad answers. Say a retrieved page holds hidden instructions (lesson [A10.2](/learn/ai/a10-safety/prompt-injection/)) and the model follows them. If that answer is cached under a key other tenants reach, every reader gets it. Keep the tenant in the key, and do not cache answers built from untrusted context unless its hash is in the key. Metric: cross-tenant cache hits must read 0, except in a namespace a team opts into for public data.
 
-**Cost of isolation.** If 100 tenants send one public prompt, a shared cache has 1 miss and 99 hits, and tenant keys have 100 misses. On Sonnet 5.5 that is 99 x $0.011 = $1.09 per distinct prompt. A small price for a leak you cannot undo.
+**Cost of isolation.** If many tenants send one public prompt, a shared cache has one miss and many hits, while tenant keys have a miss for each tenant. That is a small price for a leak you cannot undo.
 
 ## Design point: exact cost attribution
 
@@ -248,9 +232,9 @@ Lesson [A3.9](/learn/ai/a3-llm-apis/cost-metering/) taught metering one call. A 
 3. **Mirror tags at the provider where you can.** On AWS Bedrock, an application inference profile takes tags, and "Usage and costs for requests made to that Region with that model will be tracked". That is a second ledger you did not write.
 4. **Reconcile monthly.**
 
-**Worked example (illustrative).** Ledger: team A $18,420, team B $14,960, team C $8,440, total $41,820. The invoice is $42,310. The gap is $490, or 490 / 42,310 = 1.16%, above the 0.5% bar. The hunt finds $310 from a script using the raw provider key, and $180 from streams the client cut, which have no usage event in the ledger (check how your provider bills a cut stream). The fix: remove raw keys, and log a partial row from the last event seen.
+**Worked example (illustrative).** The ledger total for all teams is a little below the invoice. The gap is above the 0.5% bar. The hunt finds a script using the raw provider key, and streams the client cut, which have no usage event in the ledger (check how your provider bills a cut stream). The fix: remove raw keys, and log a partial row from the last event seen.
 
-**Why estimates drift.** Tokenizers change: lesson [A3.9](/learn/ai/a3-llm-apis/cost-metering/) quotes about 30% more tokens from Anthropic's newer one, so an old estimator reads 1 / 1.3 = 77% of the truth, 23% low. Streaming hides usage: Azure says that when streaming, "prompt tokens are always estimated". And token classes have different prices: a Sonnet 5.5 cache read is 0.05 times input price, and batch is half.
+**Why estimates drift.** Tokenizers change: lesson [A3.9](/learn/ai/a3-llm-apis/cost-metering/) quotes noticeably more tokens from Anthropic's newer one, so an old estimator reads low. Streaming hides usage: Azure says that when streaming, "prompt tokens are always estimated". And token classes have different prices: a Sonnet 5.5 cache read costs a small fraction of input, and batch is half.
 
 **Enforcement.** At 80% of budget the budget service alerts. At 100% it zeroes that team's bucket and the gateway answers 402. Others keep running. Rotating the shared provider key would stop everyone.
 
@@ -289,7 +273,7 @@ Lesson [A3.9](/learn/ai/a3-llm-apis/cost-metering/) taught metering one call. A 
         'The provider, because spend and 429s rose together',
       ],
       answer: 2,
-      explain: 'It sends 220 x 41,200 = 9.06M input tokens a minute, almost the whole 10M limit, at a normal request rate. A request limit sees 220 against 200. The teams with 429s are victims.',
+      explain: 'It sends a huge number of input tokens a minute, almost the whole provider limit, at a normal request rate. A request limit sees a flat count. The teams with 429s are victims.',
     },
     {
       prompt: 'It is 03:12. What do you do first?',
@@ -331,44 +315,13 @@ Spend 10 to 15 minutes. The gateway routes and fails over by evals, and those ev
 - **CI gates.** CI means continuous integration: a check on each pull request. The gate script returns an **exit code**, 0 for pass and 1 for fail, and a 1 blocks the merge button. The promptfoo docs mark `--fail-on-error` with "Fail on any test failures". Their pass-rate example is a script that exits with status 1 below 95%.
 - **Trace import and labeling.** Bad production traces (lesson [A9.1](/learn/ai/a9-llmops/tracing/)) go to a human labeling queue (lesson [A8.9](/learn/ai/a8-evals/feedback-flywheel/)). Labels become new cases and retest the judge.
 
-**A failure to design for: a noisy gate.** At 400 cases and a 95% pass rate, the 95% margin is 1.96 x sqrt(0.95 x 0.05 / 400) = 1.96 x 0.0109, about 2.1 points. A hard 95% line on 400 cases blocks good changes about as often as it passes them when the true rate sits near it. Two fixes: compare with the baseline on the same cases and count flips (lesson [A8.1](/learn/ai/a8-evals/eval-driven-design/)), and gate by slice, so no slice may fall more than 5 points. A flaky gate gets switched off, so stability is part of the bar.
+**A failure to design for: a noisy gate.** A golden set is a sample, so its pass rate has a margin of error. A hard pass line on a small set blocks good changes about as often as it passes them when the true rate sits near the line. Two fixes: compare with the baseline on the same cases and count flips (lesson [A8.1](/learn/ai/a8-evals/eval-driven-design/)), and gate by slice, so no slice may fall more than a set number of points. A flaky gate gets switched off, so stability is part of the bar.
 
 Step through the gate. First a regression, then the fix.
 
 <Ai13GatewayCiGate client:visible />
 
-**Prove it.** Eval cost per release is cases x runs x price per judged answer.
-
-<Ballpark
-  client:visible
-  title="Eval cost of one release"
-  scenario="A release runs a 1,200-case golden set, 3 runs per case. The judge is OpenAI gpt-6.1-sol at $2.00 in and $10.00 out per million tokens, with 2,000 tokens read and 150 written per verdict. The candidate is Claude Sonnet 5.5 ($2 and $10) on the reference request of 3,000 in and 500 out. Prices as of 2026-10-19."
-  steps={[
-    {
-      prompt: 'Cost of one judge verdict, in dollars?',
-      unit: 'dollars',
-      answer: 0.0055,
-      within: 1.1,
-      explain: '2,000 x $2 / 1M = $0.004. 150 x $10 / 1M = $0.0015. Total $0.0055.',
-    },
-    {
-      prompt: 'Judge cost of the whole release, in dollars?',
-      unit: 'dollars',
-      answer: 19.8,
-      within: 1.1,
-      explain: '1,200 x 3 = 3,600 judged answers. 3,600 x $0.0055 = $19.80.',
-    },
-    {
-      prompt: 'Add the candidate answers at $0.011 each. Total, in dollars?',
-      unit: 'dollars',
-      answer: 59.4,
-      within: 1.1,
-      explain: '3,600 x $0.011 = $39.60. Plus $19.80 is $59.40. Through the Batch API at 50% off it is $29.70.',
-    },
-  ]}
-/>
-
-A smoke gate of 100 cases x 1 run costs 100 x ($0.0055 + $0.011) = $1.65 per pull request. Run the full set at release and the smoke set on each pull request. Labels cost more, as people's time, which we do not price.
+**Cost of the gate.** Eval cost per release is cases times runs times the price per judged answer, plus the candidate calls. A full golden set at release is a modest bill. A small smoke set on each pull request is far cheaper. So run the full set at release and the smoke set on each pull request. Labels cost more, as people's time, which we do not price.
 
 ## Staff answer vs senior answer
 
@@ -385,7 +338,7 @@ A smoke gate of 100 cases x 1 run costs 100 x ($0.0055 + $0.011) = $1.65 per pul
 1. **A spend-cap 429 never clears.** Retrying, "including the SDK's automatic retries, fails until access resumes", at 00:00 UTC on the first of next month. Our reading: set your own limit lower and stop retries on `enforced_spend_limit_reached`. [Rate limits](https://platform.claude.com/docs/en/api/rate-limits).
 2. **`max_tokens` counts under one provider and not another.** Anthropic leaves it out of OTPM. OpenAI uses the maximum of it and an estimate, and advises setting it close to the expected answer. A gateway that reserves output should do the same. [OpenAI rate limits](https://developers.openai.com/api/docs/guides/rate-limits).
 3. **A provider can degrade with no error.** Anthropic's own evals "simply didn't capture the degradation". Our reading: probe each route yourself. [Postmortem](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues).
-4. **Cap retries as a ratio.** Retry only while retries are under 10% of requests, which cuts a worst case near 3 times to 1.1 times. [Google SRE book](https://sre.google/sre-book/handling-overload/).
+4. **Cap retries as a ratio.** Retry only while retries are under 10% of requests, which cuts the worst case from about 3 times the load to barely above 1. [Google SRE book](https://sre.google/sre-book/handling-overload/).
 5. **Gateway token limits are approximate.** Azure says concurrent requests "can temporarily exceed the configured token limit", and each gateway counts alone. Our reading: leave headroom, count in a shared store. [Azure policy](https://learn.microsoft.com/en-us/azure/api-management/llm-token-limit-policy).
 6. **Shared caches need the tenant in the key.** APISIX warns of cross-consumer reads. Cloudflare keys on the entire request and lets the caller set a custom key. Our reading: audit everything that can shorten the key. [APISIX](https://apisix.apache.org/docs/apisix/plugins/ai-cache/), [Cloudflare](https://developers.cloudflare.com/ai-gateway/features/caching/).
 
@@ -412,44 +365,21 @@ Do not limit by request count alone: one team can send huge prompts at a normal 
 
 ## Check yourself
 
-<Ballpark
-  client:visible
-  title="Blended cost per million tokens of a cascade"
-  scenario="Every request goes to Claude Haiku 5.5 ($0.10 in, $0.50 out per million tokens). A free code check keeps 70% of answers. The other 30% escalate to Claude Sonnet 5.5 ($2 in, $10 out) and also pay for the Haiku call. Each request has 3,000 input and 500 output tokens. Prices as of 2026-10-19."
-  steps={[
-    {
-      prompt: 'Cost per request of the cascade at 30% escalation, in dollars? (A Haiku call is $0.00055.)',
-      unit: 'dollars',
-      answer: 0.00385,
-      within: 1.1,
-      explain: 'Every request pays $0.00055. The 30% also pay $0.011. 0.00055 + 0.3 x 0.011 = $0.00385.',
-    },
-    {
-      prompt: 'Blended price per million tokens (3,500 tokens per request), in dollars?',
-      unit: 'dollars',
-      answer: 1.1,
-      within: 1.1,
-      explain: '$0.00385 / 3,500 x 1,000,000 = $1.10. All Sonnet is $0.011 / 3,500 x 1,000,000 = $3.14.',
-    },
-    {
-      prompt: 'At what escalation rate does the cascade cost the same as all Sonnet? Answer in percent.',
-      unit: 'percent',
-      answer: 95,
-      within: 1.1,
-      explain: '0.00055 + e x 0.011 = 0.011 gives e = 1 - 0.00055 / 0.011 = 0.95, or 95%.',
-    },
-  ]}
-/>
 
 <Quiz
   client:visible
   questions={[
     {
       id: 'ai13-gw-q-reserve-charge',
-      q: 'A gateway reserves input plus max_tokens, then refunds the unused part. A request has 3,000 input tokens, max_tokens of 2,000, and the model writes 400. What does the bucket finally keep charged?',
-      options: ['5,000 tokens', '3,400 tokens', '3,000 tokens', '2,400 tokens'],
+      q: 'A gateway reserves input plus max_tokens at the door, then refunds the unused part when the call ends. Which statement about the final charge is right?',
+      options: [
+        'It is input plus the full max_tokens, since that was reserved',
+        'It is input plus the output the model actually wrote',
+        'It is input only, since output is billed by the provider',
+        'It is the average of the reserve and the real output',
+      ],
       answer: 1,
-      explain: 'The reserve is 3,000 + 2,000 = 5,000. The refund is 2,000 - 400 = 1,600. The final charge is 3,400: input plus real output. The reserve only holds tokens while the call runs.',
+      explain: 'The refund returns the unused part of the reserve, so the final charge is the input plus the real output. The reserve only holds tokens while the call runs. Charging the full max_tokens would overbill. Output is metered at the gateway too.',
     },
     {
       id: 'ai13-gw-q-overreserve',
@@ -465,10 +395,15 @@ Do not limit by request count alone: one team can send huge prompts at a normal 
     },
     {
       id: 'ai13-gw-q-retry-budget',
-      q: 'A gateway sends 1,000 first attempts per second to a provider that fails every call. It uses a 10% retry budget. About how many attempts per second reach that provider?',
-      options: ['3,000', '100', '1,100', '2,000'],
-      answer: 2,
-      explain: 'The 1,000 first attempts always go. Retries stop at 10% of requests, which is 100 per second. So 1,100. With three attempts each and no budget it would be 3,000.',
+      q: 'A provider fails every call and every client retries. The gateway adds a retry budget of about 10% of requests. What does that do to the load on the failing provider?',
+      options: [
+        'It triples the load, since every call is retried',
+        'It keeps the load only a little above the first attempts',
+        'It halves the load, since half the retries are dropped',
+        'It cuts the load to zero, since retries stop at once',
+      ],
+      answer: 1,
+      explain: 'The first attempts always go. Retries are allowed only while they stay under a small share of requests, so the load rises only a little. With three tries per layer and no budget, the load would triple. A budget limits retries. It does not remove all load.',
     },
     {
       id: 'ai13-gw-q-cache-tenant',
@@ -481,6 +416,30 @@ Do not limit by request count alone: one team can send huge prompts at a normal 
       ],
       answer: 1,
       explain: 'The key leaves out the system prompt, the context, and the tenant, so both requests map to one entry. Y can read an answer built from X data. Hash the tenant and the whole request into the key.',
+    },
+    {
+      id: 'ai13-gw-q-cascade-cost',
+      q: 'A gateway sends every request to a cheap model first and escalates a share to a strong model. When does the cascade stop being cheaper than sending everything to the strong model?',
+      options: [
+        'Almost never, since the price gap between the models is wide',
+        'As soon as any request escalates to the strong model',
+        'When the check costs anything at all per request',
+        'Whenever the cheap model fails a single eval case',
+      ],
+      answer: 0,
+      explain: 'Escalated requests pay twice, but the cheap model costs a small fraction of the strong one, so the escalation rate must be very high before the cascade loses on price. Quality is the real limit: the cheap model\'s accepted answers must still pass the eval. A small check cost or one eval miss does not flip the sums.',
+    },
+    {
+      id: 'ai13-gw-q-eval-cost',
+      q: 'A team runs its full golden set, several runs per case, on every pull request. The eval bill grows fast. Which change keeps the gate and cuts the bill?',
+      options: [
+        'Drop the judge and read every verdict by hand',
+        'Run only a small smoke set on pull requests, the full set at release',
+        'Skip the eval whenever the diff looks small to the author',
+        'Use one run per case and raise the pass line to match',
+      ],
+      answer: 1,
+      explain: 'A small smoke set on each pull request catches gross regressions cheaply, and the full set at release gives the real score. Hand review costs more, as people\'s time. Skipping on a hunch removes the gate. One run raises noise, and a higher line blocks good changes.',
     },
   ]}
 />

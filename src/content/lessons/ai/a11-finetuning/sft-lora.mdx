@@ -5,7 +5,6 @@ requires: ['ai/a11-finetuning/when-to-finetune', 'ai/a2-inference-cost/gpu-memor
 
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import Math from '../../../../components/lesson/Math.astro';
 import Ai11LoraWalk from '../../../../components/anim/lessons/Ai11LoraWalk.tsx';
 import Ai11LoraMemCalc from '../../../../components/anim/lessons/Ai11LoraMemCalc.tsx';
@@ -39,7 +38,7 @@ Here is one training step, in plain words.
 
 The learning rate is a dial with two ways to go wrong. Too big, and you overshoot the valley and bounce around. Too small, and you creep so slowly that you never arrive.
 
-One concrete step. A weight is 0.50. Its gradient is 2.0, so the loss rises when the weight rises. The learning rate is 0.01. The new weight is 0.50 − 0.01 × 2.0 = 0.48. A real run repeats this for 70 billion weights, thousands of times.
+One concrete step. A weight has a gradient that says the loss rises when the weight rises. So the step nudges that weight down by a small amount. A real run repeats this for 70 billion weights, thousands of times.
 
 The rule that turns gradients into steps is the **optimizer**. The usual choice is **Adam**. Adam does one extra thing: for every weight it also remembers two running averages of recent gradients. They steady the steps, like a heavy ball rolling downhill. Keep this in mind. Those two extra numbers per weight are the source of the memory bill in Question 3.
 
@@ -66,26 +65,18 @@ So the training data is the product. 200 reviewed examples that show exactly the
 
 ## The naive way: change every weight
 
-The simplest plan is to run the loop above on all 70 billion weights. This is **full fine-tuning**. It works. It is also expensive, because each weight needs more than itself in memory. Count it up, one weight at a time.
+The simplest plan is to run the loop above on all 70 billion weights. This is **full fine-tuning**. It works. It is also expensive, because each weight needs more than itself in memory. Look at what each weight needs.
 
-- **The weight itself.** Stored in a 16-bit format called BF16: 2 bytes.
-- **Its gradient.** The same size as the weight: 2 bytes.
-- **A master copy in 32 bits.** Why? Each step is tiny, like 0.0003. A 16-bit number rounds a change that small away. So the optimizer keeps a precise 32-bit copy and adds the tiny steps to it. Picture a ledger kept in cents, with a balance shown in rounded dollars. Cost: 4 bytes.
-- **Adam's two running averages.** 4 bytes each, 8 in total.
+- **The weight itself.** Stored in a 16-bit format called BF16.
+- **Its gradient.** The same size as the weight.
+- **A master copy in 32 bits.** Why? Each step is tiny, like 0.0003. A 16-bit number rounds a change that small away. So the optimizer keeps a precise 32-bit copy and adds the tiny steps to it. Picture a ledger kept in cents, with a balance shown in rounded dollars. This copy is twice the size of the weight.
+- **Adam's two running averages.** Each is 32 bits, so together they are the largest part.
 
-<Math block tex="\text{bytes per weight} = 2 + 2 + 4 + 4 + 4 = 16" />
+Add it up and training holds about 8 times the memory that serving needs, roughly 16 bytes per weight against 2. For a 70B model that is over a terabyte, so you need a rack of 80 GB GPUs. And that is before **activations**. Activations are the in-between results the model saves during its guess, so it can compute gradients afterward. They grow with the **batch** (how many examples you train on at once) and the length of the text.
 
-For 70 billion weights:
+The 16-byte count is the standard accounting for mixed-precision training with Adam, from Microsoft's ZeRO paper. Other papers count differently, and field note 4 below shows how big the gap can be. Always check the accounting for your own setup.
 
-```text
-70,000,000,000 weights x 16 bytes = 1,120,000,000,000 bytes = 1.12 TB
-```
-
-That is 8 times the 140 GB needed to serve the same model. On 80 GB GPUs it takes at least 1,120 / 80 = 14 of them, and that is before **activations**. Activations are the in-between results the model saves during its guess, so it can compute gradients afterward. They grow with the **batch** (how many examples you train on at once) and the length of the text.
-
-The 16-byte count is the standard accounting for mixed-precision training with Adam, from Microsoft's ZeRO paper. Other papers count differently, and field note 4 below shows how big the gap can be. Always do your own arithmetic.
-
-Full fine-tuning has a second cost. Every fine-tune produces a full-size copy of the model. Ten customers means ten copies of 140 GB.
+Full fine-tuning has a second cost. Every fine-tune produces a full-size copy of the model. Ten customers means ten full copies of the model.
 
 ## Question 3: what if we train only a thin side path?
 
@@ -93,7 +84,7 @@ Look at what SFT changes. It teaches a habit, such as a tone or a format. Do you
 
 Three terms first.
 
-**Matrix.** A matrix is a grid of numbers. Each layer of the model multiplies its input list by a grid. Each output number is a weighted sum of the inputs. Tiny example: weights [0.5, 2] and inputs [4, 1] give 0.5 × 4 + 2 × 1 = 4. Almost all of a model's weights live in such grids. In Llama 3 70B, a typical grid is 8,192 x 8,192, which is 67,108,864 numbers.
+**Matrix.** A matrix is a grid of numbers. Each layer of the model multiplies its input list by a grid. Each output number is a weighted sum of the inputs. Almost all of a model's weights live in such grids. In a 70B model, a typical grid is about 8,000 by 8,000, which is tens of millions of numbers.
 
 **Rank.** Picture a spreadsheet with 8,192 rows. If every row is a mix of the same 16 base rows, the sheet has **rank** 16. It looks big, but it holds only 16 independent patterns. A thin pair of grids can build such a sheet. Grid B is 8,192 rows by 16 columns. Grid A is 16 rows by 8,192 columns. Multiply them and you get a full 8,192 x 8,192 sheet of rank 16.
 
@@ -105,15 +96,7 @@ Now the idea in one line. **Freeze** the big grid W: its numbers are read and ne
 
 In words: h is the layer's output, x is its input, r is the rank, and the fraction is a fixed scale factor you set once. The picture: a 500-page book you may not reprint. You add a two-page errata sheet and read it alongside.
 
-The size gain, for one 8,192 x 8,192 grid at rank 16:
-
-```text
-full grid:   8,192 x 8,192            = 67,108,864 numbers
-adapter:     16 x (8,192 + 8,192)     =    262,144 numbers
-ratio:       262,144 / 67,108,864     = 1/256, about 0.39%
-```
-
-Put an adapter on every grid of Llama 3 70B (all seven in each of its 80 layers) at rank 16, and the total is 207,093,760 numbers, 0.30% of the model. The LoRA authors report 10,000 times fewer trainable numbers on the 175B GPT-3, with a rank of 4 on two grids per layer.
+The size gain is large. The thin pair holds a tiny fraction of the numbers in the full grid, about 1/256 for this grid at rank 16. Put an adapter on every grid of a 70B model and the trainable part is still only about 0.3% of the model. The LoRA authors report thousands of times fewer trainable numbers on the 175B GPT-3.
 
 Step through one layer.
 
@@ -121,7 +104,7 @@ Step through one layer.
 
 ### Why training gets cheaper
 
-Memory first. The gradient, the master copy, and Adam's two averages (14 of the 16 bytes per weight) are only kept for numbers you train. For LoRA that is 0.30% of the model. The frozen base needs only its 2 bytes per weight.
+Memory first. The gradient, the master copy, and Adam's two averages (14 of the 16 bytes per weight) are only kept for numbers you train. For LoRA that is a tiny share of the model. The frozen base needs only its 2 bytes per weight.
 
 Compute next. For each layer, a training pass does three equal-sized multiplications: one forward, one to send the gradient back to the layer's input, and one to get the gradient of the weights. LoRA skips the third one on the big grid, so it does about two thirds of the work. Thinking Machines measured "slightly more than two thirds" of the compute of full fine-tuning. The extra bit is the adapter's own work.
 
@@ -129,7 +112,7 @@ Compute next. For each layer, a training pass does three equal-sized multiplicat
 
 When training ends, you can add the product into the grid once: W becomes W + (α/r) B A. The layer has its old shape. The model runs at the same speed as the base. The LoRA authors call this "no additional inference latency".
 
-Or keep the adapter as a separate small file. A base model is a shared program, and an adapter is a per-customer config file. The LoRA authors' example: 100 adapted GPT-3 models cost 350 GB + 100 x 35 MB ≈ 354 GB, instead of 35 TB for 100 full copies. The vLLM serving engine can attach adapters per request "with minimal overhead". Thinking Machines built its managed Tinker service on LoRA for this reason: "we can share the same pool of compute between multiple training runs".
+Or keep the adapter as a separate small file. A base model is a shared program, and an adapter is a per-customer config file. The LoRA authors' example: 100 adapted GPT-3 models cost about the size of one base plus 100 small files, instead of 100 full copies. The vLLM serving engine can attach adapters per request "with minimal overhead". Thinking Machines built its managed Tinker service on LoRA for this reason: "we can share the same pool of compute between multiple training runs".
 
 ## Question 4: can we shrink the frozen part too?
 
@@ -143,16 +126,7 @@ After LoRA, the 140 GB base is the biggest item left. It never changes. So it do
 
 During each step, the model un-compresses one block at a time to 16 bits, does the math, and drops it. The adapters stay in 16 bits, and they are what gets trained.
 
-The numbers for 70B:
-
-```text
-base:       70e9 x (4 + 0.127) bits / 8   =  36.1 GB
-adapters:   207,093,760 x 16 bytes        =   3.3 GB
-activations (assumed)                     =  10   GB
-total                                     =  49.4 GB
-```
-
-It fits one 80 GB GPU, with room. It does not fit one 48 GB GPU at this activation size. The QLoRA authors' own headline is a 65B model on a single 48 GB GPU, which is 65e9 x 0.516 = 33.5 GB of base, so there is more room left. They trained their Guanaco chat models in 24 hours on one GPU, and report 99.3% of ChatGPT's score on a chat-quality benchmark (their 2023 result).
+For a 70B model, the 4-bit base shrinks to roughly a quarter of its 16-bit size. The adapters add a little, and activations add more. The whole job fits on one 80 GB GPU with room to spare. It does not fit a smaller 48 GB GPU at a large activation size. The QLoRA authors' own headline is a 65B model on a single 48 GB GPU. They trained their Guanaco chat models in 24 hours on one GPU, and report 99.3% of ChatGPT's score on a chat-quality benchmark (their 2023 result).
 
 Try the three methods side by side. Change the model, the rank, and the activation assumption.
 
@@ -172,15 +146,15 @@ LoRA adds a few dials. Four findings matter. The first three come from Thinking 
 
 ## Numbers
 
-Training memory, from the calculator's model. Activations assumed at 10 GB. Rank 16. GPUs of 80 GB.
+Training memory, from the calculator above, in words.
 
 | Model | Full fine-tune | LoRA (16-bit base) | QLoRA (4-bit base) |
 |---|---|---|---|
-| Llama 3 8B | 138 GB (2 GPUs) | 26.7 GB (1) | 14.8 GB (1) |
-| Llama 3 70B | 1,130 GB (15 GPUs) | 153 GB (2) | 49.4 GB (1) |
-| Llama 3 405B | 6,490 GB (82 GPUs) | 830 GB (11) | 229 GB (3) |
+| Small (8B) | A couple of GPUs | One GPU | One small GPU |
+| Medium (70B) | A rack of GPUs | A couple of GPUs | One GPU |
+| Huge (405B) | A cluster | A rack of GPUs | A few GPUs |
 
-Every design needs three more numbers:
+Every design needs three more checks:
 
 - **Quality bar.** Your test score on the target failure, plus a general test that must hold. Measure before and after.
 - **Latency budget.** A merged adapter decodes at base-model speed. An unmerged one adds a small amount of work per layer. Measure both on your serving engine.
@@ -190,7 +164,7 @@ Every design needs three more numbers:
 
 | Method | You gain | You pay | Choose it when |
 |---|---|---|---|
-| Full fine-tune | Most capacity to learn | 16 bytes per weight, a full copy per model | You have large data and a big GPU cluster |
+| Full fine-tune | Most capacity to learn | Several times the serving memory, a full copy per model | You have large data and a big GPU cluster |
 | LoRA | About 0.3% trainable, small files, swappable per customer | A capacity ceiling on very large data | Most SFT jobs |
 | QLoRA | Biggest model on the least memory | Slower steps, and quantization error in the base | The model barely fits, or GPUs are scarce |
 
@@ -202,7 +176,7 @@ Every design needs three more numbers:
 
 3. **Put adapters on the MLP grids, not only attention.** Many tutorials target only the attention grids. Thinking Machines found attention-only LoRA trails MLP-only LoRA, even at higher rank. Use "all linear layers" in your trainer. Source: [LoRA Without Regret](https://thinkingmachines.ai/blog/lora/).
 
-4. **Published memory ratios disagree, because they count differently.** The QLoRA paper says full 16-bit fine-tuning of a 65B model needs "more than 780 GB". That is 12 bytes per weight. The ZeRO accounting gives 16 bytes, so 1.04 TB for 65B. The LoRA paper's 175B figure, 1.2 TB, is about 7 bytes per weight. None is wrong; they use different optimizers, precisions, and parallelism. Do the sum for your own setup before you rent GPUs. Sources: [QLoRA paper](https://arxiv.org/abs/2305.14314), [ZeRO paper](https://arxiv.org/abs/1910.02054), [LoRA paper](https://arxiv.org/abs/2106.09685).
+4. **Published memory ratios disagree, because they count differently.** The QLoRA paper says full 16-bit fine-tuning of a 65B model needs "more than 780 GB". The ZeRO accounting gives a larger figure per weight, and the LoRA paper's 175B figure is smaller still. None is wrong; they use different optimizers, precisions, and parallelism. Do the sum for your own setup before you rent GPUs. Sources: [QLoRA paper](https://arxiv.org/abs/2305.14314), [ZeRO paper](https://arxiv.org/abs/1910.02054), [LoRA paper](https://arxiv.org/abs/2106.09685).
 
 5. **LoRA learns less and forgets less, so match it to the data.** For a few thousand examples that teach a habit, LoRA matches full fine-tuning. For continued training on a large new domain, it can fall short. Check the size of what you want to teach before you pick the method. Source: [LoRA Learns Less and Forgets Less](https://arxiv.org/abs/2405.09673).
 
@@ -211,7 +185,7 @@ Every design needs three more numbers:
 ## Interview lens
 
 <Callout type="tip">
-Say: "Full fine-tuning keeps 16 bytes per weight: 2 for the weight, 2 for the gradient, 4 for a master copy, and 8 for Adam's two averages. For 70B that is 1.12 TB. LoRA freezes the base and trains two thin matrices, about 0.3% of the weights, so the training state nearly vanishes. QLoRA stores the frozen base in 4 bits, so a 70B base is about 36 GB. I raise the learning rate about 10x for LoRA, and I test general skills after training." That shows the derivation and the traps.
+Say: "Full fine-tuning keeps the weight, its gradient, a master copy, and Adam's two averages for every weight. That is about 8 times the memory of serving. LoRA freezes the base and trains two thin matrices, about 0.3% of the weights, so the training state nearly vanishes. QLoRA stores the frozen base in 4 bits, so a 70B base fits on one GPU. I raise the learning rate about 10x for LoRA, and I test general skills after training." That shows the derivation and the traps.
 </Callout>
 
 <Callout type="mistake">
@@ -224,16 +198,26 @@ Do not say "LoRA makes the model smaller" or "LoRA is always as good as full fin
   client:visible
   questions={[
     {
-      q: 'You fully fine-tune a 30B model with Adam in mixed precision at 16 bytes per weight. About how much memory do the weights, gradients, and optimizer state take, before activations?',
-      options: ['60 GB', '240 GB', '480 GB', '960 GB'],
-      answer: 2,
-      explain: '30 billion x 16 bytes = 480 GB. 60 GB would be only the 2-byte weights. 960 GB would be 32 bytes per weight, which no standard accounting uses.',
+      q: 'Why does fully fine-tuning a model take several times the memory of just serving it?',
+      options: [
+        'Training keeps a gradient, a master copy, and Adam notes per weight',
+        'Training loads the model twice, once for each GPU in the job',
+        'Serving compresses the weights, but training cannot use compression',
+        'Training stores every example in the dataset next to the weights',
+      ],
+      answer: 0,
+      explain: 'For every weight, training also keeps its gradient, a precise master copy, and two running averages. Serving needs only the weight. Training does not load the model twice, and the dataset does not sit next to the weights.',
     },
     {
-      q: 'A LoRA adapter sits on a 4,096 x 4,096 grid at rank 8. How many trainable numbers does it hold?',
-      options: ['32,768', '65,536', '16,777,216', '131,072'],
-      answer: 1,
-      explain: 'The adapter has A (8 x 4,096) and B (4,096 x 8): 8 x (4,096 + 4,096) = 65,536. 16,777,216 is the full grid. 32,768 counts only one of the two thin grids.',
+      q: 'A LoRA adapter replaces a big grid update with two thin grids. Why does that make training cheaper?',
+      options: [
+        'Only the thin grids need gradients and Adam state',
+        'The big grid is deleted and the thin grids replace it',
+        'Thin grids always give a better final score than full tuning',
+        'The thin grids skip the loss and train on guesses alone',
+      ],
+      answer: 0,
+      explain: 'The big grid stays frozen, so it needs no gradient or Adam notes. Only the small adapter does. The big grid is not deleted, since the layer still uses it. LoRA matches full tuning on small data but does not always beat it.',
     },
     {
       q: 'You train a LoRA adapter with the learning rate that worked for full fine-tuning. The loss barely moves. What is the best first change?',
@@ -257,34 +241,16 @@ Do not say "LoRA makes the model smaller" or "LoRA is always as good as full fin
       answer: 0,
       explain: 'Adapter state is about 3.3 GB here, against 36 GB of base and the activations. Halving rank saves about 1.7 GB. Rank does change the number of trained values, and Adam keeps no notes for frozen weights.',
     },
-  ]}
-/>
-
-<Ballpark
-  client:visible
-  title="QLoRA on a 70B model"
-  scenario="You want to fine-tune a 70-billion-weight model. First size the 4-bit base. Then see what full fine-tuning would have needed."
-  steps={[
     {
-      prompt: 'How many GB does the 4-bit base take, at 0.5 byte per weight, ignoring scale constants?',
-      unit: 'GB',
-      answer: 35,
-      within: 1.1,
-      explain: '70 billion x 0.5 byte = 35 billion bytes = 35 GB. The scale constants add about 1 GB, which gives the 36.1 GB used earlier.',
-    },
-    {
-      prompt: 'How many GB would full fine-tuning need for weights, gradients, and optimizer state at 16 bytes per weight?',
-      unit: 'GB',
-      answer: 1120,
-      within: 1.1,
-      explain: '70 billion x 16 bytes = 1,120 billion bytes = 1,120 GB, or 1.12 TB.',
-    },
-    {
-      prompt: 'How many 80 GB GPUs does that take at the least?',
-      unit: 'GPUs',
-      answer: 14,
-      within: 1.1,
-      explain: '1,120 / 80 = 14. Activations and the cost of splitting the job across GPUs come on top. QLoRA needs one GPU.',
+      q: 'You want to fine-tune a 70B model on one 80 GB GPU. What makes that possible?',
+      options: [
+        'Shrinking the frozen base to 4 bits and training only a small adapter',
+        'Training only the attention grids, which the GPU can hold in full',
+        'Dropping Adam and the gradient while still training every weight',
+        'Splitting each weight into two halves that train on alternate steps',
+      ],
+      answer: 0,
+      explain: 'QLoRA stores the frozen base in 4 bits and trains a small 16-bit adapter, so the heavy training state shrinks to almost nothing. Training every weight needs a gradient for each, whatever the optimizer. Attention-only LoRA still has a large frozen base to store.',
     },
   ]}
 />

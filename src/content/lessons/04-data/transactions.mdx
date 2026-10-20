@@ -124,10 +124,10 @@ So most systems avoid 2PC across services. They use a sequence of local transact
 | Same-datacenter round trip | ~0.5 ms (lesson 1.2) |
 | Log flush on SSD | ~0.1 to 1 ms (lesson 4.2) |
 
-Now one derived number that decides real designs: the **hot-row ceiling**. If transactions must queue on one row, and each holds the row lock for t milliseconds, at most 1000 / t of them finish per second.
+One idea decides real designs: the **hot-row ceiling**. If transactions must queue on one row, each one holds the row lock while the next waits. So the throughput on that row is capped by how long the lock is held, not by how fast the hardware is.
 
-- A transaction that locks the row, updates it, and commits holds the row lock for about three round trips. That is 3 × 0.5 ms, plus a log flush (up to 1 ms). That is ~2.5 ms. The ceiling is **~400 per second per row**.
-- Add one call to a payment API, ~100 ms, inside the transaction. Hold time becomes ~102 ms. The ceiling falls to **~10 per second per row**.
+- A transaction that locks the row, updates it, and commits holds the lock for a few round trips and a log flush. That is a few milliseconds, so one row can serve hundreds of these per second.
+- Add one call to a payment API inside the transaction. The lock is now held for the whole call, which is far longer than everything else. The ceiling falls by orders of magnitude.
 
 A flash sale on one product row hits this wall. Two rules follow. Keep transactions short. Never call another service while holding a lock.
 
@@ -185,10 +185,15 @@ Snapshot isolation detects conflicts by write sets: two transactions that write 
       explain: 'MVCC lets the reader see the last committed version, so reading never blocks. Two writers on one row still queue behind the row lock. Reading T1\'s uncommitted value would be a dirty read, which PostgreSQL does not allow.',
     },
     {
-      q: 'Every purchase locks the same product row for 25 ms, from lock to commit. What is the best-case number of purchases per second for that product?',
-      options: ['40', '25', '250', '1,000'],
+      q: 'Every purchase locks the same product row, and a flash sale sends thousands of purchases at it. What limits throughput on that row?',
+      options: [
+        'How long each transaction holds the lock, as writers queue',
+        'The number of CPU cores on the database server',
+        'The network bandwidth between the app and the database server',
+        'The number of replicas that copy the row afterwards',
+      ],
       answer: 0,
-      explain: 'Transactions on one row run one at a time. 1000 ms / 25 ms = 40 per second. No faster hardware raises this. Shorten the hold time, or split the row, for example into several counters.',
+      explain: 'Writers on one row run one at a time, so throughput depends on how long each holds the lock. Faster hardware does not help much. Shorten the hold time, never call another service inside the lock, or split the row, for example into several counters.',
     },
     {
       q: 'A coordinator running two-phase commit crashes after both databases voted YES and before it sent COMMIT. What is the state of the two databases?',

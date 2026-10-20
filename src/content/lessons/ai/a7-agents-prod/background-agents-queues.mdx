@@ -5,7 +5,6 @@ requires: ['ai/a7-agents-prod/durable-graph-runtime', '06-async/queues', '09-pat
 
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
 import Ai7BgLife from '../../../../components/anim/lessons/Ai7BgLife.tsx';
 import Ai7BgFair from '../../../../components/anim/lessons/Ai7BgFair.tsx';
@@ -97,44 +96,15 @@ The standard fixes are a queue per tenant, a concurrency limit per tenant, prior
 
 <Ai7BgFair client:visible />
 
-Try 100 runs from tenant A on 4 workers. First in, first out makes B's mean wait 151.2 minutes. Derivation: A's 100 runs need 100 / 4 = 25 rounds of 6 minutes. As a result, B's first runs start at round 25, 150 minutes in. With fair share, B's five runs start at 0, 0, 6, 6, and 12 minutes, a mean of 4.8. The last run in either mode starts at 156 minutes. Fair share adds no capacity. It decides who waits.
+Try a large burst from tenant A on a few workers. First in, first out makes B wait behind almost all of A's runs. With fair share, B's few runs start in the first rounds. The last run in either mode finishes at about the same time. Fair share adds no capacity. It decides who waits.
 
 ## Capacity and cost
 
-Sizing a pool is Little's law: runs in flight = arrival rate x time per run. The plan's example is 500 runs per hour at 6 minutes each. That is 500 x 6 = 3,000 busy minutes per hour, or 3,000 / 60 = 50 workers busy at the same time. At exactly 100% busy, queue wait grows without bound, so you add headroom. 2x headroom gives 100 workers.
+Sizing a pool is Little's law: runs in flight equals arrival rate times time per run. Slower runs or more arrivals mean more workers busy at the same time. At exactly 100% busy, queue wait grows without bound, so you add headroom. Plan for a pool about twice the average need, to absorb bursts and boot time.
 
 Cost has two lines. Model spend is bounded by the per-run cap, such as the `max_budget_usd` option in the Claude Agent SDK. The docs warn the last response can pass the cap by its own cost plus any running subagent spend. For that reason, leave margin. Sandbox spend is busy time times the sandbox price, plus idle capacity you keep warm. Boot time counts as busy time with no useful work in it.
 
 <Ai7BgCalc client:visible />
-
-<Ballpark
-  client:visible
-  title="Workers for 500 runs an hour"
-  scenario="500 runs arrive every hour, spread evenly. Each run takes 6 minutes, boot included. Every run has a $1 budget cap. Assume 2x headroom."
-  steps={[
-    {
-      prompt: 'How many runs are in flight at the same time, on average?',
-      unit: 'runs',
-      answer: 50,
-      within: 1.1,
-      explain: '500 runs/hour x 6 minutes = 3,000 busy minutes per hour. 3,000 / 60 = 50.',
-    },
-    {
-      prompt: 'How many workers with 2x headroom?',
-      unit: 'workers',
-      answer: 100,
-      within: 1.1,
-      explain: '50 x 2 = 100. The headroom absorbs bursts and boot time, and keeps the queue from growing without bound.',
-    },
-    {
-      prompt: 'What is the most the model spend can reach in one day, if every run hits its cap?',
-      unit: 'dollars',
-      answer: 12000,
-      within: 1.1,
-      explain: '500 x 24 = 12,000 runs. 12,000 x $1 = $12,000. This is an upper bound. Real spend is lower unless runs loop to the cap, which is why you alert on runs that reach it.',
-    },
-  ]}
-/>
 
 ## Trade-offs
 
@@ -150,7 +120,7 @@ Cost has two lines. Model spend is bounded by the per-run cap, such as the `max_
 ## Interview lens
 
 <Callout type="tip">
-Describe it as a pipeline: "Submit returns a run id with 202 and an idempotency key. A queue per tenant feeds a worker pool with fair share and concurrency limits. Each run gets its own sandbox. State is checkpointed, so a worker crash resumes instead of restarting. The output is a PR plus a notification. Capacity is runs per hour x minutes per run / 60 in flight, times 2 for headroom. Each run has a budget cap, and each queue has a cost limit."
+Describe it as a pipeline: "Submit returns a run id with 202 and an idempotency key. A queue per tenant feeds a worker pool with fair share and concurrency limits. Each run gets its own sandbox. State is checkpointed, so a worker crash resumes instead of restarting. The output is a PR plus a notification. Capacity follows Little's law, with headroom on top. Each run has a budget cap, and each queue has a cost limit."
 </Callout>
 
 <Callout type="mistake">
@@ -185,15 +155,15 @@ Do not leave out the visibility timeout. A 6-minute run with a 30-second timeout
       explain: 'Fair share serves B early and moves the wait to A, the tenant that caused the burst. The timeout setting does not change the order. A larger model changes nothing about scheduling.',
     },
     {
-      q: '800 runs arrive per hour and each takes 3 minutes. How many are in flight at once, on average?',
+      q: 'Your worker pool is sized to the exact average load, with no spare workers. What happens to queue wait?',
       options: [
-        '13, from 800 / 60',
-        '40, from 800 x 3 / 60',
-        '267, from 800 divided by 3',
-        '2,400, from 800 x 3',
+        'It stays flat, because supply matches demand',
+        'It grows without bound, since any burst leaves a backlog that never clears',
+        'It drops to zero, because every run finds a free worker',
+        'It only grows when runs fail and retry',
       ],
       answer: 1,
-      explain: '800 x 3 = 2,400 busy minutes per hour. 2,400 / 60 = 40 runs in flight. The other options skip the conversion from minutes to hours or invent a divisor.',
+      explain: 'At 100% busy there is no slack to drain a backlog after a burst. Headroom is what lets the queue shrink again. Matching the average does not mean matching every minute.',
     },
     {
       q: 'A cloud agent VM is reclaimed after the user leaves a run waiting for approval. Which design survives this?',
@@ -205,6 +175,17 @@ Do not leave out the visibility timeout. A 6-minute run with a 30-second timeout
       ],
       answer: 3,
       explain: 'The Claude Code docs say a reclaimed session restores the conversation but not background work. Durable state outside the sandbox is the portable answer. Sandbox disk dies with the sandbox, and a long HTTP call times out.',
+    },
+    {
+      q: 'Every background run has a budget cap. Why do you still alert on runs that reach the cap?',
+      options: [
+        'The cap is a ceiling, so many runs at the cap usually mean agents are looping',
+        'A run at the cap has always finished its work well',
+        'The cap is only a suggestion that the model may ignore',
+        'Runs at the cap are billed twice by the provider',
+      ],
+      answer: 0,
+      explain: 'The cap bounds the worst case, but real spend should sit well below it. Runs that hit it often point to loops or stuck tasks. A run that hits the cap did not finish cleanly, and the last response can pass the cap a little, but billing is not doubled.',
     },
   ]}
 />

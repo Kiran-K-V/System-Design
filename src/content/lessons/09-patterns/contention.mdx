@@ -55,7 +55,7 @@ Lock first, then read, decide, and write. The PostgreSQL manual says `FOR UPDATE
 
 The costs are all about waiting.
 
-- **Throughput on one row is one over the hold time.** If the transaction holds the lock for 5 ms, one row serves at most 200 transactions per second. If it also makes a 200 ms payment call inside the lock, the ceiling is 5 per second. Never call slow things while holding a lock. (Arithmetic, from the assumed times.)
+- **Throughput on one row is set by the hold time.** Transactions on one locked row line up one behind another, so the longer each one holds the lock, the fewer the row can serve. A slow call inside the lock, such as a payment API, cuts the row's throughput by a large factor. Never call slow things while holding a lock.
 - **Deadlocks.** Two transactions that lock rows in opposite order wait for each other forever. PostgreSQL detects this and aborts one of them. The manual's best defence is to lock rows in a consistent order in every code path.
 - **Wait control.** Add `NOWAIT` to fail at once if the row is locked. Add `SKIP LOCKED` to skip locked rows. The manual says `SKIP LOCKED` gives an inconsistent view of the data and is not for general use, but fits queue-like tables with many consumers, where each worker should grab a different row.
 
@@ -65,7 +65,7 @@ Reach for it when conflicts are frequent, the transaction is short, and everythi
 
 Do not lock. Read the row with its version. Write with `WHERE version = <the version you read>`. If zero rows change, someone else won: re-read and retry. This is cheap when conflicts are rare. The user can think for as long as they like between read and write. The reason is that nothing is held.
 
-When conflicts are frequent it wastes work. Say 10 buyers each try to take one unit from one stock row and each loser retries at once. Round 1 has 10 attempts and 1 win. Round 2 has 9 attempts. In total, 10 + 9 + ... + 1 = 55 attempts for 10 sales. That is the worst case when everyone retries in step. Add jitter (lesson [7.2](/learn/07-reliability/timeouts-retries/)) and a cap on retries. Jitter means each loser waits a small random time before it tries again, so the retries do not all land at the same moment.
+When conflicts are frequent it wastes work. Say many buyers each try to take one unit from one stock row and each loser retries at once. Each round has exactly one winner, and every loser tries again. So the number of attempts grows far faster than the number of sales. That is the worst case when everyone retries in step. Add jitter (lesson [7.2](/learn/07-reliability/timeouts-retries/)) and a cap on retries. Jitter means each loser waits a small random time before it tries again, so the retries do not all land at the same moment.
 
 ### Reservation with a TTL
 
@@ -121,9 +121,8 @@ PostgreSQL has a lighter option inside one database: **advisory locks**. They ar
 
 | Fact | Value | Source |
 |---|---|---|
-| Throughput of one locked row | 1000 / hold time in ms per second | Derived: transactions line up one behind another |
-| Hold 5 ms vs 205 ms (with a 200 ms call inside) | 200 vs about 5 per second | Derived |
-| 10 buyers, lockstep retries, one version | 55 attempts for 10 successes | Derived: 10 + 9 + ... + 1 |
+| Throughput of one locked row | Falls as the hold time grows | Derived: transactions line up one behind another |
+| Lockstep retries on one version | Many failed attempts for each success | Derived: one winner per round |
 | Deadlock | The database aborts one transaction | PostgreSQL manual |
 | Redis hold | `SET key value NX PX <ms>` | Redis docs, via lesson 8.2 |
 
@@ -158,26 +157,26 @@ At Repeatable read, a stricter isolation level where a transaction sees one froz
   client:visible
   questions={[
     {
-      q: 'Ten buyers each take one unit from one stock row with a version check. Every loser retries at once, in step. In the worst case, how many update attempts happen until all ten succeed?',
+      q: 'Many buyers each take one unit from one stock row with a version check. Every loser retries at once, in step. What is the cost?',
       options: [
-        '10 attempts, because each buyer succeeds exactly once',
-        '20 attempts, because each loser retries a single time',
-        '55 attempts, because one buyer wins in each round',
-        '100 attempts, because every buyer retries ten times',
+        'None, because each buyer succeeds on the first try',
+        'Each loser retries once, then the database queues them',
+        'Most attempts fail, so the wasted work far exceeds the sales',
+        'The version column fills up and the table stops taking writes',
       ],
       answer: 2,
-      explain: 'Round 1 has 10 attempts and 1 winner. Round 2 has 9 attempts, and so on: 10 + 9 + ... + 1 = 55. Under high contention a version check wastes most of its work. Jitter and a retry cap soften it, and a lock or queue avoids it.',
+      explain: 'Each round has one winner, and every other buyer tries again. So most attempts fail. Under high contention a version check wastes most of its work. Jitter and a retry cap soften it, and a lock or queue avoids it.',
     },
     {
-      q: 'A checkout calls a payment API for 200 ms inside a transaction that holds SELECT FOR UPDATE on the hot seat row. About how many bookings per second can that one row serve, at most?',
+      q: 'A checkout calls a payment API inside a transaction that holds SELECT FOR UPDATE on the hot seat row. Why is that a problem?',
       options: [
-        '200 per second, as the lock only blocks other writers briefly',
-        'No limit, because the database lets every transaction run at once',
-        '50 per second, because each lock is held for about 20 ms',
-        '5 per second, because they run one at a time',
+        'The lock is held through the slow call, so bookings queue',
+        'The payment API cannot be called inside a transaction',
+        'The lock only blocks readers of the seat, not other writers',
+        'The database releases the lock early, so double bookings follow',
       ],
-      answer: 3,
-      explain: 'Writers that want the row queue behind the lock holder. With 200 ms per hold, 1000 / 200 = 5 per second. Readers and writers do not block each other, but two writers of one row still do. Move the payment call outside the lock.',
+      answer: 0,
+      explain: 'Writers that want the row queue behind the lock holder, and the holder waits on a slow outside call. The row can then serve very few bookings. Readers and writers do not block each other, but two writers of one row still do. Move the payment call outside the lock.',
     },
     {
       q: 'A seat hold lives in Redis with a 5-minute expiry. Why still keep a unique constraint on (event_id, seat_id) in the booking table?',

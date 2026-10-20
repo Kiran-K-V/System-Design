@@ -1,13 +1,11 @@
 ---
-summary: 'A call has two phases. Prefill reads the whole prompt at once and is limited by compute. Decode makes one token per pass and is limited by memory bandwidth. Derive the decode floor for a 70B model and measure with MBU, not GPU utilization.'
+summary: 'A call has two phases. Prefill reads the whole prompt at once and is limited by compute. Decode makes one token per pass and is limited by memory bandwidth. See why decode has a floor set by weight bytes and bandwidth, and measure with MBU, not GPU utilization.'
 requires: ['ai/a2-inference-cost/gpu-memory-math', 'ai/a1-model-function/attention-cost']
 ---
 
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import Math from '../../../../components/lesson/Math.astro';
 import Ai2PdRoof from '../../../../components/anim/lessons/Ai2PdRoof.tsx';
 import Ai2PdTimeline from '../../../../components/anim/lessons/Ai2PdTimeline.tsx';
 
@@ -34,41 +32,27 @@ For an H100 SXM in BF16, dense: 989 TFLOPS / 3.35 TB/s = **295 FLOPs per byte**.
 
 Now the intensity of a transformer pass. Each weight is a 2-byte value. It is read from HBM once per pass. It does 2 FLOPs (a multiply and an add) for every token in that pass.
 
-<Math block tex="\text{intensity} = \frac{2 \text{ FLOPs} \times T \text{ tokens}}{2 \text{ bytes}} = T" />
-
-So intensity is about the number of tokens T that share one read of the weights. In **decode** T is the batch size b: one token from each request. At batch 1, intensity is 1, far below 295. In **prefill** T is the prompt length. A 2,000-token prompt has intensity 2,000, above the ridge. Watch the dot move.
+So intensity is about the number of tokens that share one read of the weights. In **decode** that is the batch size: one token from each request. At batch 1, intensity is about 1, far below the ridge. In **prefill** it is the prompt length. A prompt of a couple of thousand tokens sits far above the ridge. Watch the dot move.
 
 <Ai2PdRoof client:visible />
 
-The consequence: decode is **memory-bound**, prefill is **compute-bound**. A prompt shorter than about 295 tokens is still on the slope. The attention term and the KV cache reads move the real ridge. So treat 295 as a first estimate. The roofline here is our model, in the style Databricks describes.
+The consequence: decode is **memory-bound**, prefill is **compute-bound**. A prompt shorter than the ridge (a few hundred tokens) is still on the slope. The attention term and the KV cache reads move the real ridge. So treat 295 as a first estimate. The roofline here is our model, in the style Databricks describes.
 
-### The decode floor: derive it
+### The decode floor
 
-Every decode step reads all the weights once. Let W be the weight bytes, n the GPUs sharing them (tensor parallel, A2.1). And let BW be the bandwidth of one GPU. Each GPU holds W/n and reads it in parallel, so:
+Every decode step reads all the weights once. When several GPUs share the model (tensor parallel, A2.1), each reads its own slice in parallel. So the step time has a floor: the weight bytes divided by the total memory bandwidth of the GPUs that hold them.
 
-<Math block tex="t_{\text{step}} \;\ge\; \frac{W / n}{BW} \;=\; \frac{W}{n \cdot BW}" />
+This is a floor, not a forecast. The real step also reads the KV cache and talks over NVLink. For a 70B model in BF16 (~140 GB), the floor is a few tens of milliseconds per token on two H100s. Adding GPUs lowers the floor, because each one reads less. A GPU with faster memory lowers it too.
 
-This is a floor: the real step also reads the KV cache and talks over NVLink. Work the 70B BF16 case (W = 140 GB), on hardware that holds it.
-
-- **2 x H100:** 140 / (2 x 3,350 GB/s) = **20.9 ms**, so at most 48 tokens/s for one user.
-- **1 x H200:** 140 / 4,800 GB/s = **29.2 ms**, at most 34 tokens/s.
-- **4 x H100:** 140 / (4 x 3,350) = **10.4 ms**, at most 96 tokens/s, before link costs.
-
-You may see "140 GB / 3.35 TB/s = 42 ms" quoted. That uses one H100 and 140 GB of weights, which is impossible: the model does not fit. Use the number of GPUs that actually holds it.
+A common mistake is to divide the whole weight size by the bandwidth of one GPU. That assumes the model sits on one GPU, which a 70B BF16 model cannot do. Use the number of GPUs that actually holds it.
 
 ### The TTFT floor
 
-Prefill does about 2 x N x p FLOPs for p prompt tokens, plus the attention score work from [lesson A1.4](/learn/ai/a1-model-function/attention-cost/), 4 x p² x d x L. For Llama 3 70B (N = 70e9, d = 8,192, L = 80) and p = 2,000:
-
-- Weights: 2 x 70e9 x 2,000 = 2.8e14 FLOPs.
-- Attention: 4 x 2,000² x 8,192 x 80 = 1.05e13 FLOPs.
-- Total 2.9e14, over 2 x 989 TFLOPS = **147 ms**.
-
-Real servers reach a fraction of peak, so TTFT is longer. Move the sliders to see both floors for a whole request.
+Prefill does work for every prompt token, plus the attention score work from [lesson A1.4](/learn/ai/a1-model-function/attention-cost/), which grows with the square of the prompt. So TTFT grows with prompt length, and faster than a straight line for very long prompts. The floor for a 2,000-token prompt on a 70B model is on the order of ~0.1 s (our estimate). Real servers reach a fraction of peak, so TTFT is longer. Move the sliders to see both floors for a whole request.
 
 <Ai2PdTimeline client:visible />
 
-Try 2,048 tokens in and 512 out on 2 x H100. The results are TTFT about 0.15 s, TPOT about 21 ms, and total about 10.9 s. Decode is 99% of the time. This is why output length drives latency: the Databricks guide says so too. To speed up a slow answer, first ask for fewer output tokens.
+Try a short prompt and a long answer. Decode takes almost all the time. This is why output length drives latency: the Databricks guide says so too. To speed up a slow answer, first ask for fewer output tokens.
 
 ## Measuring: MFU and MBU, not "utilization"
 
@@ -83,12 +67,11 @@ At batch 1, decode MFU is tiny by design. Judge decode by MBU.
 
 ## Numbers
 
-| Fact | Value | Source |
+| Fact | Takeaway | Source |
 |---|---|---|
-| H100 ridge point, BF16 dense | 295 FLOPs/byte | Derived: 989 TFLOPS / 3.35 TB/s |
-| Decode floor, 70B BF16, 2 x H100 | 20.9 ms per token | Derived: 140 GB / (2 x 3.35 TB/s) |
-| Decode floor, 70B BF16, 1 x H200 | 29.2 ms per token | Derived: 140 GB / 4.8 TB/s |
-| TTFT floor, 70B, 2,000 tokens, 2 x H100 | 147 ms | Derived, with attention |
+| H100 ridge point, BF16 dense | About 295 FLOPs/byte | Derived: peak FLOPs over bandwidth |
+| Decode floor | Weight bytes over total GPU bandwidth | Derived |
+| TTFT floor | Grows with prompt length | Derived, with attention |
 | TPOT of 100 ms | 10 tokens/s per user | Databricks |
 | Llama 3 405B training MFU | 38 to 43% | Llama 3 paper |
 
@@ -105,7 +88,7 @@ At batch 1, decode MFU is tiny by design. Judge decode by MBU.
 ## Interview lens
 
 <Callout type="tip">
-Split every latency answer into the two phases: "TTFT is prefill, compute-bound, grows with prompt length. TPOT is decode, memory-bound, set by weight bytes over bandwidth. For 70B on two H100s, that is about 21 ms per token. So a 500-token answer takes at least 10 seconds." Then say which phase you would shorten first.
+Split every latency answer into the two phases: "TTFT is prefill, compute-bound, grows with prompt length. TPOT is decode, memory-bound, set by weight bytes over bandwidth. For 70B on two H100s, that is a few tens of ms per token. So a long answer takes seconds, however short the prompt." Then say which phase you would shorten first.
 </Callout>
 
 <Callout type="mistake">
@@ -113,39 +96,10 @@ Do not quote GPU utilization as evidence that a deployment is efficient. Do not 
 </Callout>
 
 <Callout type="deep" title="Why a bigger batch does not slow the step much">
-At batch 1, a step takes about W / (n x BW) whatever the batch is. This holds as long as compute stays below the roof. Going from 1 to 16 tokens per step adds a little KV reading and some math. But the time does not grow 16 times. That is why batching raises throughput nearly for free, until the ridge or the KV cache stops it. Lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/) builds on this.
+At batch 1, a step takes about the weight bytes over the total bandwidth, whatever the batch is. This holds as long as compute stays below the roof. Going from 1 to 16 tokens per step adds a little KV reading and some math. But the time does not grow 16 times. That is why batching raises throughput nearly for free, until the ridge or the KV cache stops it. Lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/) builds on this.
 </Callout>
 
 ## Check yourself
-
-<Ballpark
-  client:visible
-  title="The decode floor"
-  scenario="Llama 3 70B in BF16 has 140 GB of weights. It runs on 2 x H100 with tensor parallelism. Each H100 reads at 3.35 TB/s. Ignore the KV cache and link traffic."
-  steps={[
-    {
-      prompt: 'Minimum time per decode step, in milliseconds?',
-      unit: 'ms',
-      answer: 20.9,
-      within: 1.1,
-      explain: 'Each GPU reads 70 GB. 70 / 3,350 GB/s = 0.0209 s = 20.9 ms. Both GPUs read in parallel.',
-    },
-    {
-      prompt: 'Maximum tokens per second for one user at batch 1?',
-      unit: 'tokens/s',
-      answer: 48,
-      within: 1.1,
-      explain: '1 / 0.0209 s = 47.8, so about 48 tokens per second. Real systems are slower.',
-    },
-    {
-      prompt: 'Ridge point of one H100 in BF16 dense, in FLOPs per byte? (989 TFLOPS and 3.35 TB/s)',
-      unit: 'FLOPs/byte',
-      answer: 295,
-      within: 1.1,
-      explain: '989e12 / 3.35e12 = 295. Below it a kernel is memory-bound.',
-    },
-  ]}
-/>
 
 <Diagnose
   client:visible
@@ -160,7 +114,7 @@ At batch 1, a step takes about W / (n x BW) whatever the batch is. This holds as
   ]}
   steps={[
     {
-      prompt: '70 GB in 33 ms is 2.1 TB/s per GPU, 63% of 3.35 TB/s. Achieved math is 30 x 140 GFLOPs = 4.2 TFLOPS, about 0.2% of the 1,978 TFLOPS the two GPUs offer. What does the 100% mean?',
+      prompt: 'Each GPU moves most of its peak memory bandwidth, but uses a tiny share of its peak math (MFU about 0.2%, MBU about 63%). What does the 100% mean?',
       options: [
         'The compute units are saturated, so the GPU is maxed out',
         'A kernel was running; math and bandwidth use are unknown',
@@ -196,29 +150,40 @@ At batch 1, a step takes about W / (n x BW) whatever the batch is. This holds as
         'They take equal time, as both phases read the weights',
       ],
       answer: 1,
-      explain: 'Prefill handles 12 tokens in one pass. Decode runs about 600 passes, each reading all the weights, at about 21 ms each on 2 x H100: roughly 12.6 s. Both read the weights, but decode does so 600 times.',
+      explain: 'Prefill handles 12 tokens in one pass. Decode runs about 600 passes, each reading all the weights. Both read the weights, but decode does so 600 times.',
     },
     {
-      q: 'At batch 1 on an H100, what is the arithmetic intensity of a BF16 decode step, and which ceiling binds?',
+      q: 'At batch 1, why is a decode step memory-bound?',
       options: [
-        'About 295 FLOPs/byte, compute-bound',
-        'About 1 FLOP/byte, compute-bound',
-        'About 295 FLOPs/byte, memory-bound',
-        'About 1 FLOP/byte, memory-bound',
+        'Each weight is read once but used for only one token, so intensity is far below the ridge',
+        'Each weight is read many times, so the bus is saturated',
+        'The math units are slower than the memory at batch 1',
+        'The KV cache is always larger than the weights',
       ],
-      answer: 3,
-      explain: 'Each 2-byte weight does 2 FLOPs for one token: 1 FLOP per byte. That is far below the ridge at 295, so memory bandwidth binds. 295 is the ridge point, not the intensity of decode.',
+      answer: 0,
+      explain: 'A weight read feeds only one token, so there is little math per byte moved. That is below the ridge point, so memory bandwidth binds. Weights are read once per pass, and the KV cache is not larger than the weights.',
     },
     {
-      q: 'A 70B BF16 model is split over 4 H100s with tensor parallelism. What is the decode floor per token, ignoring KV reads and links?',
+      q: 'A 70B BF16 model is split over more H100s with tensor parallelism. What happens to the decode floor per token, ignoring KV reads and links?',
       options: [
-        'About 42 ms, since 140 GB / 3.35 TB/s',
-        'About 10.4 ms, since each GPU reads 35 GB',
-        'About 5.2 ms, since 4 GPUs read in series',
-        'About 20.9 ms, since the link sets the pace',
+        'It falls, because each GPU reads a smaller slice in parallel',
+        'It stays the same, because the total weight bytes are fixed',
+        'It rises, because the GPUs read their slices in series',
+        'It falls only if the batch size also grows',
       ],
-      answer: 1,
-      explain: 'Each GPU holds and reads 140 / 4 = 35 GB: 35 / 3,350 = 10.4 ms. 42 ms treats all weights as sitting on one GPU. The GPUs read in parallel, not in series. In practice the link adds time.',
+      answer: 0,
+      explain: 'Each GPU holds and reads only its share of the weights, and all of them read at the same time. The total bytes stay fixed, but the time is set per GPU. In practice the link adds some time back.',
+    },
+    {
+      q: 'You want to cut the streaming time of a long answer on a 70B model. Which change helps most?',
+      options: [
+        'Ask for fewer output tokens, since each one needs a full pass over the weights',
+        'Shorten the prompt, since the prompt is read one token at a time',
+        'Lower the temperature, since sampling is the slow step',
+        'Raise GPU utilization, since idle time dominates',
+      ],
+      answer: 0,
+      explain: 'Decode time grows with the number of output tokens, and each one costs a full weight read. The prompt is read together in prefill, and sampling is cheap. nvidia-smi utilization says nothing about useful work.',
     },
     {
       q: 'Which metric tells you best how well a decode loop uses the hardware?',

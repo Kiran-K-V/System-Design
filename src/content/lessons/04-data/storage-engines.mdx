@@ -33,9 +33,9 @@ Before the fix, the thing it protects. A table is a file cut into **pages** of e
 
 <PageLayout />
 
-The page is the unit of I/O. A query for one 200-byte row reads one 8 KB page. A page holds about 8,192 / 200 = ~40 such rows. A table of 100 million rows of 200 B is 20 GB, which is ~2.4 million pages.
+The page is the unit of I/O. A query for one 200-byte row reads one 8 KB page. A page holds dozens of such rows, so a big table is millions of pages.
 
-The database keeps recently used pages in a RAM cache, the **buffer pool**. PostgreSQL's `shared_buffers` defaults to 128 MB, which is 16,384 pages. Production systems set it much higher. A page that is in the pool costs ~100 ns to read. A page that is not costs one SSD read, ~100 µs.
+The database keeps recently used pages in a RAM cache, the **buffer pool**. PostgreSQL's `shared_buffers` defaults to a small 128 MB. Production systems set it much higher. A page that is in the pool is read from RAM. A page that is not costs one SSD read, about a thousand times slower (lesson 1.2).
 
 ## The mechanism: the write-ahead log
 
@@ -100,7 +100,7 @@ The last row decides your commit throughput. If one fsync takes 1 ms, one connec
 | Choice | You gain | You pay | Choose when |
 |---|---|---|---|
 | WAL with fsync on every commit | No acknowledged write is lost | Commit latency = fsync time | Money, orders, anything users would notice |
-| Asynchronous commit | Much lower commit latency | A crash loses the last few transactions. PostgreSQL's risk window is up to 3 × 200 ms = 600 ms | Event logs, metrics, counters |
+| Asynchronous commit | Much lower commit latency | A crash loses the last few transactions. PostgreSQL's risk window is a fraction of a second | Event logs, metrics, counters |
 | Bigger buffer pool | More reads hit RAM | Memory cost; slower warm-up | Working set fits in RAM |
 | Frequent checkpoints | Fast crash recovery | More page writes, more I/O | Recovery time targets are strict |
 | Update in place (B-tree) | Fast point reads and range reads | Random writes, page splits | Read-heavy or mixed load |
@@ -124,10 +124,15 @@ Do not say "the database writes to disk when you commit" as if it meant the tabl
   client:visible
   questions={[
     {
-      q: 'A table has 100 million rows of 200 bytes each. About how many 8 KB pages does it need, ignoring overhead?',
-      options: ['~25 thousand', '~244 million', '~2.4 million', '~2.4 billion'],
+      q: 'A query asks for one 200-byte row that is not in the buffer pool. What does the database read from disk?',
+      options: [
+        'Exactly the 200 bytes of that row',
+        'The whole table, so it can find the row',
+        'The whole 8 KB page that holds the row',
+        'Only the index entry, never the row itself',
+      ],
       answer: 2,
-      explain: '100 million × 200 B = 20 GB. 20 GB / 8 KB = about 2.4 million pages. Each page holds ~40 rows.',
+      explain: 'The page is the unit of I/O. A disk cannot hand back a single row, only a whole page, which holds many rows. Reading the whole table would be a scan, and an index lookup still ends at the row\'s page.',
     },
     {
       q: 'A database acknowledges a commit after it writes the log record to the operating system, but before fsync. The power fails one second later. What is true?',
@@ -147,15 +152,15 @@ Do not say "the database writes to disk when you commit" as if it meant the tabl
       explain: 'Only the sequential log write is required. The three dirty pages stay in RAM and reach the data file at the next checkpoint. After a crash the log restores them.',
     },
     {
-      q: 'You set wal_writer_delay to its default of 200 ms and enable asynchronous commit. What is the worst-case outcome of a crash?',
+      q: 'You enable asynchronous commit with the default wal_writer_delay. What is the worst-case outcome of a crash?',
       options: [
         'The data file is corrupted, so it must be restored from the last backup',
-        'Up to ~600 ms of recent commits may be lost, but data stays consistent',
+        'A short window of recent commits may be lost, but data stays consistent',
         'Nothing is lost; asynchronous commit only affects the replica copies',
         'All transactions since the last checkpoint are lost, with no way to replay',
       ],
       answer: 1,
-      explain: 'PostgreSQL states the risk window is at most three times wal_writer_delay, here 600 ms. Replay restores a consistent older state. The risk is loss, not corruption.',
+      explain: 'PostgreSQL states the risk window is a small multiple of wal_writer_delay. Replay restores a consistent older state. The risk is loss, not corruption.',
     },
   ]}
 />

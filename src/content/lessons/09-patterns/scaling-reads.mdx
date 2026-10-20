@@ -5,7 +5,6 @@ requires: ['04-data/replication', '05-caching/why-cache', '02-networking/cdn-pro
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import PatternsBuildsOn from '../../../components/anim/lessons/PatternsBuildsOn.tsx';
 import ScalingReadsWalk from '../../../components/anim/lessons/ScalingReadsWalk.tsx';
 import ScalingReadsMeter from '../../../components/anim/lessons/ScalingReadsMeter.tsx';
@@ -44,7 +43,7 @@ Each rung takes a share of reads away from the rung behind it. Step through all 
 
 **Rung 1: read replicas.** The primary keeps all writes. Followers copy its log (lesson [4.6](/learn/04-data/replication/)) and answer reads. Read capacity grows about linearly with the number of replicas. Writes do not grow at all. This is the simplest rung because the app still speaks SQL.
 
-**Rung 2: a cache.** A cache holds the answers to the most common reads in memory (lessons [5.1](/learn/05-caching/why-cache/) to [5.3](/learn/05-caching/cache-strategies/)). The hit ratio is the share of reads the cache answers without help. Picture a librarian who keeps the 100 most asked books on the desk: each time someone asks for one of them, no trip to the shelves is needed. With a hit ratio `h`, only a share `1 - h` of reads reaches the database. At 90% the database sees one read in ten. That is the largest single gain in the ladder, and it costs staleness (lesson [5.5](/learn/05-caching/invalidation-stampede/)).
+**Rung 2: a cache.** A cache holds the answers to the most common reads in memory (lessons [5.1](/learn/05-caching/why-cache/) to [5.3](/learn/05-caching/cache-strategies/)). The hit ratio is the share of reads the cache answers without help. Picture a librarian who keeps the 100 most asked books on the desk: each time someone asks for one of them, no trip to the shelves is needed. With a hit ratio `h`, only a share `1 - h` of reads reaches the database. At a high hit ratio, the database sees only a small share of reads. That is the largest single gain in the ladder, and it costs staleness (lesson [5.5](/learn/05-caching/invalidation-stampede/)).
 
 **Rung 3: a CDN.** A CDN (content delivery network) is a set of servers spread around the world that keep copies of your public content. The "edge" is that outer ring of servers, close to users. Picture a local shop that stocks the popular items so people do not travel to the factory. A CDN answers requests for content that is the same for every user (lesson [2.7](/learn/02-networking/cdn-proxies/)). Those requests never reach your data center. If the CDN answers half of all reads, everything behind it sees half the demand. It only helps for shared, cacheable responses: images, scripts, public pages, and API responses that are identical for everyone.
 
@@ -56,11 +55,11 @@ The chart shows how many reads per second each stage can serve. Move the sliders
 
 <ScalingReadsMeter client:visible />
 
-**The model.** Requests go from the edge inward. A tier answers a share of what it receives. The share that reaches a tier is the product of (1 - hit ratio) of every tier in front. A tier with capacity `C` that sees a share `r` saturates at a demand of `C / r`. The system limit is the smallest of those numbers.
+**The model.** Requests go from the edge inward. Each tier answers a share of what it receives and passes the rest on. A tier saturates when the share that reaches it is more than it can serve. The system limit is set by the first tier to saturate.
 
 **Assumptions.** Reads only. One database node serves 10,000 reads per second. That figure is an assumption inside the 10K to 50K range of lesson 1.5, on the low side. One cache node serves 100,000 operations per second (lesson 5.1 gives 100K to 1M). Hit ratios do not change with load. The CDN has no limit. Replicas share load evenly and have no lag. These are round numbers for reasoning. Measure your own.
 
-Try this. At the defaults (3 replicas, 2 cache nodes, 90% hit, CDN 50%), the stages give 10K, 30K, 200K, and 400K reads per second. Now drop the cache hit ratio to 50%. The cache stage falls to 60K, because the three replicas now see half of all reads. The hit ratio decides how much the cache is worth.
+Try this. At the defaults, the database tier is the first limit. Now drop the cache hit ratio. The limit falls fast, because the replicas now see a much larger share of reads. The hit ratio decides how much the cache is worth.
 
 ## Read-your-writes after replica lag
 
@@ -81,12 +80,12 @@ A cache spreads keys over nodes by hash (a hash turns a key into a number that p
 Options, cheapest first:
 
 - **A small in-process cache** in every app server for the hottest keys, with a TTL (time to live: the number of seconds a copy is kept before it is thrown away) of a few seconds. "In-process" means the copy lives in the app server's own memory, so reading it costs no network trip. The cache node sees one read per app server per TTL, not one per user.
-- **Copy the key to several cache nodes** and read from any copy. The memcache paper does this for keys that are fetched in large groups and fit on one or two servers. Its example: a server holds 100 items and answers 500K requests per second, and each request asks for all 100. To serve 1M requests per second, splitting the items across two servers sends every request to both. So each of the two servers still handles 1M. Replicating all 100 items on two servers lets each request go to either one, so each handles 500K. The price is that every write must invalidate every copy.
+- **Copy the key to several cache nodes** and read from any copy. The memcache paper does this for keys that are fetched in large groups and fit on one or two servers. Its example: every request asks for the same group of items. If you split the group across two servers, every request still goes to both, so neither server gets any relief. If you copy the whole group to both servers, each request goes to just one of them, so the load is shared. The price is that every write must invalidate every copy.
 - **Coalesce misses.** To coalesce is to merge many identical requests into one. When many requests miss on the same key at once, let one go to the database. The other requests wait (lesson [5.5](/learn/05-caching/invalidation-stampede/)). Memcache is the in-memory cache server that Facebook runs. The paper's lease does this: the server hands out one token per key. Each key gets at most one token every 10 seconds by default. The server tells other clients to wait briefly.
 
 ## Denormalize so a read is one read
 
-A normalized schema stores each fact once and links rows by id, like a phone book that lists each person once. That is good for writes and awkward for reads. Denormalizing means copying a fact into the rows that need it, so a read does not have to join several tables. Say a feed page shows 20 posts, each with the author's name and a like count. Normalized, that is 1 query for the post ids, 20 for authors, and 20 for counts: 41 queries. Denormalized, each post row stores `author_name` and `like_count`, and the page is 1 query.
+A normalized schema stores each fact once and links rows by id, like a phone book that lists each person once. That is good for writes and awkward for reads. Denormalizing means copying a fact into the rows that need it, so a read does not have to join several tables. Say a feed page shows 20 posts, each with the author's name and a like count. Normalized, the page needs one query for the post ids, then one lookup per post for the author and another for the count. That is dozens of queries. Denormalized, each post row stores `author_name` and `like_count`, and the page is 1 query.
 
 You pay on the write side. A like now updates two places. A rename updates every post by that author. And the copies can drift, so you need a way to repair them. Lesson [4.1](/learn/04-data/data-modeling/) gives the rule: copy a fact only when reads far outnumber writes and the copy is stable. Counters are the common case. Keep `like_count` as a column or in a cache instead of counting rows on every view.
 
@@ -99,7 +98,6 @@ You pay on the write side. A like now updates two places. A rename updates every
 | Replica lag, asynchronous streaming | Typically under 1 second, but spikes | PostgreSQL manual, via lesson 4.6 |
 | Facebook's memcache fleet | "over a billion requests per second" | Facebook memcache paper (their claim) |
 | Memcache lease rate limit | One token per key per 10 s, by default | Facebook memcache paper |
-| Feed page, normalized vs denormalized | 41 queries vs 1 | Derived above: 1 + 20 + 20 |
 
 ## Trade-offs
 
@@ -114,7 +112,7 @@ You pay on the write side. A like now updates two places. A rename updates every
 ## Interview lens
 
 <Callout type="tip">
-Say the order and the reason. "I would first check indexes, then add read replicas, then a cache with a short TTL in front, and a CDN for static and public content. Each step cuts load on the one behind it." Then use numbers: "25K reads per second at peak. A 90% cache hit leaves 2.5K for the database, which one replica handles." End with the cost: "Users who just wrote read the primary, to avoid stale reads."
+Say the order and the reason. "I would first check indexes, then add read replicas, then a cache with a short TTL in front, and a CDN for static and public content. Each step cuts load on the one behind it." Then say what it buys: "A high cache hit ratio leaves the database a small share of the peak, which a few replicas handle." End with the cost: "Users who just wrote read the primary, to avoid stale reads."
 </Callout>
 
 <Callout type="mistake">
@@ -122,7 +120,7 @@ Do not add a cache to cure a slow query. You hide the problem and add a stalenes
 </Callout>
 
 <Callout type="deep" title="Why a cache can make an outage worse">
-A cache that runs at 95% hit ratio protects a database that could not serve all reads on its own. If the cache is flushed, or a node dies, the database suddenly sees more reads. The read load can reach up to 20 times its normal level. It fails, and the cache cannot refill because the database is down. Plan for this. Warm the cache (fill it with popular answers) before sending traffic, rate-limit misses, and keep replicas sized for some miss traffic, not for zero. Lesson 5.5 covers the stampede in detail.
+A cache that runs at 95% hit ratio protects a database that could not serve all reads on its own. If the cache is flushed, or a node dies, the database suddenly sees more reads. The read load can jump to many times its normal level. It fails, and the cache cannot refill because the database is down. Plan for this. Warm the cache (fill it with popular answers) before sending traffic, rate-limit misses, and keep replicas sized for some miss traffic, not for zero. Lesson 5.5 covers the stampede in detail.
 </Callout>
 
 ## Check yourself
@@ -131,15 +129,15 @@ A cache that runs at 95% hit ratio protects a database that could not serve all 
   client:visible
   questions={[
     {
-      q: 'Peak reads are 60,000 per second. A 90% cache is placed in front of 3 replicas that each serve 10,000 reads per second. What do the replicas see, and are 3 enough?',
+      q: 'A cache sits in front of three read replicas. Its hit ratio falls from very high to about half. What happens behind it?',
       options: [
-        '6,000 per second, so 3 replicas have plenty of room',
-        '54,000 per second, which is more than 3 replicas can serve',
-        '30,000 per second, which is exactly the limit of 3 replicas',
-        '6,000 per second, so 2 replicas are wasted and should be removed',
+        'The replicas see a much larger share, and may saturate',
+        'Nothing, because the replicas were sized for all reads',
+        'The CDN takes over the extra reads and hides the change',
+        'The primary absorbs the load, so replicas see no change',
       ],
       answer: 0,
-      explain: 'A 90% hit ratio sends 10% of 60,000 = 6,000 reads on to the database. Three replicas can take 30,000, so they run at 20%. The last option sounds thrifty, but you keep headroom for cache misses after a restart and for a replica failure.',
+      explain: 'Only the misses reach the replicas. When the hit ratio falls, the miss share grows by a large factor, so a small drop in hit ratio can mean a big jump in database load. The CDN only serves shared content, and the primary does not take reads from replicas.',
     },
     {
       q: 'After a user renames their profile, the page still shows the old name for about a second. Reads go to replicas. What fix adds the least load to the primary?',
@@ -164,15 +162,15 @@ A cache that runs at 95% hit ratio protects a database that could not serve all 
       explain: 'A key maps to one node. More nodes spread different keys, not one key. That one node keeps its load. The fixes are an in-process copy, several copies of the key, or coalescing misses.',
     },
     {
-      q: 'You normalize a feed so each of 20 posts needs one author lookup and one like-count lookup after the first query for post ids. How many queries does one page view run, and what fixes it?',
+      q: 'A normalized feed page needs one author lookup and one like-count lookup for every post. What is the read-side problem, and what fixes it?',
       options: [
-        '21 queries. Cache the author names for ten minutes.',
-        '40 queries. Add two more read replicas to spread them.',
-        '22 queries. Batch the lookups into two big queries.',
-        '41 queries. Store both values on each post row.',
+        'One view runs many queries. Cache the author names for ten minutes.',
+        'One view runs many queries. Add more read replicas to spread them.',
+        'One view runs a few big queries. Batch the lookups into one.',
+        'One view runs many queries. Store both values on each post row.',
       ],
       answer: 3,
-      explain: '1 + 20 authors + 20 counts = 41. Replicas spread the queries but do not remove them. Storing the two values on the post row makes the view one query, at the cost of updating the copies when a name changes or a like arrives.',
+      explain: 'The page runs one query plus two lookups per post, so the count grows with the page size. Replicas spread the queries but do not remove them. Storing the two values on the post row makes the view one query, at the cost of updating the copies when a name changes or a like arrives.',
     },
     {
       q: 'Which response is safe to put in a shared CDN cache with no per-user cache key?',
@@ -185,27 +183,16 @@ A cache that runs at 95% hit ratio protects a database that could not serve all 
       answer: 1,
       explain: 'A shared cache returns one stored response to many users. That is right for identical content like an image. Anything personal, such as an inbox, email, or cart, would be served to the wrong user without a key that includes the user.',
     },
-  ]}
-/>
-
-<Ballpark
-  client:visible
-  title="How many replicas?"
-  scenario="Peak reads are 200,000 per second. A cache answers 95% of them. One database replica serves 10,000 reads per second, and you want each replica to run at no more than half of that."
-  steps={[
     {
-      prompt: 'How many reads per second reach the database after the cache?',
-      unit: 'reads/s',
-      answer: 10_000,
-      within: 1.1,
-      explain: '5% of 200,000 is 10,000 reads per second.',
-    },
-    {
-      prompt: 'How many replicas do you need, so that each runs at half capacity?',
-      unit: 'replicas',
-      answer: 2,
-      within: 1.1,
-      explain: 'Half of 10,000 is 5,000 reads per second per replica. 10,000 / 5,000 = 2 replicas. Add one more in practice, so that one failure does not push the other past half.',
+      q: 'A cache absorbs most reads in front of a few replicas. Why still size each replica to run well under its limit?',
+      options: [
+        'Replicas slow down when they run above half of their limit',
+        'The cache needs spare database capacity to store its entries',
+        'Replication lag only appears when a replica is close to full',
+        'A cache flush or a replica loss sends a burst of reads to the rest',
+      ],
+      answer: 3,
+      explain: 'A cache hides load only while it is warm. A flush, a dead cache node, or a lost replica shifts reads to the remaining database nodes at once. Headroom lets them survive that burst. Cache storage does not use the database, and lag has other causes.',
     },
   ]}
 />

@@ -6,8 +6,6 @@ requires: ['ai/a7-agents-prod/agent-identity-oauth', 'ai/a6-agents/mcp', 'ai/a10
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
-import Math from '../../../../components/lesson/Math.astro';
 import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
 import Ai13PlatformBuild from '../../../../components/anim/lessons/Ai13PlatformBuild.tsx';
 import Ai13PlatformLeakMap from '../../../../components/anim/lessons/Ai13PlatformLeakMap.tsx';
@@ -36,7 +34,7 @@ Lesson [A13.1](/learn/ai/a13-cases/llm-gateway/) built the shared model gateway 
 | Fair share | A tenant inside its quota sees a p95 queue wait under 5 s while another tenant sends 10 times its load | Weekly surge test |
 | Incident path | A bad tool version stops for every tenant within 60 s | Quarterly drill |
 
-**The bar that justifies the platform is isolation.** A platform can be fast, exact, and cheap and still fail it. Zero is hard to prove, so we bound it. If you see 0 events in n independent probes, the 95% upper bound on the true rate is about 3 / n (solve (1 - p) to the power n = 0.05). With 10,000 probes a day and no hit, the rate is under 0.03%. The bound covers only the paths you probe, so the canary set must follow the map of shared layers below.
+**The bar that justifies the platform is isolation.** A platform can be fast, exact, and cheap and still fail it. Zero is hard to prove, so we bound it. If you see no events in many independent probes, you can bound the true rate, and more probes give a tighter bound. The bound covers only the paths you probe, so the canary set must follow the map of shared layers below.
 
 **Scale (illustrative).** 500,000 tool calls a day is 5.8 per second on average, and about 29 per second at an assumed 5 times peak. Assume the top 20 tenants send half of all runs. Skew is why noisy neighbours exist.
 
@@ -53,7 +51,7 @@ Online signals: cross-tenant cache hits (must be 0), calls blocked by policy, co
 
 ## Budgets
 
-**Latency.** The platform adds work to every tool call. Our illustrative plan for a warm call, in milliseconds: verify the run token 0.5, load the pinned tool version and policy 1.0, take quota 2.0, fetch the tenant grant from a cache 1.5, check the arguments 0.5, and one extra network hop to the tool server 4.0. The sum is 9.5 ms, under the 15 ms bar. The audit and meter writes happen off the path. A code tool starts a fresh microVM, a small virtual machine. The Firecracker project claims "< 125 ms startup time" (company claim), so plan on about 125 ms there.
+**Latency.** The platform adds work to every tool call. Our illustrative plan for a warm call, in milliseconds: verify the run token 0.5, load the pinned tool version and policy 1.0, take quota 2.0, fetch the tenant grant from a cache 1.5, check the arguments 0.5, and one extra network hop to the tool server 4.0. The sum is about 10 ms, under the 15 ms bar. The audit and meter writes happen off the path. A code tool starts a fresh microVM, a small virtual machine. The Firecracker project claims "< 125 ms startup time" (company claim), so plan on about 125 ms there.
 
 **Dollars.** USD per million tokens, as of 2026-10-20, from the [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing). Reference call: 6,000 input and 400 output tokens, with no cache hit.
 
@@ -63,7 +61,7 @@ Online signals: cross-tenant cache hits (must be 0), calls blocked by policy, co
 | Claude Sonnet 5.5 | $2 | $10 | $0.0160 |
 | Claude Haiku 5.5 (prompts up to 100,000 tokens) | $0.10 | $0.50 | $0.0008 |
 
-Sonnet 5.5: 6,000 x $2 / 1M = $0.012, plus 400 x $10 / 1M = $0.004, so $0.016. A run of 10 calls costs $0.16. On the same page a Sonnet 5.5 cache read is $0.10 and the Batch API takes 50% off. A tenant with 50 runs a day makes 1,500 runs a month and costs $240 in model fees. The Ballpark at the end adds sandbox and hosting.
+A run makes about ten calls, so a busy tenant's model fees dominate its bill. Sandbox time and its share of hosting add only a small amount on top. On the same page a cache read costs much less than fresh input, and the Batch API takes 50% off.
 
 ## Core entities and API
 
@@ -93,15 +91,15 @@ Two terms first. The **control plane** holds what tenants configure: agents, con
 
 Now the question of who shares what. The AWS SaaS Lens names three **tenancy models**. In the **silo** model "tenants are provided dedicated resources". In the **pool** model "tenants share resources". The **bridge** model mixes them: "some microservices in your architecture might be implemented with silo and others might use pool".
 
-Here is the same platform in all three. Costs are illustrative: $30 a month for a dedicated slice, $8,000 a month for the shared pool, $0.20 an hour for microVM time.
+Here is the same platform in all three. Costs are illustrative.
 
-| Model | Cost a month (1,000 tenants) | One bug in the shared code reaches | What it buys |
+| Model | Cost | One bug in the shared code reaches | What it buys |
 |---|---|---|---|
-| Silo: a stack per tenant | 1,000 x $30 = $30,000 | 1 tenant (0.1%) | Smallest blast radius, 3.75 times the cost of the pool |
-| Pool: everything shared | $8,000, or $8 a tenant | 1,000 tenants (100%) | Cheapest, with the largest blast radius |
-| Bridge: pool the stateless parts, silo the risky parts | $8,000 + 5,000 microVM-hours x $0.20 = $9,000 | The pooled gateway: 100%. A code tool: 1 tenant | Small blast radius where code and secrets are, at 12.5% more than the pool |
+| Silo: a stack per tenant | Highest, a full stack for each tenant | 1 tenant | Smallest blast radius, several times the cost of the pool |
+| Pool: everything shared | Lowest, one shared stack | All tenants | Cheapest, with the largest blast radius |
+| Bridge: pool the stateless parts, silo the risky parts | The pool plus microVM time for code tools | The pooled gateway: all tenants. A code tool: 1 tenant | Small blast radius where code and secrets are, for a modest extra over the pool |
 
-The microVM-hours come from 20% of 50,000 runs a day x 60 s = 600,000 s a day, 167 hours a day, about 5,000 a month. Our reading: **silo whatever runs untrusted code or holds secrets, and pool what only coordinates.** The bridge is a map of where one bug can hurt many tenants. Large tenants can buy the full silo as a paid tier: 10 tenants cost 10 x $30 = $300 a month.
+Our reading: **silo whatever runs untrusted code or holds secrets, and pool what only coordinates.** The bridge is a map of where one bug can hurt many tenants. Large tenants can buy the full silo as a paid tier.
 
 Now build the design, one requirement at a time.
 
@@ -191,15 +189,11 @@ A **deputy** is a program with real authority that acts for other callers. It is
 
 Lesson [A7.7](/learn/ai/a7-agents-prod/background-agents-queues/) gave per-tenant queues and fair share, and lesson [A13.1](/learn/ai/a13-cases/llm-gateway/) gave token buckets. Both decide who waits. Neither helps when one tenant's input **crashes** the worker: a huge file or a hanging tool kills a worker, and the retry kills the next.
 
-**Shuffle sharding** limits how many workers one tenant can reach. Give each tenant a random set of k out of N workers and send its runs only there. The AWS Builders' Library example: eight workers, two per customer, "28 unique combinations", so a problem hits "just 1/28th" of customers. The count of ways to pick k from N is
+**Shuffle sharding** limits how many workers one tenant can reach. Give each tenant a random set of k out of N workers and send its runs only there. The AWS Builders' Library example: eight workers, two per customer, "28 unique combinations", so a problem hits "just 1/28th" of customers. The number of different sets grows very fast with the pool size. With 100 workers and 5 per tenant there are tens of millions of sets. A poison tenant takes down its 5 workers. Another tenant loses all 5 only if it has the same set, which is vanishingly rare. Plain sharding, with fixed groups of 5, would lose a whole group of tenants together.
 
-<Math block tex="C(N,k) = \frac{N (N-1) \cdots (N-k+1)}{k (k-1) \cdots 1}" />
+The damage does not vanish. A tenant is **dented** if it shares at least one worker with the poison tenant. That is a minority of tenants, and most lose one of five workers, so the retry lands on the other four. So some tenants see a small dent, and almost none see an outage.
 
-Check AWS: C(8, 2) = 8 x 7 / 2 = 28. Now take 100 workers and 5 per tenant: C(100, 5) = 100 x 99 x 98 x 97 x 96 / 120 = 9,034,502,400 / 120 = **75,287,520**. A poison tenant takes down its 5 workers. Another tenant loses all 5 only with the same set: probability 1 / 75,287,520. Plain sharding, 20 fixed groups of 5, loses 1 tenant in 20 (5%) with the poison tenant.
-
-The damage does not vanish. A tenant is **dented** if it shares at least one worker with the poison tenant: 1 - C(95, 5) / C(100, 5) = 1 - 57,940,519 / 75,287,520 = 23.0%. Most lose one of five workers, and the retry lands on the other four. So 23% see a small dent, and about 0.0000013% see an outage, against 5%.
-
-Three conditions hold (our reading). Clients retry across their own set. A run that crashes two workers is quarantined, or it will kill all 5. And tenants stay few next to C(N, k): with 1,000 tenants the expected share of identical pairs is C(1000, 2) / 75,287,520 = 0.66%, so check for twins when you assign sets. The AWS page on fairness in multi-tenant systems did not load for me, so these numbers come from the shuffle sharding article and the arithmetic shown.
+Three conditions hold (our reading). Clients retry across their own set. A run that crashes two workers is quarantined, or it will kill all 5. And tenants stay few next to the number of sets, but two tenants can still draw the same set, so check for twins when you assign sets. The AWS page on fairness in multi-tenant systems did not load for me, so this comes from the shuffle sharding article.
 
 ## Design point: exact cost attribution
 
@@ -209,7 +203,7 @@ Lesson [A3.9](/learn/ai/a3-llm-apis/cost-metering/) taught metering one call. Le
 
 **What to build.** Meter at the two gateways, because only you know the tenant. The model gateway writes tokens by class. The tool gateway writes calls, sandbox seconds, and third-party fees. Each row carries tenant, run, tool version hash, quantity, and price version.
 
-**Reconcile on two clocks.** Each hour, compare your token sums per workspace with the usage report. Each day, compare dollars with the cost report. Worked example (illustrative): the ledger sums to $4,812.40, the cost report says $4,870.12, and the gap is $57.72, or 57.72 / 4,870.12 = 1.19%, over the 1% bar. The hunt finds $46 of code execution that the token ledger never priced, and one script that used a raw key. A large tenant can get its own provider workspace: the provider then writes a second ledger for it.
+**Reconcile on two clocks.** Each hour, compare your token sums per workspace with the usage report. Each day, compare dollars with the cost report. Example (illustrative): the ledger and the cost report differ by a little over the 1% bar. The hunt finds code execution that the token ledger never priced, and one script that used a raw key. A large tenant can get its own provider workspace: the provider then writes a second ledger for it.
 
 ## Design point: the kill switch
 
@@ -283,16 +277,9 @@ Replay postmark with this in place (an illustrative timeline). At minute 3 on-ca
 
 Spend 10 to 15 minutes. Many tenants, one base model. Each tenant trains a **LoRA adapter**: a small set of extra weights that changes the base model's behavior for that tenant (lesson [A11.2](/learn/ai/a11-finetuning/sft-lora/) taught how). The platform stores hundreds of adapters and serves them on one shared base model. The isolation question is new: now the *weights* are tenant data.
 
-**The bar (ours).** Per tenant: the adapter beats the base model on that tenant's own eval set by a margin set at training time. Platform-wide: 0 requests served with another tenant's adapter, a p95 swap wait of at most 50 ms, and tenant training data deleted within 7 days of a request.
+**The bar (ours).** Per tenant: the adapter beats the base model on that tenant's own eval set by a margin set at training time. Platform-wide: 0 requests served with another tenant's adapter, a short p95 swap wait, and tenant training data deleted within 7 days of a request.
 
-**The size, derived.** LoRA adds r x (d_in + d_out) numbers to one weight matrix. For a square matrix this is 2 x d x r, but not every matrix is square. Llama-3.1-8B has hidden size 4,096, 32 layers, and 8 key-value heads of 128 each (from its config file). The query and output matrices are 4,096 x 4,096. The key and value matrices are 4,096 x 1,024, because grouped-query attention shares each key-value head across several query heads. At rank 16:
-
-- q and o: 16 x (4,096 + 4,096) = 131,072 each.
-- k and v: 16 x (4,096 + 1,024) = 81,920 each.
-- Per layer: 2 x 131,072 + 2 x 81,920 = 425,984. Over 32 layers: **13,631,488** numbers.
-- At 2 bytes each: 27,262,976 bytes, which is **26.0 MiB**.
-
-For 500 tenants: 500 x 27,262,976 = 13,631,488,000 bytes, about 13.6 GB (12.7 GiB). A full copy of the model per tenant takes 500 x 16 GB = 8,000 GB, about 587 times more. Add the three MLP matrices of each layer (width 14,336) and an adapter grows to 80.0 MiB, so 500 take 41.9 GB. The LoRA paper reports "10,000 times" fewer trainable parameters and "3 times" less GPU memory for GPT-3 175B.
+**The size.** A LoRA adapter adds two thin matrices to each weight matrix it touches. So its size grows with the rank and with how many matrices you adapt, and it stays tiny next to the base model. For an 8-billion-parameter model at a low rank on the attention matrices, an adapter is tens of megabytes (~26 MiB in our own count). Hundreds of tenants fit in one GPU server's memory. A full copy of the model per tenant would be hundreds of times larger. Adapting more matrices or raising the rank makes the adapter bigger. The LoRA paper reports "10,000 times" fewer trainable parameters and "3 times" less GPU memory for GPT-3 175B.
 
 **Design.**
 
@@ -302,46 +289,15 @@ For 500 tenants: 500 x 27,262,976 = 13,631,488,000 bytes, about 13.6 GB (12.7 Gi
 - **Batch across adapters.** S-LoRA says it can "serve thousands of LoRA adapters on a single GPU" and lift throughput "by up to 4 times" against HuggingFace PEFT and vLLM with naive LoRA support. Punica claims "12x higher throughput" and "only adding 2ms latency per token". These are paper claims on different baselines. Do not compare the two numbers.
 - **Roll out.** A new adapter version goes shadow, then 5% canary, then full, with a pointer you can roll back (lesson [A9.3](/learn/ai/a9-llmops/versioning/)).
 
-**The cache, and what a miss costs.** The GPU holds only some adapters. A request for another one waits while it loads. Move 26.0 MiB at 20 GB/s and the wait is 27,262,976 / 20e9 = 1.36 ms. From local disk at 3 GB/s it is 9 ms. From an object store at 100 MB/s it is 273 ms. The speeds are our assumptions. Traffic is skewed, so a few adapters are hot. Try it. Start at 16 slots and a skew of 1.0, then raise the rank to 64 and switch to all linear layers.
+**The cache, and what a miss costs.** The GPU holds only some adapters. A request for another one waits while it loads. The wait depends on where the adapter loads from. Over a fast link from CPU memory it is about a millisecond (~1 ms). From local disk it is several times longer. From an object store it can reach hundreds of milliseconds (~273 ms at our assumed speeds). Traffic is skewed, so a few adapters are hot. Try it. Start at 16 slots and a skew of 1.0, then raise the rank to 64 and switch to all linear layers.
 
 <Ai13PlatformAdapterSim client:visible />
 
-With uniform traffic, the hit rate of a least-recently-used list is about slots / 500, so 64 slots give 12.8%. With a skew of 1.0 the same 64 slots give about 58%. Skew is the lever. At 26 MiB a slot, memory is not the limit. At rank 64 on all matrices an adapter is 320 MiB, and 500 of them are 156 GiB, which no GPU holds. Then the cache matters, and the load source decides whether a miss costs 1 ms or 273 ms. Keep a warm CPU tier.
+With uniform traffic, the hit rate of a least-recently-used list is low, because every adapter is equally likely to be asked for. With skewed traffic the same slots give a much higher hit rate. Skew is the lever. With small adapters, memory is not the limit. At a high rank on all matrices, adapters are large and the full set no longer fits on one GPU. Then the cache matters, and the load source decides whether a miss costs a millisecond or hundreds. Keep a warm CPU tier.
 
 **A failure to design for.** A routing bug applies tenant A's adapter to tenant B's request. An adapter can reproduce patterns from its training data (our reading), so this is a data leak with no database in sight. Defense: the id comes from verified identity, a canary adapter trained on a unique string must never fire for another tenant, and a per-tenant load-rate quota stops a swap storm.
 
 **A provider note.** OpenAI's deprecations page says "Active existing customers will no longer be able to create new fine-tuning jobs" on January 6, 2027, and inference on fine-tuned models continues until the base model is deprecated (as of 2026-10-20; check again). I could not load Anthropic's fine-tuning page: check your provider. Our reading: a hosted fine-tune lives and dies with the provider's base model. An adapter on open weights that you hold does not.
-
-**Prove it.** Check the memory arithmetic.
-
-<Ballpark
-  client:visible
-  title="Memory for 500 adapters"
-  scenario="Llama-3.1-8B: hidden size 4,096, 32 layers, 32 attention heads and 8 key-value heads of 128 each. LoRA at rank 16 on q, k, v, and o only. Each number takes 2 bytes. The base model takes about 16 GB."
-  steps={[
-    {
-      prompt: 'Size of one adapter, in MiB? (q and o are 4,096 x 4,096. k and v are 4,096 x 1,024.)',
-      unit: 'MiB',
-      answer: 26,
-      within: 1.1,
-      explain: 'q and o: 16 x 8,192 = 131,072 each. k and v: 16 x 5,120 = 81,920 each. Per layer 425,984. Times 32 layers is 13,631,488 numbers. Times 2 bytes is 27,262,976 bytes, which is 26.0 MiB.',
-    },
-    {
-      prompt: 'Memory for 500 adapters, in GB (decimal)?',
-      unit: 'GB',
-      answer: 13.6,
-      within: 1.1,
-      explain: '500 x 27,262,976 bytes = 13,631,488,000 bytes, about 13.6 GB (12.7 GiB).',
-    },
-    {
-      prompt: '500 full copies of the 16 GB model take how many GB?',
-      unit: 'GB',
-      answer: 8000,
-      within: 1.1,
-      explain: '500 x 16 GB = 8,000 GB. That is about 587 times the 13.6 GB of adapters.',
-    },
-  ]}
-/>
 
 ## Staff answer vs senior answer
 
@@ -351,7 +307,7 @@ With uniform traffic, the hit rate of a least-recently-used list is about slots 
 | Isolation | Rows separated by `tenant_id` | Seven shared layers, a control and a daily canary for each, tenant id from the verified run |
 | Marketplace | Trust the registry | Registry proves names only. Vet, replay, pin by hash, re-review each change |
 | Tool auth | One service account per tool | One Connection per tenant, gateway-held tokens, no passthrough, refresh lock |
-| Noisy tenant | A per-tenant queue | Shuffle sharding plus poison quarantine: 1 in 75,287,520 for 100 workers and 5 per tenant |
+| Noisy tenant | A per-tenant queue | Shuffle sharding plus poison quarantine: a full outage needs the exact same worker set |
 | Cost | Invoice split by usage | Gateway ledger, hourly usage check, daily cost check, 1% bar |
 | Incidents | Redeploy | Kill switch per tenant, tool version, Connection; 60 s bar; drilled |
 
@@ -367,11 +323,11 @@ With uniform traffic, the hit rate of a least-recently-used list is about slots 
 
 | Choice | You gain | You pay | Choose it when |
 |---|---|---|---|
-| Silo tier | Smallest blast radius | 3.75 times the pool cost in our model | Regulated or large tenants |
+| Silo tier | Smallest blast radius | Several times the pool cost in our model | Regulated or large tenants |
 | Bridge tenancy | Small blast radius where code and secrets live | A second operating model | Agents that run code |
-| Pin and re-review | No silent tool change | 45 review hours a month | Any marketplace |
+| Pin and re-review | No silent tool change | Ongoing review hours | Any marketplace |
 | Gateway-held tokens | The agent never sees a secret | A vault and a refresh lock | Always |
-| Shuffle sharding | Outage odds near zero | A 23% chance of a small dent | Many tenants, shared workers |
+| Shuffle sharding | Outage odds near zero | A small dent for a minority of tenants | Many tenants, shared workers |
 | Tenant in cache keys | No cross-tenant hits | A lower hit rate | Always |
 
 ## Interview lens
@@ -385,35 +341,6 @@ Do not trust a tool because it is in a registry. Do not install "latest". Do not
 </Callout>
 
 ## Check yourself
-
-<Ballpark
-  client:visible
-  title="Platform cost of one tenant for a month"
-  scenario="One tenant runs 50 runs a day for 30 days. A run makes 10 model calls of 6,000 input and 400 output tokens on Claude Sonnet 5.5 ($2 in, $10 out per million tokens, as of 2026-10-20). 20% of runs use a code sandbox for 60 s, at an assumed $0.20 per microVM-hour. The shared platform costs $8,000 a month, split over 1,000 tenants."
-  steps={[
-    {
-      prompt: 'Cost of one model call, in dollars?',
-      unit: 'dollars',
-      answer: 0.016,
-      within: 1.1,
-      explain: '6,000 x $2 / 1M = $0.012. 400 x $10 / 1M = $0.004. Total $0.016.',
-    },
-    {
-      prompt: 'Model cost for the tenant for the month, in dollars?',
-      unit: 'dollars',
-      answer: 240,
-      within: 1.1,
-      explain: '50 x 30 = 1,500 runs. 1,500 x 10 calls x $0.016 = $240.',
-    },
-    {
-      prompt: 'Add sandbox time and the tenant share of hosting. Total for the month, in dollars?',
-      unit: 'dollars',
-      answer: 249,
-      within: 1.05,
-      explain: 'Sandbox: 1,500 x 20% = 300 runs x 60 s = 18,000 s = 5 hours x $0.20 = $1. Hosting: $8,000 / 1,000 = $8. Total $240 + $1 + $8 = $249. The platform adds about 3.75% to the model bill.',
-    },
-  ]}
-/>
 
 <Quiz
   client:visible
@@ -444,10 +371,10 @@ Do not trust a tool because it is in a registry. Do not install "latest". Do not
     },
     {
       id: 'ai13-plat-q-shuffle',
-      q: 'A pool has 10 workers. Each tenant is given a random set of 3 of them. One poison tenant crashes its 3 workers. What is the chance that another given tenant has exactly the same 3 workers?',
-      options: ['1 in 10, one per worker', '1 in 30, ten divided by three', '1 in 720, counting the order', '1 in 120'],
-      answer: 3,
-      explain: 'The number of ways to choose 3 of 10 is 10 x 9 x 8 / 6 = 120, so exactly the same set has probability 1 in 120. Dividing 10 by 3 or counting ordered sets (720) gives the wrong count.',
+      q: 'A pool gives each tenant a random small set of its workers. One poison tenant crashes its own set. What happens to a tenant that shares only one of those workers?',
+      options: ['It has a full outage, since a shared worker is a shared fate', 'It has a small dent, and its retries reach its other workers', 'It is moved to the poison tenant set, so it fails too', 'Nothing, since random sets can never share a worker'],
+      answer: 1,
+      explain: 'A tenant is down only if all its workers are down, which needs the exact same set. Sharing one worker costs it a fraction of its capacity, and retries use the rest. Random sets can overlap in part, so the dent is real.',
     },
     {
       id: 'ai13-plat-q-refresh-limit',
@@ -472,6 +399,20 @@ Do not trust a tool because it is in a registry. Do not install "latest". Do not
       ],
       answer: 2,
       explain: 'The platform ledger knows the tenant and is current. The usage report has 1-hour buckets and appears within about 5 minutes, so it can audit token counts. The cost report is daily and cannot split by tenant on a shared workspace. Splitting by request count ignores token size.',
+    },
+    {
+      id: 'ai13-plat-q-lora-memory',
+      q: 'A platform serves hundreds of tenant LoRA adapters on one base model. Why does storing all the adapters stay cheap?',
+      options: ['Each adapter stores only small extra matrices, not a copy of the model', 'Adapters are compressed to a tenth of their size on disk', 'Tenants share one adapter, so only one needs storing', 'Adapters live in the cloud, so they use no local memory'],
+      answer: 0,
+      explain: 'An adapter holds thin low-rank matrices, so it is tiny next to the base model. Compression, sharing, and remote storage are not what makes it small. One full copy of the model per tenant would be hundreds of times larger.',
+    },
+    {
+      id: 'ai13-plat-q-tenant-bill',
+      q: 'For a busy tenant on a shared agent platform, which part of its monthly cost is likely largest?',
+      options: ['Its share of the platform hosting', 'Sandbox time for code tools', 'The model calls its runs make', 'The kill switch and audit writes'],
+      answer: 2,
+      explain: 'Each run makes many model calls, and tokens add up fast. Sandbox time is billed by short seconds, and the hosting is split over many tenants. Audit writes are small and off the main path.',
     },
   ]}
 />

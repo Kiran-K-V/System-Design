@@ -1,11 +1,10 @@
 ---
-summary: 'Three small structures answer huge questions with a little wrong. A Bloom filter says maybe or never, HyperLogLog counts unique items in 12 KB, and Count-Min Sketch counts frequencies and only ever overcounts.'
+summary: 'Three small structures answer huge questions with a little wrong. A Bloom filter says maybe or never, HyperLogLog counts unique items in a few KB, and Count-Min Sketch counts frequencies and only ever overcounts.'
 requires: ['04-data/indexing', '01-one-machine/estimation']
 ---
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import BigBloomWalk from '../../../components/anim/lessons/BigBloomWalk.tsx';
 import BigBloomLab from '../../../components/anim/lessons/BigBloomLab.tsx';
 
@@ -13,8 +12,8 @@ import BigBloomLab from '../../../components/anim/lessons/BigBloomLab.tsx';
 
 Three questions come up again and again at scale.
 
-1. **Is this key in this file?** An LSM tree (lesson [4.3](/learn/04-data/indexing/)) is a database layout that stores data in many sorted files on disk. A read for a key that is not there would have to open each file to be sure. Each check is a disk read of about 100 µs (microseconds, millionths of a second).
-2. **How many unique visitors did we have today?** A set of 1 billion IDs, each stored in 64 bits (8 bytes), takes at least 8 GB. You want that number per page, per day.
+1. **Is this key in this file?** An LSM tree (lesson [4.3](/learn/04-data/indexing/)) is a database layout that stores data in many sorted files on disk. A read for a key that is not there would have to open each file to be sure. Each check is a disk read, which is slow next to memory.
+2. **How many unique visitors did we have today?** A set of 1 billion IDs, each stored in 64 bits (8 bytes), takes gigabytes. You want that number per page, per day.
 3. **Which items are most frequent?** A table of counters, one per search query, grows with the number of distinct queries. Think of a tally sheet with one row for every different thing anyone ever typed.
 
 An exact answer costs memory that grows with the number of items. Give up a little accuracy and memory becomes **small and fixed**. These structures are called **probabilistic**. Each one trades a known, tunable error for a very small size.
@@ -53,14 +52,7 @@ For a target rate ε, the bits needed per item are
 
 **m / n = −ln(ε) / (ln 2)²**
 
-Compute one by hand. You want ε = 1% for n = 1,000,000 items.
-
-- m / n = −ln(0.01) / 0.4805 = 4.605 / 0.4805 = **9.585 bits per item**.
-- m = 9.585 million bits, which is 1.198 MB. About **1.2 MB**.
-- k = 9.585 × 0.693 = 6.64. Hashes come in whole numbers, so use **k = 7**.
-- Check: ε = (1 − e^(−7/9.585))^7 = (1 − 0.4818)^7 = 0.5182^7 = **1.0%**.
-
-For ε = 0.1% the cost is 14.4 bits per item. Each 10× drop in error costs about 4.8 more bits per item. Memory grows slowly as you ask for accuracy.
+In practice, about 10 bits per item buys a 1% false-positive rate, with about 7 hash functions. A million items fit in roughly a megabyte. Each 10 times drop in error costs only a few more bits per item. Memory grows slowly as you ask for accuracy.
 
 Now try it. Add words, ask about words, and change m and k. Watch the bits fill up and the expected error climb.
 
@@ -69,7 +61,7 @@ Now try it. Add words, ask about words, and change m and k. Watch the bits fill 
 Two warnings.
 
 - **It cannot delete.** Clearing a bit might also clear it for other items, and then those items would get a false negative. (There are variants with counters that allow deletes.)
-- **It must be sized for n.** If you plan for 1 million items and add 2 million to the same filter, the rate changes. With k = 7, the rate is about 16%, not 1%.
+- **It must be sized for n.** If you plan for 1 million items and add 2 million to the same filter, the false-positive rate climbs far above the 1% you planned for.
 
 Lesson 4.3 showed the main use. Each SSTable file keeps a Bloom filter in memory. A read checks it first and skips files that say "definitely not". Cassandra (a database built on an LSM tree) and PostgreSQL also use Bloom filters to skip disk reads for rows that are not there, as the [Wikipedia article](https://en.wikipedia.org/wiki/Bloom_filter) lists.
 
@@ -77,7 +69,7 @@ Lesson 4.3 showed the main use. Each SSTable file keeps a Bloom filter in memory
 
 **HyperLogLog** (HLL) estimates the number of **distinct** items in a stream, which is a flow of items that you see once and cannot replay. It uses a fixed memory, and it never stores the items.
 
-The idea is a coin game. Hash each item to a random bit string. A random string starts with 0 half the time. The string starts with 00 a quarter of the time. With k zeros at the start, that happens 1 time in 2^k. If you saw a hash with 10 leading zeros, you probably looked at around 2^10 = 1,000 distinct items.
+The idea is a coin game. Hash each item to a random bit string. A random string starts with 0 half the time. The string starts with 00 a quarter of the time. With k zeros at the start, that happens 1 time in 2^k. If you saw a hash with 10 leading zeros, you probably looked at about a thousand distinct items. Rare events need many tries.
 
 One lucky hash makes a noisy guess. So HLL keeps **m registers** and splits the items among them. A register is just a small slot that holds one number. Averaging many guesses is steadier than trusting one, like asking thousands of people to guess the height of a tree instead of one.
 
@@ -98,18 +90,7 @@ Do it by hand with p = 2, so 4 registers, and 8-bit hashes.
 
 The registers end as **[3, 4, 1, 0]**. Adding "a" a second time changed nothing. A repeat gives the same hash and the same rank, so it never counts twice. The estimate combines all registers with a harmonic mean, a kind of average that is not pulled up by a few very large values. This stops one lucky register from dominating.
 
-The error depends only on the number of registers. The standard error is **1.04 / √m**. Standard error is the typical size of the miss. A 1% standard error means that for a true count of 1,000,000, the estimate usually lands within about 10,000 of it.
-
-| Registers m | Standard error |
-|---|---|
-| 64 | 13% |
-| 1,024 | 3.25% |
-| 16,384 | 0.81% |
-| 65,536 | 0.41% |
-
-Four times the registers halves the error. The Redis implementation uses 16,384 registers of 6 bits each. That is 16,384 × 6 / 8 = 12,288 bytes. The result matches the "up to 12 KB" in the Redis docs, with a standard error of 0.81%. It counts up to 2^64 items.
-
-Compare: exact counting of 1 billion IDs takes at least 8 GB. HLL takes 12 KB. That is about 650,000 times smaller (8 GB / 12 KB).
+The error depends only on the number of registers. More registers give a smaller error, with diminishing returns: you must add many registers to shave a little more error. The Redis implementation uses 16,384 small registers. That fits in about 12 KB and gives an error under 1%, however many items you count. Exact counting of a billion IDs needs gigabytes. HLL needs kilobytes.
 
 Two more facts. Two HLLs merge by taking the **maximum** of each register pair. The result counts the union (everything seen by either one), with no loss of accuracy. This lets you count each server separately and then merge. Redis (a fast in-memory data store) exposes this as `PFADD`, `PFCOUNT`, and `PFMERGE`. And HLL **cannot answer "did user X visit?"**. It keeps no items, only the maxima.
 
@@ -134,21 +115,9 @@ Here is a tiny grid: w = 4, d = 2. We add a three times, b once, and c twice. Th
 - Query c: min(2, 5) = **2**. Exact.
 - Query an item never added, such as z. The item z hashes to row 1 column 1 and row 2 column 0. Its estimate is min(4, 5) = **4**. The true count is 0.
 
-The guarantee: with width w = ⌈e / ε⌉ and depth d = ⌈ln(1 / δ)⌉, the estimate is at most the true count plus **ε × N**, with probability at least 1 − δ. N is the total of all counts. For ε = 0.01 and δ = 0.01: w = ⌈271.8⌉ = 272 and d = ⌈4.6⌉ = 5. That is 1,360 counters.
+The guarantee: a wider grid gives a smaller error, and more rows make a bad estimate less likely. The estimate is at most the true count plus a small share of N, the total of all counts. A grid of a few hundred columns and a handful of rows is enough for a 1% share.
 
-The error is relative to the **total** N, not to the item. With N = 1,000,000 the bound is ±10,000. An item seen 50,000 times is measured well. An item seen 50 times is swamped. So CMS is for **heavy hitters**, the items that are frequent. A common design keeps a CMS plus a small heap of the current top items.
-
-## Numbers
-
-| Fact | Value | Source |
-|---|---|---|
-| Bloom, 1% error | 9.585 bits per item; 1,000,000 items ≈ 1.2 MB; k = 7 | Derived from the formulas |
-| Bloom, 0.1% error | 14.4 bits per item | Derived |
-| Bloom rate with k = 7 at twice its planned n | ~16% | Derived |
-| HLL standard error | 1.04 / √m | Flajolet et al. 2007 |
-| Redis HLL | up to 12 KB, 0.81% error, 16,384 registers of 6 bits | Redis docs and source |
-| CMS size for ε = δ = 0.01 | 272 × 5 = 1,360 counters | Derived from the Wikipedia formulas |
-| Exact set of 1 billion 64-bit IDs | at least 8 GB | Derived |
+The error is relative to the **total** N, not to the item. A very frequent item is measured well. A rare item is swamped by the noise. So CMS is for **heavy hitters**, the items that are frequent. A common design keeps a CMS plus a small heap of the current top items.
 
 ## Trade-offs
 
@@ -185,16 +154,16 @@ A register holds a rank, which is a count of leading zeros plus 1. With a 64-bit
       explain: '"Possibly present" can be a false positive. Only the real store knows. The filter\'s job is to skip the lookup when it says "definitely not". Adding the key again changes nothing, and a second pass with the same hashes gives the same answer.',
     },
     {
-      q: 'You want 1% false positives for 100 million keys in a Bloom filter. About how much memory is that?',
-      options: ['About 12 MB', 'About 120 MB', 'About 1.2 GB', 'About 12 KB'],
+      q: 'Your Bloom filter was sized for 1 million keys and now holds 2 million. What happens to its false-positive rate?',
+      options: ['It stays the same, because the hash count does not change', 'It rises well above the planned rate, because more bits are set to 1', 'It falls, because the filter has seen more keys', 'It turns into false negatives for the oldest keys'],
       answer: 1,
-      explain: '9.585 bits per item × 100 million = 958.5 million bits, which is about 120 MB. At 1 million keys it is 1.2 MB, so 100 million keys is 100 times that.',
+      explain: 'More items set more bits, so a new key finds all its bits set by accident more often. The filter must be sized for the number of items it will hold. It never gives false negatives, because bits are not cleared.',
     },
     {
-      q: 'A HyperLogLog uses 16,384 registers. You move to 65,536 registers. What happens to the standard error?',
-      options: ['It stays at 0.81%, because memory does not affect error', 'It drops to about 0.2%', 'It drops to about 0.41%, half as large', 'It rises, because more registers mean more noise'],
-      answer: 2,
-      explain: 'The error is 1.04 / √m. Four times the registers gives √4 = 2 times smaller error: 0.81% becomes about 0.41%. It is not 4 times smaller, because the square root is in the formula.',
+      q: 'A team wants its HyperLogLog counts to be more accurate. What is the trade?',
+      options: ['Use more registers, which costs more memory and gives smaller gains each time', 'Store a sample of the real IDs, which lets it list the visitors', 'Use fewer registers, because each one then averages more items', 'Nothing, because the error is fixed by the hash function'],
+      answer: 0,
+      explain: 'The error depends only on the number of registers. More registers mean a smaller error and more memory, with diminishing returns. Fewer registers make the error larger. Storing real IDs would defeat the purpose of the structure.',
     },
     {
       q: 'A Count-Min Sketch reports that a search term was seen 4,200 times. What is the best conclusion about the true count?',
@@ -208,34 +177,11 @@ A register holds a rank, which is a count of leading zeros plus 1. With a 64-bit
       answer: 1,
       explain: 'Bits are shared between items. If you reset the three bits of one item, another item that used one of those bits would now see a 0 and be reported as "definitely not". That is a false negative, which the structure promises never to give.',
     },
-  ]}
-/>
-
-<Ballpark
-  client:visible
-  title="Bloom filters for an LSM tree"
-  scenario="A key-value store has 20 data files. Each file holds 50 million keys and has its own Bloom filter sized for a 1% false-positive rate (9.585 bits per key)."
-  steps={[
     {
-      prompt: 'How many MB is the Bloom filter of one file?',
-      unit: 'MB',
-      answer: 60,
-      within: 1.1,
-      explain: '50 million × 9.585 bits = 479 million bits. Divide by 8 for bytes: about 59.9 million bytes, which is 60 MB.',
-    },
-    {
-      prompt: 'How many GB of memory do the filters of all 20 files take?',
-      unit: 'GB',
-      answer: 1.2,
-      within: 1.1,
-      explain: '20 × 60 MB = 1,200 MB, which is 1.2 GB.',
-    },
-    {
-      prompt: 'A read asks for a key that exists in none of the files. On average, how many file reads are wasted by false positives?',
-      unit: 'reads',
-      answer: 0.2,
-      within: 1.3,
-      explain: 'Each of the 20 filters wrongly says "maybe" 1% of the time. 20 × 0.01 = 0.2 wasted reads on average. Without filters it would be 20 reads.',
+      q: 'An LSM store keeps one Bloom filter per data file. A read asks for a key that exists in none of the files. How does the filter help?',
+      options: ['It skips almost every file read, because each filter says "definitely not"', 'It reads all the files in parallel so the answer comes back faster', 'It stores the key so the next read is a cache hit', 'It removes the files that do not hold the key'],
+      answer: 0,
+      explain: 'Each filter says "definitely not" for nearly every file. A rare false positive costs one wasted read. Without filters the read would open every file. A filter does not read files or delete them.',
     },
   ]}
 />

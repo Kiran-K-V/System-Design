@@ -6,7 +6,6 @@ requires: ['04-data/consistent-hashing', '05-caching/eviction', '04-data/replica
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import DistributedCacheBuild from '../../../components/anim/lessons/DistributedCacheBuild.tsx';
 import DistributedCacheCompare from '../../../components/anim/lessons/DistributedCacheCompare.tsx';
 
@@ -30,12 +29,11 @@ Here the cache is the product, not a helper. You are asked to design the cache i
 
 ### Scale, derived
 
-- Nodes for the data. Assume a node has 64 GB of RAM and 50 GB of that holds data. Then 1 TB / 50 GB = 20 nodes (using 1 TB = 1,000 GB).
-- Replicas. With one copy of each range, that is 20 x 2 = 40 nodes.
-- Load per node. 100,000 / 20 = 5,000 requests per second per node, if keys spread evenly. That is small. Capacity is set by memory here, not by request rate.
-- Keys. At 1 KB per entry (assumption), 1 TB is 1 billion keys, about 50 million per node.
-- LRU overhead. A linked list is a chain of entries in which each one points to the one before and the one after. Those two pointers cost 16 bytes per entry. On 1 KB entries that is 1.6%. On 100-byte entries it is 16%. Small values make exact LRU costly.
-- Latency. A round trip inside one data center costs about 0.5 ms (lesson [1.2](/learn/01-one-machine/latency-numbers/)). One round trip from the client to the owning node leaves most of the 10 ms budget unused. A proxy in the middle adds a second hop. A client library that knows the ring avoids it.
+- Nodes for the data. A node holds a slice of the data in RAM, so capacity is set by memory: a terabyte needs a few dozen nodes.
+- Replicas. One extra copy of each range roughly doubles the node count.
+- Load per node. If keys spread evenly, each node sees a small share of the request rate. Capacity is set by memory here, not by request rate.
+- LRU overhead. A linked list is a chain of entries in which each one points to the one before and the one after. Those two pointers cost a small, fixed amount per entry. On large values that is nothing. On tiny values it is a big share. Small values make exact LRU costly.
+- Latency. A round trip inside one data center is well under a millisecond (lesson [1.2](/learn/01-one-machine/latency-numbers/)). One round trip from the client to the owning node leaves most of the 10 ms budget unused. A proxy in the middle adds a second hop. A client library that knows the ring avoids it.
 
 ## Core entities
 
@@ -71,9 +69,9 @@ Exact LRU must update the list on every read, which means a lock on a shared str
 
 ### Placing keys: the ring
 
-With 20 nodes, `hash(key) % 20` sends each key to a node. Going to 21 nodes changes `hash % N` for nearly everyone. A share of N/(N+1) of the keys move, here 20/21 or about 95%. Each moved key is a miss, so the database behind the cache takes almost all the traffic at once. The ring of lesson [4.8](/learn/04-data/consistent-hashing/) moves only about 1/21, near 5%. The ring is a circle of positions. Each node sits at a point on the circle, and a key belongs to the first node you meet walking around from the key's own point. A new node takes over only the stretch just before it, so only the keys in that stretch move.
+With 20 nodes, `hash(key) % 20` sends each key to a node. Going to 21 nodes changes `hash % N` for nearly everyone. Nearly all the keys move. Each moved key is a miss, so the database behind the cache takes almost all the traffic at once. The ring of lesson [4.8](/learn/04-data/consistent-hashing/) moves only a small share, about one node's worth. The ring is a circle of positions. Each node sits at a point on the circle, and a key belongs to the first node you meet walking around from the key's own point. A new node takes over only the stretch just before it, so only the keys in that stretch move.
 
-Use **virtual nodes**: each physical node owns many points on the ring, such as 128 (assumption). Many points per node smooth out the load, so no node gets a much larger arc than the rest. They also spread the load of a failed node over many survivors, not just its single neighbor. With 40 nodes and 128 points, the ring has 5,120 points. A binary search finds the owner in about 13 steps.
+Use **virtual nodes**: each physical node owns many points on the ring, such as 128 (assumption). Many points per node smooth out the load, so no node gets a much larger arc than the rest. They also spread the load of a failed node over many survivors, not just its single neighbor. A binary search over the sorted points finds the owner quickly.
 
 Where does the ring live? In the **client library**, loaded from a small config service that all nodes agree on (lesson [8.8](/learn/08-technologies/zookeeper/)). Clients refresh it when membership changes. A stale ring only sends a request to a node that no longer owns the key. That is a miss, not an error, which a cache can tolerate. Redis Cluster takes a related approach: 16,384 fixed numbered buckets, called hash slots, each key going to slot `hash(key) % 16,384` and each slot assigned to a node (lesson [8.2](/learn/08-technologies/redis/)).
 
@@ -83,7 +81,7 @@ If a node dies, its range is gone and its keys miss. Misses are survivable, but 
 
 Copy **asynchronously**. A write is acknowledged by the primary, and the copy follows. If the primary dies before the copy arrives, you lose a recent write. For a cache that costs a stale value or a miss, never the only copy of the data. This is the trade that eventual consistency gives you: lower write latency and higher availability, in return for stale reads.
 
-When a node joins, it takes ranges from its neighbors, and those keys miss until they are filled. Warm it slowly, or accept a brief rise in database load of about 1/N.
+When a node joins, it takes ranges from its neighbors, and those keys miss until they are filled. Warm it slowly, or accept a brief rise in database load.
 
 ### The hot key
 
@@ -93,49 +91,18 @@ Now the problem the ring cannot solve. A single key gets enormous traffic. A cel
 
 **Adding nodes does not help**, because one key still lives on one node. Three tools:
 
-1. **Near cache.** Each app server keeps the hot value in its own memory for a second or two (lesson [5.2](/learn/05-caching/cache-placement/)). With 200 app servers (assumption), the owner then sees at most about 200 reads per second for that key. The owner does not see 60,000 reads per second. The price is a value that is up to two seconds old.
+1. **Near cache.** Each app server keeps the hot value in its own memory for a second or two (lesson [5.2](/learn/05-caching/cache-placement/)). With a few hundred app servers, the owner then sees at most one read per app server per second for that key. The owner does not see every user read. The price is a value that is up to two seconds old.
 2. **Read copies under suffixed names.** Store `hot#0` to `hot#3`. Names hash to different nodes. Readers pick one at random. A write updates every copy.
 3. **Split a write-hot key.** A counter becomes sub-counters that are summed on read.
 
 Detect hot keys by counting requests per key on each node over a short window. Treat only the top few as hot. A cache that treats every key this way pays the copy cost for no gain.
-
-## Numbers
-
-<Ballpark
-  client:visible
-  title="Cache cluster size"
-  scenario="Assume 1 TB of data (1,000 GB), 50 GB of usable data memory per node, 100,000 requests per second, and one replica of every range."
-  steps={[
-    {
-      prompt: 'How many primary nodes hold the data?',
-      unit: 'nodes',
-      answer: 20,
-      within: 1.1,
-      explain: '1,000 GB / 50 GB per node = 20 nodes.',
-    },
-    {
-      prompt: 'How many nodes in total, with one replica of every range?',
-      unit: 'nodes',
-      answer: 40,
-      within: 1.1,
-      explain: 'Each range is stored twice, so 20 x 2 = 40 nodes.',
-    },
-    {
-      prompt: 'If a 21st primary joins a ring, about what percent of keys move?',
-      unit: 'percent',
-      answer: 4.8,
-      within: 1.2,
-      explain: 'A new node takes its fair share, 1/21 of the keys, which is about 4.8%. With hash modulo N the share would be 20/21, about 95%.',
-    },
-  ]}
-/>
 
 ## Trade-offs
 
 | Choice | Gain | Pay | When to choose |
 |---|---|---|---|
 | Modulo hashing | Trivial | Nearly all keys move on resize | Fixed-size cluster |
-| Ring with virtual nodes | About 1/N of keys move; even load | Ring state in every client | Default |
+| Ring with virtual nodes | Only a small share of keys move; even load | Ring state in every client | Default |
 | Smart client | No extra hop | Every language needs the library | Latency target is tight |
 | Proxy tier | Thin clients, one place to change | Extra hop and extra machines | Many client languages |
 | Async replicas | Fast writes, available reads | Stale reads, possible lost write | A cache |
@@ -163,15 +130,15 @@ A cache holds copies. If a copy is lost or stale, the system falls back to the s
   client:visible
   questions={[
     {
-      q: 'A cache cluster grows from 20 to 21 nodes and uses hash(key) % N. About what share of keys now map to a different node?',
+      q: 'A cache cluster grows by one node and uses hash(key) % N. What happens to the keys?',
       options: [
-        'About 5%, which is the share that the new node takes',
-        'About 50%, because half of the nodes see a change in their range',
-        'About 95%, because the modulus changes for almost every key',
-        'Exactly 0%, because the hash of each key stays the same',
+        'Only the keys the new node takes over move',
+        'Half of the keys move, since half of the nodes change',
+        'Almost every key maps to a different node, so most reads miss',
+        'No key moves, because the hash of each key stays the same',
       ],
       answer: 2,
-      explain: 'A key stays only when hash % 20 equals hash % 21, which is true for about 1 key in 21. So about 20/21 move. The 5% figure belongs to the ring, not to modulo.',
+      explain: 'The hash stays the same, but the modulus changes, so nearly every key lands on a new node. The database then takes almost all the traffic. Only a ring moves just the new node\'s share.',
     },
     {
       q: 'One key gets 60,000 reads per second and its node handles 20,000. You add 10 nodes to the ring. What happens to the hot key?',
@@ -194,6 +161,12 @@ A cache holds copies. If a copy is lost or stale, the system falls back to the s
       ],
       answer: 3,
       explain: 'A proxy adds a hop in front of every request. A client that knows the ring goes straight to the owner. The price is that every client language needs the library.',
+    },
+    {
+      q: 'A team must hold a very large data set in cache with replicas. What sets the number of nodes?',
+      options: ['The total memory the data needs, doubled for replicas', 'The number of requests per second alone', 'The length of the key names', 'The number of app servers'],
+      answer: 0,
+      explain: 'Each node holds a slice in RAM, so memory sets the node count, and each replica adds a copy. Request rate per node is small for a cache like this. Key names and app server count do not size the cluster.',
     },
     {
       q: 'A node dies. Its asynchronous replica takes over. What can the callers see?',
@@ -231,7 +204,7 @@ A cache holds copies. If a copy is lost or stale, the system falls back to the s
         'The LRU list on cache-17 is exact and locks on every single read',
       ],
       answer: 1,
-      explain: 'A load of 58,000 against about 5,000 for the others is far beyond what an uneven ring gives. And adding nodes did not help. Both fit one hot key. A large arc would hold many keys, and the load would drop when nodes were added.',
+      explain: 'A load many times higher than the others is far beyond what an uneven ring gives. And adding nodes did not help. Both fit one hot key. A large arc would hold many keys, and the load would drop when nodes were added.',
     },
     {
       prompt: 'The hot key is a read-heavy product record. What do you do first?',

@@ -6,7 +6,6 @@ requires: ['02-networking/real-time-transport', '07-reliability/rate-limiting', 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import ChatgptBuild from '../../../components/anim/lessons/ChatgptBuild.tsx';
 import ChatgptBatching from '../../../components/anim/lessons/ChatgptBatching.tsx';
 
@@ -99,28 +98,13 @@ Use two token buckets per user (lesson [7.4](/learn/07-reliability/rate-limiting
 
 Messages are written once and read in order. The access pattern fits a wide-column or key-value store (lessons [8.3](/learn/08-technologies/cassandra/) and [8.4](/learn/08-technologies/dynamodb/)). Use the conversation id as the partition key, which decides the machine that stores the row, so one chat stays together. Use a sequence number as the sort key, which keeps messages in order inside it. The chat list is a second table keyed by user, sorted by last activity.
 
-The model has no memory. Each turn, the context builder sends the history again, as part of the prompt. The most text a model can read in one go is its **context window**. That is the cost driver. Suppose 20 turns, each adding about 300 tokens (a question and an answer). Turn n sends about 300 x n tokens. The total over 20 turns is 300 x (1 + 2 + ... + 20). That is 300 x 210 = 63,000 tokens, but only 6,000 are new. That is 10.5 times the new text.
+The model has no memory. Each turn, the context builder sends the history again, as part of the prompt. The most text a model can read in one go is its **context window**. That is the cost driver. Each turn sends all earlier turns again, so the text the model reads grows with every turn. Over a long chat, the model reads the same early messages many times. Most of what it reads is old text, not new text.
 
 Keep the history inside a budget. Drop the oldest turns, or replace them with a short summary. Say the price out loud: the model forgets what you trimmed, and a summary can lose detail.
 
 ## Numbers
 
-Every figure below is an assumption, so you can change it and redo the math.
-
-<Ballpark
-  client:visible
-  title="Size the GPU fleet"
-  scenario="Assume 100 million daily users, 10 prompts each. Peak load is 3 times the daily average. An answer is 400 tokens, streamed at 50 tokens per second."
-  facts={['One 8-GPU server holds 256 streams at once (an assumption: it depends on model size and context length)']}
-  steps={[
-    { prompt: 'How many prompts per second at peak?', unit: 'prompts/s', answer: 34700, within: 1.2, explain: '100 million x 10 = 1 billion prompts a day. 1,000,000,000 / 86,400 is about 11,570 per second on average. Three times that is about 34,700 at peak.' },
-    { prompt: 'How long does one answer take to stream, in seconds?', unit: 's', answer: 8, within: 1.1, explain: '400 tokens / 50 tokens per second = 8 seconds. Time to first token is separate, and should be under about a second.' },
-    { prompt: 'How many streams run at once at peak? Use prompts per second x seconds per answer (Little\'s law, lesson 1.3).', unit: 'streams', answer: 277600, within: 1.2, explain: '34,700 x 8 is about 278,000 concurrent streams. Little\'s law: concurrency = arrival rate x time in system.' },
-    { prompt: 'How many 8-GPU servers does that need?', unit: 'servers', answer: 1085, within: 1.2, explain: '278,000 / 256 is about 1,085 servers, or about 8,700 GPUs. If continuous batching doubles the streams per server, the fleet halves. That is why scheduling is the first thing you tune.' },
-  ]}
-/>
-
-Storage is small next to compute. At 1 billion prompts and 1 billion answers a day, that is 2 billion messages. At 2 KB each, that is 4 TB a day, or about 1.5 PB a year. It is large, but it is cold, append-only data.
+The scale is an assumption, so size it in words. Prompts arrive at tens of thousands per second at peak. Each answer streams for several seconds. By Little's law (concurrency equals arrival rate times time in system, lesson [1.3](/learn/01-one-machine/throughput-vs-latency/)), that means hundreds of thousands of streams at once. Each GPU server holds a few hundred streams, so the fleet is large. Continuous batching raises streams per server, so scheduling is the first thing you tune. Storage is small next to compute. Messages are cold, append-only data.
 
 ## Trade-offs
 
@@ -134,7 +118,7 @@ Storage is small next to compute. At 1 billion prompts and 1 billion answers a d
 | Summarize old turns | Lower cost per turn | The model may forget detail | Long conversations |
 
 <Callout type="tip">
-Lead with the scarce resource: "The GPU is the bottleneck, so the design is a queue and a scheduler in front of it." Then the user-facing parts: SSE for tokens, a run id for resume, token buckets for fairness. Quote the Little's law step: concurrency equals rate times time.
+Lead with the scarce resource: "The GPU is the bottleneck, so the design is a queue and a scheduler in front of it." Then the user-facing parts: SSE for tokens, a run id for resume, token buckets for fairness. Say the Little's law idea: concurrency equals arrival rate times time in the system.
 </Callout>
 
 <Callout type="mistake">
@@ -184,15 +168,15 @@ The first token is slow because the model must read the whole prompt before it c
       explain: 'Fifty thousand tokens costs about a thousand times more than fifty. A limit on requests per minute lets one user take a large share of GPU time. A tokens-per-minute budget, charged at admission and refunded at the end, caps the real cost.',
     },
     {
-      q: 'A 20-turn chat adds about 300 tokens per turn and resends the full history each turn. About how many tokens does the model read over the whole chat?',
+      q: 'A chat runs for 20 turns. The service resends the full history every turn. Why does the cost of the chat grow faster than the amount of new text?',
       options: [
-        'About 6,000, because only the new text of each turn is read',
-        'About 63,000: turn n reads about 300 x n',
-        'About 120,000, because each turn is read twice by the model',
-        'About 300,000, because 300 tokens are read about 1,000 times',
+        'The model has no memory, so each turn it reads all earlier turns again',
+        'The model stores every turn on the GPU and re-checks it for errors',
+        'Each new turn is longer than the one before',
+        'The gateway sends each token twice to be safe',
       ],
-      answer: 1,
-      explain: 'Turn n sends the history of n turns, about 300 x n tokens. The sum for 20 turns is 300 x 210 = 63,000. The new text is only 6,000, so history is about 10 times the new content. That is why old turns are trimmed or summarized.',
+      answer: 0,
+      explain: 'The model has no memory between turns, so the history is part of every prompt. Most tokens read in a long chat are old ones. That is why old turns are trimmed or summarized. Turn length and token delivery are not the cause.',
     },
   ]}
 />

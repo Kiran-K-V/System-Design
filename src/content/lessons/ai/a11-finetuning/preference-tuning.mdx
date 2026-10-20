@@ -29,11 +29,9 @@ The method at the center is called **preference tuning**. Its best-known recipe 
 
 A language model writes one **token** at a time. A token is a small piece of text, often a word or part of a word. At each step the model gives every possible next token a **probability**: a number from 0 to 1, like a weather forecast. "70% chance of rain" is a probability of 0.7.
 
-The model then picks a token, usually a likely one, and repeats. So an answer is a chain of picks. The probability of the whole answer is every pick's probability multiplied together. Take a three-token answer with probabilities 0.5, 0.2 and 0.1. The answer has probability 0.5 x 0.2 x 0.1 = 0.01.
+The model then picks a token, usually a likely one, and repeats. So an answer is a chain of picks. The probability of the whole answer is every pick's probability multiplied together. Each pick is below 1, so a long answer has a tiny probability, far too small for a computer to handle well. So everyone uses the **logarithm** (log) instead. A log turns multiplying into adding. The picture is sound: engineers add decibels instead of multiplying power ratios.
 
-Now take a real answer of 100 tokens, each at 0.5. That is 0.5 to the power 100, about 8 x 10^-31. Computers handle such numbers badly, and long multiplications are awkward. So everyone uses the **logarithm** (log) instead. A log turns multiplying into adding. The picture is sound: engineers add decibels instead of multiplying power ratios.
-
-The natural log of 0.5 is -0.69. Of 0.2 it is -1.61. Of 0.1 it is -2.30. Add them: -4.61. That is the log of 0.01. Read it like this: **the log-probability of an answer is always zero or below. The closer to zero, the more likely the answer.** An answer at -10 is far more likely than one at -12. In fact it is e^2, about 7.4 times as likely.
+So the model adds up one log per token instead. Read it like this: **the log-probability of an answer is always zero or below. The closer to zero, the more likely the answer.** An answer at -10 is more likely than one at -12, because it sits closer to zero.
 
 Why does this matter here? Because it lets us ask a precise question about training: did this answer become more likely or less likely? We will subtract one log-probability from another to find out.
 
@@ -47,7 +45,7 @@ Where do pairs come from?
 - **A stronger model as the judge.** The UltraFeedback project asked GPT-4 to rate answers and produced over 1 million pieces of feedback on 250,000 conversations. Separately, the Zephyr project tuned a 7-billion-parameter model on answers ranked by a teacher model, with no human labels. On the MT-Bench chat test it surpassed Llama2-Chat-70B, a model ten times larger.
 - **Comparing two models.** Generate one answer from your model and one from a rival, then let a judge pick. The open Tulu 3 recipe from the Allen Institute for AI used a mix of 354,192 such preference examples.
 
-A judge model costs real money, so do the sum. Say a pair is 1,400 tokens of input (the prompt and both answers) and the judge writes 100 tokens. At Sonnet 5.5 list prices, $2 per million input tokens and $10 per million output tokens (as of 2026-10-16, [pricing page](https://platform.claude.com/docs/en/about-claude/pricing)), one pair costs 1,400 x $2 / 1,000,000 + 100 x $10 / 1,000,000 = $0.0028 + $0.001 = $0.0038. A set of 20,000 pairs costs about $76. Labels are cheap compared with the human hours that SFT answers would take. But there is a catch about who may train on a model's outputs, covered in lesson [A11.5](/learn/ai/a11-finetuning/distillation-data/).
+A judge model costs real money, but little. Each pair is one prompt and two answers in, and a short verdict out. Even a large set of pairs costs far less than the human hours that SFT answers would take. But there is a catch about who may train on a model's outputs, covered in lesson [A11.5](/learn/ai/a11-finetuning/distillation-data/).
 
 ## Question 3: how could a model learn from "better"?
 
@@ -83,7 +81,7 @@ The cost: you must run the reference model on every answer once. That is one ext
 
 For any answer, we can compute its log-probability under the policy and under the reference. Subtract the two. The result is the **log-ratio**: how much more or less likely training made this answer.
 
-Example: an answer scores -12.0 under the reference. After some training the policy scores -10.0. The log-ratio is +2.0, and the answer is about 7.4 times as likely as before. A log-ratio of 0 means nothing changed. A negative one means the answer got less likely.
+Example: after some training, the policy scores an answer closer to zero than the reference did. The log-ratio is positive, and the answer is now more likely. A log-ratio of 0 means nothing changed. A negative one means the answer got less likely.
 
 DPO computes one log-ratio for the chosen answer and one for the rejected answer.
 
@@ -97,7 +95,7 @@ Then the **loss** turns the margin into a penalty. A loss is a number that train
 
 loss = -ln( sigmoid(margin) )
 
-Three points show how it behaves. At a margin of 0 the model is guessing, so the loss is 0.693. At a margin of 2.2 the sigmoid gives 0.9, and the loss is 0.105. At a margin of -2.2 the model prefers the wrong answer with 90% confidence, and the loss is 2.30.
+Three cases show how it behaves. At a margin of zero the model is guessing, so the loss is middling. At a large positive margin the model prefers the chosen answer, and the loss is near zero. At a large negative margin the model prefers the wrong answer with confidence, and the loss is large.
 
 There is one more detail the DPO paper proves. The margin acts as a reward. The quantity beta x log-ratio plays the role of the reward-model score. So the policy **is** its own reward model, which is why the paper's title says "your language model is secretly a reward model". DPO does not remove the reward model from the maths. It folds it into the policy, so you never train a separate one. That is why it needs one stage, not two.
 
@@ -113,7 +111,7 @@ DPO is a middle step. You start from an SFT model, because the reference must al
 
 <Ai11PrefPipe />
 
-Training cost is modest. Take 20,000 pairs of 1,400 tokens (prompt plus both answers), which is 28 million tokens. A standard rule says training costs about 6 x parameters x tokens in floating-point operations, and the reference's forward pass adds 2 more (lesson [A1.7](/learn/ai/a1-model-function/scaling-laws/) introduced it). For an 8-billion-parameter model that is 8 x 8 x 10^9 x 28 x 10^6, about 1.8 x 10^18 operations. At an assumed 4 x 10^14 operations per second on one good GPU, that is about 4,500 seconds, about 1.2 GPU-hours. The assumption is mine, not a measurement, but the order of magnitude holds: the labels cost more than the training.
+Training cost is modest. A preference set is small next to a pretraining corpus, and each pair needs one pass through the policy and one through the reference. On one good GPU, a run on a small model takes hours, not weeks. The labels cost more than the training.
 
 Open-source tools do it for you. The Hugging Face TRL library has a `DPOTrainer` that also works with LoRA adapters. The managed route is shrinking: OpenAI's [deprecations page](https://developers.openai.com/api/docs/deprecations) says that since May 7, 2026 organizations that had never run fine-tuning cannot start, and active customers lose the ability to create new fine-tuning jobs on January 6, 2027. If you plan on a vendor, check that date first.
 
@@ -136,8 +134,8 @@ One more variant helps when you have no pairs. **KTO** learns from single answer
 Every tuning job needs three numbers fixed before you start.
 
 - **Quality bar and how you measure it.** Win rate against your current SFT model on your own held-out prompts, judged with length controlled, plus no drop on your regression tests. A typical gate: win rate above 55% with the average answer length within 10% of the baseline. The cutoffs are a convention for the lesson, not an industry standard. Pick yours from your golden set ([A8.3](/learn/ai/a8-evals/golden-sets/)).
-- **Latency budget.** Preference tuning does not change model size, so time per token does not change. But time per answer follows answer length. If length grows from 210 to 390 tokens (the case below), generation takes 390 / 210 = 1.86 times as long.
-- **Cost per request.** The same effect hits cost. Output tokens cost more than input tokens (Sonnet 5.5 charges $10 per million output against $2 per million input), so a 1.86x longer answer raises the output part of the bill by 86%.
+- **Latency budget.** Preference tuning does not change model size, so time per token does not change. But time per answer follows answer length. If answers grow much longer (the case below), generation takes proportionally longer.
+- **Cost per request.** The same effect hits cost. Output tokens cost more than input tokens (Sonnet 5.5 charges $10 per million output against $2 per million input), so longer answers raise the output part of the bill by the same share.
 
 Training numbers from published recipes, all for full fine-tuning (LoRA uses other values):
 
@@ -185,10 +183,10 @@ Do not say "DPO has no reward model". The paper rewrites the reward model into t
   client:visible
   questions={[
     {
-      q: 'In a DPO training step, the chosen answer has a log-ratio of +1.0 and the rejected answer has -1.5. With beta = 0.1, what is the margin?',
-      options: ['2.5, the plain gap between the two log-ratios', '0.5, which is beta times the chosen log-ratio', '0.25, which is beta times the gap of 2.5', '0.1, which is simply the value of beta'],
-      answer: 2,
-      explain: 'The margin is beta x (chosen - rejected) = 0.1 x (1.0 - (-1.5)) = 0.25. Skipping beta gives 2.5. Using only the chosen log-ratio ignores the rejected answer.',
+      q: 'In DPO, a larger beta scales the margin more strongly. What does beta control?',
+      options: ['How strictly the policy is held near the reference', 'How many preference pairs are drawn for each step', 'How long the chosen answers are allowed to grow', 'Which of the two answers counts as chosen'],
+      answer: 0,
+      explain: 'Beta sets how strict the leash is: it shapes how far the policy may move from the reference before the loss pushes back. It does not pick pairs or decide which answer is chosen. Length is a side effect, not what beta controls.',
     },
     {
       q: 'Why does DPO keep a frozen reference copy of the SFT model during training?',

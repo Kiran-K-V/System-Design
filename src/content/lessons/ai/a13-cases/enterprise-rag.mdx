@@ -6,7 +6,6 @@ requires: ['ai/a5-rag/retrieval-permissions', 'ai/a5-rag/freshness-updates', 'ai
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
 import Ai13RagBuild from '../../../../components/anim/lessons/Ai13RagBuild.tsx';
 import Ai13RagLeak from '../../../../components/anim/lessons/Ai13RagLeak.tsx';
@@ -58,42 +57,41 @@ The eval comes before the design (lesson [A0.2](/learn/ai/a0-orientation/ai-desi
 
 **1. A retrieval golden set.** Build it as lesson [A8.3](/learn/ai/a8-evals/golden-sets/) says: 300 to 500 real questions, each with the chunk ids that answer it. Slice it by the two cases that fail first: **narrow-access callers** (who may read about 2% of the corpus) and **recently edited documents** (last 7 days). An admin account hides both. Run the set as real caller profiles.
 
-**2. Generation metrics.** The Ragas docs define **faithfulness** as "claims in the response supported by the retrieved context" divided by "total claims in the response". Their example: "Einstein was born in Germany on 20th March 1879" has two claims. The birthplace is supported. The date is not, because the context says 14 March. Score: 1 / 2 = 0.5. **Context recall** is reference claims supported by the retrieved context, divided by all reference claims. **Answer relevancy** is the mean cosine similarity between the question and questions generated from the answer ([Ragas](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/faithfulness/)).
+**2. Generation metrics.** The Ragas docs define **faithfulness** as "claims in the response supported by the retrieved context" divided by "total claims in the response". Their example: "Einstein was born in Germany on 20th March 1879" has two claims. The birthplace is supported. The date is not, because the context says 14 March. So only half the claims are supported, and faithfulness is low. **Context recall** is reference claims supported by the retrieved context, divided by all reference claims. **Answer relevancy** is the mean cosine similarity between the question and questions generated from the answer ([Ragas](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/faithfulness/)).
 
 **3. Leak tests with canary documents.** A **canary document** [mid] is a planted document with a unique made-up string, readable only by a probe group. Callers outside the group ask questions built to retrieve it: its title, its topic, the exact string. The string must never appear in a prompt, citation, answer, cache entry, or log line. Run this in CI on every retrieval or ACL change, and all day in production.
 
-Canary tests do not prove zero. If 1,000 canary queries find no leak, the **rule of three** [senior] says the true leak rate is below about 3 / 1,000 = 0.3% at 95% confidence. So canaries find bugs. The zero comes from the design: a filter inside the search plus a final check.
+Canary tests do not prove zero. If a thousand canary queries find no leak, the **rule of three** [senior] only says the true leak rate is small at 95% confidence, not that it is zero. So canaries find bugs. The zero comes from the design: a filter inside the search plus a final check.
 
 **4. Freshness probes.** A probe edits, revokes, and deletes a test document in every source on a timer and times how long the index takes to agree (deep dive 2). Online, watch the share of answers with a valid citation and user reports of "this cites something I cannot open".
 
 ## Budgets
 
-**Latency.** These stage times are illustrative. Measure your own.
+**Latency.** The stages run one after another. These stage times are illustrative. Measure your own.
 
-| Stage | ms |
+| Stage | Cost |
 |---|---|
-| Embed the query | 40 |
-| Load groups (cached) | 10 |
-| Hybrid search with ACL filter | 60 |
-| Rerank 50 candidates | 150 |
-| Final permission check | 30 |
-| Model time to first token (about 16,500 input tokens) | 700 |
-| **Total to first token** | **990** |
+| Embed the query | Tiny, tens of ms |
+| Load groups (cached) | Tiny |
+| Hybrid search with ACL filter | Small |
+| Rerank 50 candidates | The largest search-side stage |
+| Final permission check | Small |
+| Model time to first token (long prompt of about 16,500 tokens) | The largest stage overall |
 
-The model line is the prefill cost from lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/). The 30 ms final check removes most of the leak window.
+The first token arrives in about a second. The model line is the prefill cost from lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/). The small final check removes most of the leak window.
 
-**Dollars per query.** Prices fetched 2026-10-19. Inputs per query are illustrative: a 30-token question, 50 rerank candidates of 300 tokens, 20 chunks of 800 tokens in the prompt, 500 other prompt tokens, and a 400-token answer.
+**Dollars per query.** Prices fetched 2026-10-19. A query embeds a short question, reranks about 50 candidate chunks, and sends about 20 chunks plus the question to the answer model.
 
-| Piece | Provider, model, unit, price | Math | Cost |
-|---|---|---|---|
-| Embed query | OpenAI text-embedding-3-small, $0.02 per 1M tokens ([pricing](https://developers.openai.com/api/docs/pricing)) | 30 x $0.02 / 1M | $0.0000006 |
-| Rerank | Voyage rerank-3, $0.05 per 1M tokens, page updated 2026-09-29 ([pricing](https://docs.voyageai.com/docs/pricing)) | 15,000 x $0.05 / 1M | $0.00075 |
-| Answer, Haiku 5.5 | $0.10 in, $0.50 out per 1M tokens ([pricing](https://platform.claude.com/docs/en/about-claude/pricing)) | 16,500 x $0.10 / 1M + 400 x $0.50 / 1M | $0.00185 |
-| Answer, Sonnet 5.5 | $2 in, $10 out per 1M tokens (same page) | 16,500 x $2 / 1M + 400 x $10 / 1M | $0.037 |
+| Piece | Provider, model, unit, price | Weight in the bill |
+|---|---|---|
+| Embed query | OpenAI text-embedding-3-small, $0.02 per 1M tokens ([pricing](https://developers.openai.com/api/docs/pricing)) | Negligible |
+| Rerank | Voyage rerank-3, $0.05 per 1M tokens, page updated 2026-09-29 ([pricing](https://docs.voyageai.com/docs/pricing)) | Small |
+| Answer, Haiku 5.5 | $0.10 in, $0.50 out per 1M tokens ([pricing](https://platform.claude.com/docs/en/about-claude/pricing)) | Small |
+| Answer, Sonnet 5.5 | $2 in, $10 out per 1M tokens (same page) | Most of the bill |
 
-A query costs about $0.0026 with Haiku 5.5 and $0.038 with Sonnet 5.5. At 10,000 employees x 5 questions x 22 days = 1.1M queries a month, that is about $2,900 against $41,500. Generation is 98% of the Sonnet bill, so the model choice sets the cost. I found no Cohere rerank price and no OpenAI batch price for embeddings, so I use none.
+The answer call dominates the cost of a query, because it reads a long prompt. So the model choice sets the monthly bill, and the strong model costs many times the small one. I found no Cohere rerank price and no OpenAI batch price for embeddings, so I use none.
 
-**Index cost.** The corpus is 500,000 documents of 6,000 tokens: 3.0B tokens, or 3.75M chunks of 800 tokens. Embedding it costs 3,000 x $0.02 = $60 with text-embedding-3-small, or 3,000 x $0.13 = $390 with text-embedding-3-large. Vectors of 1,024 float32 numbers take 3.75M x 4,096 B = 15.4 GB. Contextual lines cost more: Anthropic states $1.02 per million document tokens (a company claim, on older prices), so 3,000 x $1.02 = $3,060. Lesson [A5.4](/learn/ai/a5-rag/chunking-contextual/) recomputed about $0.38 per million on Haiku 5.5 with caching, about $1,140. A re-embed is cheap in dollars and slow in time: at the 100 chunks per second of lesson [A5.8](/learn/ai/a5-rag/freshness-updates/), 3.75M chunks take 37,500 s, about 10.4 hours.
+**Index cost.** Embedding a company corpus once is cheap. Writing contextual lines with an LLM costs far more than the vectors, and it repeats for each edited document. Anthropic states $1.02 per million document tokens (a company claim, on older prices). Lesson [A5.4](/learn/ai/a5-rag/chunking-contextual/) recomputed a much lower cost on Haiku 5.5 with caching. A re-embed is cheap in dollars and slow in time: at the chunk rate of lesson [A5.8](/learn/ai/a5-rag/freshness-updates/), a full re-embed of millions of chunks takes many hours.
 
 ## Core entities and API
 
@@ -109,8 +107,8 @@ A query costs about $0.0026 with Haiku 5.5 and $0.038 with Sonnet 5.5. At 10,000
 One service account reads every source into one index. A system prompt says "only use documents the user may see". A nightly job rebuilds the index. It fails three ways.
 
 - **It leaks by construction.** Any text in the index can reach any prompt. A system prompt is not an access control (lesson [A5.9](/learn/ai/a5-rag/retrieval-permissions/)).
-- **A post-filter returns nothing.** Suppose you search for the top 10 and then drop the unreadable chunks, and the caller may read 2% of the corpus. If rank ignores permission (illustrative: independent), each of the 10 survives with chance 0.02. The chance that all 10 are dropped is 0.98^10 = 81.7%. Four queries in five return nothing.
-- **The window is a day.** A nightly rebuild means a revoke takes up to 24 hours. Add a 60-minute answer cache and the worst case is 25 hours.
+- **A post-filter returns nothing.** Suppose you search for the top 10 and then drop the unreadable chunks, and the caller may read only a small share of the corpus. If rank ignores permission (illustrative: independent), almost every one of the 10 is dropped. Most queries return nothing.
+- **The window is a day.** A nightly rebuild means a revoke takes up to a day. Add an answer cache and the worst case is longer still.
 
 ## High-level design
 
@@ -132,15 +130,15 @@ Lesson [A5.9](/learn/ai/a5-rag/retrieval-permissions/) named the strategies. Her
 | Pre-filter | The ACL is a condition inside the search | Full lists if the store filters inside the graph | A list of group ids per query | [Azure AI Search](https://learn.microsoft.com/en-us/azure/search/search-security-trimming-for-azure-search) |
 | Index per tenant | One index or namespace per customer | Perfect isolation between customers | Overhead per index | [Qdrant](https://qdrant.tech/documentation/guides/multiple-partitions/), [Pinecone](https://docs.pinecone.io/guides/index-data/indexing-overview) |
 
-Post-filter rows scale as `ef_search` x selectivity (selectivity [mid] is the share of rows that pass the filter): 40 x 0.10 = 4, 40 x 0.02 = 0.8, 40 x 0.001 = 0.04. A narrow-access employee gets under one row. Iterative scans keep going, but stop at `hnsw.max_scan_tuples`, 20,000 by default.
+Post-filter rows shrink with selectivity (selectivity [mid] is the share of rows that pass the filter). The index scans a fixed number of candidates (`ef_search`), and only the passing share survives. A narrow-access employee gets under one row. Iterative scans keep going, but stop at `hnsw.max_scan_tuples`, 20,000 by default.
 
-Pre-filtering has its own cost. Azure's security trimming is "a regular OData filter" over a string field of principals. An OR chain over hundreds of ids "slows down query response time by many seconds", while `search.in` gives "subsecond response times". Pinecone's `$in` takes at most 10,000 values. Azure also says the principal is "just a string": nothing verifies it, so one piece of code must build the filter. Elasticsearch enforces a role query inside the engine, but "Document level security doesn't apply to write APIs" ([Elastic](https://www.elastic.co/docs/deploy-manage/users-roles/cluster-or-deployment-auth/controlling-access-at-document-field-level)). An exact scan over the matches also costs work: 2% of 3.75M chunks is 75,000 vectors of 4,096 bytes, 307 MB per query, 6.1 GB per second at 20 queries per second. Use an index that filters inside the graph.
+Pre-filtering has its own cost. Azure's security trimming is "a regular OData filter" over a string field of principals. An OR chain over hundreds of ids "slows down query response time by many seconds", while `search.in` gives "subsecond response times". Pinecone's `$in` takes at most 10,000 values. Azure also says the principal is "just a string": nothing verifies it, so one piece of code must build the filter. Elasticsearch enforces a role query inside the engine, but "Document level security doesn't apply to write APIs" ([Elastic](https://www.elastic.co/docs/deploy-manage/users-roles/cluster-or-deployment-auth/controlling-access-at-document-field-level)). An exact scan over the matches also costs a lot of memory traffic on every query. Use an index that filters inside the graph.
 
-The per-tenant row separates **customers**, not employees. Pinecone advises "one namespace per customer", with caps from 100 namespaces (Starter) to 1,000,000 (Enterprise). Qdrant says a collection per tenant "is rarely the most efficient approach", because "each collection carries its own resource overhead", and suggests an indexed tenant field. A per-user index is far worse. If 10,000 users each read 30% of 3.75M chunks (illustrative), the copies total 11.25 billion chunks, 3,000 times the corpus.
+The per-tenant row separates **customers**, not employees. Pinecone advises "one namespace per customer", with caps from 100 namespaces (Starter) to 1,000,000 (Enterprise). Qdrant says a collection per tenant "is rarely the most efficient approach", because "each collection carries its own resource overhead", and suggests an indexed tenant field. A per-user index is far worse. If each of thousands of users reads a large share of the corpus (illustrative), the copies total thousands of times the corpus.
 
 ### Group ids on chunks, resolved at query time
 
-Why not write user ids on chunks? One membership change would rewrite thousands of rows. A group that reads 20,000 documents of 8 chunks means 160,000 rows, and at 200 rows a second that takes 800 s, 13 minutes. With group ids on chunks, removing a user changes only that user's group list in the permission service. The price is a longer filter list, so flatten nested groups and use coarse labels (team, project, level).
+Why not write user ids on chunks? One membership change would rewrite thousands of rows. A group that reads thousands of documents with several chunks each means a long rewrite, and during it the old permission still answers. With group ids on chunks, removing a user changes only that user's group list in the permission service. The price is a longer filter list, so flatten nested groups and use coarse labels (team, project, level).
 
 ### The leak window
 
@@ -159,16 +157,16 @@ Everything else is yours. Start with the defaults: a doc unshared, a 15-minute p
 
 The poll interval, rewrite rate, group TTL, and cache TTL are illustrative.
 
-| Case | Window |
+| Case | Window is made of |
 |---|---|
-| Doc unshared, 15 min poll, answer cache 60 min | 15 min + 1 s + 60 min = 75 min |
-| Same, but a cache hit re-checks its sources | 15 min |
-| Graph webhook, typical (1 min) | 1 min + 60 min = 61 min |
-| Graph webhook at its 6 h maximum, 30 min renewal gap | 6.5 h + 60 min = 7.5 h |
-| Nightly poll | 24 h + 60 min = 25 h |
-| User leaves group, groups read live, TTL 300 s, cache re-checks | 5 min |
-| User leaves group, ACL expanded at index time, 15 min poll | 15 min + 13 min + 60 min = 88 min |
-| Final check against the permission service, lag 5 s | 5 s |
+| Doc unshared, 15 min poll, answer cache 60 min | Poll interval, plus the cache TTL. The longest term is the cache |
+| Same, but a cache hit re-checks its sources | Only the poll interval |
+| Graph webhook, typical | A short delay, plus the cache TTL |
+| Graph webhook at its 6 h maximum, with a renewal gap | Hours, plus the cache TTL |
+| Nightly poll | About a day, plus the cache TTL |
+| User leaves group, groups read live, short TTL, cache re-checks | Only the short group TTL |
+| User leaves group, ACL expanded at index time, 15 min poll | Poll, plus the rewrite time, plus the cache TTL |
+| Final check against the permission service | Only the lag of that service, seconds |
 
 The answer cache is often the largest term. The final check replaces the whole chain with one number: how far the permission service lags the identity system.
 
@@ -188,7 +186,7 @@ The index filter is fast and possibly stale. It exists for recall: it fills the 
 
 Lesson [A5.8](/learn/ai/a5-rag/freshness-updates/) built the content pipeline: event, re-chunk, diff, embed, upsert, delete old chunks. Permissions add four things.
 
-**Lanes.** ACL, membership, and delete events go in a first lane. Edits go second. Backfills and re-embeds go last. A burst of 10,000 edited documents takes about 22 minutes to drain (the A5.8 example). A revoke must not wait behind it.
+**Lanes.** ACL, membership, and delete events go in a first lane. Edits go second. Backfills and re-embeds go last. A burst of 10,000 edited documents takes many minutes to drain (the A5.8 example). A revoke must not wait behind it.
 
 **Order.** Key events by document id and give each a version. An upsert older than the stored version is dropped.
 
@@ -209,7 +207,7 @@ Derived data also holds the text: context lines, summaries, eval sets, and logs.
 
 Set two SLOs, not one. **Permission freshness**: 99.9% of revokes effective within 60 s. **Content freshness**: 99% of edits searchable within 5 minutes. They differ because a slow edit is an annoyance and a slow revoke is a breach. All numbers are illustrative.
 
-Measure from the source's own modified time to the first query that sees the change. With 50,000 edits a day (illustrative), a 99% SLO allows 500 slow edits a day.
+Measure from the source's own modified time to the first query that sees the change. At a high edit volume, even a 99% SLO allows many slow edits a day.
 
 Probes make it real. Every 5 minutes a probe per source edits a test document and queries as the probe user until it sees the edit. Another revokes the probe user and queries until the document disappears: that is the leak window, measured. A third deletes a document and waits. Alert on the P99 of each. Add two gauges: the age of the oldest queued event and the age of each connector's cursor. When a connector falls behind, those move first.
 
@@ -226,7 +224,7 @@ If the right chunk is not in the top 20, no prompt can find it (lesson [A5.10](/
 | + contextual BM25 | 2.9% | 49% |
 | + reranking | 1.9% | 67% |
 
-Source: [Anthropic](https://www.anthropic.com/news/contextual-retrieval), read 2026-10-19. It is one test on one data set. Anthropic also found 20 chunks in the prompt beat 5 or 10. Its one-time cost is "$1.02 per million document tokens" (a company claim: 800-token chunks, 8k-token documents, 100 tokens of context per chunk). For our corpus that is $3,060 once. After that only edited documents cost money: at 0.1% a day, 500 documents x 6,000 tokens = 3M tokens, about $3 a day.
+Source: [Anthropic](https://www.anthropic.com/news/contextual-retrieval), read 2026-10-19. It is one test on one data set. Anthropic also found 20 chunks in the prompt beat 5 or 10. Its one-time cost is "$1.02 per million document tokens" (a company claim, with stated chunk and document sizes). For a large corpus that is a real one-time bill. After that only edited documents cost money, so the running cost is small.
 
 Contextual retrieval has a permission rule. Write the context line from the **same document only**. A line such as "this follows the sales plan in the pricing sheet" copies facts from a second document into a chunk of the first, and a reader of only the first now reads part of the second. A shared summary or cluster node that merges documents (lesson [A5.7](/learn/ai/a5-rag/graphrag-longctx/)) needs an ACL no wider than the intersection of its sources. This is our reasoning, not a published finding. Test it with canary strings.
 
@@ -297,45 +295,9 @@ Our reading: neither case broke an ACL. Every retrieved text was readable by the
 
 Filters work as in the main case: attribute filters (date, place) and the same ACL group ids if photos are private. New photos go to a small exact "fresh" index that every query also searches, and a nightly job merges it into the big one. Deletes use tombstones (lesson [A5.8](/learn/ai/a5-rag/freshness-updates/)). After the nearest 100 by code are found, re-score them with full vectors read from disk. The plan's variants (similar listings, entity linking, defect detection) change only the query and the labels. Street-view blurring is a detection job, not a search job.
 
-**Failure.** A new embedding model puts every vector in a new space, so the old codes are worthless. At an illustrative 5,000 images per second, 500M images take 100,000 s, about 27.8 hours, plus retraining the codebooks. Build a second index and swap (lesson [A5.8](/learn/ai/a5-rag/freshness-updates/)).
+**Failure.** A new embedding model puts every vector in a new space, so the old codes are worthless. Re-encoding hundreds of millions of images takes many hours, plus retraining the codebooks. Build a second index and swap (lesson [A5.8](/learn/ai/a5-rag/freshness-updates/)).
 
-**Prove it.** The FAISS wiki gives the size: flat PQ is `ceil(M x nbits / 8)` bytes per vector, and the IVF form (IVFADC) adds 8 bytes for the id ([FAISS](https://github.com/facebookresearch/faiss/wiki/Faiss-indexes)). With M = 64 pieces of 8 bits, one code is 64 bytes. Then 500,000,000 x 64 B = 32,000,000,000 B = 32 GB (29.8 GiB). Add the 8 id bytes: 72 B x 500M = 36 GB (33.5 GiB). Raw vectors are 512 x 4 B = 2,048 B each, so 500M x 2,048 B = 1.024 TB, or 28.4 times the index. The figure leaves out small extras: with an illustrative 262,144 cells the coarse centroids take 262,144 x 512 x 4 B = 537 MB, and the codebooks take 64 x 256 x 8 x 4 B = 512 KB. 64 bytes is not the whole index.
-
-<Ballpark
-  client:visible
-  title="Index size for 500M images"
-  scenario="500 million images, 512 dimensions, product quantization with 64 pieces of 8 bits each, in an IVF index. Each entry also stores an 8-byte id."
-  steps={[
-    {
-      prompt: 'Bytes for one PQ code, ceil(64 x 8 / 8)?',
-      unit: 'bytes',
-      answer: 64,
-      within: 1.1,
-      explain: '64 pieces x 8 bits = 512 bits = 64 bytes.',
-    },
-    {
-      prompt: 'Size of the codes for 500M images, in GB?',
-      unit: 'GB',
-      answer: 32,
-      within: 1.1,
-      explain: '500,000,000 x 64 B = 32,000,000,000 B = 32 GB, which is 29.8 GiB.',
-    },
-    {
-      prompt: 'With the 8-byte id per entry, how many GB is the index?',
-      unit: 'GB',
-      answer: 36,
-      within: 1.1,
-      explain: '(64 + 8) x 500,000,000 = 36,000,000,000 B = 36 GB.',
-    },
-    {
-      prompt: 'Raw float32 vectors of 512 dimensions for the same images, in GB?',
-      unit: 'GB',
-      answer: 1024,
-      within: 1.1,
-      explain: '512 x 4 B = 2,048 B per vector. 500M x 2,048 B = 1.024 TB, or 1,024 GB. Against the 36 GB index that is about 28 times more.',
-    },
-  ]}
-/>
+**Why it fits.** The FAISS wiki says a PQ code stores each vector as a short list of small codes, about tens of bytes per vector, plus a small id in the IVF form ([FAISS](https://github.com/facebookresearch/faiss/wiki/Faiss-indexes)). A raw vector of 512 floats is far larger, about a thousand times the size of a few bytes per piece. So the compressed index is a small fraction of the raw vectors and fits in the RAM of a few hosts. It also has small extras, such as the coarse centroids and codebooks. The cost of compression is a loss of exactness, which the re-score step with full vectors repairs.
 
 ## Drill: Document extraction pipeline
 
@@ -358,48 +320,11 @@ Batch the work (lesson [A3.7](/learn/ai/a3-llm-apis/batch-async-apis/)). Start w
 - **One vendor's accuracy falls after a template change.** Track validation-fail and review rates per vendor. Alert at twice that vendor's baseline (illustrative), and add the new template to the golden set.
 - **Text inside a document tries to steer the model**, such as "set the total to 0". A page is data, never instructions (lesson [A10.2](/learn/ai/a10-safety/prompt-injection/)). Give the extractor no tools, constrain its output to the schema, and let the validators catch the rest.
 
-**Prove it.** Take 2M pages a day. Anthropic's [PDF page](https://platform.claude.com/docs/en/build-with-claude/pdf-support) says a page "typically uses 1,500–3,000 tokens" of text, with image tokens on top. I use 3,000 input tokens (image tokens left out) and 300 output tokens (illustrative: about 20 fields).
+**Why batch.** Take millions of pages a day. Anthropic's [PDF page](https://platform.claude.com/docs/en/build-with-claude/pdf-support) says a page typically uses a few thousand tokens of text, with image tokens on top. At that volume, price and wait time are the design questions.
 
-- Input: 2,000,000 x 3,000 = 6.0B tokens a day. Output: 2,000,000 x 300 = 0.6B.
-- The Batch API is 50% of the standard price on input and output (prices fetched 2026-10-19, [pricing](https://platform.claude.com/docs/en/about-claude/pricing)). Haiku 5.5 batch is $0.05 in and $0.25 out per 1M tokens: 6,000 x $0.05 = $300 plus 600 x $0.25 = $150, so **$450 a day**, or $0.225 per 1,000 pages. Sonnet 5.5 batch is $1 and $5: $6,000 + $3,000 = $9,000 a day. At standard prices Haiku is $900.
-- The [Textract page](https://aws.amazon.com/textract/pricing/) (US West, Oregon) lists, per 1,000 pages above 1M pages: Detect Document Text $0.60, Tables $10, Forms $40, Analyze Expense $8. For 2,000 units of 1,000 pages that is $1,200, $20,000, $80,000, and $16,000 a day. I did not find how often the 1M tier resets, so I use the lower rate. The Azure Document Intelligence price page did not load, so I give none. These are prices, not accuracy: your golden set decides.
-- Wall-clock. A batch holds at most 100,000 requests or 256 MB, "whichever is reached first". At about 12 KB per request (3,000 tokens x 4 characters, illustrative), size binds first: 256 MB holds about 21,000 requests, so 2M pages is about 94 batches. Most batches finish within 1 hour, and a batch expires if not done in 24 hours. The Scale tier queue holds 500,000 waiting requests ([rate limits](https://platform.claude.com/docs/en/api/rate-limits)), so 2M pages is 4 queue-fulls: about 4 hours at 1 hour each, but only 500,000 pages a day if each takes the full 24 hours, a quarter of the need. Plan a next-day SLO and keep a synchronous path for urgent files.
-
-<Ballpark
-  client:visible
-  title="Extraction cost and batches for 2M pages a day"
-  scenario="2,000,000 pages a day, 3,000 input tokens and 300 output tokens per page. Claude Haiku 5.5 on the Batch API: $0.05 per 1M input tokens, $0.25 per 1M output tokens (as of 2026-10-19). A batch holds up to 256 MB, and one request is about 12 KB."
-  steps={[
-    {
-      prompt: 'Input tokens per day?',
-      unit: 'tokens',
-      answer: 6e9,
-      within: 1.1,
-      explain: '2,000,000 x 3,000 = 6,000,000,000 tokens, or 6.0B.',
-    },
-    {
-      prompt: 'Batch cost per day for input and output together, in USD?',
-      unit: 'USD',
-      answer: 450,
-      within: 1.1,
-      explain: 'Input: 6,000 x $0.05 = $300. Output: 2,000,000 x 300 = 600M tokens, 600 x $0.25 = $150. Total $450.',
-    },
-    {
-      prompt: 'How many requests fit in a 256 MB batch at 12 KB each?',
-      unit: 'requests',
-      answer: 21333,
-      within: 1.1,
-      explain: '256,000,000 / 12,000 = 21,333. That is well under the 100,000-request cap, so size binds first.',
-    },
-    {
-      prompt: 'How many batches does 2M pages a day need?',
-      unit: 'batches',
-      answer: 94,
-      within: 1.1,
-      explain: '2,000,000 / 21,333 = 93.75, so 94 batches.',
-    },
-  ]}
-/>
+- The Batch API gives a large discount on input and output (prices fetched 2026-10-19, [pricing](https://platform.claude.com/docs/en/about-claude/pricing)). The small model is far cheaper than the strong one. Batch makes it cheaper still.
+- The [Textract page](https://aws.amazon.com/textract/pricing/) lists per-page prices that grow with the features you use: plain text detection is the cheapest, and tables, forms, and expense analysis cost several times more. The Azure Document Intelligence price page did not load, so I give none. These are prices, not accuracy: your golden set decides.
+- Wall-clock. A batch has a request-count cap and a size cap, and it takes up to a day. Millions of pages need many batches and a queue. Plan a next-day SLO and keep a synchronous path for urgent files.
 
 ## Staff answer vs senior answer
 
@@ -446,56 +371,31 @@ Do not say a prompt rule protects restricted data. Do not say "revokes are insta
 
 ## Check yourself
 
-<Ballpark
-  client:visible
-  title="Index cost for a company corpus"
-  scenario="500,000 documents of 6,000 tokens each, cut into 800-token chunks. Embeddings: OpenAI text-embedding-3-small at $0.02 per 1M tokens. Contextual lines: Anthropic's stated $1.02 per 1M document tokens (company claim). Prices as of 2026-10-19."
-  steps={[
-    {
-      prompt: 'Corpus size in millions of tokens?',
-      unit: 'M tokens',
-      answer: 3000,
-      within: 1.1,
-      explain: '500,000 x 6,000 = 3,000,000,000 tokens, which is 3,000 million.',
-    },
-    {
-      prompt: 'How many chunks of 800 tokens, in millions?',
-      unit: 'M chunks',
-      answer: 3.75,
-      within: 1.1,
-      explain: '3,000M / 800 = 3.75M chunks.',
-    },
-    {
-      prompt: 'Cost to embed the whole corpus once, in USD?',
-      unit: 'USD',
-      answer: 60,
-      within: 1.1,
-      explain: '3,000 x $0.02 = $60.',
-    },
-    {
-      prompt: 'Cost of the contextual lines for the whole corpus, in USD?',
-      unit: 'USD',
-      answer: 3060,
-      within: 1.1,
-      explain: '3,000 x $1.02 = $3,060, about 51 times the embedding bill. The lines cost far more than the vectors, and they repeat for each edited document.',
-    },
-  ]}
-/>
 
 <Quiz
   client:visible
   questions={[
     {
-      q: 'A caller may read 2% of all chunks. An HNSW index with ef_search 40 is post-filtered. About how many readable rows does a query return, on average?',
-      options: ['4.0', '0.8', '8.0', '40.0'],
-      answer: 1,
-      explain: 'The scan visits about 40 candidates and 2% of them pass: 40 x 0.02 = 0.8. Four rows is the answer for a 10% filter. Eight would need ef_search 400. Forty is the number scanned, not the number that pass.',
+      q: 'A caller may read only a tiny share of all chunks. An HNSW index is post-filtered after scanning a fixed number of candidates. What does that caller usually see?',
+      options: [
+        'Full top-10 results, because the index ranks by relevance first',
+        'The same results as an admin, since the filter only hides text',
+        'Fewer than one readable row on average, often an empty answer',
+        'Slower results with the same number of readable rows',
+      ],
+      answer: 2,
+      explain: 'The scan picks candidates before the filter runs, so few of them are readable by a narrow-access caller. Often none are. Full results would need the filter inside the search. Admins see more only because most rows pass for them. Slowness is not the problem here, emptiness is.',
     },
     {
-      q: 'A document is unshared at 10:00. The connector polls every 20 minutes, the index rewrite and commit take 2 seconds, and answers are cached for 30 minutes with no re-check. What is the worst-case window?',
-      options: ['20 min, the poll interval', '30 min, the cache TTL', 'About 50 min', 'About 80 min, double counted'],
-      answer: 2,
-      explain: 'The stages add: 20 min + 2 s + 30 min is about 50 min. A single stage alone understates it. Eighty minutes counts the stages twice.',
+      q: 'A document is unshared. The connector polls on an interval, the index rewrite is fast, and answers are cached with no re-check. What sets the worst-case leak window?',
+      options: [
+        'The poll interval alone, since the rewrite is fast',
+        'The poll interval and the cache lifetime together',
+        'The cache lifetime alone, since polls only add data',
+        'The rewrite time, since it is the last step to finish',
+      ],
+      answer: 1,
+      explain: 'The delays of the layers stack: detection first, then the rewrite, then the cache that keeps serving the old answer. A single stage alone understates the window. The rewrite is fast, so it adds almost nothing.',
     },
     {
       q: 'Alice leaves group G at 09:00. At 09:05 Bob adds a new file to the folder G can read. At 09:10 Alice’s permission check hits a cache entry made at 08:55. What goes wrong, and what stops it?',
@@ -509,21 +409,59 @@ Do not say a prompt rule protects restricted data. Do not say "revokes are insta
       explain: 'The stale check still says Alice may read the folder, so the new file reaches her. This is the new-enemy problem. A consistency token makes the check at least as fresh as the write. Polling faster or hiding counts does not touch the stale cache.',
     },
     {
-      q: 'A leak test runs 1,000 canary queries and finds zero leaks. What can you claim at 95% confidence?',
+      q: 'A leak test runs a thousand canary queries and finds zero leaks. What can you claim?',
       options: [
         'The system cannot leak, since no test failed',
         'The leak rate is exactly zero at this confidence',
-        'The leak rate is below 0.03% at this confidence',
-        'The leak rate is below about 0.3%',
+        'The rate is low, but zero comes from design',
+        'The leak rate is below any number you choose',
       ],
-      answer: 3,
-      explain: 'By the rule of three the bound is about 3 / 1,000 = 0.3%. Zero observed leaks never proves zero. The guarantee must come from the design, with canaries as a bug finder.',
+      answer: 2,
+      explain: 'By the rule of three, zero failures in n checks only bounds the rate to a small number. It never proves zero. So the guarantee must come from the design, with canaries as a bug finder. Claiming zero or "cannot leak" overstates what a test shows.',
     },
     {
-      q: 'An answer makes 4 claims and the retrieved chunks support 3 of them. What is its faithfulness score by the Ragas definition?',
-      options: ['0.25', '0.75', '0.5', '0.33'],
+      q: 'An answer makes several claims and the retrieved chunks support most but not all of them. What does the Ragas faithfulness score measure?',
+      options: [
+        'How relevant the answer is to the question asked',
+        'Answer claims backed by the retrieved context',
+        'The share of reference claims found by retrieval',
+        'How many citations the answer carries',
+      ],
       answer: 1,
-      explain: 'Faithfulness is supported claims divided by total claims: 3 / 4 = 0.75. Putting 1 over 4 counts only the unsupported claim.',
+      explain: 'Faithfulness is supported claims divided by total claims in the answer. Relevance is a different metric. Context recall looks at reference claims, not answer claims. Citation count says nothing about support.',
+    },
+    {
+      q: 'An image index holds hundreds of millions of vectors from a CLIP-style model. Why does IVF with PQ codes let it fit in RAM on a few hosts?',
+      options: [
+        'It drops most of the images and keeps only popular ones',
+        'It moves all vectors to disk and reads them on demand',
+        'It stores short codes, not full float vectors',
+        'It shares one vector between all images that look similar',
+      ],
+      answer: 2,
+      explain: 'PQ replaces each long float vector with a short code, so the index is a small fraction of the raw size. The cost is a loss of exactness, which re-scoring with full vectors repairs. Dropping images loses data. Disk reads break the latency bar. Sharing vectors would merge distinct photos.',
+    },
+    {
+      q: 'A team extracts fields from millions of pages a day, and no user waits on any single page. Which choice cuts the model bill most?',
+      options: [
+        'Run every page on the strongest model, synchronously',
+        'Fine-tune a model first, before trying a prompt and schema',
+        'Keep a synchronous path for every page, in case of a rush',
+        'Use a small model on batch and accept a delay',
+      ],
+      answer: 3,
+      explain: 'Batch gives a large discount, and a small model is cheaper per token. The price is a next-day delay, which is fine when nobody waits. The strongest model costs far more. Fine-tuning comes only after a prompt and schema fail. A sync path for everything gives up the batch discount.',
+    },
+    {
+      q: 'You add contextual lines to every chunk of a large company corpus. Which part of the one-time indexing bill is largest?',
+      options: [
+        'The LLM calls that write the context lines',
+        'The embedding calls that turn chunks into vectors',
+        'The storage of the vectors in the index',
+        'The reranker, which runs once per chunk',
+      ],
+      answer: 0,
+      explain: 'Contextual lines need an LLM call for every chunk, and the LLM is far more expensive per token than an embedding model. Embeddings are cheap. Storage is a small ongoing cost. The reranker runs per query, not per chunk. After the first pass, only edited documents add cost.',
     },
   ]}
 />

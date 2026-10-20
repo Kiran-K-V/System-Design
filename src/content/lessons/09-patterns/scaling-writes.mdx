@@ -95,11 +95,11 @@ Set a hot key to 20% of writes with 8 shards and no salts. Then raise the salts.
 
 <ScalingWritesLab client:visible />
 
-**The model.** One commit costs 0.08 ms fixed plus 0.02 ms per row. So one row per commit gives 1000 / 0.10 = 10,000 rows per second. A batch of 100 costs 0.08 + 2.0 = 2.08 ms for 100 rows. That works out to about 48,000 rows per second. The ceiling is 1 / 0.02 ms = 50,000. With `N` shards, a hot key takes a share `p`. Using `k` salts, the hottest shard gets `p / k + (1 - p) / N` of all writes. The cluster limit is one shard's capacity divided by that share.
+**The model.** Each commit has a fixed cost plus a small cost per row. With one row per commit, the fixed cost dominates. A big batch shares that fixed cost over many rows, so throughput rises toward a ceiling set by the per-row cost. For sharding, a hot key lands on one shard, and that shard gets more than its fair share. Salting splits the hot key over several shards and cuts the hottest shard's share. The cluster limit is set by the hottest shard, not by the total.
 
-**Assumptions.** The two costs are illustrative round numbers, not measurements of any database. Other keys spread evenly. Shards are equal. Salts land on different shards. There are no cross-shard transactions and no network cost. The burst numbers use 4,000 writes per second of normal traffic.
+**Assumptions.** The two costs are illustrative round numbers, not measurements of any database. Other keys spread evenly. Shards are equal. Salts land on different shards. There are no cross-shard transactions and no network cost. The burst uses a steady level of normal traffic.
 
-Check it by hand. With 8 shards, batches of 100, and a hot key at 20%: one shard handles 48,077. Unsalted, the hottest shard gets 0.2 + 0.8 / 8 = 0.3 of all writes. So the cluster takes 48,077 / 0.3 = about 160,000 per second. The cluster does not take the 8 x 48,077 = 385,000 an even spread would give. With 8 salts the hot share is 0.2 / 8 + 0.1 = 0.125. So the cluster takes about 385,000 again.
+What to notice: with no salts, the hot key's shard saturates first, and the cluster takes far less than the sum of its shards. Raise the salts and the hot share falls toward an even spread, so the cluster limit climbs back close to the sum of its shards.
 
 ## Numbers
 
@@ -108,9 +108,9 @@ Check it by hand. With 8 shards, batches of 100, and a hot key at 20%: one shard
 | One database node, simple writes | ~5K to 20K per second | Lesson 1.5 |
 | DynamoDB, one partition | designed for 1,000 write units per second | DynamoDB docs, via lesson 8.4 |
 | DynamoDB salting example | suffix 1 to 200 on a date key | DynamoDB developer guide |
-| Batch of 1, 10, 100 rows in the model | 10,000 / 35,714 / 48,077 rows per second | Derived from the cost model above |
-| Hottest shard, 8 shards, 20% hot key | 30% of writes unsalted, 12.5% with 8 salts | Derived above |
-| Backlog after a burst | (arrival - drain) x seconds. 25K/s for 20 s with a 10K/s drain leaves 300,000 writes | Derived |
+| Batch size in the model | Bigger batches give more rows per second, with a ceiling | Derived from the cost model above |
+| Hottest shard with a hot key | Takes more than its fair share. Salting brings it back toward even | Derived above |
+| Backlog after a burst | Grows while arrivals exceed the drain rate, then shrinks | Derived |
 
 ## Trade-offs
 
@@ -125,7 +125,7 @@ Check it by hand. With 8 shards, batches of 100, and a hot key at 20%: one shard
 ## Interview lens
 
 <Callout type="tip">
-Say which problem you have before you pick a fix. "Is it total volume or one hot key?" Then give the order: "Batch first, since it is free. A queue to absorb the sale spike. Shard by user id for the sustained rate. If one key is hot, salt it and sum the partial counts on read." Give a number: "30K writes per second is 3x one node, so I need at least 4 shards with headroom."
+Say which problem you have before you pick a fix. "Is it total volume or one hot key?" Then give the order: "Batch first, since it is free. A queue to absorb the sale spike. Shard by user id for the sustained rate. If one key is hot, salt it and sum the partial counts on read." Size it from the load: "The peak is several times one node, so I need more shards, with headroom."
 </Callout>
 
 <Callout type="mistake">
@@ -142,15 +142,15 @@ A like counter for a viral post is a hot key by design. One row updated thousand
   client:visible
   questions={[
     {
-      q: 'A table has 8 shards. One key receives 50% of all writes. The other 50% spread evenly. What share of all writes lands on the shard that holds the hot key?',
+      q: 'A table has 8 shards. One key receives half of all writes. Why does the cluster scale poorly even with 8 shards?',
       options: [
-        '12.5%, since 8 shards split the writes evenly',
-        '50%, since only the hot key matters to that shard',
-        '56.25%, which is 50% plus a fair share of the rest',
-        '43.75%, which is the evenly spread half minus the hot key',
+        'The shards share one lock, so only one runs at a time',
+        'The shard with the hot key takes a huge share and saturates first',
+        'Hashing sends every key to the same shard once one key is hot',
+        'Each shard must apply every write, as a replica would',
       ],
-      answer: 2,
-      explain: 'The hot shard gets all of the hot key (50%) plus its fair share of the remaining 50%: 50% / 8 = 6.25%. That is 56.25%. The shard saturates when total writes reach its capacity divided by 0.5625, so the cluster scales poorly even with 8 shards.',
+      answer: 1,
+      explain: 'The hot shard gets all of the hot key plus its fair share of the rest. It hits its limit first, and that caps the whole cluster. The other shards sit with spare room. Hashing still spreads the other keys, and shards do not copy each other\'s writes.',
     },
     {
       q: 'You batch inserts so each commit carries 100 rows instead of 1. Which statement about the result is correct?',
@@ -161,7 +161,7 @@ A like counter for a viral post is a hot key by design. One row updated thousand
         'Throughput rises, and each row is acknowledged faster than before',
       ],
       answer: 1,
-      explain: 'Batching removes the fixed per-commit cost from 99 of 100 rows. The per-row work stays. In the lab model the gain is about 4.8x, from 10,000 to about 48,000 rows per second. Each row also waits for its batch, so single-row latency does not improve.',
+      explain: 'Batching removes the fixed per-commit cost from 99 of 100 rows. The per-row work stays. In the lab model the gain is several times, not the full factor. Each row also waits for its batch, so single-row latency does not improve.',
     },
     {
       q: 'An API acknowledges a write as soon as it is in a durable queue. A user writes a comment and the page reloads one second later. What may the user see?',

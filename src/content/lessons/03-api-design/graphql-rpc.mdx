@@ -14,7 +14,7 @@ Your mobile team builds a profile screen. It shows the user's name and avatar, p
 
 With the REST design from lesson 3.1 the app needs five requests. It fetches the user, then the post list, then each author. The phone is on a mobile network with an ~80 ms round trip (assumption). Each step waits for the one before it.
 
-The screen takes ~240 ms to fill, and downloads ~11 KB to show ~1.3 KB of data. The web team has a different screen that needs different fields. The iOS team wants a third shape.
+The screen waits on several round trips in a row, and downloads far more data than it shows. The web team has a different screen that needs different fields. The iOS team wants a third shape.
 
 One resource per URL cannot fit all three. What do you do?
 
@@ -72,7 +72,7 @@ Say the query asks for 20 posts with their authors. A naive resolver does this. 
 1. One query loads the 20 posts.
 2. For each post, the `author` resolver runs its own query. That is 20 more.
 
-That is **N+1 queries**: one for the list, N for the children. At ~1 ms per database query (assumption), the server spends ~21 ms in sequence. The fix is **batching**: gather many small lookups and send them as one. Think of one trip to the shop with a full list, not 20 trips for one item each. A tool such as DataLoader waits for a tiny moment (one "tick" of the program, well under a millisecond), collects all author ids requested in that time, and asks for them together. The database query for that is `WHERE id IN (...)`, which means "give me every row whose id is in this list". That is 2 queries, ~2 ms.
+That is **N+1 queries**: one for the list, N for the children. The server runs all those queries one after another. The fix is **batching**: gather many small lookups and send them as one. Think of one trip to the shop with a full list, not 20 trips for one item each. A tool such as DataLoader waits for a tiny moment (one "tick" of the program, well under a millisecond), collects all author ids requested in that time, and asks for them together. The database query for that is `WHERE id IN (...)`, which means "give me every row whose id is in this list". That is 2 queries in total, however long the list is.
 
 GraphQL did not remove the fan-out. It moved it from the phone to your data center, where round trips cost microseconds instead of 80 ms. That is a good trade. It still needs care.
 
@@ -101,7 +101,7 @@ GraphQL is not free. Four costs come up again and again.
 | GraphQL | 1 | ~85 ms | ~1.3 KB |
 | RPC, per-screen method | 1 | ~85 ms | ~1.5 KB |
 
-At 5,000 profile loads per second, REST makes 25,000 requests per second. GraphQL or RPC makes 5,000 (derived). Each request also pays for headers, auth checks and logging.
+At high traffic, REST makes several times as many requests as GraphQL or RPC. Each request also pays for headers, auth checks and logging.
 
 ## Trade-offs
 
@@ -134,21 +134,21 @@ GraphQL puts a general query engine in front of your data. That gives clients po
   client:visible
   questions={[
     {
-      q: 'A screen needs data from three REST endpoints. The second call needs an id from the first, and the third needs an id from the second. The round trip is 100 ms. About how long does the screen wait for the network?',
-      options: ['~100 ms, because calls run in parallel', '~600 ms', '~300 ms', '~30 ms'],
-      answer: 2,
-      explain: 'Each call depends on the one before it, so they cannot run in parallel. 3 round trips x 100 ms = ~300 ms. Dependencies, not request count, set the wait.',
+      q: 'A screen needs data from three REST endpoints. The second call needs an id from the first, and the third needs an id from the second. Why can the app not fetch all three at once?',
+      options: ['Browsers allow only one request at a time to any server', 'Each call needs data from the one before it', 'REST forbids more than one call for each screen', 'The server rejects calls that arrive close together'],
+      answer: 1,
+      explain: 'Calls that depend on each other must wait for the earlier answer, so the waits add up on a slow network. Browsers and servers can handle many parallel requests. Dependencies, not request count, set the wait. One GraphQL or per-screen call removes the chain.',
     },
     {
-      q: 'A GraphQL query asks for 50 posts and each post author. The resolver for author runs one query per post. How many database queries run, and what is the usual fix?',
+      q: 'A GraphQL query asks for a list of posts and each post author. The author resolver runs one query per post. What is this problem called, and what is the usual fix?',
       options: [
-        '1 query. The posts query already fetches every author',
-        '50 queries. Add a database index on the author column',
-        '51 queries. Switch the whole API to REST with more endpoints',
-        '51 queries. Batch the author lookups with a loader',
+        'Over-fetching. Remove fields from the query',
+        'Cache stampede. Add a database index on the author column',
+        'N+1 queries. Switch the whole API to REST with more endpoints',
+        'N+1 queries. Batch the author lookups with a loader',
       ],
       answer: 3,
-      explain: 'One query for the posts plus 50 for the authors is 51 (N+1). Batching all author ids in one WHERE id IN (...) query cuts this to 2. An index makes each query faster but does not cut the count.',
+      explain: 'One query for the list plus one per item is the N+1 pattern. Batching all author ids into one lookup cuts the count to a couple of queries. An index makes each query faster but does not cut how many run.',
     },
     {
       q: 'Which API style fits best for calls between your own order service and your payment service, where latency and typed contracts matter most?',

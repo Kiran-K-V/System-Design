@@ -1,13 +1,11 @@
 ---
-summary: 'Many requests share a long prefix. Providers store its KV entries and charge a small read price on a hit and a write premium on a miss. A write premium of 1.25x repays after 1 reuse, and 2x after 2.'
+summary: 'Many requests share a long prefix. Providers store its KV entries and charge a small read price on a hit and a write premium on a miss. The short-lived write repays after one reuse. The long-lived write needs two.'
 requires: ['ai/a2-inference-cost/kv-cache', '05-caching/cache-strategies']
 ---
 
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
-import Math from '../../../../components/lesson/Math.astro';
 import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
 import Ai2CacheWalk from '../../../../components/anim/lessons/Ai2CacheWalk.tsx';
 import Ai2CacheCalc from '../../../../components/anim/lessons/Ai2CacheCalc.tsx';
@@ -16,7 +14,7 @@ import Ai2CacheCalc from '../../../../components/anim/lessons/Ai2CacheCalc.tsx';
 
 An assistant sends the same 20,000 tokens at the start of every call. Those tokens are a system prompt, a tool list, and a few examples. The user's actual question is 300 tokens. You pay for the 20,000 on every call, and the model re-reads them on every call.
 
-The money first. At Sonnet 5.5's $2 per million input tokens, 20,000 tokens cost 20,000 x $2 / 1,000,000 = $0.04 per call. At 1,000 calls a day, that is $40 a day for text that never changes (derived). The time next: the provider must run the prefill pass over all 20,000 tokens. This happens before the first output token (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)). That is the wait you feel as time to first token.
+The money first. Input tokens are billed per token, so a 20,000-token prefix is most of the bill on every call, for text that never changes. The time next: the provider must run the prefill pass over all 20,000 tokens. This happens before the first output token (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)). That is the wait you feel as time to first token.
 
 ## Naive solution: send it and pay again
 
@@ -62,22 +60,16 @@ All numbers are USD per 1M input tokens, as of 2026-10-16, from each provider's 
 **Google Gemini** ([caching guide](https://ai.google.dev/gemini-api/docs/caching), [pricing](https://ai.google.dev/gemini-api/docs/pricing), last updated 2026-10-15):
 
 - Implicit caching is on by default for Gemini 2.5 and newer. The minimum is 2,048 tokens on 2.5 Flash and 2.5 Pro, and 4,096 on newer models. Savings pass on automatically; the guide gives no percentage.
-- Explicit caches take a lifetime as a duration string such as `"300s"`. The guide does not state a default. They also carry a storage fee: $1.00 per 1M tokens per hour on 2.5 Flash, $4.50 on 2.5 Pro. A 20,000-token explicit cache on 2.5 Flash costs 20,000 / 1e6 x $1.00 = $0.02 per hour. This is the cost just to keep it (derived).
+- Explicit caches take a lifetime as a duration string such as `"300s"`. The guide does not state a default. They also carry a storage fee: $1.00 per 1M tokens per hour on 2.5 Flash, $4.50 on 2.5 Pro. So you pay a small hourly fee just to keep the cache, even when nobody reads it.
 - Cached input is $0.03 on 2.5 Flash (base $0.30). On 2.5 Pro it is $0.125 (base $1.25, prompts up to 200K).
 
 ## Numbers: the break-even
 
-Let P be the base price, w the write multiplier, and r the read multiplier. A write costs wP. A read costs rP. An uncached call costs P.
+A write costs a premium over the base price. A read costs a small fraction of it. So caching pays an extra amount at the write, and each read then saves most of the base price. The number of reads needed to recover the premium is the premium divided by the saving per read.
 
-Caching pays an extra (w - 1)P at the write. Each read then saves (1 - r)P. So the number of reads needed to recover the premium is:
-
-<Math block tex="n_{\text{break-even}} = \frac{w - 1}{1 - r}" />
-
-In words: the write premium divided by the saving per read.
-
-- 5-minute write, w = 1.25, r = 0.1: 0.25 / 0.9 = 0.28. One reuse is enough.
-- 1-hour write, w = 2, r = 0.1: 1.0 / 0.9 = 1.11. You need 2 reuses.
-- On Sonnet 5.5, r = 0.05: 0.26 and 1.05. The whole numbers stay 1 and 2.
+- **5-minute write (1.25x), read at 0.1x:** the premium is small and each read saves a lot. One reuse is enough.
+- **1-hour write (2x), read at 0.1x:** the premium is bigger. You need two reuses.
+- **On Sonnet 5.5**, reads are cheaper still, so the whole-number answers stay at one and two.
 
 Now watch three calls on Sonnet 5.5. A fourth call after a 6-minute gap shows the cost of a lapse.
 
@@ -116,7 +108,7 @@ Semantic caching stores whole answers and reuses one when a new question looks s
 ## Interview lens
 
 <Callout type="tip">
-Say it with numbers: "Our 20K-token prefix costs $0.04 per call uncached. A 5-minute write costs 1.25x and a read about 0.05 to 0.1x, so one reuse breaks even. I keep stable content first, check the cache-read field in the response, and alert when it drops to zero."
+Say it with the mechanism: "Our 20K-token prefix is most of each call's input bill. A 5-minute write costs a small premium and a read costs a small fraction of base, so one reuse breaks even. I keep stable content first, check the cache-read field in the response, and alert when it drops to zero."
 </Callout>
 
 <Callout type="mistake">
@@ -157,49 +149,32 @@ Do not cache a prompt that changes every call: you pay the write premium and nev
   ]}
 />
 
-<Ballpark
-  client:visible
-  title="Cost of a cached prefix"
-  scenario="A 20,000-token prefix on Sonnet 5.5. Base input $2 per million tokens, 5-minute write 1.25x, read 0.05x. Count only the prefix."
-  steps={[
-    {
-      prompt: 'What does one uncached call cost for the prefix, in dollars?',
-      unit: 'dollars',
-      answer: 0.04,
-      within: 1.1,
-      explain: '20,000 x $2 / 1,000,000 = $0.04.',
-    },
-    {
-      prompt: 'How many reads does a 1-hour write (2x) need at a 0.1x read price to pay for itself? Give the exact fraction.',
-      unit: 'reads',
-      answer: 1.11,
-      within: 1.1,
-      explain: '(2 - 1) / (1 - 0.1) = 1.11. So you need 2 whole reuses.',
-    },
-    {
-      prompt: 'One write and 99 reads inside the lifetime. What is the total prefix cost, in dollars?',
-      unit: 'dollars',
-      answer: 0.248,
-      within: 1.1,
-      explain: '$0.04 x (1.25 + 99 x 0.05) = $0.04 x 6.2 = $0.248. Uncached it would be 100 x $0.04 = $4.',
-    },
-  ]}
-/>
-
 <Quiz
   client:visible
   questions={[
     {
       id: 'a25-q-oneh',
-      q: 'A 1-hour Anthropic write costs 2x and a read 0.1x. A prefix is read 1 time before the entry expires. Compared with no caching, the total prefix cost is:',
+      q: 'A prefix is read only once before its entry expires. Why is the 1-hour write a worse choice than the 5-minute write here?',
       options: [
-        'Lower, because any read at 0.1x beats the base price of the prefix',
-        'Higher: 2.1x cached against 2x for two uncached calls',
-        'Equal, because the write premium cancels the saving exactly here',
-        'Lower, since the 1-hour write is billed only once per day of use',
+        'Its bigger write premium is not yet repaid after one read',
+        'It makes the read price higher than base',
+        'It cannot be read until an hour has passed',
+        'It is billed once per day of use',
       ],
-      answer: 1,
-      explain: 'Cached: 2x + 1 x 0.1x = 2.1x. Uncached, two calls cost 2x. The break-even is 1.11 reads, so one read is not enough. A 5-minute write at 1.25x would already have paid.',
+      answer: 0,
+      explain: 'The 1-hour write needs two reuses to pay back, so one read leaves you slightly behind no caching. The 5-minute write has a smaller premium and has already paid back. Read price does not depend on the lifetime.',
+    },
+    {
+      id: 'a25-q-nochange',
+      q: 'A team turns on prompt caching for a prompt that changes in its first lines on every call. What happens to the bill?',
+      options: [
+        'It rises, because each call pays the write premium and never gets a read',
+        'It falls, because any caching lowers input cost',
+        'It stays the same, because misses are billed at the base price',
+        'It falls, because writes are free on every provider',
+      ],
+      answer: 0,
+      explain: 'The cache matches by prefix, so a change near the start misses every time. Each miss still pays the write premium. Misses are billed above base on a provider with a write fee, and writes are not free everywhere.',
     },
     {
       id: 'a25-q-tools',

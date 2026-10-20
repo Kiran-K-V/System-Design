@@ -41,18 +41,16 @@ Two more tools cut the tail of the list. Long tails matter: with a 128K vocabula
 
 After each cut, the kept probabilities are scaled so they sum to 1 again. Then the sampler draws one token.
 
-Here is a worked example with ten illustrative scores for the next token after "The capital of France is". At T = 1, softmax gives Paris 76.5%, the 8.5%, a 4.7%, and a small tail. Check the first number by hand: the scores are 5.0, 2.8, 2.2, 1.9, 1.5, 1.2, 0.8, 0.5, 0.1, and -0.3. The value e^5 is 148.4. The sum of all ten e^x is 194.0. So Paris is 148.4 / 194.0 = 0.765.
-
-Now cut. With top-k = 3, the kept values are 148.4, 16.4, and 9.0, which sum to 173.8. Paris becomes 148.4 / 173.8 = 85.4%. With top-p = 0.9 at T = 1, the running total is 76.5%, 84.9%, 89.6%, 93.0%. The first three are below 0.9 and the fourth passes it, so four tokens stay. Try it.
+Here is an example with ten illustrative scores for the next token after "The capital of France is". At T = 1, softmax gives Paris most of the probability (about 3 in 4), "the" and "a" a few percent each, and a small tail. A top-k cut of 3 drops the tail, so Paris gains share. A top-p cut of 0.9 keeps the few tokens that together cover 90% of the mass. Try both.
 
 <Ai1SampBars client:visible />
 
 What to notice:
 
-1. **Temperature changes shape, not order.** The ranking of tokens never changes. At T = 0.5 Paris holds 98.1%. At T = 2 it holds 40.0% and the tail wakes up.
+1. **Temperature changes shape, not order.** The ranking of tokens never changes. Low T makes Paris almost certain. High T flattens the bars and the tail wakes up.
 2. **Cuts are applied in order.** This widget runs temperature, then top-k, then top-p. Libraries differ in the exact order and in tie handling, so read the docs of the one you use.
 3. **The grey bar shows what was cut.** The blue bar is bigger than the grey bar for every kept token. The reason is that the cut mass is shared among the survivors.
-4. **Counts match the bars.** Press "Draw 1,000 samples". With T = 1 and no cuts, Paris should get about 765 of 1,000 draws.
+4. **Counts match the bars.** Press "Draw 1,000 samples". The counts should follow the bars: the tallest bar gets the most draws.
 
 Now watch decoding run. The sampler needs one random number per token. It lines up the probabilities as a strip from 0 to 1 and picks the token whose segment holds the number.
 
@@ -74,7 +72,7 @@ A GPU adds up thousands of numbers inside every matrix multiply. How it splits t
 
 Most of the time the last bits do not matter. But at some token the top two scores are almost tied. A change in the 7th digit flips which one wins. Once one token differs, every token after it can differ. This is a backend idea you know: a result that depends on the **hidden state of a shared system**, like a cache hit that changes a timing, but here it changes the output.
 
-The fix exists. Batch-invariant kernels compute each request the same way regardless of batch size. It costs speed. On one GPU, the paper tested Qwen-3-8B with 1,000 sequences of about 100 tokens. Default vLLM took 26 seconds. The unoptimized deterministic version took 55 seconds. With an improved attention kernel, the run took 42 seconds. That is 1.6 times slower in the best case (42 / 26 = 1.6).
+The fix exists. Batch-invariant kernels compute each request the same way regardless of batch size. It costs speed. The paper tested Qwen-3-8B on one GPU. The first deterministic version was about twice as slow as default vLLM. An improved attention kernel closed part of the gap, but it stayed slower.
 
 <Callout type="deep" title="Seed, temperature 0, and what you can promise">
 A seed fixes the random number u. It does not fix the scores that go into the strip. If the scores move by a tiny amount, the same u can land on a different token. So "temperature 0" and "seed = 42" are both **best effort** on a shared hosted model. The exception is when the provider documents a stronger guarantee. Check the provider's docs. Do not build a system that fails if two calls differ. Build one that checks the output (see below) and treats a rare difference as normal.
@@ -90,7 +88,7 @@ A seed fixes the random number u. It does not fix the scores that go into the st
 | Repetition penalty about 1.2 | Divides the score of tokens already used | Stops loops. The CTRL paper reports 1.2 as a good balance |
 | Constrained decoding | Sets the probability of tokens that break a format to zero before the draw | JSON, a fixed label set |
 
-Cost: sampling is cheap. A softmax over a 128K vocabulary is on the order of 5e5 operations. The figure is derived: 128K values times a few steps each. The forward pass of a 70B model is 2 x 70e9 = 1.4e11 FLOPs per token. Sampling is about 300,000 times smaller. Nobody picks greedy to save compute.
+Cost: sampling is cheap. The forward pass of a large model does billions of operations per token. Sampling over the vocabulary is several orders of magnitude smaller (our derived estimate). Nobody picks greedy to save compute.
 
 ## Trade-offs
 
@@ -118,26 +116,26 @@ Do not say "temperature 0 makes it deterministic". It removes the deliberate ran
   client:visible
   questions={[
     {
-      q: 'Three tokens have scores 2.0, 1.0, and 0.0 at T = 1. You apply top-k with k = 2, and rescale. What probability does the top token get?',
+      q: 'You apply top-k with a small k, then rescale. What happens to the probability of the top token?',
       options: [
-        'About 66.5%, because the cut does not change any probability',
-        'About 73.1%, because 7.39 / (7.39 + 2.72) after the cut',
-        'About 50%, because two tokens stay and they share equally',
-        'About 100%, because top-k keeps only the best token',
-      ],
-      answer: 1,
-      explain: 'The full softmax gives 66.5%. Top-k drops the third token, leaving e^2 = 7.39 and e^1 = 2.72. Rescaled, the top one is 7.39 / 10.11 = 73.1%. Equal sharing would ignore the scores, and k = 2 keeps two tokens, not one.',
-    },
-    {
-      q: 'After temperature, four tokens have probabilities 0.50, 0.30, 0.15, and 0.05. Top-p is 0.9. What happens?',
-      options: [
-        'Three tokens stay and the top one becomes about 52.6%',
-        'Two tokens stay and the top one becomes about 62.5%',
-        'Three tokens stay and the top one stays at 50% exactly',
-        'All four stay, since the total is above 0.9 already',
+        'It rises, because the cut mass is shared among the survivors',
+        'It stays the same, because the cut does not change any probability',
+        'It falls, because fewer tokens means less confidence',
+        'It becomes 100%, because top-k keeps only the best token',
       ],
       answer: 0,
-      explain: 'The running totals are 0.50, 0.80, 0.95. The set stops at the first total that reaches 0.9, which is the third token. The kept mass is 0.95, so the top token becomes 0.50 / 0.95 = 52.6%. Two tokens would only reach 0.80.',
+      explain: 'After a cut, the kept probabilities are scaled to sum to 1 again, so each survivor gains share. Keeping the old values would leave a total below 1. A k above 1 keeps several tokens, not only the best one.',
+    },
+    {
+      q: 'The model is very confident about one token. Top-p is 0.9. How does the set of kept tokens compare with a case where the model is unsure?',
+      options: [
+        'It is much smaller, because one token already covers the mass',
+        'It is the same size, because p fixes the set size',
+        'It is larger, because a confident model has a longer tail',
+        'It is always exactly one token for any p',
+      ],
+      answer: 0,
+      explain: 'Top-p keeps the smallest set that covers p of the mass, so the set shrinks when the model is confident and grows when it is unsure. A fixed size is what top-k does. A confident model has a short tail, not a long one.',
     },
     {
       q: 'A team sets temperature to 0. Over 1,000 identical calls to a shared hosted model, a handful of outputs differ at token 100 or later. What is the most likely cause?',

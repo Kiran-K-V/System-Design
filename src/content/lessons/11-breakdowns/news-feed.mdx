@@ -6,7 +6,6 @@ requires: ['05-caching/cache-strategies', '06-async/queues', '08-technologies/re
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import NewsFeedBuild from '../../../components/anim/lessons/NewsFeedBuild.tsx';
 import NewsFeedFanout from '../../../components/anim/lessons/NewsFeedFanout.tsx';
 
@@ -16,7 +15,7 @@ You open a social app. A page of posts from people you follow appears, newest fi
 
 The question that drives the design is simple. A feed is the answer to: "show the latest posts of everyone I follow". When do you compute that answer? When the user asks (a **pull**), or when each author posts (a **push**)? Each choice moves a large cost to a different place, and each has a case where it fails.
 
-Sources for this topic are scarce. I did not reach a primary source with company numbers for this lesson. So every number below is an assumption that we derive. Do the same in an interview: state assumptions, then show the arithmetic.
+Sources for this topic are scarce. I did not reach a primary source with company numbers for this lesson. So every number below is a rough assumption. Do the same in an interview: state your assumptions, then move on to the design.
 
 ## Requirements
 
@@ -30,23 +29,12 @@ Sources for this topic are scarce. I did not reach a primary source with company
 
 **Non-functional.** Feed reads are fast. The system favors availability: a post may reach followers a few seconds late. Reads far outnumber writes.
 
-**Scale.** Interview assumptions, with the math shown.
+**Scale.** Interview assumptions, kept rough.
 
-- 100 million daily active users, each opening the feed 10 times a day. That is 1 billion reads a day, or 1,000,000,000 ÷ 86,400 ≈ **11,600 feed reads a second**.
-- 1 in 10 users posts once a day. That is 10 million posts a day, or about **116 posts a second**.
+- 100 million daily active users, each opening the feed 10 times a day. That is about **11,600 feed reads a second**.
+- 1 in 10 users posts once a day. That is about **116 posts a second**.
 - A typical user follows 500 accounts and has 200 followers.
-- Read to write ratio: 11,600 ÷ 116 = 100 to 1.
-
-<Ballpark
-  client:visible
-  title="Size the feed"
-  scenario="100 million daily users open the feed 10 times a day. One in ten posts once a day. The average author has 200 followers. A day has 86,400 seconds."
-  steps={[
-    { prompt: 'Feed reads per second on average', unit: 'per s', answer: 11574, within: 1.3, explain: '100M × 10 = 1 billion a day. 1,000,000,000 ÷ 86,400 ≈ 11,574 a second.' },
-    { prompt: 'Posts per second on average', unit: 'per s', answer: 116, within: 1.3, explain: '100M × 0.1 = 10M posts a day. 10,000,000 ÷ 86,400 ≈ 116 a second.' },
-    { prompt: 'Feed writes per second if every post is pushed to 200 followers', unit: 'per s', answer: 23148, within: 1.3, explain: '116 × 200 ≈ 23,100 writes a second. That is the write amplification of fan-out on write: one post becomes 200 writes.' },
-  ]}
-/>
+- Reads outnumber writes by about 100 to 1.
 
 ## Core entities
 
@@ -78,13 +66,13 @@ Switch between the designs below and step through each one.
 
 <NewsFeedFanout client:visible />
 
-**Fan-out on read** costs nothing at post time. All the cost lands on reads. With 500 followees, each feed read does 500 lookups. At 11,600 reads a second, that is 500 × 11,600 = **5.8 million lookups a second**. Most of them fetch posts nobody has read yet. The feed gets slower for users who follow more people. The scatter-gather pattern from [lesson 4.7](/learn/04-data/sharding/) makes the slowest of 500 calls set the latency.
+**Fan-out on read** costs nothing at post time. All the cost lands on reads. With 500 followees, each feed read does 500 lookups. Across all readers, that is **millions of lookups a second**. Most of them fetch posts nobody has read yet. The feed gets slower for users who follow more people. The scatter-gather pattern from [lesson 4.7](/learn/04-data/sharding/) makes the slowest of 500 calls set the latency.
 
 **Fan-out on write** moves the cost to post time. When a post is created, a queue ([lesson 6.1](/learn/06-async/queues/)) hands it to workers. A worker reads the author's follower list and adds the post id to each follower's feed. A feed read is then one lookup of a ready-made list, then a fetch of those posts by id. Reads are cheap and flat, no matter how many people the user follows.
 
-The price is **write amplification**: one post becomes one write per follower. With 200 followers on average, 116 posts a second become 23,100 feed writes a second. That is fine. It runs in the background, off the request path, and a queue smooths bursts ([lesson 6.4](/learn/06-async/backpressure-dlq/)).
+The price is **write amplification**: one post becomes one write per follower. With about 200 followers on average, a modest stream of posts becomes a much larger stream of feed writes. That is fine. It runs in the background, off the request path, and a queue smooths bursts ([lesson 6.4](/learn/06-async/backpressure-dlq/)).
 
-How big are the stored feeds? Keep only the newest 500 ids per user. At 8 bytes an id, that is 500 × 8 B = 4 KB. For 100 million active users: 100M × 4 KB = **400 GB** of raw ids. Real storage costs more, because every structure has overhead, so plan for several times that, spread over many shards (separate machines that each hold a slice of the data). If a user's feed is missing or has expired, rebuild it with the pull method from the posts table. The cache is a copy, not the truth.
+How big are the stored feeds? Keep only the newest 500 ids per user. Ids are small, so the raw ids for 100 million users fit in hundreds of GB (~400 GB). Real storage costs several times more, because every structure has overhead. Spread it over many shards (separate machines that each hold a slice of the data). If a user's feed is missing or has expired, rebuild it with the pull method from the posts table. The cache is a copy, not the truth.
 
 A **sorted set** in Redis ([lesson 8.2](/learn/08-technologies/redis/)) suits a feed. It is a collection of unique items, each with a number called a score, and Redis keeps the items ordered by that score. Picture a leaderboard that re-sorts itself each time someone is added. Here the item is a post id and the score is the post time.
 
@@ -94,7 +82,7 @@ It is also safe to repeat. Queue delivery can run a job twice ([lesson 6.3](/lea
 
 ## Deep dive 2: the celebrity problem
 
-Fan-out on write assumes that an author has few followers. Some accounts have millions. Say one has 20 million followers and posts once. That is 20 million feed writes from a single post. If the workers manage 200,000 writes a second, the job takes 20,000,000 ÷ 200,000 = **100 seconds**. The last follower waits more than a minute and a half. Meanwhile the queue backs up, and ordinary authors' posts wait behind the celebrity's job.
+Fan-out on write assumes that an author has few followers. Some accounts have millions. Say one has 20 million followers and posts once. That is 20 million feed writes from a single post. Even with fast workers, the job takes **minutes, not milliseconds**. The last follower waits a long time. Meanwhile the queue backs up, and ordinary authors' posts wait behind the celebrity's job.
 
 The fix is a **hybrid**. Pick a threshold, such as 100,000 followers. Authors below it are pushed. Authors above it are not pushed at all. At read time, the feed service does two things. It reads the user's ready-made list. It also reads the recent posts of the few celebrities the user follows, and merges them in by time. A typical user follows a handful of celebrities, so this adds a handful of lookups, not 500.
 
@@ -118,7 +106,7 @@ The hybrid has its own costs.
 | Eventual consistency | Availability and speed | A post may be seconds late | Social feeds, where a delay is harmless |
 
 <Callout type="tip">
-Say the trade in one line: "Pull makes reads slow, push makes writes big. I push for ordinary authors so reads are one lookup. I pull for celebrities so one post is not 20 million writes." Back it with your numbers: "500 lookups per read at 11,600 reads a second is 5.8 million lookups a second. So pull alone fails."
+Say the trade in one line: "Pull makes reads slow, push makes writes big. I push for ordinary authors so reads are one lookup. I pull for celebrities so one post is not 20 million writes." Back it with one fact: "500 lookups per read, across every reader, is millions of lookups a second. So pull alone fails."
 </Callout>
 
 <Callout type="mistake">
@@ -146,15 +134,26 @@ The hybrid is one point on a line. At one end, push to nobody and pull everythin
       explain: 'Pull builds the feed at read time by asking each followee for recent posts. That is one lookup per account followed. A single lookup describes fan-out on write, and followers matter only for the push side.',
     },
     {
-      q: 'An account with 20 million followers posts once. Workers manage 200,000 feed writes a second. How long does a full fan-out on write take?',
+      q: 'An account with 20 million followers posts once. Why is fan-out on write a problem for this one post?',
       options: [
-        'About 1 second, since the writes run in parallel',
-        'About 10 seconds, one second for every 2 million',
-        'About 100 seconds, which is 20 million over 200,000',
-        'About 4,000 seconds, because one worker does each write',
+        'The post body must be copied into every follower feed',
+        'One post becomes millions of feed writes that hold the workers',
+        'Followers cannot read the post until they log in again',
+        'Sorted sets cannot hold more than a few thousand ids',
       ],
-      answer: 2,
-      explain: '20,000,000 ÷ 200,000 = 100 seconds. The 200,000 rate already counts all workers working together. The delay also blocks the queue for other authors, which is why celebrities are pulled.',
+      answer: 1,
+      explain: 'Push turns one post into one write per follower. For a huge account that one job occupies the workers for a long time, and other authors wait behind it. Only ids are stored, not bodies, and sorted sets hold far more than a few thousand entries.',
+    },
+    {
+      q: 'What does write amplification mean in fan-out on write for a news feed?',
+      options: [
+        'One post causes one feed write for each follower',
+        'Each feed read causes one lookup per followed account',
+        'Each post is stored on several servers for safety',
+        'Each retry of a failed job doubles the stored data',
+      ],
+      answer: 0,
+      explain: 'Amplification means one incoming write becomes many stored writes. Here it is one per follower. The second option describes the cost of fan-out on read. Replication and retries are different effects.',
     },
     {
       q: 'Why store only post ids in each follower feed and not the whole post?',
@@ -197,12 +196,12 @@ The hybrid is one point on a line. At one end, push to nobody and pull everythin
       prompt: 'What is the root cause of the delay for ordinary users?',
       options: [
         'The cache evicted the feeds of the ordinary users',
-        'The celebrity job holds the workers for about 100 seconds',
+        'The celebrity job holds the workers for a long time',
         'Ordinary users posted too many posts in that period',
         'The follow graph database lost some of its replicas',
       ],
       answer: 1,
-      explain: '20 million writes at 200,000 a second occupy every worker for about 100 seconds. Other jobs wait behind them. Workers and cache are healthy, so the cause is the size of one job, not a fault.',
+      explain: '20 million writes occupy every worker for a long stretch. Other jobs wait behind them. Workers and cache are healthy, so the cause is the size of one job, not a fault.',
     },
     {
       prompt: 'What change prevents this for the next celebrity post?',

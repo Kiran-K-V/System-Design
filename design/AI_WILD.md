@@ -5,7 +5,7 @@ Read `design/NEXT_LESSONS.md`, `design/AI_LESSONS.md`, and `design/AI_CASES.md` 
 ## 1. Shape
 
 - 2,800 to 3,800 words of prose. Path: `src/content/lessons/ai/a14-wild/<slug>.mdx`. Slug and title from `src/lib/ai-syllabus.ts`. Components: `src/components/anim/lessons/Ai14<Name>.tsx`.
-- Read two finished lessons for house style and structure: `src/content/lessons/ai/a13-cases/support-agent.mdx` and `src/content/lessons/12-in-the-wild/shopify-inventory.mdx` (the backend teardown shape). Use the question-chain teaching style of `ai/a12-multimodal/speech-pipeline.mdx`: teach every term at the moment of need; four parts per idea (what, picture, why, number).
+- Read two finished lessons for house style and structure: `src/content/lessons/ai/a13-cases/support-agent.mdx` and `src/content/lessons/12-in-the-wild/shopify-inventory.mdx` (the backend teardown shape). Use the question-chain teaching style of `ai/a12-multimodal/speech-pipeline.mdx`: teach every term at the moment of need; four parts per idea (what, picture, why, example).
 - Fetch the primary source(s) named in the plan block yourself, read the WHOLE page, and quote exactly. If a page does not load, say so and do not use its numbers. Labelling is mandatory: every claim from the source is a "**Company claim**" (with the source and its date); every inference of ours is "**Our reading**". Never present a vendor number as measured fact. Never invent a figure the page does not state; say "not published".
 - Spec: `AI_SYSTEM_DESIGN_PLAN.md`, section "A14. In the Wild", the block for your lesson. Follow its topic list; you may improve the animation ideas.
 
@@ -17,7 +17,7 @@ Read `design/NEXT_LESSONS.md`, `design/AI_LESSONS.md`, and `design/AI_CASES.md` 
 4. **The numbers** (every published figure in a table: figure, what it measures exactly, source and date, label; and what is NOT published).
 5. **Our reading** (what we infer, how it maps onto lessons, what we would test before copying it).
 6. **What to copy and what not to** (a short table: idea, when it fits, when it does not).
-7. **Interview lens** (`Callout` tip and mistake), **Check yourself** (`Quiz` 4 questions, plus the Ballpark or Diagnose the plan names, unique ids), **Further reading** (the primary source plus 1 to 3 more you fetched and confirmed load).
+7. **Interview lens** (`Callout` tip and mistake), **Check yourself** (`Quiz` 4 questions, plus the Diagnose the plan names; no Ballpark, unique ids), **Further reading** (the primary source plus 1 to 3 more you fetched and confirmed load).
 
 ## 3. Visuals
 

@@ -5,7 +5,6 @@ requires: ['ai/a3-llm-apis/tool-calling-protocol', 'ai/a0-orientation/probabilis
 
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import Math from '../../../../components/lesson/Math.astro';
 import Ai6LoopWalk from '../../../../components/anim/lessons/Ai6LoopWalk.tsx';
 import Ai6LoopSim from '../../../../components/anim/lessons/Ai6LoopSim.tsx';
@@ -99,33 +98,7 @@ The API is stateless (lesson [A3.1](/learn/ai/a3-llm-apis/api-anatomy/)). Every 
 
 Anthropic measured the effect at the system level. In their multi-agent research write-up, agents "typically use about 4× more tokens than chat interactions". Their number is an average for their own workloads, not a law, but the direction is general.
 
-Work one example. Assume a 2,000-token start (system prompt, tools, goal). Each turn adds 1,000 new tokens to the history. Those tokens are the model's request plus the tool result. These numbers are illustrative. Call i sends 2,000 + (i - 1) x 1,000 tokens. Over 12 calls:
-
-<Math block tex="\sum_{i=1}^{12} \bigl(2000 + (i-1)\cdot 1000\bigr) = 12 \cdot 2000 + 1000 \cdot \tfrac{12 \cdot 11}{2} = 24{,}000 + 66{,}000 = 90{,}000" />
-
-If history did not grow, the same 12 calls would send 24,000 tokens. The growth adds 66,000. Prompt caching (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) makes the repeated prefix cheap, but only if the prefix stays stable. A loop that appends is a good fit for it.
-
-<Ballpark
-  client:visible
-  title="Cost of a 12-step run"
-  scenario="An agent runs 12 model calls. The first call sends 2,000 input tokens. After each call, the history grows by 1,000 tokens (the model's request plus the tool result). Each call resends the full history. Input costs $2 per million tokens (Sonnet 5.5, claude.com/pricing, as of 2026-10-16). Ignore output tokens and caching."
-  steps={[
-    {
-      prompt: 'How many input tokens does the whole run send?',
-      unit: 'tokens',
-      answer: 90000,
-      within: 1.1,
-      explain: 'Call i sends 2,000 + (i - 1) x 1,000 tokens. The sum over 12 calls is 12 x 2,000 + 1,000 x (0 + 1 + ... + 11) = 24,000 + 66,000 = 90,000.',
-    },
-    {
-      prompt: 'What does that input cost, in dollars?',
-      unit: 'dollars',
-      answer: 0.18,
-      within: 1.1,
-      explain: '90,000 x $2 / 1,000,000 = $0.18 per run. At 100,000 runs a day, that is $18,000 a day for input alone, before output tokens.',
-    },
-  ]}
-/>
+Picture a run of a dozen calls. The first call sends the system prompt, tools and goal. Every later call sends all of that plus everything added since. Most of the total input is old history sent again, not new work. Cost grows much faster than the number of turns. Prompt caching (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)) makes the repeated prefix cheap, but only if the prefix stays stable. A loop that appends is a good fit for it.
 
 ## Why long loops fail more often
 
@@ -133,11 +106,11 @@ Every turn is a chance to go wrong. The model may pick the wrong tool, pass a ba
 
 <Math block tex="P(\text{run succeeds}) = p^{n}" />
 
-Lesson [A0.3](/learn/ai/a0-orientation/probabilistic-components/) built this formula. Take a step that is right 95% of the time. Ten steps give 0.95 to the power 10, about 59.9%. Thirty steps give about 21.5% (derived: 0.95 to the power 30). Real agents recover from some errors, so the formula is a worst case. It still shows why a loop needs checks inside it.
+Lesson [A0.3](/learn/ai/a0-orientation/probabilistic-components/) built this formula. A step that is right 95% of the time sounds safe. Chain thirty of them, and the run fails more often than it succeeds. Real agents recover from some errors, so the formula is a worst case. It still shows why a loop needs checks inside it.
 
 The second measure is about repeats. A **tau-bench** task puts an agent in a customer-service role with tools and a policy. A model plays the customer. The score compares the final database state with the goal state. The authors define **pass^k** as the chance that all k independent trials of a task succeed, averaged over tasks. For their best function-calling agent, gpt-4o, they report a pass^1 of 61.2% on the retail domain. They also report that pass^8 is below 25% in retail. The same agent solves a task about six times in ten. Yet it rarely solves the same task eight times in a row. The models are from 2024, so read the shape, not the numbers.
 
-Why is pass^8 not simply 0.612 to the power 8, which is about 2%? Because tasks differ. Some are easy and the agent nearly always gets them. Some are hard. A mix of easy and hard tasks keeps pass^k above the all-equal curve. Try it. The "tau-bench retail shape" preset uses a 61% average and a 30-point spread. That is an illustrative fit, not the paper's data.
+Why is pass^8 not just the one-run rate multiplied by itself eight times? Because tasks differ. Some are easy and the agent nearly always gets them. Some are hard. A mix of easy and hard tasks keeps pass^k above the all-equal curve. Try it. The "tau-bench retail shape" preset uses a 61% average and a 30-point spread. That is an illustrative fit, not the paper's data.
 
 <Ai6LoopSim client:visible />
 
@@ -180,23 +153,23 @@ Do not say "the agent decides when it is done" and leave it there. Say what happ
       explain: 'Nothing in the API caps tool rounds. A vague error gives the model no next step, so it may repeat the call. Only your cap ends such a loop.',
     },
     {
-      q: 'A run needs 20 steps in a row. Each step is right with probability 0.9, and steps are independent. About how often does the whole run succeed?',
+      q: 'Each step of an agent is right 90% of the time. Why is a 20-step run far less reliable than any single step?',
       options: [
-        'About 90%, since each step is 90% likely to work',
-        'About 12%, since 0.9 to the 20th is 0.12',
-        'About 50%, since errors cancel out over many steps',
-        'About 2%, since 0.9 times 20 steps is small',
+        'All steps must work, so error rates multiply',
+        'Later steps are always harder than earlier steps',
+        'Errors cancel out, so the run averages the steps',
+        'The model gets tired as the history grows longer',
       ],
-      answer: 1,
-      explain: 'The chance that all 20 steps work is 0.9 to the power 20, about 0.12. The 90% figure is for one step only. Errors do not cancel: each step multiplies the success rate by 0.9.',
+      answer: 0,
+      explain: 'A run succeeds only if all steps succeed, so each step lowers the odds a little more. Errors do not cancel. Later steps are not harder by rule, and a model does not tire.',
     },
     {
-      q: 'You set max_budget_usd to $1.00. The loop has spent $0.97 when the next response arrives and costs $0.20. What can happen?',
+      q: 'You set a dollar budget on a loop. The loop is just under the cap when one more expensive response arrives. What can happen?',
       options: [
-        'The response is cut off at exactly $1.00 of total spend',
-        'The call is refused before it runs, because it would exceed the cap',
-        'Spend ends near $1.17, a little past the cap',
-        'The cap is raised to $1.20 so that the response can finish',
+        'The response is cut off at exactly the cap',
+        'The call is refused before it runs, because it would pass the cap',
+        'Spend ends a little past the cap, by one response',
+        'The cap is raised so that the response can finish',
       ],
       answer: 2,
       explain: 'The cost of a response is known only after it arrives, so the SDK checks the cap after each response. The response that reaches the cap still completes, so spend can pass the cap by one response.',
@@ -211,6 +184,17 @@ Do not say "the agent decides when it is done" and leave it there. Say what happ
       ],
       answer: 3,
       explain: 'pass^k is the chance that all k tries succeed, so it matches a user who needs every run to work. pass@k is the chance that at least one try works, which fits when you can pick the best result.',
+    },
+    {
+      q: 'An agent runs a dozen turns, and each turn adds a little to the history. Where does most of its input cost come from?',
+      options: [
+        'Resending old history on every call',
+        'The new tool result added on each turn',
+        'The final answer the model writes at the end',
+        'The system prompt, which is sent only once',
+      ],
+      answer: 0,
+      explain: 'The API is stateless, so each call resends the whole history. Old turns are paid for again and again. New tool results matter less than their repeats. The system prompt is also resent every call.',
     },
   ]}
 />

@@ -64,11 +64,9 @@ Keep two counters: the current window and the previous one. Estimate the sliding
 estimate = previous x (share of previous window still in range) + current
 ```
 
-Cloudflare's example: the limit is 50 per minute. The previous minute had 42 requests. The current minute started 15 seconds ago and has 18. So 45 of the previous 60 seconds are still in range:
+Cloudflare's idea: early in a new minute, most of the previous minute is still inside the sliding window. So most of the previous count still counts. Later in the minute, less of it counts. The estimate slides smoothly between the two counters. It needs no list of timestamps.
 
-`42 x (45 / 60) + 18 = 31.5 + 18 = 49.5`
-
-Two numbers per client. Cloudflare tested this on 400 million requests from 270,000 sources. 0.003% of requests were wrongly allowed or limited. The average difference between the real rate and the estimate was 6%. No source that was blocked was below the threshold. The three sources that got through wrongly were less than 15% over the threshold.
+That is two numbers per client. Cloudflare tested this on 400 million requests from 270,000 sources. 0.003% of requests were wrongly allowed or limited. The average difference between the real rate and the estimate was 6%. No source that was blocked was below the threshold. The three sources that got through wrongly were less than 15% over the threshold.
 
 Now compare the three window methods at a boundary. A client sends 10 requests just before the boundary and 10 just after. The limit is 10 per 10 seconds. Move the gap between the bursts.
 
@@ -117,7 +115,6 @@ The last two are load shedding ([lesson 7.3](/learn/07-reliability/circuit-break
 
 | Fact | Value | Source |
 |---|---|---|
-| Sliding counter example | 42 x 0.75 + 18 = 49.5 | Cloudflare blog |
 | Cloudflare test size | 400 million requests, 270,000 sources | Same |
 | Wrongly allowed or limited | 0.003% | Same |
 | Average error of the estimate | 6% | Same |
@@ -155,28 +152,28 @@ Do not stop at "a fixed window counter": say what happens at the boundary. Do no
   client:visible
   questions={[
     {
-      q: 'A token bucket has capacity 10 and refills 2 tokens per second. It starts full. A client sends 30 requests at once. How many pass at once?',
-      options: ['2', '10', '20', '30'],
+      q: 'A token bucket is full and has a small capacity. A client sends a huge burst at once. What decides how many requests pass at that instant?',
+      options: ['The refill rate of the bucket', 'The tokens saved up', 'The number of clients using the limiter', 'The length of the time window it uses'],
       answer: 1,
-      explain: 'The bucket holds 10 tokens, and each request takes one. The first 10 pass and the other 20 are refused. The refill rate of 2 per second matters only over time, not at the instant of the burst.',
+      explain: 'Each request takes one token, so the burst passes only while tokens last. The refill rate matters over time, not at the instant of the burst. The rest of the burst is refused.',
     },
     {
-      q: 'The burst above empties the bucket (capacity 10, refill 2 per second). How long until 6 more requests can pass?',
-      options: ['1 second', '2 seconds', '3 seconds', '6 seconds'],
+      q: 'A token bucket was just emptied by a burst. What sets how fast the client can send again at a steady pace?',
+      options: ['The bucket capacity', 'The size of the last burst', 'The refill rate', 'The number of servers behind the limiter'],
       answer: 2,
-      explain: 'At 2 tokens per second, 6 tokens take 6 / 2 = 3 seconds. The refill rate sets the long-run speed. The capacity only sets how much can be saved up.',
+      explain: 'The refill rate sets the long-run speed. Capacity only sets how much can be saved up for a burst. A bigger bucket does not make a drained bucket refill faster.',
     },
     {
-      q: 'A fixed-window limit is 100 per minute. A client sends 100 requests at 12:00:59 and 100 more at 12:01:01. How many are allowed?',
-      options: ['100', '150', '0', '200'],
+      q: 'A fixed-window limit counts per calendar minute. A client sends a full limit of requests just before a minute ends, and another full limit just after it starts. What goes wrong?',
+      options: ['Both bursts are refused, because the counter is shared', 'Half of each burst is refused by the limiter', 'Only the first burst is allowed, because the counter never resets', 'Both bursts pass, so the client gets double the limit'],
       answer: 3,
-      explain: 'The two bursts fall in different calendar minutes, and the counter resets at 12:01:00. Each minute sees exactly 100. So all 200 pass, in 2 seconds. This edge burst is the flaw of the fixed window.',
+      explain: 'The counter resets at the minute boundary, so each burst lands in a different window and looks fine. This edge burst is the flaw of the fixed window. Sliding windows fix it by looking back from now, not from the clock.',
     },
     {
-      q: 'The limit is 50 per minute. The previous minute had 42 requests. The current minute is 15 seconds old with 18 requests. What does the sliding window counter estimate?',
-      options: ['49.5', '60', '28.5', '18'],
+      q: 'Why does the sliding window counter use two counters instead of one?',
+      options: ['It weights the old window by how much is still in range', 'It keeps one counter for reads and one for writes', 'It keeps a backup counter in case the first one is lost', 'It counts allowed and refused requests separately'],
       answer: 0,
-      explain: 'The previous window is weighted by the part still in range: 45 of 60 seconds, which is 0.75. 42 x 0.75 + 18 = 49.5. The value 28.5 comes from using 0.25 as the weight, which is the part that has already passed.',
+      explain: 'The estimate blends the previous window with the current one. Early in a new window, the previous count still matters a lot. Later, it matters less. A single counter would reset at the boundary and allow the edge burst again.',
     },
     {
       q: 'The Redis cluster that holds the rate limit counters goes down. What should the API do for most routes?',

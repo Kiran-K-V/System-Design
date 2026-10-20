@@ -11,12 +11,12 @@ import AsyncFlowLab from '../../../components/anim/lessons/AsyncFlowLab.tsx';
 
 ## The problem
 
-A photo app resizes every upload into thumbnails. One resize takes about 200 ms of CPU. A **worker** is a program that takes one job and does it. A pool of 10 workers does 10 × 5 = **50 resizes per second**. Normal traffic is 30 uploads per second. That is fine.
+A photo app resizes every upload into thumbnails. One resize takes about 200 ms of CPU. A **worker** is a program that takes one job and does it. A pool of 10 workers keeps up with normal traffic easily.
 
-A marketing email goes out. For 10 seconds, uploads arrive at 300 per second. The upload endpoint now has two bad options.
+A marketing email goes out. For 10 seconds, uploads arrive several times faster than the workers can resize them. The upload endpoint now has two bad options.
 
 - **Do the resize inside the request.** The user waits for the resize. Requests pile up on the 10 workers. By lesson 1.3, waiting time explodes once the arrival rate passes the service rate. Users see timeouts.
-- **Buy for the peak.** You need 300 ÷ 5 = 60 workers for 10 seconds, and 10 for the rest of the day. For a one-time spike, 50 machines sit idle.
+- **Buy for the peak.** You need many extra workers for 10 seconds, and few for the rest of the day. For a one-time spike, most of those machines sit idle.
 
 Both fail for the same reason. The caller and the work are **tied together in time**. The caller must wait. The workers must be ready at the moment of the burst.
 
@@ -35,13 +35,11 @@ Try it. Press Play. The workers never change speed. Only the queue depth moves.
 
 <AsyncFlowLab client:visible />
 
-The numbers, derived by hand, match the widget:
+Watch three things in the widget:
 
-- The burst adds messages faster than workers remove them. The result is (300 − 50) × 10 s = **2,500 messages** waiting at the end of the burst.
-- A new message at that moment waits 2,500 ÷ 50 = **50 s**.
-- After the burst, arrivals drop to 30 per second. Workers remove 50. The queue shrinks by 20 per second, so it empties in 2,500 ÷ 20 = **125 s**.
-
-Now set workers to 6. Six workers do 30 per second, exactly the base rate. The queue never empties.
+- During the burst, messages arrive faster than workers remove them. The queue grows, and a new message waits behind all of them.
+- After the burst, arrivals drop below the workers' speed. The queue shrinks, but only by the small gap between the two. So it takes a while to empty.
+- Now cut the workers down to just enough for the normal rate. The queue never empties, because there is no gap left to drain it.
 
 <Callout type="deep" title="A queue buffers. It does not add capacity">
 If producers are faster than workers for long enough, the backlog grows without end. A queue only moves the wait from the caller to the queue. It does not remove the wait. Lesson 1.3 showed why: the closer the load gets to 100% of capacity, the longer the line. Lesson 6.4 covers what to do when the line grows.
@@ -79,8 +77,6 @@ A timeout that is too short hands a slow job to a second worker, so you get dupl
 | SQS standard queue, in-flight messages (received but not yet deleted) | about 120,000 | SQS docs |
 | SQS FIFO queue, per partition (one slice of the queue) | 300 API calls per second per action, or 3,000 messages per second with batching | SQS quotas page |
 | RabbitMQ prefetch | 100 to 300 usually gives good throughput | RabbitMQ docs |
-| Example above: backlog after the burst | (300 − 50) × 10 = 2,500 | Derived |
-| Example above: time to empty | 2,500 ÷ 20 = 125 s | Derived |
 
 Prefetch is how many unacknowledged messages a RabbitMQ consumer may hold at once. A high value keeps workers busy. It can also leave one worker holding many messages while others sit idle.
 
@@ -113,10 +109,10 @@ Do not say "the queue makes the system faster". It makes the **caller** faster. 
   client:visible
   questions={[
     {
-      q: 'Producers send 80 messages per second for 30 seconds. Workers finish 50 per second. Nothing else changes. About how many messages are waiting when the burst ends?',
-      options: ['1,500', '2,400', '4,000', '900'],
-      answer: 3,
-      explain: 'The queue grows by the difference: (80 − 50) × 30 = 900. 1,500 would be 50 × 30, the total the workers remove. 2,400 is 80 × 30, the total sent. The queue holds only what workers have not finished yet.',
+      q: 'Producers send faster than the workers finish for 30 seconds. Then the burst ends. What is the queue holding?',
+      options: ['Every message sent during the burst', 'Only the messages the workers have not finished yet', 'Only the messages the workers have already finished', 'Nothing, because the queue clears when the burst ends'],
+      answer: 1,
+      explain: 'The queue holds the gap between what was sent and what workers finished. It is not everything sent, because workers drained some while the burst ran. It does not clear by itself either: the backlog stays until workers catch up.',
     },
     {
       q: 'A worker receives a message from a standard SQS queue, then crashes before it deletes the message. What happens?',

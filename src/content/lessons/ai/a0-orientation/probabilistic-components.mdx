@@ -5,8 +5,6 @@ requires: ['ai/a0-orientation/ai-design-method']
 
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
-import Math from '../../../../components/lesson/Math.astro';
 import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
 import Ai0ChainWalk from '../../../../components/anim/lessons/Ai0ChainWalk.tsx';
 import Ai0ChainSim from '../../../../components/anim/lessons/Ai0ChainSim.tsx';
@@ -17,7 +15,7 @@ A backend function has one contract: same input, same output. Your tests rely on
 
 A model call breaks that contract. Send one prompt twice and you may get two different answers. Set the temperature to 0, and you may still get two.
 
-This is not a bug you can fix once. It is a property of the component. You must design around it, the way you design around a network that drops packets. This lesson gives the four consequences, the math that shows how fast they add up, and the design rules that follow.
+This is not a bug you can fix once. It is a property of the component. You must design around it, the way you design around a network that drops packets. This lesson gives the four consequences, the idea that shows how fast they add up, and the design rules that follow.
 
 ## Naive solution: set temperature to 0
 
@@ -32,7 +30,7 @@ It does not work, and there is a measurement. Thinking Machines sampled 1,000 co
 | First tokens that were identical | 102 |
 | Split at token 103 | "Queens, New York" in 992 runs, "New York City" in 8 |
 
-The cause they found is that GPU kernels are not batch invariant. A kernel is the low-level routine that does the math. Batch invariant means it returns the same numbers whatever the batch size. Batch size changes with server load, so your output depends on how many other users are on the machine. With batch-invariant kernels all 1,000 completions matched. The cost is shown as run time. For Qwen3-8B on one GPU, 1,000 requests took 26 s with the default vLLM setup. An unoptimized deterministic setup took 55 s, and an improved kernel took 42 s. That is about 1.6 times the default time (derived: 42 / 26).
+The cause they found is that GPU kernels are not batch invariant. A kernel is the low-level routine that does the math. Batch invariant means it returns the same numbers whatever the batch size. Batch size changes with server load, so your output depends on how many other users are on the machine. With batch-invariant kernels all 1,000 completions matched. The cost is shown as run time. For Qwen3-8B on one GPU, the deterministic setups were slower than the default vLLM setup. An unoptimized one took about twice as long. An improved kernel cut that, but it stayed slower.
 
 So even "deterministic" settings give you a distribution unless the serving stack is built for it. Treat every output as a draw from a distribution.
 
@@ -48,26 +46,13 @@ The backend track covers timeouts, retries, and backoff for calls that fail from
 
 **3. Errors compound across steps.** An agent or pipeline calls a model several times. If each step must be right, the chances multiply.
 
-**4. Tests become statistics.** A test passes or fails once. An eval runs many trials and reports a rate with a margin of error. Anthropic's guide on agent evals gives two ways to summarize several tries. **pass@k** is the chance at least one of k tries succeeds. **pass^k** is the chance that all k tries succeed. At a 75% rate per try and k = 3, pass^3 is 0.75 to the power 3, about 42%. The same tries give pass@3 of 1 minus 0.25 cubed, about 98% (derived). The first number matters when the user sees each try. The second matters when you can pick a good one.
+**4. Tests become statistics.** A test passes or fails once. An eval runs many trials and reports a rate with a margin of error. Anthropic's guide on agent evals gives two ways to summarize several tries. **pass@k** is the chance at least one of k tries succeeds. **pass^k** is the chance that all k tries succeed. For the same agent, pass^k falls as k grows, and pass@k rises. The first matters when the user sees each try. The second matters when you can pick a good one.
 
-## The math of compounding
+## How errors compound
 
-If each of n steps succeeds with probability p, and all must succeed, the chance of a clean run is:
+If every step must succeed, the chance of a clean run is the per-step rate multiplied by itself once for each step. The steps are assumed independent. The result falls fast. A component that is "95% good" per step gives a ten-step pipeline that fails about four runs in ten. Stretch it to twenty steps and most runs fail. Raising each step a few points helps far more than it looks. Anthropic's guide on building agents says agents "cost more and risk compounding errors". Long chains are where that cost shows up.
 
-<Math block tex="P(\text{success}) = p^{n}" />
-
-In words: multiply p by itself n times. The steps are assumed independent.
-
-| Per-step p | Steps n | End to end |
-|---|---|---|
-| 95% | 10 | 59.9% |
-| 90% | 10 | 34.9% |
-| 95% | 20 | 35.8% |
-| 99% | 20 | 81.8% |
-
-All four rows are derived from the formula, not measured. Read the first row: a component that is "95% good" gives a pipeline that fails four runs in ten. Anthropic's guide on building agents says agents "cost more and risk compounding errors". The table puts a number on that.
-
-Step through the first example.
+Step through an example.
 
 <Ai0ChainWalk client:visible />
 
@@ -81,33 +66,11 @@ The model behind the simulator is simple. A verifier checks each step output. It
 
 Three rules follow from the math.
 
-1. **Shorten the chain.** Every step you remove multiplies the success rate by 1 / p. Merge two steps into one call when the model can do both.
+1. **Shorten the chain.** Every step you remove removes one chance to fail. Merge two steps into one call when the model can do both.
 2. **Add checks where errors are cheap to catch.** A schema check on JSON output costs almost nothing and catches many failures. A model as judge costs a model call. A retest against a small set of rules costs milliseconds.
 3. **Keep a human path.** When the check fails twice, hand off. Say what share of requests reach the human, because that share is a staffing cost.
 
 Real failures show the human path is not optional. In 2024 an Air Canada chatbot gave a passenger wrong bereavement-fare advice. The tribunal held that the airline "did not take reasonable care to ensure its chatbot was accurate". In 2023 a New York court fined two lawyers $5,000 for a brief with cases ChatGPT had invented. In both, an automated step had no check and no human gate.
-
-<Ballpark
-  client:visible
-  title="A 20-step agent"
-  scenario="An agent runs 20 steps in a row. Each step is right 95% of the time, and one wrong step ruins the run. Steps are independent."
-  steps={[
-    {
-      prompt: 'What share of runs finish with every step right? Answer in percent.',
-      unit: '%',
-      answer: 36,
-      within: 1.1,
-      explain: '0.95 to the power 20 is about 0.358, so about 36%. Roughly two runs in three contain at least one wrong step.',
-    },
-    {
-      prompt: 'Raise each step to 99%. What is the end-to-end rate in percent?',
-      unit: '%',
-      answer: 82,
-      within: 1.1,
-      explain: '0.99 to the power 20 is about 0.818, so about 82%. Four points more per step more than doubles the end-to-end rate.',
-    },
-  ]}
-/>
 
 ## Trade-offs
 
@@ -115,13 +78,13 @@ Real failures show the human path is not optional. In 2024 an Air Canada chatbot
 |---|---|---|---|
 | Fewer, larger steps | Higher end-to-end rate | Harder prompts. Harder to debug which part failed. | When one call can do both parts |
 | Verifier plus retry | Large gain in rate | More latency and cost per step | When a bad answer is costly |
-| Deterministic serving | Repeatable outputs for debugging | About 1.6x time in the Thinking Machines test | When you must reproduce a result |
+| Deterministic serving | Repeatable outputs for debugging | Slower serving in the Thinking Machines test | When you must reproduce a result |
 | Human review | Highest trust | Staff cost, slow | High-risk actions |
 
 ## Interview lens
 
 <Callout type="tip">
-When someone proposes a ten-step agent, say this. "If each step is 95% reliable, ten steps give about 60% (0.95 to the power 10). I would cut steps, add a check after the risky ones, and route low-confidence cases to a person." One line of arithmetic shows you think in rates.
+When someone proposes a ten-step agent, say this. "If each step is 95% reliable, ten steps give only about 60% end to end. I would cut steps, add a check after the risky ones, and route low-confidence cases to a person." One line shows you think in rates.
 </Callout>
 
 <Callout type="mistake">
@@ -147,34 +110,39 @@ Do not say "temperature 0 makes it deterministic". The Thinking Machines test fo
     },
     {
       id: 'a0-3-q-compound',
-      q: 'A pipeline has 5 steps. Each is right 90% of the time. About how often is a whole run right?',
-      options: ['About 59%', 'About 90%', 'About 45%', 'About 81%'],
+      q: 'A pipeline has many steps, and each step is right 90% of the time. Why is a whole run right far less often than 90%?',
+      options: [
+        'Each step adds one more chance for the run to fail',
+        'The model gets tired as the chain gets longer',
+        'Later steps cannot see the output of earlier steps',
+        'Steps that are right 90% of the time are always correlated',
+      ],
       answer: 0,
-      explain: '0.9 to the power 5 is 0.59. The first answer is the per-step rate, not the chain rate. Each step multiplies the success rate by 0.9.',
+      explain: 'All steps must succeed, so the chances multiply and the rate falls with every step. Models do not tire, and later steps normally do see earlier output. Correlation would change the exact rate, not why it falls.',
     },
     {
       id: 'a0-3-q-passk',
-      q: 'An agent passes a task 75% of the time per try. A user needs three tries in a row to all work. Which number applies, and what is it?',
+      q: 'An agent passes a task often, but not always, on one try. A user needs every one of three tries in a row to work. Which measure applies, and how does it compare with the single-try rate?',
       options: [
-        'pass@3, about 98%, because the agent only needs one success',
-        'pass^3, about 98%, because three tries raise the odds',
-        'pass@3, about 42%, because the tries are repeated',
-        'pass^3, about 42%, because all three tries must succeed',
+        'pass@3, and it is higher, because the agent only needs one success',
+        'pass^3, and it is higher, because three tries raise the odds',
+        'pass@3, and it is lower, because the tries are repeated',
+        'pass^3, and it is lower, because all three tries must succeed',
       ],
       answer: 3,
-      explain: 'pass^k is the chance that all k trials succeed: 0.75 cubed, about 42%. pass@k is the chance at least one succeeds: 1 minus 0.25 cubed, about 98%. The words "in a row" and "all work" point to pass^k.',
+      explain: 'pass^k is the chance that all k trials succeed, so it falls as k grows. pass@k is the chance at least one succeeds, so it rises. The words "in a row" and "every one" point to pass^k.',
     },
     {
       id: 'a0-3-q-rule',
-      q: 'Which change most improves end-to-end success for a 12-step chain with 95% steps and no checks?',
+      q: 'Which change most improves end-to-end success for a long chain of fairly reliable steps with no checks?',
       options: [
         'Run the model at a lower sampling temperature',
         'Use a longer prompt for each of the steps',
-        'Merge steps: 6 steps instead of 12',
+        'Merge steps into fewer, larger calls',
         'Add a log line after each of the steps',
       ],
       answer: 2,
-      explain: 'Merging halves the exponent. 0.95 to the power 12 is about 54%, and to the power 6 about 74%. A lower temperature does not remove the variance, a longer prompt may help one step only, and logs do not change success.',
+      explain: 'Merging removes steps, so fewer chances to fail multiply together. A lower temperature does not remove the variance, a longer prompt may help one step only, and logs do not change success.',
     },
   ]}
 />

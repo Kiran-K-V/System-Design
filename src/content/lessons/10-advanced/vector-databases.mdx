@@ -5,7 +5,6 @@ requires: ['04-data/indexing', '01-one-machine/latency-numbers']
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import VecMetrics from '../../../components/anim/lessons/VecMetrics.tsx';
 import VecHnsw from '../../../components/anim/lessons/VecHnsw.tsx';
 
@@ -37,13 +36,7 @@ At A = (1, 0) and B = (1, 1), C wins on cosine (it points the same way). C also 
 
 Exact kNN computes the distance from the query to **every** stored vector, then keeps the best k. The cost per query is N × d.
 
-For 1 million vectors of 768 float32 numbers:
-
-A **float32** is a decimal number stored in 4 bytes.
-
-- Memory: 1,000,000 × 768 × 4 bytes = **3.07 GB**.
-- Work: 1,000,000 × 768 = **768 million** multiplications and additions per query.
-- Time floor: reading 3.07 GB at the 10 to 50 GB/s of RAM (lesson [1.2](/learn/01-one-machine/latency-numbers/)) takes 61 to 307 ms, and that is before any math.
+A **float32** is a decimal number stored in 4 bytes. A million vectors of 768 numbers each take a few gigabytes. Every query must read all of it from memory and do hundreds of millions of multiplications. Just streaming that much memory takes a noticeable fraction of a second, before any math.
 
 That is fine for 10,000 vectors, and too slow for 100 queries per second over a million. The result is **perfect**: its recall is 100%. **Recall** is the share of the true top k that you return. pgvector does exact search by default and gets perfect recall.
 
@@ -55,10 +48,7 @@ To go faster we accept an **approximate** nearest neighbor (ANN) search: it may 
 
 In pgvector this is the IVFFlat index. The README suggests `lists` = rows / 1,000 up to 1 million rows, and √rows above that. The default `ivfflat.probes` is 1.
 
-Count the work. Take 1 million vectors, 1,000 lists, even lists of 1,000 each.
-
-- `probes = 1`: compare to 1,000 centers, then scan 1,000 vectors. About **2,000** distances, 500 times fewer than 1,000,000.
-- `probes = 10`: 1,000 + 10,000 = **11,000** distances, about 1.1% of exact.
+Say the lists are about equal in size. With `probes = 1`, a query compares to the centers and then scans one list. That is a tiny share of the full scan. With `probes = 10` it scans ten lists. That is still a small share of exact, and more accurate.
 
 The miss: a query near a cluster border has its true neighbor in the **next** cluster. With probes = 1 you never look there. More probes raise recall and cost.
 
@@ -67,7 +57,7 @@ The miss: a query near a cluster border has its true neighbor in the **next** cl
 **HNSW** (hierarchical navigable small world) is a graph. Each vector is a node linked to some near neighbors. A search starts somewhere and keeps stepping to whichever linked node is closer to the query. This is a **greedy** walk. A single graph walks slowly across a big space. HNSW stacks layers, like the express and local lanes of a metro.
 
 - Every vector is in layer 0. A vector is also placed in layer 1 with probability 1/M, in layer 2 with probability 1/M², and so on. The paper's choice is mL = 1/ln M.
-- For 1 million vectors and M = 16, the layers hold about 1,000,000 / 16^l. Layer 1 holds **62,500**, layer 2 holds **3,906**, and layer 3 holds **244**. Layer 4 holds **15**, and layer 5 holds **1**. This number is derived from the rule, not measured.
+- Each layer holds about one sixteenth of the layer below, for M = 16. A million vectors shrink to a handful of nodes within five layers. The top layer is tiny, so the first steps cross the space fast.
 - A search enters at the top, walks greedily to the node closest to the query. The search then drops one layer and repeats from there. On layer 0 it widens the walk with a candidate list of size **efSearch**.
 
 Step through a toy: 18 points, three layers.
@@ -92,7 +82,7 @@ The pgvector README says IVFFlat builds faster and uses less memory, but gives a
 
 ## Filtering breaks the index
 
-Real queries add a condition: "the 10 nearest products **in category 7**". An approximate index is scanned first, and the filter is applied **after** it. If a condition matches 10% of the rows, and `ef_search` is 40, the scan returns 40 candidates. Only about 40 × 10% = **4** survive. You asked for 10.
+Real queries add a condition: "the 10 nearest products **in category 7**". An approximate index is scanned first, and the filter is applied **after** it. If a condition matches only a small share of the rows, most of the scan's candidates fail the filter. Only a few survive. You asked for 10 and get fewer.
 
 pgvector offers three fixes.
 
@@ -110,13 +100,8 @@ As said above, pgvector adds a `vector` type and these indexes to PostgreSQL (le
 
 | Fact | Value | Source |
 |---|---|---|
-| 1M × 768 float32 | 3.07 GB; 768 million multiply-adds per query | Derived |
-| Time to stream 3.07 GB from RAM | 61 to 307 ms | Derived from 50 and 10 GB/s |
-| Layer sizes, N = 1M, M = 16 | 62,500; 3,906; 244; 15; 1 | Derived from the 1/M rule |
-| IVF, 1,000 lists, probes = 1 | ~2,000 distances instead of 1,000,000 | Derived, assumes even lists |
 | HNSW graph memory | ~60 to 450 bytes per element, M 6 to 48 | HNSW paper |
 | pgvector defaults | m 16, ef_construction 64, ef_search 40, probes 1 | pgvector README |
-| Filter loses rows | 10% match, ef_search 40: ~4 rows | pgvector README |
 
 ## Trade-offs
 
@@ -154,10 +139,10 @@ A k-d tree splits space one axis at a time, like a quadtree (lesson [10.1](/lear
       explain: 'Cosine for C is 1.0 (same direction) and for B is 0.707, so C wins. L2 distance to B is 1 and to C is 2, so B wins. Direction and gap can disagree when lengths differ.',
     },
     {
-      q: 'You store 1 million embeddings of 768 float32 numbers and scan them all for every query. About how much memory must one query read?',
-      options: ['About 3 MB', 'About 30 MB', 'About 300 MB', 'About 3 GB'],
-      answer: 3,
-      explain: '1,000,000 × 768 × 4 bytes = 3.07 GB. At RAM speeds of 10 to 50 GB/s that is 61 to 307 ms for one query, before any computation.',
+      q: 'A product has millions of embeddings and serves many searches per second. Why does exact scan stop working?',
+      options: ['Every query must read and score every stored vector', 'Exact scan returns results in a random order', 'Exact scan cannot use cosine similarity', 'Exact scan needs a B-tree, which vectors cannot have'],
+      answer: 0,
+      explain: 'Cost per query grows with the number of vectors, so many queries over millions of vectors saturate memory and CPU. The results are perfect, and any measure works. An approximate index trades a little recall for far less work.',
     },
     {
       q: 'An HNSW index gives poor recall. You cannot rebuild it today. Which change can you make at query time?',
@@ -166,10 +151,10 @@ A k-d tree splits space one axis at a time, like a quadtree (lesson [10.1](/lear
       explain: 'ef_search is the candidate list size per query. A larger list reads more nodes and misses less. M and ef_construction are fixed when the graph is built, so changing them needs a rebuild.',
     },
     {
-      q: 'A pgvector HNSW query has ef_search = 40, LIMIT 10, and a filter that matches 10% of rows. How many rows does it likely return?',
-      options: ['About 10, because LIMIT always guarantees that many rows come back', 'About 4, since the filter runs after the scan', 'About 40, because ef_search sets how many rows come back', 'None, because a filter and an HNSW index can never be combined'],
+      q: 'A pgvector HNSW query asks for 10 rows, with a filter that matches only a small share of the table. It returns just a few rows. Why?',
+      options: ['LIMIT always guarantees that many rows come back, so this is a bug', 'The index scan collects its candidates first, and the filter removes most of them', 'ef_search sets how many rows come back, and it was set too low', 'A filter and an HNSW index can never be combined'],
       answer: 1,
-      explain: 'The scan collects about 40 candidates, then the filter keeps 10% of them: about 4. LIMIT is a cap, not a promise. Iterative scans, a B-tree on the filter column, or partitions fix it.',
+      explain: 'The filter runs after the scan, so most candidates are dropped. LIMIT is a cap, not a promise. Iterative scans, a B-tree on the filter column, or partitions fix it.',
     },
     {
       q: 'An IVF index has 1,000 lists and probes = 1. A query sits near the border of two clusters. What can go wrong?',
@@ -177,34 +162,11 @@ A k-d tree splits space one axis at a time, like a quadtree (lesson [10.1](/lear
       answer: 2,
       explain: 'With probes = 1 only the nearest cluster is scanned. A neighbor just across the border lives in another list and is skipped. Raising probes scans more lists, costs more, and misses less.',
     },
-  ]}
-/>
-
-<Ballpark
-  client:visible
-  title="Embedding storage for a document search"
-  scenario="A search product embeds 10 million documents. Each embedding has 1,536 dimensions stored as float32 (4 bytes each). The HNSW index uses M = 16."
-  steps={[
     {
-      prompt: 'How many GB do the raw vectors take?',
-      unit: 'GB',
-      answer: 61.4,
-      within: 1.1,
-      explain: '10,000,000 × 1,536 × 4 bytes = 61.44 billion bytes, about 61 GB. The graph links come on top.',
-    },
-    {
-      prompt: 'The same vectors as half-precision (2 bytes each, the halfvec type). How many GB?',
-      unit: 'GB',
-      answer: 30.7,
-      within: 1.1,
-      explain: 'Half the bytes per number gives half the size: about 30.7 GB. The price is lower precision in each number.',
-    },
-    {
-      prompt: 'How many of the 10 million points are on HNSW layer 1, if each point reaches layer 1 with probability 1/M?',
-      unit: 'points',
-      answer: 625000,
-      within: 1.1,
-      explain: '10,000,000 / 16 = 625,000 points on layer 1. Layer 2 has about 39,000. Each layer is one sixteenth of the one below.',
+      q: 'A team stores raw vectors for ten million documents in a database with an HNSW index. Where does the memory go, and what can shrink it?',
+      options: ['Only the graph links cost memory, and nothing can shrink it', 'The vectors dominate, and a half-precision type stores each number in fewer bytes at a small cost in precision', 'The vectors cost nothing, because only the graph is kept', 'The vectors dominate, and lowering ef_search shrinks them'],
+      answer: 1,
+      explain: 'The vectors themselves are large, and the graph links come on top. Storing each number in fewer bytes cuts the size, at a small cost in precision. ef_search only changes query effort, not storage.',
     },
   ]}
 />

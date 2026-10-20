@@ -10,9 +10,9 @@ import PaginationSim from '../../../components/anim/lessons/PaginationSim.tsx';
 
 ## The problem
 
-Your tweets table has 10 million rows. A client calls `GET /tweets`. If the server answers with everything, that is 10 million x ~300 bytes = ~3 GB in one response. The server runs out of memory and the phone never finishes the download.
+Your tweets table has 10 million rows. A client calls `GET /tweets`. If the server answers with everything, that is gigabytes in one response. The server runs out of memory and the phone never finishes the download.
 
-So every list endpoint must return a bounded slice, and let the client ask for the next slice. This is **pagination**. The default page is small: 20 tweets is ~6 KB, one fast round trip.
+So every list endpoint must return a bounded slice, and let the client ask for the next slice. This is **pagination**. The default page is small: 20 tweets is a few kilobytes, one fast round trip.
 
 The design question is how the client says "the next slice".
 
@@ -40,7 +40,7 @@ An insert above the reader pushes items down, so the next page repeats one. A de
 
 The database cannot jump to row 1,000,000. PostgreSQL's documentation says it plainly: "The rows skipped by an OFFSET clause still have to be computed inside the server; therefore a large OFFSET might be inefficient."
 
-So `OFFSET 1000000 LIMIT 20` reads and drops 1,000,000 rows to return 20. The cost grows in a straight line with the offset. If skipping a row costs ~1 µs (an assumption), page 1 costs ~20 µs and offset 1,000,000 costs ~1 s. A crawler is a program that walks every page of a list, such as a bot that copies a site. For it, the total cost is **quadratic**: double the pages and the total work grows about four times.
+So `OFFSET 1000000 LIMIT 20` reads and drops 1,000,000 rows to return 20. The cost grows in a straight line with the offset. Skipping a row is cheap, but a deep offset skips a million of them, so the last pages take seconds. A crawler is a program that walks every page of a list, such as a bot that copies a site. For it, the total cost is **quadratic**: double the pages and the total work grows about four times.
 
 One more rule from the same docs: always use `ORDER BY` with a unique ordering. `ORDER BY` tells the database how to sort the rows. Without it, the database may return rows in a different order for each query.
 
@@ -103,10 +103,10 @@ Cursors also do not freeze the list. New rows above the cursor never show up in 
 
 ## Numbers
 
-- **Response size.** 20 items x ~300 B = ~6 KB. 100 items = ~30 KB. Choose the page size to fit one fast round trip.
-- **Offset cost.** Reads `offset + limit` rows. Page 50,000 at 20 per page is offset 1,000,000: ~1,000,020 rows read for 20 returned.
-- **Cursor cost.** About log(n) index steps plus `limit` rows. For 10 million rows, a balanced tree (the sorted structure behind an index, with all branches about equally deep) is only 3 to 4 levels deep. The tree has a few hundred keys per node (assumption, see lesson 4.3).
-- **Total cost of a full walk.** Offset sums to roughly n^2 / (2 x limit) row reads. Cursor reads n rows. For n = 1,000,000 and limit 20, that is ~25 billion against 1 million (derived).
+- **Response size.** Choose the page size to fit one fast round trip. Bigger pages mean fewer calls but slower ones.
+- **Offset cost.** It reads `offset + limit` rows. A deep page reads and drops a huge number of rows to return 20.
+- **Cursor cost.** The database seeks straight to the cursor in a balanced tree (the sorted structure behind an index, with all branches about equally deep). The tree is only a few levels deep, even for millions of rows (lesson 4.3).
+- **Total cost of a full walk.** Offset grows with the square of the list size. Cursor grows in a straight line. For a full export, that is the difference between minutes and days.
 
 ## Trade-offs
 
@@ -169,15 +169,15 @@ Say the data is split across S **shards**. A shard is one database machine that 
       explain: 'Offset is the only style that jumps to page 37. At 5,000 rows, the cost and the drift are small. Cursors are better for large, live lists, not for every list.',
     },
     {
-      q: 'A job exports all 2 million rows of a table using OFFSET with LIMIT 1000. About how many row reads does the database do in total, and what is the better design?',
+      q: 'A job exports every row of a huge table using OFFSET with LIMIT 1000. It gets slower with every page. What is the cause and the better design?',
       options: [
-        '2 million reads in total. Offset is fine for a one-time export',
-        '~2 billion. Use a cursor so each page seeks directly',
-        '~2 trillion reads. Use a bigger limit per page, such as 100,000',
-        '~4 million reads. Add an index on the offset column and keep paging',
+        'Offset is fine for a one-time export, so the cause is elsewhere',
+        'Pages re-read earlier rows. Use a cursor to seek directly',
+        'The page size is too small. Use a much bigger limit per page',
+        'The offset column lacks an index. Add one and keep paging on',
       ],
       answer: 1,
-      explain: 'There are 2,000 pages. Page k reads about k x 1,000 rows, so the total is about 1,000 x (2,000 x 2,001 / 2) = ~2 billion. With a cursor, each page seeks to its start and reads 1,000 rows: 2 million in total.',
+      explain: 'Each page makes the database read and drop every row before it, so total work grows with the square of the table size. A cursor seeks to its start and reads only the page. A bigger limit only hides the problem. An index does not let the database skip rows by count.',
     },
   ]}
 />

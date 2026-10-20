@@ -1,20 +1,18 @@
 ---
-summary: 'Decode is memory-bound, so many requests can share each read of the weights. Batching lifts throughput a lot while latency per user rises. Continuous batching refills a slot the moment a request finishes. Turn it into dollars per million tokens.'
+summary: 'Decode is memory-bound, so many requests can share each read of the weights. Batching lifts throughput a lot while latency per user rises. Continuous batching refills a slot the moment a request finishes. See why it cuts the cost per token.'
 requires: ['ai/a2-inference-cost/kv-cache', '06-async/queues']
 ---
 
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import Math from '../../../../components/lesson/Math.astro';
 import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
 import Ai2BatTimeline from '../../../../components/anim/lessons/Ai2BatTimeline.tsx';
 import Ai2BatSlider from '../../../../components/anim/lessons/Ai2BatSlider.tsx';
 
 ## The problem
 
-[Lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/) showed that one user at batch 1 uses about 0.3% of an H100's compute ceiling. You still pay for the whole GPU, by the hour. A 70B model on two H100s serves at most 48 tokens per second to a single user. At the price in the example below, that is about $46 per million output tokens.
+[Lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/) showed that one user at batch 1 uses about 0.3% of an H100's compute ceiling. You still pay for the whole GPU, by the hour. A 70B model on two H100s serves only a few dozen tokens per second to a single user. That makes each token very expensive.
 
 The same two GPUs can serve many users at nearly the same step time. This lesson shows how much, what it costs each user, and how the scheduler decides who is in the batch.
 
@@ -28,17 +26,17 @@ The next idea is to group requests. That is **batching** [junior]: run several r
 
 Decode is memory-bound: its time is set by reading the weights, not by math. A step with 1 token and a step with 16 tokens read the same 140 GB. So the extra 15 tokens are nearly free until compute or the KV cache becomes the limit. The weights are read once, and every request in the batch uses them.
 
-Databricks measured this on one A100 with MPT-7B, static batching, 512 input and 64 output tokens. Throughput in requests per second is 0.9 at batch 1, 3.2 at batch 4, and 5.3 at batch 8. It is 8.0 at batch 16, 10.5 at batch 32, and 12.5 at batch 64. That is 14x more throughput at batch 64. Move the slider.
+Databricks measured this on one A100 with MPT-7B, static batching, 512 input and 64 output tokens. Throughput in requests per second is 0.9 at batch 1, 3.2 at batch 4, and 5.3 at batch 8. It is 8.0 at batch 16, 10.5 at batch 32, and 12.5 at batch 64. That is about ~14x more throughput at batch 64. Move the slider.
 
 <Ai2BatSlider client:visible />
 
 Read three things off it.
 
-1. **Throughput rises fast, then flattens.** Doubling from 8 to 16 adds 51%. Doubling from 32 to 64 adds 19%. Past the compute-bound point, Databricks says, every doubling of batch size increases latency without increasing throughput.
-2. **Latency per user rises.** Databricks reports about 4x more latency at batch 64. Our own estimate from the table is 4.6x. A full static batch finishes together, so latency = batch / throughput = 64 / 12.5 = 5.1 s. Compare that with 1 / 0.9 = 1.1 s. The two agree on the size, not on the last digit.
+1. **Throughput rises fast, then flattens.** Early doublings add a lot. Later doublings add little. Past the compute-bound point, Databricks says, every doubling of batch size increases latency without increasing throughput.
+2. **Latency per user rises.** Databricks reports several times more latency at batch 64 than at batch 1. A full static batch finishes together, so every user waits for the whole batch.
 3. **There is a knee.** A service picks a batch size that meets its latency target, not the biggest one.
 
-Two more limits stop the batch from growing. The KV cache ([lesson A2.3](/learn/ai/a2-inference-cost/kv-cache/)) grows with every user. On 4 x H100 with 70B, the pool holds 55 sequences of 8K tokens. The same pool holds only 3 sequences of 128K tokens. And the ridge point (295 on an H100) caps how many tokens help.
+Two more limits stop the batch from growing. The KV cache ([lesson A2.3](/learn/ai/a2-inference-cost/kv-cache/)) grows with every user. On 4 x H100 with 70B, the pool holds dozens of 8K-token sequences, but only a handful of 128K-token ones. And the ridge point (295 on an H100) caps how many tokens help.
 
 <CrossTrackLink id="01-one-machine/throughput-vs-latency">
 Throughput and latency are different numbers, and a queue links them. As load rises, a server does more total work, but each request waits longer. A batch size is the same trade: more work per second, more wait per user. Little's Law ties them together.
@@ -56,7 +54,7 @@ The animation uses six requests with output lengths 3, 12, 5, 4, 6, and 3 steps 
 
 <Ai2BatTimeline client:visible />
 
-The same 33 tokens take 18 steps under static batching and 12 under continuous. Slot use is 46% against 69%. For a backend engineer this is a worker pool. Static batching is a pool that waits for all its workers to finish before taking new jobs. Continuous batching hands a job to any worker that is free.
+The same tokens finish in fewer steps under continuous batching, and the slots stay fuller. For a backend engineer this is a worker pool. Static batching is a pool that waits for all its workers to finish before taking new jobs. Continuous batching hands a job to any worker that is free.
 
 Reported gains depend on the baseline, so do not add them up. Anyscale measured 8x for continuous batching alone over static batching on OPT-13B on one A100 40GB, and up to 23x when paged memory is added (vLLM). The Orca paper reports 36.9x over FasterTransformer on GPT-3 175B at the same latency. Different models, hardware, and baselines. The common point: filling idle slots is worth a large factor.
 
@@ -64,20 +62,17 @@ One caution. At low load there is little to batch. Databricks notes that dynamic
 
 ### Goodput
 
-**Goodput** [mid] is the rate of requests that meet their latency targets (TTFT and TPOT), not the raw rate. A server that completes 100 requests per second where 40 miss the TPOT target has a goodput of 60. Throughput can rise with batch size while goodput falls once users are too slow. Pick the batch size by goodput.
+**Goodput** [mid] is the rate of requests that meet their latency targets (TTFT and TPOT), not the raw rate. A server that completes many requests per second but misses the TPOT target on a large share of them has a low goodput. Throughput can rise with batch size while goodput falls once users are too slow. Pick the batch size by goodput.
 
 ## From throughput to dollars
 
-<Math block tex="\text{USD per million output tokens} = \frac{\text{GPU USD per hour}}{\text{tokens per second} \times 3600} \times 10^{6}" />
+The GPU costs the same whether it is busy or idle. So cost per token falls when throughput rises, and rises when the GPU sits idle. Two factors set the cost: tokens per second, and the share of time the GPU has work (utilization).
 
-The GPU costs the same whether it is busy or idle. So cost per token falls when throughput rises, and rises when the GPU sits idle. Divide by the utilization (the share of time with work) as a second factor.
+Price anchor: Lambda lists an NVIDIA H100 SXM 80 GB at ~$3.99 per GPU per hour on its 8-GPU instance (on-demand; Lambda pricing page, [lambda.ai/pricing](https://lambda.ai/pricing), as of 2026-10-16). Prices change, so check the page.
 
-Price used here: Lambda lists an NVIDIA H100 SXM 80 GB at **$3.99 per GPU per hour** on its 8-GPU instance, before tax (on-demand; Lambda pricing page, [lambda.ai/pricing](https://lambda.ai/pricing), as of 2026-10-16). Prices change, so check the page.
-
-- **At 1,500 tokens/s per GPU, 100% busy:** 3.99 / (1,500 x 3,600) x 10^6 = **$0.74** per million. (1,500 is a round figure for the example, not a measured result for any model.)
-- **Same GPU, 30% busy:** 0.74 / 0.30 = **$2.46** per million.
-- **Batch 1 on 2 x H100 (70B, 48 tokens/s):** 2 x 3.99 / (48 x 3,600) x 10^6 = **$46** per million.
-- **32 streams sharing the step, if the step time held at 21 ms:** 32 x 48 = 1,536 tokens/s. That gives about **$1.44** per million. This is an upper bound on the gain. The KV reads and the ridge point make real systems slower.
+- **Batch 1 on a 70B model:** the GPUs do almost no useful math per step, so each token carries a huge share of the hourly bill.
+- **Many streams sharing each step:** the same hourly bill is spread over many more tokens, so cost per token falls a lot. This is an upper bound on the gain. The KV reads and the ridge point make real systems slower.
+- **A busy GPU versus a mostly idle one:** the idle GPU costs the same per hour, so each useful token costs several times more.
 
 Doubling throughput halves the cost per token. That is why the scheduler is a cost lever, not only a speed lever. Internals such as Orca's iteration-level scheduling and PagedAttention are elective E3.1 and E3.2.
 
@@ -86,11 +81,10 @@ Doubling throughput halves the cost per token. That is why the scheduler is a co
 | Fact | Value | Source |
 |---|---|---|
 | Throughput, batch 1 to 64, MPT-7B on A100 | 0.9 to 12.5 requests/s (14x) | Databricks, Table 2 |
-| Latency rise at batch 64 | about 4x (we derive 4.6x) | Databricks; derived |
+| Latency rise at batch 64 | several times | Databricks |
 | Continuous vs dynamic batching | 10x to 20x | Databricks |
 | Continuous vs static, OPT-13B | 8x (23x with vLLM) | Anyscale |
-| Cost per M tokens, $3.99/h at 1,500 tok/s | $0.74 | Derived; price as of 2026-10-16 |
-| Same, 30% busy | $2.46 | Derived |
+| Cost per token | Falls as throughput rises, rises as the GPU idles | Derived |
 
 ## Trade-offs
 
@@ -105,47 +99,18 @@ Doubling throughput halves the cost per token. That is why the scheduler is a co
 ## Interview lens
 
 <Callout type="tip">
-Tie batching to the roofline: "Decode is memory-bound, so each weight read serves one token at batch 1. Batching shares the read across users, so throughput rises, up to the ridge or the KV cache limit. Each user's latency rises. Continuous batching keeps slots full when lengths differ." Then give the cost formula and say what utilization you assume.
+Tie batching to the roofline: "Decode is memory-bound, so each weight read serves one token at batch 1. Batching shares the read across users, so throughput rises, up to the ridge or the KV cache limit. Each user's latency rises. Continuous batching keeps slots full when lengths differ." Then say that cost per token falls as throughput rises, and state what utilization you assume.
 </Callout>
 
 <Callout type="mistake">
-Do not say "more users, same speed for everyone". Per-user TPOT rises with batch size. Do not quote a continuous-batching gain without its baseline. Do not compute cost per token at 100% utilization and call it the bill.
+Do not say "more users, same speed for everyone". Per-user TPOT rises with batch size. Do not quote a continuous-batching gain without its baseline. Do not quote a cost per token at full utilization and call it the bill.
 </Callout>
 
 <Callout type="deep" title="Why throughput eventually stops rising">
-The step time is roughly max(time to read weights and KV, time to do the math). While memory dominates, more tokens in the step are almost free. Once the math dominates, each extra token adds its own time. So a doubled batch doubles the step, and throughput stays flat. KV reads grow with batch and context, so the real knee comes earlier than the 295 estimate.
+The step time is roughly max(time to read weights and KV, time to do the math). While memory dominates, more tokens in the step are almost free. Once the math dominates, each extra token adds its own time. So a doubled batch doubles the step, and throughput stays flat. KV reads grow with batch and context, so the real knee comes earlier than the ridge point suggests.
 </Callout>
 
 ## Check yourself
-
-<Ballpark
-  client:visible
-  title="Cost per million tokens"
-  scenario="An H100 SXM costs $3.99 per GPU hour (Lambda, as of 2026-10-16). Assume 1,500 output tokens/s per GPU, an illustrative figure. Use USD per million = price per hour / (tokens/s x 3600) x 1,000,000."
-  steps={[
-    {
-      prompt: 'Cost per million output tokens at 100% utilization, in USD?',
-      unit: 'USD',
-      answer: 0.74,
-      within: 1.1,
-      explain: '3.99 / (1,500 x 3,600) = 3.99 / 5.4e6 = 7.39e-7 dollars per token, so $0.74 per million.',
-    },
-    {
-      prompt: 'Same GPU, but busy only 30% of the time?',
-      unit: 'USD',
-      answer: 2.46,
-      within: 1.1,
-      explain: 'Useful tokens per hour fall to 30%, so cost rises by 1 / 0.30: 0.74 / 0.30 = $2.46 per million.',
-    },
-    {
-      prompt: 'Databricks, batch 1 to 64: throughput goes from 0.9 to 12.5 requests/s. What is the ratio?',
-      unit: 'x',
-      answer: 14,
-      within: 1.1,
-      explain: '12.5 / 0.9 = 13.9, about 14x. Cost per request falls by the same factor, if latency is acceptable.',
-    },
-  ]}
-/>
 
 <Diagnose
   client:visible
@@ -199,26 +164,26 @@ The step time is roughly max(time to read weights and KV, time to do the math). 
       explain: 'The step time is set by reading the weights from HBM. A batch of 16 reads them once for 16 tokens. Clock speed and weight size do not change, and the KV cache is still read for each request.',
     },
     {
-      q: 'A static batch of 4 has output lengths 3, 12, 5, and 4 steps. How many slot-steps are idle?',
+      q: 'A static batch holds requests with very different output lengths. What happens to the slots?',
       options: [
-        '24 of the 48 slot-steps',
-        '12 of the 48 slot-steps',
-        '36 of the 48 slot-steps',
-        'None, because all slots start together',
+        'Slots of short requests sit idle until the longest one finishes',
+        'Short requests give their slots to waiting requests at once',
+        'All slots finish at the same time, so nothing is wasted',
+        'The longest request is dropped to keep the batch fast',
       ],
       answer: 0,
-      explain: 'The batch runs 12 steps on 4 slots, so 48 slot-steps. The tokens made are 3 + 12 + 5 + 4 = 24. The other 24 are idle: half. Starting together is the problem, since short requests then wait for the longest.',
+      explain: 'A static batch returns only when its longest member is done, so short requests leave slots empty. Giving slots away at once is continuous batching, not static. No request is dropped.',
     },
     {
-      q: 'You double the tokens per second of a GPU at the same hourly price. What happens to the cost per million tokens?',
+      q: 'A GPU is rented by the hour, but traffic is light and it sits mostly idle. What happens to the cost of each useful token?',
       options: [
-        'It doubles',
-        'It halves',
-        'It stays the same',
-        'It falls by a quarter',
+        'It rises, because the same hourly bill is spread over fewer tokens',
+        'It falls, because an idle GPU uses less power',
+        'It stays the same, because the hourly price is fixed',
+        'It falls, because idle GPUs are billed at a lower rate',
       ],
-      answer: 1,
-      explain: 'Cost per million = hourly price / (tokens/s x 3600) x 1e6. Doubling the denominator halves the result. The hourly price is fixed, so more tokens per second means each token carries less of it.',
+      answer: 0,
+      explain: 'The hourly price does not change with load, so fewer tokens means a bigger share of the bill per token. Staying the same would need the token count to stay the same, and it does not.',
     },
     {
       q: 'Where can dynamic batching beat continuous batching, according to Databricks?',
@@ -230,6 +195,17 @@ The step time is roughly max(time to read weights and KV, time to do the math). 
       ],
       answer: 2,
       explain: 'With little traffic there is little to fill slots with, so the simpler policy can be as good. At high load and mixed lengths continuous batching wins, and a full KV cache hurts every policy.',
+    },
+    {
+      q: 'Databricks saw throughput rise a lot from batch 1 to batch 64 on one GPU. What is the catch?',
+      options: [
+        'Each user waits longer, so the batch size needs a latency target',
+        'The GPU needs more weights for each added request',
+        'Cost per token rises with every added request',
+        'Throughput keeps rising, so the biggest batch is always best',
+      ],
+      answer: 0,
+      explain: 'A bigger batch shares each weight read across more users, which raises throughput, but every user waits for a longer step. Cost per token falls, and the gain flattens past the compute-bound point.',
     },
   ]}
 />

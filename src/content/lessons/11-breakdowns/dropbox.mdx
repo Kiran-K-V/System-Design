@@ -6,7 +6,6 @@ requires: ['08-technologies/blob-storage', '09-patterns/large-blobs', '03-api-de
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import DropboxBuild from '../../../components/anim/lessons/DropboxBuild.tsx';
 import DropboxChunks from '../../../components/anim/lessons/DropboxChunks.tsx';
 
@@ -31,24 +30,13 @@ A file sync service has to move large files over weak links to many devices. It 
 
 A **hash** is a fingerprint of some bytes. A function reads the bytes and returns a short, fixed-length number. The same bytes always give the same fingerprint. Different bytes give a different fingerprint, with a chance of a clash so small that it can be ignored. **SHA-256** is a strong hash function, and its fingerprint is 32 bytes long, whether the input is 5 bytes or 5 gigabytes. A fingerprint is how the service will recognize a piece of data it has seen before without comparing the bytes.
 
-**Scale numbers, as assumptions.** A GiB is 1,024 MiB, and a MiB is 1,024 KiB. The "i" units use powers of 1,024 and keep the arithmetic exact. Take 50 GB to mean 50 GiB so the arithmetic is clean. Use 8 MiB chunks, since S3 (Amazon's object storage) requires each part of a multipart upload to be at least 5 MiB. Assume a 100 Mbit/s home upload link. That is 100 megabits, or 12.5 megabytes, per second.
+**Scale, in words.** Use 8 MiB chunks (a MiB is a binary megabyte). S3 (Amazon's object storage) requires each part of a multipart upload to be at least 5 MiB, so this is a safe size.
 
-- Chunks in a 50 GiB file: 50 × 1,024 MiB ÷ 8 MiB = **6,400 chunks**. That is under the 10,000-part limit of one S3 multipart upload, so one multipart upload can carry the file.
-- Upload time at 100 Mbit/s: 50 GB is 400 gigabits. 400 ÷ 0.1 = 4,000 seconds, about **67 minutes**. A link failure in that hour is likely. So uploads must resume, which is why chunks matter.
-- Chunk list size: each SHA-256 hash is 32 bytes. The list is 6,400 × 32 B = 204,800 B, about **200 KB** of metadata for a 50 GiB file. Tiny next to the file.
+- A 50 GB file is a few thousand chunks. That fits inside the part limit of one S3 multipart upload, so one multipart upload can carry the file.
+- Over a home upload link, a file that big takes about an hour. A link failure in that hour is likely. So uploads must resume, which is why chunks matter.
+- The list of chunk hashes is tiny next to the file. It is a few hundred kilobytes of metadata for a huge file.
 
 One company claim, as context: Dropbox's engineering blog says every file is split into 4 MB blocks. Each block is identified by a SHA-256 hash. A file is the ordered list of those hashes. This is a claim from their article on streaming file synchronization, not our measurement. Our 8 MiB chunks are our own choice. The idea is the same.
-
-<Ballpark
-  client:visible
-  title="Size a big upload"
-  scenario="A user uploads a 50 GiB file in 8 MiB chunks over a 100 Mbit/s link. A SHA-256 hash is 32 bytes. Use 1 GiB = 1,024 MiB and 50 GB ≈ 400 gigabits."
-  steps={[
-    { prompt: 'Number of chunks', unit: 'chunks', answer: 6400, within: 1.1, explain: '50 GiB × 1,024 = 51,200 MiB. 51,200 ÷ 8 = 6,400 chunks.' },
-    { prompt: 'Upload time at 100 Mbit/s, in minutes', unit: 'min', answer: 67, within: 1.3, explain: '400 gigabits ÷ 0.1 gigabits a second = 4,000 seconds, about 67 minutes.' },
-    { prompt: 'Size of the chunk hash list in kilobytes (32 bytes each)', unit: 'KB', answer: 205, within: 1.3, explain: '6,400 × 32 B = 204,800 B, about 205 KB. The metadata is a tiny share of the file.' },
-  ]}
-/>
 
 ## Core entities
 
@@ -88,7 +76,7 @@ Step through it. Note that the app servers never touch file bytes.
 
 One `POST` of a whole 50 GiB file fails at once: it exceeds any gateway limit. A drop at minute 66 restarts from zero. The fix is the multipart pattern from lesson [9.6](/learn/09-patterns/large-blobs/). The client cuts the file into chunks. Each chunk is its own request. Parts go in parallel. After a failure, the client asks which parts exist (S3 offers `ListParts`) and sends only the missing ones. Finally one `complete` call joins them.
 
-Resume is why 8 MiB beats 5 GB: a failed chunk costs a few seconds, not an hour. Too small is also bad. At 8 KiB there would be 6.5 million chunks for 50 GiB. There would be a metadata row for each chunk, and a request for each chunk. Chunk size trades retry cost against bookkeeping cost.
+Resume is why 8 MiB beats 5 GB: a failed chunk costs a few seconds, not an hour. Too small is also bad. With tiny chunks there would be millions of them for one big file. There would be a metadata row for each chunk, and a request for each chunk. Chunk size trades retry cost against bookkeeping cost.
 
 ## Deep dive 2: dedupe and delta sync
 
@@ -146,7 +134,7 @@ When a chunk is named by its hash, the name is also a checksum. After a download
   client:visible
   questions={[
     {
-      q: 'A user inserts one byte at the start of a 1 GiB file. With fixed 8 MiB chunks, how many chunk hashes change?',
+      q: 'A user inserts one byte at the start of a large file. With fixed-size chunks, which chunk hashes change?',
       options: [
         'All of them, as boundaries shift',
         'None, because the file name did not change',
@@ -188,6 +176,12 @@ When a chunk is named by its hash, the name is also a checksum. After a download
       ],
       answer: 1,
       explain: 'The cursor marks the last change the device saw, so one call returns everything after it, whether a minute or a week passed. Nudges sent while the phone was offline are lost, which is why the call does not depend on them.',
+    },
+    {
+      q: 'A 50 GB upload takes about an hour on a home link. Why does that push the design toward chunks?',
+      options: ['A link failure during the hour is likely, and chunks let the upload resume', 'Chunks make the link faster', 'Object storage refuses single large files', 'Chunks remove the need for hashes'],
+      answer: 0,
+      explain: 'A long transfer will probably hit a failure. With chunks, only the failed chunk is sent again. Chunking does not raise link speed, and hashes are still needed for dedupe.',
     },
   ]}
 />

@@ -24,11 +24,11 @@ The answer to all three is the same: **keep copies of the data on other machines
 
 Replication does three jobs. It keeps the system **alive** when a machine dies. It adds **read capacity**, because any replica can answer a read. And it can put data **near users**. A replica (say, in Frankfurt) answers European reads with a few ms of network time, not ~100 ms (lesson 1.2).
 
-It does **not** add write capacity. Every replica must apply every write. Seven replicas of a database that tops out at 15K writes per second still top out at 15K. Splitting writes is sharding, the next lesson.
+It does **not** add write capacity. Every replica must apply every write. Seven replicas of a database that tops out on writes still top out at the same rate. Splitting writes is sharding, the next lesson.
 
 It does not replace a backup either. A follower copies a mistake as fast as it copies a good write. In 2017 GitLab lost hours of data that way. [The story](#incident) comes after the trade-offs.
 
-Here is how much copies help availability. Say one node is up 99.9% of the time. That is ~8.8 hours of downtime a year (0.001 × 8,760 h). With two nodes that fail **independently** and a **perfect, instant** failover, both are down together. That happens 0.001 × 0.001 = 0.0001% of the time. That is about 30 seconds a year. Neither assumption holds in real life. Failover takes time and failures are often correlated. But the direction is right: copies make downtime rarer by orders of magnitude.
+Copies also help availability. If one node is down for a few hours a year, two nodes that fail **independently** are both down together almost never. That assumes a perfect, instant failover. Neither assumption holds in real life. Failover takes time and failures are often correlated. But the direction is right: copies make downtime much rarer.
 
 ## Naive: let the app write to both
 
@@ -193,15 +193,15 @@ A leader must keep log segments until every follower has them. PostgreSQL's repl
   client:visible
   questions={[
     {
-      q: 'A user saves a profile and reloads 300 ms later. Two followers are 80 ms and 1,200 ms behind. The router picks a follower at random. About how often does the user see the OLD profile?',
+      q: 'A user saves a profile and reloads a moment later. The router sends reads to a random follower, and some followers lag behind. What does the user sometimes see, and what fixes it?',
       options: [
-        'Never, because the router waits for the write',
-        '25% of the time, one read in four',
-        '50% of the time, one read in two',
-        'Always, because the 1,200 ms follower is far behind'
+        'The old profile. Nothing fixes it, since lag is unavoidable',
+        'An error. Retry the read until a follower has the write',
+        'The old profile. Read from the leader just after a write',
+        'The new profile every time, since the router waits for all followers',
       ],
       answer: 2,
-      explain: 'After 300 ms, the follower with 80 ms lag has the write and the follower with 1,200 ms lag does not. The router picks each with equal chance, so one read in two is stale.',
+      explain: 'A lagging follower may not have the write yet, so the user sees stale data. That is a read-your-writes failure. Sending that user\'s reads to the leader for a short time after a write avoids it. The router does not wait for followers, and lag is not an error.',
     },
     {
       q: 'A leader replicates asynchronously. It acknowledges a write, then its machine dies before shipping the record. Followers hold log positions 41, 41, 39 and the lost write was 42. What is true after failover?',
@@ -215,11 +215,11 @@ A leader must keep log segments until every follower has them. PostgreSQL's repl
       explain: 'No follower received record 42, so it is gone. Promote the follower with the longest log (41) so you lose as little as possible. If the old leader returns with record 42, it holds a write the cluster never accepted. It must be discarded or reconciled by hand.',
     },
     {
-      q: 'Your database tops out at 15K writes per second. You add 5 read replicas. What happens to the maximum write rate?',
+      q: 'Your database tops out on writes. You add 5 read replicas. What happens to the maximum write rate?',
       options: [
-        'It stays about 15K, the same as before',
-        'It grows to about 90K, six times the current rate',
-        'It drops to about 3K, since the leader now serves reads',
+        'It stays the same as before',
+        'It grows several times, since six machines now hold the data',
+        'It drops, since the leader now also ships changes to replicas',
         'It doubles, because the replicas take half the writes'
       ],
       answer: 0,

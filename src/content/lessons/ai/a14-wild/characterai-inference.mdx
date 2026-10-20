@@ -1,11 +1,10 @@
 ---
-summary: 'Character.AI says it serves about 20,000 queries per second for under one cent per hour of conversation. Its posts describe the parts: a small KV cache, a host-memory cache kept between turns, and int8 end to end. We split company claims from our reading and price the claim in GPU-hours.'
+summary: 'Character.AI says it serves about 20,000 queries per second for under one cent per hour of conversation. Its posts describe the parts: a small KV cache, a host-memory cache kept between turns, and int8 end to end. We split company claims from our reading and turn the cost claim into GPU time.'
 requires: ['ai/a13-cases/chatgpt-assistant', 'ai/a2-inference-cost/kv-cache', 'ai/a2-inference-cost/quantization-small-models']
 ---
 
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import Ai14CharacterCostBars from '../../../../components/anim/lessons/Ai14CharacterCostBars.tsx';
 import Ai14CharacterLookup from '../../../../components/anim/lessons/Ai14CharacterLookup.tsx';
 import Ai14CharacterCacheSim from '../../../../components/anim/lessons/Ai14CharacterCacheSim.tsx';
@@ -28,7 +27,7 @@ Take a plain design. Each turn goes to any free GPU server. The server reads the
 
 **Problem 1: the work repeats.** The first pass over a prompt is called **prefill**, and the work is heavy (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)). With a 180-message history, turn 181 repeats the prefill of messages 1 to 180, and so does turn 182. The post says "continuously refilling KV caches on each turn would be prohibitively expensive". The **KV cache** is the saved result of that first pass: a store of keys and values that the model computes for every token it has read (lesson [A2.3](/learn/ai/a2-inference-cost/kv-cache/)). With the cache, the model reads only what is new. Without it, it re-reads everything.
 
-**Problem 2: the cache is too big to keep.** Suppose the server does keep the cache in GPU memory. The post says: "The key bottleneck of LLM inference throughput is the size of the cache of attention keys and values (KV). It not only determines the maximum batch size that can fit on a GPU, but also dominates the I/O cost on attention layers." A **batch** is the set of chats the GPU serves in one step. A bigger batch gives more tokens per second for the same weights (lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/)). The cache decides how many chats fit. For scale, lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/) worked an example: a 70-billion-parameter model needs 1.31 GB of KV for one 4,000-token chat, so one 8-card server holds only 342 chats. Character.AI's model size is not published. The example shows the size of the problem, not their number.
+**Problem 2: the cache is too big to keep.** Suppose the server does keep the cache in GPU memory. The post says: "The key bottleneck of LLM inference throughput is the size of the cache of attention keys and values (KV). It not only determines the maximum batch size that can fit on a GPU, but also dominates the I/O cost on attention layers." A **batch** is the set of chats the GPU serves in one step. A bigger batch gives more tokens per second for the same weights (lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/)). The cache decides how many chats fit. For scale, lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/) worked an example: a 70-billion-parameter model needs over a gigabyte of KV for one 4,000-token chat, so one 8-card server holds only a few hundred chats. Character.AI's model size is not published. The example shows the size of the problem, not their number.
 
 So there are two goals. Make each chat's cache smaller, so more chats fit. And keep the cache between turns, so a turn does not start from zero. The post attacks both, then makes the arithmetic cheaper with int8.
 
@@ -44,9 +43,9 @@ Here are the company's own before and after figures. Step through them. The bars
 
 **Multi-Query Attention (MQA).** A model layer has many **attention heads**. Each head looks at the text in its own way. Each head has a **query**, the question it asks, and a **key** and **value**, the labels and contents of every earlier token. The cache stores keys and values. In plain multi-head attention, every head has its own key and value, so the cache is big. **Grouped-Query Attention (GQA)** lets a group of query heads share one key and value. **MQA** lets all query heads share one. Picture a class where each student keeps a private copy of the textbook, then groups of students share a copy, then the whole class shares one.
 
-**Company claim**: "We adopt Multi-Query Attention (Shazeer, 2019) in all attention layers. This reduces KV cache size by 8X compared to the Grouped-Query Attention adopted in most open source models." **Our check**: the 70B model in lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/) has 8 KV heads. One shared head is one eighth of that, so 327,680 bytes per token falls to 40,960. The 8x fits a baseline of 8 KV heads. The price is model capacity. One shared key and value holds less than eight, so the model must be trained with MQA from the start. The post does not give a quality number for this step alone.
+**Company claim**: "We adopt Multi-Query Attention (Shazeer, 2019) in all attention layers. This reduces KV cache size by 8X compared to the Grouped-Query Attention adopted in most open source models." **Our check**: the 70B model in lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/) has 8 KV heads, so one shared head fits the 8x claim. The price is model capacity. One shared key and value holds less than eight, so the model must be trained with MQA from the start. The post does not give a quality number for this step alone.
 
-**Hybrid attention horizons.** Normal attention lets every token look at all earlier tokens. This is **global attention**. **Local attention** lets a token look only at the last N tokens, a **sliding window**. A local layer never needs a cache longer than N. The post: "We interleave local attention (Beltagy et al., 2020) with global attention layers." It reports that "reducing attention horizon to 1024 on most attention layers does not have a significant impact on evaluation metrics, including the long context needle-in-haystack benchmark. In our production model, only 1 out of every 6 layers uses global attention." The needle test hides one fact in a long text and asks the model to find it. **Our arithmetic**: take a 9,000-token chat (180 messages of 50 tokens, our assumption). One layer in six keeps all 9,000 tokens. Five in six keep at most 1,024. The cache is 1/6 + 5/6 x 1,024 / 9,000 = 26% of full size, a cut of 3.8x. At 32,000 tokens the cut is 5.2x. The longer the chat, the more this helps.
+**Hybrid attention horizons.** Normal attention lets every token look at all earlier tokens. This is **global attention**. **Local attention** lets a token look only at the last N tokens, a **sliding window**. A local layer never needs a cache longer than N. The post: "We interleave local attention (Beltagy et al., 2020) with global attention layers." It reports that "reducing attention horizon to 1024 on most attention layers does not have a significant impact on evaluation metrics, including the long context needle-in-haystack benchmark. In our production model, only 1 out of every 6 layers uses global attention." The needle test hides one fact in a long text and asks the model to find it. **Our reading**: take a long chat. One layer in six keeps all of it. Five in six keep at most 1,024 tokens. So the cache is a fraction of full size, and the longer the chat, the bigger the cut.
 
 **Cross-layer KV sharing.** Neighbouring layers often learn similar keys and values. The post: "We tie the KV cache across neighboring attention layers, which further reduces KV cache size by a factor of 2-3x." Tied layers read one stored copy. For global layers, which dominate memory in long chats, the post ties "the KV cache of multiple global layers across blocks". It cites Brandon et al., 2024 and says "we find that sharing KV across layers does not regress quality."
 
@@ -108,28 +107,19 @@ Every figure in the posts. The label is **claim** for a company statement. None 
 
 ### What "less than one cent" implies
 
-**Our reading.** The claim is a unit price, so convert it. At $0.01 per conversation hour, one million conversation hours cost $10,000. Prices as of 2026-10-20: a Lambda H100 SXM 80 GB on an 8-GPU on-demand instance costs $3.99 per GPU-hour ([Lambda pricing](https://lambda.ai/pricing)). $10,000 / $3.99 = 2,506 GPU-hours. So one conversation hour gets at most $0.01 / $3.99 = 0.0025 GPU-hours, which is **9.0 GPU-seconds**. Nine seconds of one H100 for an hour of chat.
+**Our reading.** The claim is a unit price, so convert it into GPU time. Prices as of 2026-10-20: a Lambda H100 SXM 80 GB on an 8-GPU on-demand instance costs about $4 per GPU-hour ([Lambda pricing](https://lambda.ai/pricing)). At one cent an hour, one conversation hour gets only a few GPU-seconds of one H100, for a full hour of chat. That is a very small slice.
 
-Now the fleet. 20,000 queries per second is 72 million per hour. How many conversation hours is that? It depends on how often a user sends a message, which the posts do not give. We assume a range, shown below. Conversation hours served per hour = 72 million / turns per hour. Cost per hour is that times $0.01. GPUs are that divided by $3.99.
+Now the fleet. The number of GPUs the claim allows depends on how often a user sends a message, which the posts do not give. If users message often, the same traffic needs fewer conversation hours and the budget per turn is tiny. Whatever rate you assume, the fleet the claim allows is far smaller than the A13.2 drill, where a 70B model with a 90% hit rate needed several times more GPUs for the same 20,000 queries per second. So at least one of these must hold if the claim is right: the model is much smaller than 70B, the hit rate is higher, a turn is shorter, or Character.AI pays less per GPU-hour. The claim does not say which. Treat this as a check on an assumption, not as Character.AI's fleet.
 
-| Turns per conversation hour (assumed) | Conversation hours per hour | Cost ceiling per hour | H100s at $3.99 |
-|---|---|---|---|
-| 30 | 2.4 million | $24,000 | 6,015 |
-| 60 | 1.2 million | $12,000 | 3,008 |
-| 120 | 600,000 | $6,000 | 1,504 |
-| 240 | 300,000 | $3,000 | 752 |
-
-At one message a minute, the claim says the whole fleet costs at most about $12,000 an hour, which is 3,008 H100s at $3.99, or $8.8 million a month (730 hours). Compare the A13.2 drill. There, a 70B model with a 90% hit rate needed 12,536 GPUs for the same 20,000 queries per second. That is about four times more. So at least one of these must hold if the claim is right: the model is much smaller than 70B, the hit rate is higher, a turn is shorter, or Character.AI pays less than $3.99 per GPU-hour. The claim does not say which. Treat the rows as arithmetic on an assumption, not as Character.AI's fleet.
-
-A second check on the post's own arithmetic. 100 million users x 1 hour x 365 days x $0.01 is $365 million, or $3.65 per user. That matches. $4.75 billion / $365 million is 13.0, a little under the "13.5X" in the same post. Both say "at least", so they can agree.
+A second check on the post's own example. The two cost figures in it (the yearly total at one cent an hour, and the commercial-API total) agree in order of magnitude with the "at least 13.5X" claim. Both say "at least", so they can agree.
 
 ### The 20x puzzle
 
-**Our reading.** Multiply the three listed cuts for a 9,000-token chat: 8 (MQA) x 3.8 (hybrid, our arithmetic above) x 2 to 3 (sharing) is 61x to 92x, far above "more than 20X". The post does not say if the baseline already has some of these, which chat length it counts, or whether the three cuts stack. Do not reuse "20x" as a rule. Compute the cut for your own model and your own chat length.
+**Our reading.** The three listed cuts multiply: MQA, the hybrid layers, and the sharing. Stacked on a long chat, they would give far more than "more than 20X". The post does not say if the baseline already has some of these, which chat length it counts, or whether the three cuts stack. Do not reuse "20x" as a rule. Work out the cut for your own model and your own chat length.
 
 ### Why the host-memory tier is believable
 
-**Our reading.** Take the 70B baseline of 327,680 bytes per token and cut it 20x: 16,384 bytes per token. A 9,000-token dialogue is 147 MB. A server with 1 TB of RAM could hold about 6,800 of them. That agrees with "thousands of dialogues", under assumptions of our own: the model shape, the 20x, and 1 TB of RAM are all guesses. Moving 147 MB from host memory to the GPU over an assumed 25 GB/s link takes about 6 ms. A 70B prefill of 8,000 tokens takes about 400 ms (lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/), our model). So the copy is cheap beside the work it saves. We did not find a primary source for the link speed.
+**Our reading.** Shrink the cache of a large model by 20x, and one long dialogue takes a small amount of memory. A server with a terabyte of RAM could then hold thousands of them. That agrees with "thousands of dialogues", under assumptions of our own: the model shape, the 20x, and the RAM size are all guesses. Copying one dialogue from host memory to the GPU takes a few milliseconds over a fast link, while a long prefill of a large model takes hundreds of milliseconds (lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/), our model). So the copy is cheap beside the work it saves. We did not find a primary source for the link speed.
 
 ### Which cache rate is 95%?
 
@@ -172,7 +162,7 @@ For a team that hosts an open model, the practical copy is the first three rows:
 ## Interview lens
 
 <Callout type="tip">
-Say: "In long chats the history is the cost. I keep the KV between turns, in host memory under the GPU, indexed by a rolling hash of the prefix so an edit still matches its start. I route a dialogue to one server, and I check that the cache has room for the dialogues that server owns. The model shape sets how many fit, so MQA and tied layers, if I own the model. I would ask how 'cache rate' is counted before I trust 95%. And I turn any cost-per-hour claim into GPU-seconds: one cent is 9 GPU-seconds of an H100 at $3.99."
+Say: "In long chats the history is the cost. I keep the KV between turns, in host memory under the GPU, indexed by a rolling hash of the prefix so an edit still matches its start. I route a dialogue to one server, and I check that the cache has room for the dialogues that server owns. The model shape sets how many fit, so MQA and tied layers, if I own the model. I would ask how 'cache rate' is counted before I trust 95%. And I turn any cost-per-hour claim into GPU time, then ask what model and hit rate make it possible."
 </Callout>
 
 <Callout type="mistake">
@@ -181,22 +171,20 @@ Do not repeat "20x smaller KV" or "95% cache rate" as facts. They are company cl
 
 ## Check yourself
 
-<Ballpark
-  client:visible
-  title="Cost per million conversation hours"
-  scenario="Character.AI claims under one cent ($0.01) per hour of conversation. A Lambda H100 SXM costs $3.99 per GPU-hour (as of 2026-10-20). Treat $0.01 as the cost, and assume a user sends one message a minute."
-  facts={['1 hour of conversation = 60 turns (our assumption)', '20,000 queries per second is the company claim', '1 hour = 3,600 seconds']}
-  steps={[
-    { prompt: 'What does one million conversation hours cost at $0.01 an hour?', unit: 'USD', answer: 10000, within: 1.1, explain: '1,000,000 x $0.01 = $10,000.' },
-    { prompt: 'How many H100 GPU-hours is that at $3.99?', unit: 'GPU-hours', answer: 2506, within: 1.1, explain: '$10,000 / $3.99 = 2,506 GPU-hours.' },
-    { prompt: 'How many GPU-seconds of one H100 does one conversation hour get?', unit: 'GPU-seconds', answer: 9, within: 1.15, explain: '$0.01 / $3.99 = 0.0025 GPU-hours. Times 3,600 seconds is 9.0 seconds.' },
-    { prompt: 'At 20,000 queries per second and 60 turns per hour, how many H100s does the claim allow?', unit: 'GPUs', answer: 3008, within: 1.15, explain: '20,000 x 3,600 = 72 million turns an hour. Divide by 60 for 1.2 million conversation hours an hour. Times $0.01 is $12,000 an hour. Divide by $3.99: 3,008 GPUs.' },
-  ]}
-/>
-
 <Quiz
   client:visible
   questions={[
+    {
+      q: 'Character.AI claims under one cent per hour of conversation. What is the best way to test that claim in a design review?',
+      options: [
+        'Turn it into GPU time and ask what model and hit rate allow it',
+        'Accept it, because the company serves the traffic itself today',
+        'Compare it only with the price of one single API call alone',
+        'Check whether the cache rate is above ninety percent or not',
+      ],
+      answer: 0,
+      explain: 'A price claim hides a model size, a cache hit rate and a turn length. Turning it into GPU time exposes those assumptions. Trusting it because the company runs the traffic skips the check. A cache rate alone does not set the bill.',
+    },
     {
       q: 'A dialogue has 180 messages and a user sends message 181. Which design makes the GPU prefill the fewest tokens?',
       options: [

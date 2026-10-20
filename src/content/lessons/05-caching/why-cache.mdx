@@ -1,5 +1,5 @@
 ---
-summary: A cache is a small, fast copy of data that is read often. Skewed traffic makes a small cache absorb most reads, and hit ratio math tells you what it buys you.
+summary: A cache is a small, fast copy of data that is read often. Skewed traffic makes a small cache absorb most reads, and the hit ratio tells you what it buys you.
 requires: ['01-one-machine/latency-numbers', '01-one-machine/numbers-to-know']
 ---
 
@@ -54,33 +54,27 @@ Skew is the reason a small cache works. Move the slider and watch how little mem
 
 The model uses a clean law. Real traffic is messier. Some workloads are skewed more, some less. The lesson holds: before you size a cache, find out how skewed your reads are. Log key access counts for a day.
 
-## Hit ratio math
+## What the hit ratio buys
 
-For a cache with hit ratio *h*, cache latency *c*, and database latency *d*:
+A hit is fast. A miss is slower than having no cache, because the read pays for the failed cache lookup first and then for the database read. Many people forget that first cost. So the average read time sits close to the hit time when most reads hit, and it climbs toward the miss time as more reads miss.
 
-**average latency = h × c + (1 − h) × (c + d)**
-
-A miss pays *c* first (the failed lookup), then *d*. Many people forget the *c* on a miss.
-
-Example: *c* = 0.5 ms, *d* = 10 ms, *h* = 0.9. Average = 0.9 × 0.5 + 0.1 × 10.5 = **1.5 ms**. Without the cache it is 10 ms.
-
-The calculator shows **p99 latency**. Sort every read by how long it took. The p99 is the time that 99 out of 100 reads beat. It shows the slow tail that the average hides. Now try the calculator. Pay close attention to the database reads and the p99 outputs.
+The calculator shows **p99 latency**. Sort every read by how long it took. The p99 is the time that 99 out of 100 reads beat. It shows the slow tail that the average hides. Now try the calculator. Pay close attention to the database reads and the p99 outputs. You do not need to compute anything. Watch how the outputs move.
 
 <HitRatioCalc client:visible />
 
 Three things to learn from it:
 
-1. **Think in miss ratio, not hit ratio.** Going from 90% to 99% hits looks like +9 points. It cuts database load 10 times. Going from 99% to 99.9% cuts it 10 times again.
+1. **Think in miss ratio, not hit ratio.** Going from 90% to 99% hits looks like a small gain. It cuts database load about 10 times. Each extra nine of hit ratio cuts the load by another large factor.
 2. **Average latency flattens early.** After 90%, the average improves slowly. The database load keeps falling fast.
 3. **The tail stays slow.** If more than 1% of reads miss, p99 latency is the miss latency. Caches fix the average and the load. They do not fix the tail unless the hit ratio is very high.
 
 <Callout type="deep" title="The cold cache trap">
-Say the cache absorbs 95% of reads, so your database sees 5% of 30,000 = 1,500 reads per second. A small database handles that. Then the cache restarts. Its memory is empty. For the first minutes, every read misses, and the database sees 30,000 reads per second: 20 times its normal load. It falls over. When it falls over, the cache can never refill, and the outage does not end by itself. If the system cannot survive without the cache, the cache is not an optimization any more. It is a required component. You must treat it like one. Replicate it (run a second copy), warm it (fill it with popular keys before you send traffic), and limit how much load can reach the database. Lesson 5.5 covers this.
+Say the cache absorbs almost all reads, so your database sees only a small fraction of the traffic. A small database handles that. Then the cache restarts. Its memory is empty. For the first minutes, every read misses, and the database sees the full traffic: many times its normal load. It falls over. When it falls over, the cache can never refill, and the outage does not end by itself. If the system cannot survive without the cache, the cache is not an optimization any more. It is a required component. You must treat it like one. Replicate it (run a second copy), warm it (fill it with popular keys before you send traffic), and limit how much load can reach the database. Lesson 5.5 covers this.
 </Callout>
 
 ## When a cache does not help
 
-- **Uniform reads.** If every key is equally likely and the data set is bigger than the cache, the hit ratio is about cache size divided by data size. A 1 GB cache over 100 GB of uniform data gives ~1% hits.
+- **Uniform reads.** If every key is equally likely and the data set is bigger than the cache, the hit ratio is about the share of the data that fits in the cache. A cache that holds a tiny slice of uniform data gives a tiny hit ratio.
 - **Write-heavy data.** If a value changes between every two reads, each cached copy is wrong before its second use.
 - **Data that must be exactly fresh.** An account balance during a transfer, or inventory at checkout. A copy can be stale (out of date). Lesson 5.5 shows how stale it can get.
 - **Data that already fits in the database's memory.** The database already caches. PostgreSQL keeps recently used pages (fixed-size blocks of table data) in its **shared buffers**, a memory area of 128 MB by default. It also relies on the operating system's **page cache**, which is free memory the OS uses to hold recently read file data. Adding a Redis in front helps only if you avoid the query work or the network trip, not the disk read.
@@ -110,7 +104,7 @@ A cache hit is not "100 ns fast". The memory read is fast. The network trip to r
 ## In practice
 
 <Callout type="tip">
-Do not say "add a cache" and stop. Say what you cache, why it is cacheable, and how big it is. For example: "Reads are 100:1 over writes and the top 1% of products get most views. The hot set is ~10 GB, so it fits in one Redis node. I expect a 95%+ hit ratio, which cuts database reads 20 times." Then name the cost: staleness.
+Do not say "add a cache" and stop. Say what you cache, why it is cacheable, and how big it is. For example: "Reads are 100:1 over writes and the top 1% of products get most views. The hot set is ~10 GB, so it fits in one Redis node. I expect a very high hit ratio, which cuts database reads many times over." Then name the cost: staleness.
 </Callout>
 
 <Callout type="mistake">
@@ -123,16 +117,26 @@ Do not treat the cache as free speed. Every cache adds a second copy that can di
   client:visible
   questions={[
     {
-      q: 'Cache lookup takes 1 ms. A database read takes 20 ms. The hit ratio is 95%. A miss pays the failed lookup first. What is the average read latency?',
-      options: ['1.0 ms', '2.0 ms', '1.95 ms', '10.5 ms'],
-      answer: 1,
-      explain: '0.95 × 1 + 0.05 × (1 + 20) = 0.95 + 1.05 = 2.0 ms. The 1.95 ms answer forgets the failed lookup on a miss.',
+      q: 'A cache sits in front of a database. A read misses the cache. How does that read compare to a system with no cache at all?',
+      options: [
+        'It is the same, because the database does the real work either way',
+        'It is faster, because the cache already warmed the database up',
+        'It is slower, as it pays for the failed lookup and the database read',
+        'It is slower only if the cache and the database sit in different regions',
+      ],
+      answer: 2,
+      explain: 'A miss asks the cache first, then the database, then often writes back. That is extra work on top of the database read. A cache only pays off when enough later reads hit. The tempting "same" answer forgets the failed lookup.',
     },
     {
-      q: 'Traffic is 30,000 reads per second. You tune the cache and the hit ratio rises from 95% to 99%. What happens to the database load?',
-      options: ['It drops 4%, from 1,500 reads per second to about 1,440 reads per second', 'It drops 20 times, from 1,500 reads per second down to 75 reads per second', 'It drops 5 times (1,500 to 300 reads/s)', 'It does not change, because the database still receives every read'],
-      answer: 2,
-      explain: 'Database reads equal traffic times miss ratio. 5% of 30,000 is 1,500. 1% of 30,000 is 300. The miss ratio fell from 5% to 1%, which is 5 times.',
+      q: 'Your cache hit ratio improves from good to excellent. Traffic stays the same. Which result is the clearest?',
+      options: [
+        'Database load drops a lot, because it follows the miss ratio',
+        'Database load drops a little, because hits were already common',
+        'Database load stays the same, because every read still reaches it',
+        'Average latency drops sharply, while database load barely moves',
+      ],
+      answer: 0,
+      explain: 'The database only sees misses. A small change in the hit ratio is a large change in the miss ratio, so the load can fall many times over. Average latency flattens early, so the load is where the gain shows.',
     },
     {
       q: 'Which workload gets the smallest benefit from a cache?',

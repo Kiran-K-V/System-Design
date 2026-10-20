@@ -6,7 +6,6 @@ requires: ['09-patterns/contention', '08-technologies/redis', '07-reliability/ra
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import FlashSaleBuild from '../../../components/anim/lessons/FlashSaleBuild.tsx';
 import FlashSaleOversell from '../../../components/anim/lessons/FlashSaleOversell.tsx';
 
@@ -30,7 +29,7 @@ Ten thousand pairs of limited-edition shoes go on sale at noon. Ten million peop
 - The admission rule is fair and stated in advance. The rule is arrival order, or a lottery among everyone who joined before the start.
 - The database and the payment provider must not fall over.
 
-For a sense of real peaks: Shopify's engineering team wrote that on its cloud in 2021 its Black Friday and Cyber Monday peak "surpassed 32 million app server requests per minute", and that one flash sale used over 20% of its total computing capacity at its peak. That is about 32,000,000 / 60 = 533,000 requests per second across all merchants. Our single sale is a spike of the same order, aimed at one item.
+For a sense of real peaks: Shopify's engineering team wrote that on its cloud in 2021 its Black Friday and Cyber Monday peak "surpassed 32 million app server requests per minute", and that one flash sale used over 20% of its total computing capacity at its peak. That is hundreds of thousands of requests per second across all merchants. Our single sale is a spike of the same order, aimed at one item.
 
 ## Core entities
 
@@ -60,7 +59,7 @@ Start with the obvious design, then the fix.
 
 <FlashSaleOversell client:visible />
 
-The naive design reads, checks, and writes in three steps. Between the read and the write, the world changes. This is the check-then-act race from lesson [9.4](/learn/09-patterns/contention/). Making the row lock bigger is the usual first fix: `SELECT ... FOR UPDATE` on the product row. It is correct. It is also a queue of one. If each reservation holds the lock for 5 ms, the best case is one over the hold time. That is 1 / 0.005 = 200 reservations per second. For 10 million users that is hopeless.
+The naive design reads, checks, and writes in three steps. Between the read and the write, the world changes. This is the check-then-act race from lesson [9.4](/learn/09-patterns/contention/). Making the row lock bigger is the usual first fix: `SELECT ... FOR UPDATE` on the product row. It is correct. It is also a queue of one. Only one reservation can hold the lock at a time, so the best case is one reservation per hold time. With a hold of a few milliseconds, that is only a few hundred reservations per second. For 10 million users that is hopeless.
 
 Redis (lesson [8.2](/learn/08-technologies/redis/)) runs commands one at a time on one thread. So a single `DECR` (decrement by 1 and return the new value) is atomic, and it takes microseconds, not milliseconds. Two buyers sending `DECR` at the same instant get two different answers, never the same one. A few details matter.
 
@@ -86,11 +85,11 @@ Two things can happen to a `held` reservation, and they can happen at the same m
 
 ### Surviving the burst
 
-Ten million users, each reloading every 5 seconds, is 10,000,000 / 5 = 2,000,000 requests per second. The CDN (lesson [2.7](/learn/02-networking/cdn-proxies/)) absorbs page views. But every user also wants to press reserve at 12:00:00.
+Ten million users, each reloading every few seconds, send millions of requests per second. The CDN (lesson [2.7](/learn/02-networking/cdn-proxies/)) absorbs page views. But every user also wants to press reserve at 12:00:00.
 
 A **waiting room** is admission control at the edge, the way a club doorman lets people in a few at a time so the room never overfills. Users who arrive get a place in line, and a token when their turn comes. The Sale API accepts only requests with a valid token, so the API and Redis see the rate we choose. It is a rate limiter (lesson [7.4](/learn/07-reliability/rate-limiting/)) that holds users in a queue instead of rejecting them.
 
-Pick the rate from the slowest part. Say Redis and the reservation table can take 2,000 reservations per second with room to spare. Then the waiting room admits 2,000 users per second.
+Pick the rate from the slowest part. Say Redis and the reservation table can take a few thousand reservations per second with room to spare. Then the waiting room admits that many users per second, and no more.
 
 Fairness is a policy, so state it. Arrival order rewards fast connections and bots. A lottery is more fair: everyone who joined the room before the sale starts gets a random position. When the counter reaches zero, the waiting room stops admitting. It tells everyone still in line "sold out" at once, so they do not wait for nothing.
 
@@ -105,22 +104,13 @@ Defend in two layers.
 
 ## Numbers
 
-<Ballpark
-  client:visible
-  title="Size the sale"
-  scenario="10 million users, 10,000 units, 5-minute reservations. The waiting room admits 2,000 users a second."
-  steps={[
-    { prompt: 'Each user reloads once every 5 seconds. How many requests per second hit the edge before any waiting room?', unit: 'req/s', answer: 2000000, within: 1.1, explain: '10,000,000 users / 5 s = 2,000,000 requests per second. Our servers must never see this. The CDN and the waiting room handle it.' },
-    { prompt: 'If every admitted user wins a unit, how many seconds until all 10,000 units are reserved?', unit: 's', answer: 5, within: 1.1, explain: '10,000 units / 2,000 per second = 5 seconds. After that, every request is "sold out", and the waiting room can answer without calling Redis.' },
-    { prompt: 'Assume 30% of reservations are never paid. How many units come back to stock after the expiry?', unit: 'units', answer: 3000, within: 1.1, explain: '30% of 10,000 is 3,000. They return after about 5 minutes, so there is a small second wave. The waiting room must stay open and announce the restock.' },
-  ]}
-/>
+The sale is a short, huge spike. The edge sees millions of requests per second, so the CDN and the waiting room must take them. The waiting room admits only what the slowest part can take, so the stock is gone within seconds. After that every request is "sold out" and needs no call to Redis. Unpaid reservations return to stock later, so there is a small second wave. The waiting room stays open and announces the restock.
 
 ## Trade-offs
 
 | Choice | You gain | You pay | Choose when |
 |---|---|---|---|
-| `FOR UPDATE` on one row | Simple, correct, no new system | About 200 reservations/s at 5 ms of lock | Small sales |
+| `FOR UPDATE` on one row | Simple, correct, no new system | A few hundred reservations/s at best | Small sales |
 | Redis `DECR` or Lua | Atomic, microseconds per call | Extra system, async replication risk | Large sales |
 | Reservation with expiry | No lock during payment | A sweeper and a status race to handle | Always for slow payment |
 | Waiting room | The load is the rate you choose | Users wait. Needs a fairness rule | Demand far beyond capacity |
@@ -135,7 +125,7 @@ Do not answer "just add more servers". The bottleneck is one counter. Do not rea
 </Callout>
 
 <Callout type="deep" title="Sharding the counter">
-If one Redis shard is still the limit, split the stock: 10 shards with 1,000 units each. A request picks a random shard and falls through to the next if it is empty. Contention drops tenfold. The cost: the last units are scattered. A request may see "empty" on one shard while another has 3 left. Use this only when one counter truly cannot keep up. For 2,000 admissions a second, it cannot be the answer.
+If one Redis shard is still the limit, split the stock: 10 shards with 1,000 units each. A request picks a random shard and falls through to the next if it is empty. Contention drops tenfold. The cost: the last units are scattered. A request may see "empty" on one shard while another has 3 left. Use this only when one counter truly cannot keep up. When the waiting room already limits admissions to what one counter can take, it cannot be the answer.
 </Callout>
 
 ## Check yourself
@@ -153,6 +143,12 @@ If one Redis shard is still the limit, split the stock: 10 shards with 1,000 uni
       ],
       answer: 1,
       explain: 'Redis sets a missing key to 0 and then decrements, so the result is -1. The code treats a negative result as sold out, so the very first buyer is rejected. Seed the key to the full stock before the sale opens.',
+    },
+    {
+      q: 'Millions of users want a few thousand units, and every user reloads every few seconds. Where must the reload traffic be absorbed?',
+      options: ['At the edge, by the CDN and the waiting room', 'In Redis, using the stock counter', 'In the reservation table, with row locks', 'In the payment provider'],
+      answer: 0,
+      explain: 'The core services see only the rate the waiting room admits. The CDN serves page views. Redis, the table, and the payment provider cannot take a reload storm.',
     },
     {
       q: 'The 10,000th unit is reserved. What is the best way to treat the next 9,990,000 reserve attempts?',
@@ -177,15 +173,15 @@ If one Redis shard is still the limit, split the stock: 10 shards with 1,000 uni
       explain: 'Each statement says WHERE status = held. The first one to run changes the row. The second finds zero rows. The sweeper returns the unit to stock only if it changed a row. A delay only narrows the race, and a table lock would stall the whole sale.',
     },
     {
-      q: 'Each reservation holds the product-row lock for 5 ms with SELECT FOR UPDATE. What is the best-case reservation rate?',
+      q: 'A team uses SELECT FOR UPDATE on the product row for every reservation. Why does adding app servers not raise the reservation rate?',
       options: [
-        'About 5 per second',
-        'About 200 per second',
-        'About 5,000 per second',
-        'About 200,000 per second',
+        'Each server adds its own lock, which slows the others',
+        'Only one reservation can hold the row lock at a time, so all servers queue for it',
+        'The database refuses connections from more than a few servers',
+        'The lock moves to the slowest server in the group',
       ],
       answer: 1,
-      explain: 'One holder at a time means 1 / 0.005 s = 200 per second. More servers do not help, because they all wait for the same lock. It works for a small sale and fails for a sale with millions of users.',
+      explain: 'One lock means one holder at a time, so the rate is set by how long each hold lasts, not by the number of servers. It works for a small sale and fails for millions of users. An atomic Redis decrement removes the long hold.',
     },
   ]}
 />

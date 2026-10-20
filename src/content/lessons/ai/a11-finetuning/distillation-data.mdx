@@ -12,9 +12,9 @@ import Ai11DistillSlice from '../../../../components/anim/lessons/Ai11DistillSli
 
 ## The problem
 
-Your support assistant runs on a large model. A typical request has 2,000 input tokens and 400 output tokens. At Opus 5.5 list prices, $4 per million input tokens and $20 per million output tokens (as of 2026-10-16, [pricing page](https://platform.claude.com/docs/en/about-claude/pricing)), one request costs 2,000 x $4 / 1,000,000 + 400 x $20 / 1,000,000 = $0.008 + $0.008 = $0.016. On Haiku 5.5, at $0.10 and $0.50, the same request costs $0.0002 + $0.0002 = $0.0004. That is 40 times cheaper. At 1 million requests a day, the gap is $16,000 against $400.
+Your support assistant runs on a large model. A typical request is a few thousand tokens in and a few hundred out. Run that on a large model and it costs real money at volume. Run the same request on a small model and it costs a small fraction of that. At list prices (see the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing)), the gap is about 40 times between a top-tier model and the smallest one. At a million requests a day, that gap decides whether the feature pays for itself.
 
-Cost follows size. Lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/) showed why: a model must read all its weights to produce each token, and weights take 2 bytes per parameter in bf16. An 8-billion-parameter model needs 16 GB. A 70-billion-parameter model needs 140 GB. The smaller one fits on one GPU and reads 8.75 times fewer bytes per token (140 / 16).
+Cost follows size. Lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/) showed why: a model must read all its weights to produce each token, and weights take 2 bytes per parameter in bf16. A small model fits on one GPU and reads far fewer bytes per token than a large one.
 
 But small models are worse at hard tasks. So here is the question this lesson answers: can a small model learn your narrow task from a large model, and reach the large model's quality on that task at the small model's price? The four questions on the way are:
 
@@ -47,7 +47,7 @@ Two things go into each example: a prompt and a teacher answer.
 
 How many examples? It depends on the task. For learning a response format or style, little is needed. The LIMA project fine-tuned a 65-billion-parameter model on only 1,000 carefully chosen examples and humans rated its answers equal or better than GPT-4's in 43% of cases. DeepSeek's reasoning students needed 800,000 because they were learning to reason. Start small, measure, and add data where the failures are.
 
-What does the teacher data cost? Take 50,000 prompts at 700 input and 600 output tokens each. That is 35 million input tokens and 30 million output tokens. At the Opus 5.5 prices above, that is 35 x $4 + 30 x $20 = $140 + $600 = $740. The Batch API takes 50% off both prices, so $370. These are list-price figures to show scale. Whether you may train on a provider's outputs is a separate question, covered below.
+What does the teacher data cost? You pay the teacher's list price for every prompt and every answer. For tens of thousands of prompts, that is a one-time bill, small next to the savings from serving a small model. A batch API, if your provider offers one, usually halves it. Whether you may train on a provider's outputs is a separate question, covered below.
 
 ## Question 3: what can the student fail to copy?
 
@@ -67,7 +67,7 @@ Here is how that fails. The animation shows five support questions. Four are com
 
 <Ai11DistillWalk client:visible />
 
-The student matches the teacher on 4 of 5 and looks done. Now do the sum. Say 97% of traffic is common questions, where the teacher scores 97% and the student 96%. The remaining 3% is rare, where the teacher scores 90% and the student 50%. Overall, the teacher scores 0.97 x 0.97 + 0.03 x 0.90 = 96.8%. The student scores 0.97 x 0.96 + 0.03 x 0.50 = 94.6%. The gap is 2.2 points. On the rare slice it is 40 points. A test set that mirrors traffic hides it.
+The student matches the teacher on 4 of 5 and looks done. Now look at the slices. Most traffic is common questions, where the student is almost as good as the teacher. A small share is rare questions, where the student is much worse. Because the rare share is small, the overall average barely moves. The student looks a little worse overall, yet it fails badly on the rare slice. A test set that mirrors traffic hides it.
 
 ## The real fix: build the data and the test as one system
 
@@ -89,8 +89,7 @@ The common mistake is to split after generation, or to dedupe within the trainin
 
 A **slice** is a subset of your traffic with a shared trait: a topic, a language, a customer tier, a risk level. Score each slice on its own. The overall average is a weighted sum, so a slice that is 3% of traffic can fail without moving it.
 
-But a rare slice has few examples in a test set that mirrors traffic. With 500 test questions and a 3% slice, you get 15 rare questions. A score from 15 examples is noisy. The worst-case 95% error bar is about 1.96 x the square root of (0.5 x 0.5 / 15), which is 25 points. With 100 examples it is about 10 points. So **stratify**: collect each important slice on purpose, up to about 100 examples, and keep each as its own test set. Try the numbers.
-
+But a rare slice has few examples in a test set that mirrors traffic. A test set that mirrors traffic holds only a handful of rare questions. A score from so few examples is noisy, and the error bar is wide. So **stratify**: collect each important slice on purpose, up to about 100 examples, and keep each as its own test set. Try it. 
 <Ai11DistillSlice client:visible />
 
 ### Idea 3: on-policy distillation, the newer route
@@ -99,7 +98,7 @@ Ordinary distillation trains on text the teacher wrote. But at test time the stu
 
 **On-policy distillation** fixes this. In October 2025, Thinking Machines Lab described it. The student writes its own answers, and the teacher grades each token the student wrote: how much more does the student favor this token than the teacher does? The training pushes that gap to zero. Think of a coach who stands beside you and comments on every move you make, rather than showing you videos of experts. The gap measure is called a reverse KL divergence, and the post calls it "unhackable", since low KL means the teacher would have chosen the same tokens.
 
-The post reports a math model reaching 70% on AIME 2024 in about 150 training steps. That is about 77,000 prompts with 4 samples each. Ordinary SFT on 400,000 examples reached 60%, and the authors extrapolate that about 2 million examples would reach 70%. They report the cost reduction as 9 times in FLOPs, about 18 times in GPU-hours, and up to about 30 times if you count generating the teacher data. The same figure moves with what you count, so state your accounting. The post also cites the Qwen3 report: reinforcement learning reached 67.6% on AIME using 17,920 GPU-hours, while on-policy distillation reached 74.4% using 1,800, about a tenth.
+The post reports a math model reaching 70% on AIME 2024 in about 150 training steps. Ordinary SFT needed far more examples to reach a similar score. The authors report a large cost cut, and the size of the cut moves with what you count, so state your accounting. The post also cites the Qwen3 report: on-policy distillation beat reinforcement learning on the same math test using about a tenth of the GPU-hours.
 
 One limit: the teacher must give you probabilities for each token the student writes. A model you host can. Many chat APIs return few or none, so in practice the teacher is an open-weight model you run. That part is my inference, not the post's claim. The post also notes that the Qwen3 models it used have since been retired from its platform (June 2026), so exact reproduction needs the updated recipes.
 
@@ -116,8 +115,8 @@ Two checks come before any training run.
 Fix three numbers before the run.
 
 - **Quality bar.** A convention for this lesson, not a standard: the student is within 2 points of the teacher overall, and within 5 points on every slice that has at least 100 test examples. Measure with the frozen, stratified test set and the same judge or check for both models.
-- **Latency budget.** Decode speed is limited by reading weights, so weights bytes per token is a rough guide. Moving from a 70-billion model (140 GB) to an 8-billion one (16 GB) cuts bytes per token by 8.75 times. That is an upper bound on the speedup, as other costs do not shrink.
-- **Cost per request.** Compare at the same traffic: the example above gives $0.016 at an Opus-class price against $0.0004 at a Haiku-class price, a 40 times gap. A student you host has its own cost, set by GPU price and utilization, so run the lesson [A2.7](/learn/ai/a2-inference-cost/self-host-vs-api/) comparison before you commit.
+- **Latency budget.** Decode speed is limited by reading weights, so weights bytes per token is a rough guide. Moving to a much smaller model cuts bytes per token a lot. That is an upper bound on the speedup, as other costs do not shrink.
+- **Cost per request.** Compare at the same traffic: the top-tier model costs about 40 times more per request than the smallest one. A student you host has its own cost, set by GPU price and utilization, so run the lesson [A2.7](/learn/ai/a2-inference-cost/self-host-vs-api/) comparison before you commit.
 
 ## Trade-offs
 
@@ -154,16 +153,21 @@ Do not say "the student matches the teacher on average, so ship". Averages hide 
   client:visible
   questions={[
     {
-      q: 'A request uses 2,000 input and 400 output tokens. Opus 5.5 charges $4 and $20 per million tokens, and Haiku 5.5 charges $0.10 and $0.50. How many times cheaper is Haiku?',
-      options: ['About 10 times', 'About 20 times', 'About 40 times', 'About 80 times'],
-      answer: 2,
-      explain: 'Opus: $0.008 + $0.008 = $0.016. Haiku: $0.0002 + $0.0002 = $0.0004. The ratio is 40. Both input and output prices differ by the same factor of 40, so the mix does not change it.',
+      q: 'Why does serving a distilled small student cost much less per request than the large teacher?',
+      options: [
+        'A small model reads far fewer weights to make each token',
+        'Distillation removes the need for any GPU at serving time',
+        'The student skips the prompt and reads only the answer',
+        'Small models write shorter answers whatever the task is',
+      ],
+      answer: 0,
+      explain: 'Each token needs the model to read all its weights, so fewer weights means less work and less money per token. Distillation still needs a GPU to serve. The student reads the same prompt and writes answers as long as the task needs.',
     },
     {
-      q: 'A rare slice is 3% of traffic. You test with 500 questions chosen in proportion to traffic. About how precise is the score on that slice?',
-      options: ['Within about 25 points, as only 15 are in it', 'Within about 3 points, since the whole set has 500 questions', 'Within about 10 points, since 500 questions is a large sample', 'Exact, because a slice score is a fixed share of the total'],
-      answer: 0,
-      explain: '3% of 500 is 15 questions. The worst-case 95% error bar is 1.96 x sqrt(0.25 / 15), about 25 points. The 500 count applies to the whole set, not to the slice.',
+      q: 'A rare slice is a small share of traffic. You test with questions chosen in proportion to traffic. Why is the score on that slice unreliable?',
+      options: ['Rare slices are always graded by a different judge model', 'The slice score is a fixed share of the total score, so it never varies', 'Few test questions fall in the slice, so the score is noisy', 'A large whole test set makes the score on every slice precise'],
+      answer: 2,
+      explain: 'A small share of a test set is only a handful of questions, and a score from a handful is noisy. The size of the whole set does not help the slice. That is why rare slices need their own test set.',
     },
     {
       q: 'A student trained on teacher answers sounds just like the teacher but gets facts wrong on topics that were rare in the data. What does that show?',

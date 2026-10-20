@@ -5,16 +5,12 @@ requires: ['01-one-machine/throughput-vs-latency', '06-async/queues', '06-async/
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import AsyncFlowLab from '../../../components/anim/lessons/AsyncFlowLab.tsx';
 import AsyncPoisonWalk from '../../../components/anim/lessons/AsyncPoisonWalk.tsx';
 
 ## The problem
 
-Lesson 6.1 said a queue hides a spike. It did not say what happens when the spike never ends. During a sale, orders arrive at 120 per second. The workers finish 100 per second. Nothing crashes. The queue just grows by 20 messages every second.
-
-- After one hour: 20 × 3,600 = **72,000 messages** waiting.
-- A new order waits 72,000 ÷ 100 = **720 s**, 12 minutes, before a worker sees it.
+Lesson 6.1 said a queue hides a spike. It did not say what happens when the spike never ends. During a sale, orders arrive a little faster than the workers can finish them. Nothing crashes. The queue just grows by a few messages every second. After an hour, the backlog is huge. A new order waits at the back of it, many minutes, before a worker sees it.
 
 The difference between how fast messages arrive and how fast they are handled is called **lag**. Consumer lag is how far behind the newest message the consumer is. Lag shows up as a wait. Users see "my order is stuck". The queue itself looks healthy.
 
@@ -42,11 +38,11 @@ Compare the three runs:
 
 | Policy | Peak queue | Worst wait | Lost messages | Who feels it |
 |---|---|---|---|---|
-| No limit | grows to (300 − 50) × 20 = 5,000 | 5,000 ÷ 50 = 100 s | 0 | Every user waits |
-| Block | stays at 200 | 200 ÷ 50 = 4 s | 0 | Producers wait. Their callers feel it. |
-| Drop | stays at 200 | 4 s | thousands | Dropped users lose data |
+| No limit | grows to thousands | long, and still growing | 0 | Every user waits |
+| Block | stays at the limit | short and bounded | 0 | Producers wait. Their callers feel it. |
+| Drop | stays at the limit | short and bounded | thousands | Dropped users lose data |
 
-The numbers in the first row are derived by hand and match the widget. In the block run, the producers hold the extra 4,800 or so messages. The 5,000 in the queue and at the producers together drain at 20 per second. So everything is done at about 275 s. Choose by asking what the work is worth. Dropping a "like" event is fine. Dropping a payment is not. Blocking protects the data and moves the wait upstream. That only helps if the upstream can wait or can tell its own callers "try later".
+In the block run, the producers hold the extra messages while the queue stays at its limit. The work still gets done, just later. Choose by asking what the work is worth. Dropping a "like" event is fine. Dropping a payment is not. Blocking protects the data and moves the wait upstream. That only helps if the upstream can wait or can tell its own callers "try later".
 
 Also watch the right signal. **Queue age** (how old the oldest message is) tells you the user wait. Queue size alone does not. SQS is Amazon's managed queue service. It reports `ApproximateAgeOfOldestMessage` for this. Autoscale workers and alert on age.
 
@@ -81,7 +77,6 @@ A DLQ is **not** the fix. It keeps a bad message safe and out of the way. A pers
 
 | Fact | Value | Source |
 |---|---|---|
-| Example: 120 in, 100 out per second, 1 hour | 72,000 backlog, 720 s wait | Derived |
 | SQS `maxReceiveCount` back-of-queue move | received 3 or more times, when the limit is above 3 | SQS DLQ docs |
 | SQS in-flight messages, standard queue | about 120,000 | SQS docs |
 | RabbitMQ prefetch for good throughput | 100 to 300 | RabbitMQ docs |
@@ -123,10 +118,10 @@ Do not say "the queue will absorb it" without saying what happens if the load st
       explain: 'The default, drop-head, removes from the front of the queue (or dead-letters it). Refusing the new message is the reject-publish setting. No overflow setting silently exceeds the limit.',
     },
     {
-      q: 'A standard SQS message waited 3 days in the source queue, then moved to a DLQ with 4 day retention. About how long can it stay in the DLQ?',
-      options: ['4 days, counted from the moment it reaches the DLQ', '7 days, adding the 3 days in the source to the 4 in the DLQ', 'About 1 day, because the enqueue time is kept', 'It is deleted at once, because it already waited 3 days'],
+      q: 'A standard SQS message waited a while in the source queue, then moved to a DLQ. Why should the DLQ retention be longer than the source retention?',
+      options: ['The DLQ clock starts fresh, so the message gets its full retention again', 'The DLQ copy is bigger, so it needs more time to be read by people', 'The enqueue time is kept, so time in the source counts against the DLQ', 'Messages in a DLQ are read less often, so they need more time to be seen'],
       answer: 2,
-      explain: 'For standard queues the expiry is based on the original enqueue time, so 3 of the 4 days are already used. That is why DLQ retention should be longer than the source retention. 7 days would add the two periods, which does not happen.',
+      explain: 'For standard queues the expiry is based on the original enqueue time. If the DLQ retention were equal or shorter, a moved message could vanish almost at once. The tempting fresh-clock idea is wrong: the clock does not reset.',
     },
     {
       q: 'Your consumer calls a payment API that times out about 2% of the time. The queue has maxReceiveCount = 1. What do you see?',
@@ -140,34 +135,11 @@ Do not say "the queue will absorb it" without saying what happens if the load st
       answer: 0,
       explain: 'Blocking or rejecting producers loses nothing, and the workers see no more than the queue limit. Both drop options lose data. A prefetch of 0 removes the limit on what one consumer holds, which makes uneven load worse.',
     },
-  ]}
-/>
-
-<Ballpark
-  client:visible
-  title="Email backlog"
-  scenario="Email workers send 40 messages per second in total. A 20 minute promotion enqueues 55 messages per second. After the promotion, the app enqueues 25 per second."
-  steps={[
     {
-      prompt: 'How many messages are waiting when the promotion ends?',
-      unit: 'messages',
-      answer: 18000,
-      within: 1.1,
-      explain: 'The queue grows by 55 − 40 = 15 messages per second, for 20 × 60 = 1,200 seconds: 15 × 1,200 = 18,000.',
-    },
-    {
-      prompt: 'How long does the last promotion email wait before it is sent?',
-      unit: 'seconds',
-      answer: 450,
-      within: 1.1,
-      explain: 'A message that arrives at the end has 18,000 messages ahead of it. Workers clear 40 per second: 18,000 ÷ 40 = 450 s, or 7.5 minutes.',
-    },
-    {
-      prompt: 'After the promotion, how long until the queue is empty?',
-      unit: 'seconds',
-      answer: 1200,
-      within: 1.1,
-      explain: 'Now workers remove 40 and producers add 25, so the queue shrinks by 15 per second: 18,000 ÷ 15 = 1,200 s, or 20 minutes.',
+      q: 'A promotion pushes email jobs into a queue faster than the workers send them. The promotion ends and traffic returns to normal. What decides how long the backlog takes to clear?',
+      options: ['How much faster the workers are than the new arrival rate', 'The size of the queue limit that you set up earlier on', 'How many producers were running during the whole promotion', 'The retention period of the queue that holds the messages'],
+      answer: 0,
+      explain: 'The backlog only shrinks by the gap between worker speed and the new arrival rate. A thin gap means a long drain, even after the burst is over. The queue limit and retention do not change how fast workers work.',
     },
   ]}
 />

@@ -6,7 +6,6 @@ requires: ['06-async/queues', '08-technologies/zookeeper', '09-patterns/long-run
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import JobSchedulerBuild from '../../../components/anim/lessons/JobSchedulerBuild.tsx';
 import JobSchedulerCompare from '../../../components/anim/lessons/JobSchedulerCompare.tsx';
 
@@ -32,12 +31,10 @@ This design comes from first principles and the earlier lessons, not from one co
 
 ### Scale, derived
 
-- Runs per day at that peak: 10,000 x 86,400 s = 864 million.
-- Runs due in one minute: 10,000 x 60 s = 600,000. Call this one **bucket**.
-- Memory for one bucket, as an id (16 B) plus a time (8 B): 600,000 x 24 B. That is 14.4 MB. It fits in one process, so the scheduler can hold the whole next minute in memory.
-- Run history: a run row of about 200 bytes (assumption) is 864,000,000 x 200 B. That is 173 GB per day. Keep seven days and that is about 1.2 TB. Old runs are deleted or moved out.
-- Concurrency: apply Little's Law (lesson [1.4](/learn/01-one-machine/estimation/)). If a job takes 2 seconds on average (assumption), running work in flight is 10,000 x 2 = 20,000 jobs. At 50 jobs per worker (assumption) that is 400 workers.
-- Heartbeats: a heartbeat is a small "I am still alive" message that a worker sends on a timer. If each running job renews its lease with one every 10 seconds, 20,000 / 10 = 2,000 renewals per second.
+- Runs due in one minute: one **bucket**. At peak that is hundreds of thousands of runs. Each is just an id and a time, so one bucket fits in the memory of one process. The scheduler can hold the whole next minute in memory.
+- Run history: a run row is small, but there are hundreds of millions of runs a day. Keep a few days. Old runs are deleted or moved out.
+- Concurrency: apply Little's Law (lesson [1.4](/learn/01-one-machine/estimation/)). Jobs in flight equal the start rate times the average job time. That is tens of thousands of running jobs, so hundreds of workers.
+- Heartbeats: a heartbeat is a small "I am still alive" message that a worker sends on a timer. Every running job renews its lease on a timer, so heartbeats are a steady write load of thousands per second.
 
 ## Core entities
 
@@ -82,11 +79,11 @@ Three decisions need a reason.
 **Better:** a **time-bucketed scan with look-ahead**.
 
 1. Cut time into buckets of one minute (assumption).
-2. Shortly before a bucket starts, the scheduler reads the whole bucket from the store with one indexed range query. At 10,000 jobs per second that is 600,000 rows, read once.
+2. Shortly before a bucket starts, the scheduler reads the whole bucket from the store with one indexed range query. At peak that is hundreds of thousands of rows, read once.
 3. It holds them in memory, ordered by time, and pushes each job to the ready queue when its time arrives. The 2-second target is met by the in-memory timer, not by a database poll.
 4. A job created for less than a minute ahead is sent straight to the scheduler that owns it, and also saved in the store. Otherwise it would miss its bucket load.
 
-The database sees one big read per minute per shard instead of a scan per second. The cost is memory (about 14 MB per bucket) and a small chance that a scheduler dies holding a bucket. The next section handles this.
+The database sees one big read per minute per shard instead of a scan per second. The cost is memory (a small bucket per scheduler) and a small chance that a scheduler dies holding a bucket. The next section handles this.
 
 ### Many schedulers, one owner per shard
 
@@ -118,34 +115,7 @@ Make it safe with an idempotency key (lesson [3.4](/learn/03-api-design/idempote
 
 ## Numbers
 
-<Ballpark
-  client:visible
-  title="Scheduler load"
-  scenario="Assume 10,000 job runs start per second, jobs take 2 seconds on average, a worker runs 50 jobs at once, and each running job sends a heartbeat every 10 seconds."
-  steps={[
-    {
-      prompt: 'How many jobs are due in one one-minute bucket?',
-      unit: 'jobs',
-      answer: 600000,
-      within: 1.1,
-      explain: '10,000 per second x 60 seconds = 600,000 jobs.',
-    },
-    {
-      prompt: 'How many workers are needed to run the load?',
-      unit: 'workers',
-      answer: 400,
-      within: 1.1,
-      explain: 'Jobs in flight = 10,000 per second x 2 seconds = 20,000 (Little\'s Law). 20,000 / 50 jobs per worker = 400 workers.',
-    },
-    {
-      prompt: 'How many heartbeats per second reach the store?',
-      unit: 'per second',
-      answer: 2000,
-      within: 1.1,
-      explain: '20,000 running jobs / 10 seconds between heartbeats = 2,000 heartbeats per second. This is a real write load. Batch heartbeats per worker if it grows.',
-    },
-  ]}
-/>
+The load is a steady stream of starts, a large pool of running jobs, and a constant trickle of heartbeats. Heartbeats are a real write load. Batch them per worker if they grow.
 
 ## Trade-offs
 
@@ -210,6 +180,12 @@ Some queues support delayed messages. They are enough for "run in 30 seconds". L
       ],
       answer: 3,
       explain: 'The side effect and the status write cannot be atomic. After the lease expires, a second worker runs the task again. An idempotency key lets the email step recognize the repeat and skip it.',
+    },
+    {
+      q: 'Thousands of jobs are running at once, and each renews its lease with a heartbeat. What does that add to the design?',
+      options: ['A steady write load on the store, which can be batched per worker', 'A need to run every job twice', 'A second queue for each worker', 'Nothing, because heartbeats cost no writes'],
+      answer: 0,
+      explain: 'Each heartbeat is a write, so many running jobs make a constant load. Batching per worker cuts it. Heartbeats do not cause duplicate runs by themselves.',
     },
     {
       q: 'The look-ahead bucket is one minute. A user creates a job due in 20 seconds. Without a special rule, what goes wrong?',

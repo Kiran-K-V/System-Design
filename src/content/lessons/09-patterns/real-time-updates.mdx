@@ -54,7 +54,7 @@ With two servers it breaks in a quiet way. The write request for a message may l
 
 Two bad fixes appear next.
 
-- **Each socket polls the database** every second. With 100,000 sockets that is 100,000 queries per second to learn that usually nothing changed.
+- **Each socket polls the database** every second. With a hundred thousand sockets that is a flood of queries to learn that usually nothing changed.
 - **Every server asks every other server.** The number of connections grows with the square of the fleet.
 
 ## The mechanism
@@ -79,7 +79,7 @@ How many internal messages does one event cost? It depends on how many servers h
 
 <RealTimeUpdatesFanout client:visible />
 
-**The model.** If each member sits on a random server, the expected number of servers with at least one member is `S x (1 - (1 - 1/S)^m)`. For `S = 50` and `m = 20`, the expected count is 50 x (1 - 0.98^20). The result is 50 x (1 - 0.668) = about 16.6. A global topic sends 50. One message per member sends 20, and many of them go to the same server.
+**The model.** If each member sits on a random server, then some members share a server. So the number of servers that hold a member is lower than the number of members. A global topic sends to every server. One message per member sends more messages than there are servers to reach, and many of them go to the same server.
 
 **Assumptions.** Uniform random placement. Equal servers. Every server subscribes only to channels it has members in. Real placement is skewed, because friends often join around the same time and hit the same server. So real numbers are usually a little lower for small groups.
 
@@ -114,8 +114,7 @@ Slow clients need a rule as well. A client that cannot read as fast as events ar
 | Redis Pub/Sub delivery | at-most-once | Redis docs |
 | SSE connections per browser and domain on HTTP/1.1 | 6 (the limit is per browser and domain, across tabs) | MDN |
 | SSE streams on HTTP/2 | negotiated, default 100 | MDN |
-| Expected servers reached, 20 members, 50 servers | ~16.6 | Derived above |
-| Expected servers reached, 5 members, 50 servers | 50 x (1 - 0.98^5) = ~4.8 | Derived |
+| Servers reached for a small channel | Fewer than the member count, as some share a server | Derived above |
 | Sockets per server | measure it: depends on runtime and kernel settings | Lesson 2.5 |
 
 ## Trade-offs
@@ -148,15 +147,15 @@ A rolling deploy restarts connection servers one at a time. Each restart drops a
   client:visible
   questions={[
     {
-      q: 'A channel has 20 members placed at random on 50 connection servers. Servers subscribe per channel. About how many servers receive one event?',
+      q: 'A small channel has members spread at random over many connection servers, and servers subscribe per channel. What does one event cost in internal messages?',
       options: [
-        'About 17 servers, because some members share a server',
-        'Exactly 20 servers, one for each of the members',
-        'All 50 servers, because pub/sub sends to the whole fleet',
-        'Exactly 1 server, because the channel has one owner',
+        'One message to each server that holds a member, a bit fewer than the member count',
+        'One message to every server in the fleet, whatever the channel size',
+        'One message per member, even when two members share a server',
+        'One message to a single owner server that relays to the rest',
       ],
       answer: 0,
-      explain: 'The expected number is 50 x (1 - (49/50)^20) = about 16.6. Twenty members would need 20 servers only if no two shared one. With 20 members on 50 servers, a few collide, so the count is a little below 20.',
+      explain: 'The cost follows the number of servers that hold a member. Members that share a server share one message, so the count is a little below the member count. A global topic would reach the whole fleet, which wastes work for a small channel.',
     },
     {
       q: 'A connection server restarts and is gone for 3 seconds. Events published meanwhile use Redis Pub/Sub only. What happens for the clients of that server when they reconnect?',

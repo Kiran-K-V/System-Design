@@ -39,11 +39,11 @@ This is **short polling**. To **poll** means to ask again and again on a timer. 
 
 Why does it exist? Because it needs nothing new. You can build it in an afternoon.
 
-It fails in two ways. Here are the numbers.
+It fails in two ways.
 
-**Failure 1: most polls are empty.** Say the browser polls every 2 seconds. That is 3,600 / 2 = 1,800 requests per hour for one user. Now say 1 million users are online. The servers get 1,000,000 / 2 = 500,000 requests per second. Almost all of them carry no data. Each one still pays for its headers, a login check and a log line.
+**Failure 1: most polls are empty.** Say the browser polls every 2 seconds. That is a steady stream of requests for one user. Now say a million users are online. The servers get a flood of requests every second, and almost all of them carry no data. Each one still pays for its headers, a login check and a log line.
 
-**Failure 2: the news is late.** Suppose an event happens just after a poll. It waits almost one full interval for the next poll. With a 2 second interval, news can be up to 2 seconds late. You can poll every 100 ms to cut the delay. That multiplies the load by 20.
+**Failure 2: the news is late.** Suppose an event happens just after a poll. It waits almost one full interval for the next poll. With a 2 second interval, news can be up to 2 seconds late. You can poll ten times faster to cut the delay. That multiplies the load by the same factor.
 
 You cannot lower both costs. If you poll more, the load grows. If you poll less, the delay grows. The way out is to stop asking again and again, and to keep one connection open instead.
 
@@ -62,7 +62,7 @@ This is **long polling**:
 
 Why does this exist? It cuts the delay to about one trip over the network, because the answer is ready the moment the news is. It also removes empty polls (except at the timeout). And it works anywhere HTTP works.
 
-The cost: every event still needs a whole new HTTP request, with all its headers. And the server now holds one open request for every client, all the time. A 30 second timeout means an idle user still sends 3,600 / 30 = 120 requests per hour. That is far better than 1,800, but not zero.
+The cost: every event still needs a whole new HTTP request, with all its headers. And the server now holds one open request for every client, all the time. A 30 second timeout means an idle user still sends a request every 30 seconds. That is far fewer than short polling, but not zero.
 
 Long polling is a good fallback for old or strict networks. For a main design, we can do better.
 
@@ -153,7 +153,7 @@ There are three problems to solve.
 To get through, WebRTC uses a process called **ICE**. ICE tries several paths and uses the best one that works. It uses two helpers.
 
 - A **STUN** server answers one question: "What address do you see me coming from?" It is like phoning a friend and asking what number shows on their caller ID. The two browsers then try to connect using those public addresses.
-- Some routers are strict and refuse a direct link. Then ICE falls back to a **TURN** server. TURN relays all the data between the two browsers. It works almost every time, but you pay for the relay. As a rough example, relay 1,000 calls at 1 Mbps of video each way and your servers carry 1,000 x 2 x 1 Mbps = 2 Gbps. So TURN is the last resort.
+- Some routers are strict and refuse a direct link. Then ICE falls back to a **TURN** server. TURN relays all the data between the two browsers. It works almost every time, but you pay for the relay. Every relayed call passes all its video through your servers, in both directions, so the bandwidth bill grows with the number of calls. So TURN is the last resort.
 
 **Problem 3: stale media.** WebRTC sends audio and video over UDP when it can (lesson 2.1). Old audio is useless, so waiting for a lost packet (head-of-line blocking) is wrong for a call. Video calls also care about **jitter**. Here that word means the network sense: how much the delay of packets varies from one packet to the next. If delays vary a lot, the audio stutters. (The other meaning of jitter, random retry timing, comes later in this lesson. It is a different idea.)
 
@@ -211,7 +211,7 @@ Two rules fix it.
 
 **Jitter.** Here, jitter means the retry sense: a random amount added to the wait. (It has nothing to do with the packet-delay jitter above.) Backoff alone is not enough. All 100,000 clients start together and follow the same 1, 2, 4 schedule. So they all retry in lockstep, and each retry is a new spike. With jitter, each client picks a random wait inside a window. The spikes spread into a flat flow.
 
-The numbers are easy. Suppose the survivors accept 5,000 new connections per second. Without jitter, 100,000 arrive in one second. That is 20 times what they can accept. With jitter spread over 30 seconds, about 100,000 / 30 = 3,333 arrive per second. That is below 5,000, so the survivors cope. Change the sliders and see.
+The idea is simple. The survivors can accept only so many new connections per second. Without jitter, every client arrives in the same second, far more than they can take. With jitter spread over many seconds, the arrivals fall below that limit, so the survivors cope. Change the sliders and see.
 
 <ReconnectStorm client:visible />
 
@@ -219,18 +219,15 @@ A reconnect must also **resume**. A new socket restores the pipe. It does not gi
 
 ## Numbers
 
-| Method | Idle requests per hour per user | Delay after an event |
+| Method | Idle requests | Delay after an event |
 |---|---|---|
-| Short polling, every 2 s | 3,600 / 2 = 1,800 | 0 to 2 s |
-| Short polling, every 30 s | 3,600 / 30 = 120 | 0 to 30 s |
-| Long polling, 30 s timeout | 1 per event, plus up to 120 timeouts | About 1 network trip |
+| Short polling, fast | Very many | Short |
+| Short polling, slow | Fewer | Long |
+| Long polling, 30 s timeout | 1 per event, plus one per timeout | About 1 network trip |
 | SSE | 1 (the stream stays open) | About 1 network trip |
 | WebSocket | 1 (the upgrade) | About 1 network trip |
 
-Two more numbers to keep:
-
-- 1 million users polling every 2 s means 500,000 requests per second on the servers.
-- A channel of 1 million subscribers on 500 gateways costs 500 sends from the channel server.
+One more idea to keep: with two-level fan-out, the channel server sends once per gateway, not once per subscriber.
 
 Memory per open connection, and sockets per server, depend on your language and your operating system settings. Do not quote a number from memory. Measure it with a test, or say "I would load test it".
 
@@ -265,10 +262,10 @@ The WebSocket standard requires every frame from a browser to carry a random 4-b
   questions={[
     {
       id: 'real-time-transport-dashboard-polls-every-5',
-      q: 'A dashboard polls every 5 seconds. 20,000 users are online. About how many requests per second hit the server, and what is the worst-case delay for an event?',
-      options: ['20,000 per second, up to 5 s late', '4,000 per second, always instant', '4,000 per second, up to 5 s late', '100 per second, up to 20 s late'],
-      answer: 2,
-      explain: '20,000 users / 5 s = 4,000 requests per second, whatever the data. An event just after a poll waits almost the whole 5 s. To cut the delay you must poll more, which raises the load, or hold a connection open.',
+      q: 'A dashboard polls the server on a timer. Users complain that updates arrive late. What happens if you shorten the poll interval?',
+      options: ['Updates arrive sooner, but server load rises even when nothing changes', 'Updates arrive sooner and server load stays the same', 'Updates arrive at the same time, but server load rises', 'Updates arrive sooner, and server load falls, because polls are smaller'],
+      answer: 0,
+      explain: 'An event just after a poll waits almost a whole interval, so a shorter interval cuts the delay. But every poll is a request, and most carry no news, so load rises. To cut delay without the load, hold a connection open instead.',
     },
     {
       id: 'real-time-transport-live-sports-page-pushes',
@@ -308,10 +305,10 @@ The WebSocket standard requires every frame from a browser to carry a random 4-b
     },
     {
       id: 'real-time-transport-gateway-channel-server-design',
-      q: 'In the gateway and channel-server design, a channel has 1 million subscribers spread over 500 gateways. How many sends does the channel server make for one message?',
-      options: ['1,000,000', '1', '500', '500,000'],
-      answer: 2,
-      explain: 'The channel server sends once per gateway that has a subscriber: 500. Each gateway then writes to its own sockets. Splitting fan-out into two levels keeps the owner of a hot channel from doing a million writes.',
+      q: 'In the gateway and channel-server design, a channel has a huge number of subscribers spread over many gateways. Why does the channel server send once per gateway, not once per subscriber?',
+      options: ['Gateways cannot receive more than one message at a time', 'It spares the hot channel owner from every socket write', 'Subscribers would then see each message twice by design', 'It removes the need for gateways to track their sockets'],
+      answer: 1,
+      explain: 'Each gateway holds its own sockets and writes to them, so the work is shared across gateways. Without the second level, the one server that owns a hot channel would do every write itself and become the bottleneck.',
     },
   ]}
 />

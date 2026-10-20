@@ -13,7 +13,7 @@ import RelBulkheadLab from '../../../components/anim/lessons/RelBulkheadLab.tsx'
 
 [Lesson 7.2](/learn/07-reliability/timeouts-retries/) gave every call a time limit. That caps how long one call hurts. It does not stop the next call from hurting just as much.
 
-Say 500 calls per second go to a dependency that has stopped answering. Each call waits for a 1-second timeout. By Little's law ([lesson 1.3](/learn/01-one-machine/throughput-vs-latency/)), the number of calls in flight equals the arrival rate times the time each call takes. Here that is 500 x 1 = 500 threads held at any moment. A thread is one worker inside your server that handles one call at a time. A pool of 200 threads cannot cover 500. The caller is stuck on a dependency it already knows is broken, and every retry makes it worse.
+Say many calls per second go to a dependency that has stopped answering. Each call waits for its full timeout. By Little's law ([lesson 1.3](/learn/01-one-machine/throughput-vs-latency/)), the number of calls in flight grows with the arrival rate and with the time each call takes. A thread is one worker inside your server that handles one call at a time. Every waiting call holds one thread, so the pool runs out fast. The caller is stuck on a dependency it already knows is broken, and every retry makes it worse.
 
 The caller needs a way to learn from its own recent failures and stop calling.
 
@@ -21,7 +21,7 @@ The caller needs a way to learn from its own recent failures and stop calling.
 
 **Ping first.** "Check that the dependency is healthy, then call." It costs an extra call. The answer is stale by the time the real call goes out. And the ping can pass while the real call fails (gray failure, [lesson 7.1](/learn/07-reliability/failure-modes/): a dependency that is sick in some ways but still answers simple checks).
 
-**Shorter timeouts only.** A 100 ms timeout holds 50 threads at 500 calls per second, not 500. Better. But every call still goes out, still waits, and still fails. The dependency, which may be recovering, still gets the full load.
+**Shorter timeouts only.** A shorter timeout holds far fewer threads at the same call rate. Better. But every call still goes out, still waits, and still fails. The dependency, which may be recovering, still gets the full load.
 
 **Retry harder.** This is the opposite of what the sick dependency needs.
 
@@ -66,8 +66,8 @@ Try it. A service has 100 threads. Dependency A is healthy. Dependency B gets sl
 
 What to notice:
 
-1. **Shared pool.** At 5 s, B's calls demand 100 x 5 = 500 threads. The pool has 100. About 1 in 5 calls of any kind gets a thread. A is healthy, and A's users still see about 80% failures.
-2. **Bulkhead.** B is confined to 25 threads. B still fails mostly (5% served). But A keeps its own 75 threads and serves everything. The damage stays on the sick path.
+1. **Shared pool.** As B's hold time grows, B's calls demand far more threads than the pool has. Most calls of any kind fail to get a thread. A is healthy, and A's users still see most of their calls fail.
+2. **Bulkhead.** B is confined to a small slice of the pool. B still fails mostly. But A keeps its own threads and serves everything. The damage stays on the sick path.
 3. **Bulkhead and breaker.** With B's breaker open, B's calls fail at once and hold no threads. The users of B get a fast error or a fallback, and A is untouched.
 
 The price of a bulkhead is that capacity is split. When B is healthy, its 25 threads cannot help A at a peak. That is the trade.
@@ -89,11 +89,8 @@ If your work flows through a queue instead of direct calls, the same pressure ap
 | Fact | Value | Source |
 |---|---|---|
 | Failure threshold in Fowler's example code | 5 | Martin Fowler, CircuitBreaker |
-| Threads held with no breaker (500 calls/s, 1 s timeout) | 500 | Derived: 500 x 1 s |
-| Threads held with a 100 ms timeout | 50 | Derived: 500 x 0.1 s |
 | Client-side throttling history | last 2 minutes | Google SRE book |
 | Fleet shedder reserve (Stripe's example) | 20% for critical methods | Stripe engineering blog |
-| Shared pool, B holds 5 s (lab) | A served about 20% | Lab model, derived |
 
 The reset timeout and the threshold are tuning values. Pick them from how long your dependency usually takes to recover and how noisy its errors are.
 

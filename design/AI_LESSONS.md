@@ -37,7 +37,7 @@ import Math from '../../../../components/lesson/Math.astro';
 Inline: the cache holds <Math tex="2 \times L \times H_{kv} \times d" /> values per token.
 <Math block tex="\text{FLOPs} \approx 6ND" />
 ```
-Inside the `tex` attribute, a backslash is written once (MDX attribute strings are literal). Keep formulas short; always say in words what the formula means and work one example with real numbers.
+Inside the `tex` attribute, a backslash is written once (MDX attribute strings are literal). Keep formulas short; always say in words what the formula means. Work a numeric example only in number lessons (see Numbers policy in `NEXT_LESSONS.md`).
 
 ## 5. Prices and model facts
 

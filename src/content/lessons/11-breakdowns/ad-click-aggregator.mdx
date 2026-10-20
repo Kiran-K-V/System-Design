@@ -6,7 +6,6 @@ requires: ['06-async/delivery-semantics', '08-technologies/kafka', '08-technolog
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import AdClickBuild from '../../../components/anim/lessons/AdClickBuild.tsx';
 import AdClickCompare from '../../../components/anim/lessons/AdClickCompare.tsx';
 
@@ -31,12 +30,11 @@ Advertisers pay per click. So a click count is money. This case study follows th
 
 ### Scale, derived
 
-Assume 100 million clicks a day. Lesson [1.4](/learn/01-one-machine/estimation/) gives the method.
+Assume about 100 million clicks a day. Lesson [1.4](/learn/01-one-machine/estimation/) gives the method.
 
-- Average rate: 100,000,000 / 86,400 s = about 1,160 clicks per second.
-- Peak is 10,000 per second, about 8.6 times the average. The design must handle the peak, so size for 10,000.
-- Raw volume: at 100 bytes per event (assumption), 100,000,000 x 100 B = 10 GB per day. That is about 3.65 TB per year. The stream carries 10,000 x 100 B = 1 MB per second at peak. That is small for Kafka.
-- Aggregated volume: a row is (ad id, minute, count). A day has 1,440 minutes. A single ad has at most 1,440 rows a day. In total there are at most 100 million non-empty rows a day, because each click lands in one row. Real counts are far smaller, because many clicks share a row.
+- The average rate is about a thousand clicks per second, but the peak is roughly ten times that. The design must handle the peak, so size for 10,000.
+- Each raw event is small (about 100 bytes, an assumption). The stream at peak is about a megabyte per second. That is small for Kafka. Raw clicks for a year fit easily in cheap storage.
+- Aggregated rows are (ad id, minute, count). One ad has at most one row per minute, so a day is at most 1,440 rows per ad. Real counts are far smaller, because many clicks share a row.
 
 ## Core entities
 
@@ -98,7 +96,7 @@ Duplicates come from three places. The sources are a browser that retries, a use
 
 **Better:** dedupe by **click id**. The id is unique per ad impression, and it is signed. Because a token binds one click id to one ad id, a repeat always lands on the same Flink task. That task keeps a set of recent click ids in its checkpointed state and drops a repeat. The state restarts with the job, so the set survives a crash.
 
-How long must it remember? Only as long as a token is valid. Assume a one-hour expiry. At peak that is 10,000 x 3,600 = 36 million ids. At 16 bytes each (assumption), that is 36,000,000 x 16 B = 576 MB across the whole job. Per task, that is a few MB. Without the token expiry we would have to remember ids forever.
+How long must it remember? Only as long as a token is valid. Assume a one-hour expiry. The set holds one hour of click ids. Spread over many tasks, that is a small amount of memory per task. Without the token expiry we would have to remember ids forever.
 
 Do not dedupe in the click service with "check a cache, then write to Kafka". If you mark the id first and the write fails, the retry is dropped and the click is lost. If you write first and the mark fails, the retry duplicates. Both orders have a gap. State inside the stream has no such gap. The reason is that the id set and the log offsets are saved by the same checkpoint. Lesson [3.4](/learn/03-api-design/idempotency/) covers the key idea.
 
@@ -116,36 +114,7 @@ Keying by ad id has a cost. One ad that gets most of the traffic sends most clic
 
 ## Numbers
 
-Try the arithmetic yourself.
-
-<Ballpark
-  client:visible
-  title="Click traffic and dedupe state"
-  scenario="Assume 100 million clicks a day, a peak of 10,000 clicks per second, tokens valid for one hour, and 16 bytes per click id."
-  steps={[
-    {
-      prompt: 'What is the average click rate?',
-      unit: 'clicks per second',
-      answer: 1157,
-      within: 1.1,
-      explain: '100,000,000 clicks / 86,400 seconds = about 1,157 per second. Peak is 10,000, about 8.6 times higher.',
-    },
-    {
-      prompt: 'How much memory does the dedupe state need at peak?',
-      unit: 'MB',
-      answer: 576,
-      within: 1.1,
-      explain: 'Ids to remember: 10,000 per second x 3,600 seconds = 36,000,000. Then 36,000,000 x 16 bytes = 576,000,000 bytes = 576 MB for the whole job.',
-    },
-    {
-      prompt: 'An advertiser asks for one ad over the last 24 hours at one-minute granularity. How many rows does the query read at most?',
-      unit: 'rows',
-      answer: 1440,
-      within: 1.1,
-      explain: '24 hours x 60 minutes = 1,440 rows. Reading raw clicks instead could mean millions of rows.',
-    },
-  ]}
-/>
+The numbers here are assumptions to size the design. The peak is about ten times the average, the stream is small for Kafka, and a query reads at most one row per minute.
 
 ## Trade-offs
 
@@ -219,6 +188,12 @@ Some teams skip it and trust checkpoints. That is fine when the cost of a wrong 
       ],
       answer: 2,
       explain: 'The batch recount sees every event, including late ones and ones the stream mishandled, so it is the reference. Overwriting the rows is safe because the write is an upsert. Averaging mixes a right number with a wrong one.',
+    },
+    {
+      q: 'An advertiser asks for one ad over the last day at one-minute granularity. Why is the query fast?',
+      options: ['Flink answers it live by scanning the Kafka log', 'The query reads a small set of pre-aggregated rows, not raw clicks', 'The query cache holds every ad for every day', 'The database indexes each click by its user id'],
+      answer: 1,
+      explain: 'The pipeline stores one small row per ad per minute, so a query reads a short range of rows. Reading raw clicks would touch millions of records. Scanning Kafka for a query is slow, and the user id plays no part.',
     },
   ]}
 />

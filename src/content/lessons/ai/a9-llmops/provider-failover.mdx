@@ -75,7 +75,7 @@ Why does this choice exist? You want two things that pull against each other: lo
 
 How do you measure the result? With an **RTO**, a recovery time objective. It is the longest time you accept between "the primary failed" and "users get answers again". For a support bot, that might be 30 seconds. For a nightly batch job, it might be hours. The RTO decides how much you spend, because a short RTO needs a backup that is always ready.
 
-Numbers make the RTO concrete. Say each attempt waits up to 30 seconds before it times out. The SDK retries twice. That is 3 attempts, so 3 x 30 = 90 seconds of waiting before you even start the backup. An RTO of 30 seconds cannot work with those settings. You need a shorter timeout on the first piece of the answer. This is the **time to first token (TTFT)**: how long until the first words arrive. With streaming you can say "if no first token in 5 seconds, give up on this attempt". Lesson [A9.7](/learn/ai/a9-llmops/llm-dashboards/) teaches TTFT in depth.
+Timeouts make the RTO concrete. Say each attempt waits a long time before it times out, and the SDK retries twice. Those waits stack up before you even start the backup. A short RTO cannot work with those settings. You need a shorter timeout on the first piece of the answer. This is the **time to first token (TTFT)**: how long until the first words arrive. With streaming you can say "if no first token in 5 seconds, give up on this attempt". Lesson [A9.7](/learn/ai/a9-llmops/llm-dashboards/) teaches TTFT in depth.
 
 ## Question 3: will the backup give answers my product can use?
 
@@ -83,7 +83,7 @@ The backup is a different model, from a different company. It was trained differ
 
 Four things can change. Treat each as a test you run before the outage.
 
-**Quality.** The same question may get a worse answer. You measure this with a **golden set**: a fixed list of test questions, each with a known good answer or a check. [Lesson A8.3](/learn/ai/a8-evals/golden-sets/) builds one. Run the golden set on the backup, and write down the score next to the primary's. Say the primary scores 0.90 and the backup scores 0.84 (illustrative). Now you know the cost of switching: 6 points. You can decide if that is acceptable, or if the backup should only serve some tasks.
+**Quality.** The same question may get a worse answer. You measure this with a **golden set**: a fixed list of test questions, each with a known good answer or a check. [Lesson A8.3](/learn/ai/a8-evals/golden-sets/) builds one. Run the golden set on the backup, and write down the score next to the primary's. Say the backup scores a bit lower than the primary (illustrative). Now you know the cost of switching. You can decide if that is acceptable, or if the backup should only serve some tasks.
 
 **Format.** Your code probably parses the answer as JSON with fixed field names. A backup might wrap the JSON in a markdown code fence, rename `amount_cents` to `amountCents`, or return the number `1250` as the string `"1250"`. The HTTP code is still 200. Your parser fails, and the failure shows up far from the cause. A gateway vendor's blog post lists exactly these drifts, but gives no measurements. Treat it as a sensible warning, not a statistic. The fix is a **schema check** in the router: validate every answer against the expected shape, and count the failures per provider. [Lesson A3.3](/learn/ai/a3-llm-apis/structured-output/) covers structured output.
 
@@ -95,7 +95,7 @@ Four things can change. Treat each as a test you run before the outage.
 
 You pay twice: in tokens and in speed.
 
-The cost comes from the **prompt cache**. Most prompts start with the same long block: instructions, tool definitions, documents. A provider can store the processed form of that block, so the next call that begins with the same block costs much less. [Lesson A2.5](/learn/ai/a2-inference-cost/prompt-caching/) explains how. The saving is large. On Anthropic's pricing page, a cache hit on Sonnet 5.5 costs $0.10 per million tokens, against $2 for normal input. That is 20 times cheaper.
+The cost comes from the **prompt cache**. Most prompts start with the same long block: instructions, tool definitions, documents. A provider can store the processed form of that block, so the next call that begins with the same block costs much less. [Lesson A2.5](/learn/ai/a2-inference-cost/prompt-caching/) explains how. The saving is large. On Anthropic's pricing page, a cache hit costs a small fraction of normal input.
 
 The cache lives inside one provider. Anthropic's docs say caches are isolated between organizations and, on its own API, between workspaces. So after a failover, the backup starts with an empty cache. The first requests pay full price for the long block. They also pay the cache-write premium: 1.25 times the input price, to store it.
 
@@ -105,7 +105,7 @@ Try it. Change the repeated block and watch which backup stops caching.
 
 <Ai9FailCost client:visible />
 
-At 800 tokens, the primary Sonnet 5.5 costs $0.00468 per request. The backup Sonnet 4.6 costs $0.0093: 1.99 times as much. Part of that is the higher price per token ($3 against $2). The rest is the cache that never starts. Move the slider to 1,100 tokens, and the backup caches. Then the gap shrinks to about 1.5 times.
+At 800 tokens, the backup costs about double the primary. Part of that is the higher price per token. The rest is the cache that never starts. Move the slider to 1,100 tokens, and the backup caches. Then the gap shrinks.
 
 ## The naive way: retry harder, or switch blindly
 
@@ -141,7 +141,7 @@ A backup you have never run is a hope. A fire exit that nobody has used is often
 - one real request per target per day, using the exact request builder, to catch rejected settings;
 - the schema check on every answer, with a counter for failures.
 
-Cost check, derived: a 500-case golden set with 3,000 input tokens and 500 output tokens per case, run on Sonnet 4.6 at $3 and $15 per million tokens, costs 500 x (3,000 x 3 + 500 x 15) / 1,000,000 = $8.25 per run. A weekly run is about $33 per month. That is small next to a 4-hour outage.
+A golden set run on a backup costs a few dollars. A weekly run is small next to a long outage.
 
 ### Idea 4: keep a trickle on the backup
 
@@ -164,13 +164,11 @@ One more point on regions. You might think moving to another region adds capacit
 | OpenAI outage, 11 Dec 2024 | 4 h 22 min (3:16 PM to 7:38 PM Pacific) | OpenAI incident report |
 | Anthropic monthly spend cap | $500 Start, $1,000 Build, $200,000 Scale | Anthropic rate-limits page |
 | Default SDK retries | 2 | Anthropic error docs |
-| Wait before a backup, 30 s timeout, 2 retries | 3 x 30 = 90 s | derived |
+| Wait before a backup | Timeouts times attempts stack up | derived |
 | Cache minimum, Sonnet 5.5 / Sonnet 4.6 / Haiku 4.5 | 512 / 1,024 / 4,096 tokens | Anthropic caching docs |
 | Cache write / hit, as a multiple of input price | 1.25x / 0.1x (Sonnet 5.5 hit is 0.05x) | Anthropic caching and pricing pages |
-| Weekly 500-case golden set on a backup | $8.25 per run | derived |
-| Per request, 800-token prefix, 300 new, 400 out | Sonnet 5.5 $0.00468, Sonnet 4.6 $0.0093 | derived from prices as of 2026-10-16 |
 
-Prices come from [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing), as of 2026-10-16. Sonnet 5.5 is $2 input and $10 output per million tokens. Sonnet 4.6 is $3 and $15.
+Prices come from [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing), as of 2026-10-16.
 
 Your design should name its three bars. **Quality bar:** the backup scores at least a stated number on the golden set. **Latency budget:** first token within 5 seconds, and total time to a working answer within your RTO. **Cost:** compute the per-request cost on the backup, cold and warm, as the widget does.
 
@@ -221,10 +219,15 @@ Do not say "we have a fallback model, so we are covered". A backup that was neve
     },
     {
       id: 'ai9-failover-timeout-math',
-      q: 'Each attempt has a 30 second timeout, and the SDK retries twice. Ignoring backoff, how long do users wait before the router even starts the backup?',
-      options: ['30 seconds', '60 seconds', '120 seconds', '90 seconds'],
-      answer: 3,
-      explain: 'Two retries mean 3 attempts in total, so 3 x 30 = 90 seconds. Counting only the retries (60) or adding one more attempt (120) are the usual slips. The fix is a short limit on the first token, not a long limit on the whole call.',
+      q: 'Each attempt has a long timeout, and the SDK retries twice before the router tries the backup. Why can this break a short recovery time goal?',
+      options: [
+        'The retries do not wait for the provider to answer',
+        'Retries and failover cannot be used together',
+        'The waits stack up before the backup even starts',
+        'Timeouts only apply to the backup provider',
+      ],
+      answer: 2,
+      explain: 'Each failed attempt waits out its full timeout, so the waits add up before the backup is tried. The fix is a short limit on the first token, not a long limit on the whole call. Retries do wait, and they work with failover.',
     },
     {
       id: 'ai9-failover-cache-minimum',
@@ -236,7 +239,7 @@ Do not say "we have a fallback model, so we are covered". A backup that was neve
         'The cache works, but the hit price is a little lower',
       ],
       answer: 0,
-      explain: 'Below the minimum the block is processed at full price and no error is returned. Sonnet 4.6 also costs $3 per million input tokens against $2. That gives $0.0093 against $0.00468 for a 300 new, 400 output token request.',
+      explain: 'Below the minimum the block is processed at full price and no error is returned. Sonnet 4.6 also costs more per token, so the gap is wider still.',
     },
     {
       id: 'ai9-failover-trickle',

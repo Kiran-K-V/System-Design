@@ -6,7 +6,6 @@ requires: ['06-async/cdc', '08-technologies/elasticsearch', '04-data/indexing']
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import PostSearchBuild from '../../../components/anim/lessons/PostSearchBuild.tsx';
 import PostSearchCompare from '../../../components/anim/lessons/PostSearchCompare.tsx';
 
@@ -31,52 +30,18 @@ A social site has billions of posts. A user types two words and expects the best
 
 ### Scale, derived
 
-Lesson [1.4](/learn/01-one-machine/estimation/) gives the method. Show the math, because the answer shapes the design.
+Lesson [1.4](/learn/01-one-machine/estimation/) gives the method. Here we only need the conclusions, because the answer shapes the design.
 
-- Posts per day: 10,000 x 86,400 s = 864 million.
-- Posts in ten years: 864,000,000 x 365 x 10 = about 3.15 trillion.
-- Raw text: assume 500 bytes per post with its metadata. Then 3.15 x 10^12 x 500 B = about 1.6 PB.
-- Index size: assume 20 distinct terms per post. Assume each entry in a posting list takes 8 bytes (a 64-bit post id). That is 160 bytes per post, so 3.15 x 10^12 x 160 B = about 500 TB.
-- Shards: a shard is one slice of the index that sits on one machine, so a huge index is split over many machines. Lesson [8.5](/learn/08-technologies/elasticsearch/) gives 10 GB to 50 GB per shard. At the very best, 500 TB / 50 GB = 10,000 shards. That is the full ten-year index, and it already says something: we cannot ask every shard on every search.
-- Likes: 100,000 per second is 10 times the post rate. Likes will be the main write load, not posts.
-
-## Core entities
-
-- **Post**: id, author, text, created time. The id grows with time (lesson [10.5](/learn/10-advanced/ids-and-time/)).
-- **Like**: post id, user id. We mostly need the count.
-- **Index entry**: term, list of post ids (the posting list).
-
-## API
-
-```
-POST /posts                       -> { postId }
-POST /posts/{id}/like
-GET  /search?q=&sort=recency|likes&cursor=   -> { posts[], nextCursor }
-```
-
-Results use cursor pagination, as in lesson [3.3](/learn/03-api-design/pagination/).
-
-## Data flow
-
-Two chains. The write chain turns a post into an index entry. The read chain turns a query into a ranked page of post ids. They meet only at the index.
-
-## High-level design
-
-Step through the build. Each step names its requirement.
-
-<PostSearchBuild client:visible />
-
-**Why not `LIKE '%word%'` in the posts table?** That reads every row. At trillions of rows it never finishes. A B-tree cannot help with a match in the middle of text (lesson [4.3](/learn/04-data/indexing/)). The **inverted index** flips the question: for each term, keep the list of posts that contain it. A two-word search then finds the posts in both lists. See the build-up in lesson 4.3.
-
-**Why a change feed and not a second write?** If the application writes to the database and then to the index, one of the writes can fail. The two copies then differ for good. [Lesson 6.5](/learn/06-async/cdc/) shows this race. With **change data capture**, the database log is the single record of what happened. The index is rebuilt from it, and it can be replayed.
-
-**Freshness budget.** The requirement is one minute. Add up the stages, with assumed worst cases: change capture 5 s, indexer batching 5 s, search engine refresh 1 s (the default of lesson 8.5), result cache 30 s. That 30 s is the cache's TTL (time to live): how long a saved answer is reused before it is thrown away. The total is 41 s, under 60 s. If you raise the cache time to 60 s, you break the requirement.
+- Posts pile up fast: ~864 million a day at our assumed rate. Over ten years that is trillions of posts, and the raw text alone reaches petabytes.
+- The index is also huge: each post adds an entry for each distinct term in it. The full ten-year index is hundreds of TB.
+- A shard is one slice of the index that sits on one machine, so a huge index is split over many machines. Lesson [8.5](/learn/08-technologies/elasticsearch/) gives a healthy size per shard. At that size, a ten-year index needs thousands of shards. That already says something: we cannot ask every shard on every search.
+- Likes: their rate is 10 times the post rate. Likes will be the main write load, not posts.
 
 ## Deep dives
 
 ### Sharding the index
 
-Lesson 8.5 showed the engine's default: documents are spread over shards by id. A search asks every shard (scatter-gather, lesson [4.7](/learn/04-data/sharding/)). That is simple and spreads load evenly. With 10,000 shards it is too much work for every query.
+Lesson 8.5 showed the engine's default: documents are spread over shards by id. A search asks every shard (scatter-gather, lesson [4.7](/learn/04-data/sharding/)). That is simple and spreads load evenly. With thousands of shards it is too much work for every query.
 
 **Split by time first.** Put posts into time slices, such as one slice per week, and shard each slice by post id. The default sort is recency, so a search asks the newest slice first. It stops as soon as it has a full page. Most searches touch a few slices.
 
@@ -90,7 +55,7 @@ Look at the likes path with one viral post.
 
 <PostSearchCompare client:visible />
 
-The Likes store holds the exact count. The index holds a rough count, updated only when the exact count passes a power of 2. A post with 1,000,000 likes crosses 20 milestones, so it causes 20 index writes. At query time the query service takes the top candidates and re-reads their exact counts, then sorts. This is a **two-stage ranking**: a cheap, approximate first stage over many posts, and an exact second stage over few.
+The Likes store holds the exact count. The index holds a rough count, updated only when the exact count passes a power of 2. A post with a million likes crosses only about 20 milestones, so it causes about 20 index writes, not a million. At query time the query service takes the top candidates and re-reads their exact counts, then sorts. This is a **two-stage ranking**: a cheap, approximate first stage over many posts, and an exact second stage over few.
 
 The honest cost: the first stage orders posts only up to a factor of 2. A post at 1,000 likes and one at 1,023 share a bucket. Take enough candidates that the re-rank sees every post in the top bucket. If a bucket is too crowded, use finer milestones near the top.
 
@@ -99,37 +64,6 @@ The honest cost: the first stage orders posts only up to a factor of 2. A post a
 Search terms follow a skewed pattern. A few queries ("world cup final") arrive again and again. Without help, each repeat does a full scatter-gather. Put a result cache in front of the query service. The key is the normalized query plus the sort order and the page. Use a short TTL, chosen from the freshness budget above. Lesson [5.2](/learn/05-caching/cache-placement/) covers placement, and lesson [5.5](/learn/05-caching/invalidation-stampede/) covers a popular key expiring. In that case, use one refresher per key, not one per user.
 
 Posting lists also have a hot-term problem. A common word has a huge list. When intersecting, start with the shortest list. Test those ids against the longer ones, so the cost follows the rare term.
-
-## Numbers
-
-<Ballpark
-  client:visible
-  title="Post volume and index writes"
-  scenario="Assume 10,000 new posts per second, 500 bytes per post, 1,000,000 likes on a viral post, and a rough like count that is indexed at each power of 2 (1, 2, 4, 8, ...)."
-  steps={[
-    {
-      prompt: 'How many posts are created per day?',
-      unit: 'million posts',
-      answer: 864,
-      within: 1.1,
-      explain: '10,000 per second x 86,400 seconds = 864,000,000 posts, which is 864 million.',
-    },
-    {
-      prompt: 'How much raw text is that per year, at 500 bytes per post?',
-      unit: 'TB',
-      answer: 158,
-      within: 1.15,
-      explain: '864 million x 365 = 315 billion posts. 315,000,000,000 x 500 B = about 158 TB per year. Ten years is about 1.6 PB.',
-    },
-    {
-      prompt: 'How many index writes does the viral post cause under the milestone rule?',
-      unit: 'writes',
-      answer: 20,
-      within: 1.1,
-      explain: 'Milestones are 2^0, 2^1, up to 2^19 = 524,288. The next one, 2^20 = 1,048,576, is above 1,000,000. That is 20 writes, not 1,000,000.',
-    },
-  ]}
-/>
 
 ## Trade-offs
 
@@ -195,15 +129,26 @@ A search for "new york" as an exact phrase needs word positions in the posting l
       explain: 'A fan-out of 10,000 multiplies work, and the response waits for the slowest shard. Splitting by time slice lets a recency search stop after the newest slices.',
     },
     {
-      q: 'The pipeline takes 11 s from post to indexed. The freshness requirement is one minute. What is the longest result-cache TTL that still meets it, ignoring other delays?',
+      q: 'A new post must be searchable within a minute. How does the result-cache TTL affect that freshness goal?',
       options: [
-        '60 seconds, because the cache is separate from the pipeline',
-        '49 seconds, because the pipeline delay and the TTL add up',
-        '11 seconds, because the TTL must match the pipeline delay',
-        'There is no limit, because the cache stores only popular queries',
+        'It does not, because the cache is separate from the indexing pipeline',
+        'It adds to the delay, so the TTL plus the pipeline lag must fit the budget',
+        'It replaces the delay, because cached results are always the freshest',
+        'It only matters for posts with many likes, since only those are cached',
       ],
       answer: 1,
-      explain: 'A cached answer can be as old as the TTL, and the post may also have taken 11 s to be indexed. Worst case is 11 + TTL, which must be at most 60, so the TTL is at most 49 s. A shorter TTL gives a safety margin.',
+      explain: 'A cached answer can be as old as its TTL. The post may also have spent time in the pipeline before it was indexed. Both delays stack, so a short TTL leaves a safety margin. The cache is in the read path, so it cannot be ignored.',
+    },
+    {
+      q: 'A viral post gets a million likes. How does the milestone rule change the index write load for that post?',
+      options: [
+        'It sends one index write for every like, as before',
+        'It stops all index writes for the post until the likes slow down',
+        'It sends one index write for every thousand likes',
+        'It sends a few writes in total, as the count passes each power of 2',
+      ],
+      answer: 3,
+      explain: 'The index is updated only when the count passes a power of 2. The number of writes grows with the log of the likes, not the likes. Per-like writes are the naive design. A fixed batch size still grows with the likes.',
     },
   ]}
 />

@@ -5,21 +5,14 @@ requires: ['04-data/storage-engines', '07-reliability/observability']
 
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import TsGorilla from '../../../components/anim/lessons/TsGorilla.tsx';
 import TsCardinality from '../../../components/anim/lessons/TsCardinality.tsx';
 
 ## The problem
 
-Lesson [7.5](/learn/07-reliability/observability/) said to measure everything. Do the arithmetic on "everything".
+Lesson [7.5](/learn/07-reliability/observability/) said to measure everything. Think about what "everything" costs.
 
-A company runs 20,000 servers. Each exposes 50 metrics. A small program called a collector reads each metric every 10 seconds. This read is called a **scrape**.
-
-- Series: 20,000 × 50 = **1,000,000**.
-- Samples per second: 1,000,000 / 10 = **100,000**.
-- Samples per day: 100,000 × 86,400 = **8.64 billion**.
-
-Each sample is a 64-bit timestamp and a 64-bit value: 16 bytes. That is 8.64 billion × 16 B = **~138 GB per day**. Nobody wants to store that, or to scan it.
+A company runs thousands of servers. Each exposes dozens of metrics. A small program called a collector reads each metric every few seconds. This read is called a **scrape**. Every metric on every server is its own stream of values over time. That is a million streams, and each one gets a new sample every few seconds. Stored as plain 16-byte samples, this adds up to hundreds of gigabytes per day. Nobody wants to store that, or to scan it.
 
 The workload has an unusual shape.
 
@@ -45,7 +38,7 @@ One metric name plus one exact set of tags is one **series**. Change one tag val
 Make a table `(metric, tags, ts, value)` with a B-tree index on `(metric, tags, ts)`. Lesson [4.3](/learn/04-data/indexing/) showed how that index works. It fits the read pattern. It fails on cost.
 
 - **Space.** 16 bytes of data for every sample, plus a row header and index entries.
-- **Write path.** 1 million series interleave. New samples land in a million places in the index. Each insert is a random page write (lesson [4.2](/learn/04-data/storage-engines/)).
+- **Write path.** Millions of series interleave. New samples land in millions of places in the index. Each insert is a random page write (lesson [4.2](/learn/04-data/storage-engines/)).
 - **Deletes.** Dropping data older than 15 days means deleting billions of rows one by one. Then the database must reclaim the space.
 
 A log-structured design (lesson 4.2) fixes the write path. We still pay 16 bytes per sample. We still delete row by row. We need to use what we know about the data.
@@ -80,7 +73,7 @@ Step through the paper's own example. Three samples go in. A block comes out.
 
 <TsGorilla client:visible />
 
-The total is 167 bits for 3 samples, from 384. That is only 2.3 times, because a tiny block pays for its header and its first raw value. A long block pays them once. The paper's production average is **1.37 bytes per point**. Against 16 bytes raw, that is a 12-fold reduction (16 / 1.37 = 11.7).
+A tiny block saves little, because it pays for its header and its first raw value. A long block pays them once. The paper's production average is about **1.4 bytes per point**, against 16 bytes raw. That is roughly a tenfold saving.
 
 The cost of this trick: **decoding is sequential**. To read point 500 of a block you decode points 1 to 499. That is why blocks are short.
 
@@ -97,7 +90,7 @@ Gorilla itself uses the same two-hour block. Gorilla keeps 26 hours in memory as
 
 ### Downsampling
 
-A graph of 90 days with one point every 10 seconds has 90 × 8,640 = 777,600 points per series. A screen shows about a thousand. Old data rarely needs full detail.
+A graph of 90 days with one point every 10 seconds has nearly a million points per series. A screen shows about a thousand. Old data rarely needs full detail.
 
 **Downsampling** (also called a **rollup**) replaces old raw samples with fewer points. For example, keep one point per 5 minutes. That point holds the count, sum, min, and max of the raw points in that window. Then you can still compute an average or a maximum. A plain average alone hides spikes.
 
@@ -111,22 +104,16 @@ The Prometheus naming guide warns: do not use labels for values with high cardin
 
 <TsCardinality client:visible />
 
-With one million user IDs the same 50 series become 50 million. That is 288 billion samples per day. At 1.5 bytes each it is about 432 GB per day. The tag that "made per-user graphs possible" costs more than the whole rest of the system. Put per-user data in logs or events, not in tags.
+With a million user IDs the same 50 series become tens of millions. The storage bill explodes. The tag that "made per-user graphs possible" costs more than the whole rest of the system. Put per-user data in logs or events, not in tags.
 
 ## Numbers
 
 | Fact | Value | Source |
 |---|---|---|
 | Raw sample | 16 bytes (64-bit time + 64-bit value) | Gorilla paper |
-| Gorilla average | 1.37 bytes per point, 12× smaller | Gorilla paper |
-| Gorilla scale, spring 2015 | over 2 billion series, about 12 million points per second | Gorilla paper (a company claim) |
-| Prometheus average | 1 to 2 bytes per sample | Prometheus docs |
+| Gorilla average | about 1.4 bytes per point, about 12 times smaller | Gorilla paper |
 | Prometheus head block | 2 hours, WAL in 128 MB segments | Prometheus docs |
 | Prometheus default retention | 15 days | Prometheus docs |
-| 100,000 samples/s for 15 days at 1.5 B | 194 GB | Derived: 100,000 × 1,296,000 s × 1.5 |
-| The same at 16 B raw | 2.07 TB | Derived |
-
-The Prometheus docs give the capacity formula: disk = retention seconds × samples per second × bytes per sample.
 
 ## Trade-offs
 
@@ -169,10 +156,10 @@ A float64 has 64 bits of detail, and a **gauge** (a metric that goes up and down
       explain: 'The XOR is all zeros, so Gorilla writes a single "0" bit. A changed value costs control bits plus its meaningful bits. 14 bits is the cost of 24.0 after 12.0 in the example.',
     },
     {
-      q: 'A team adds a `customer_id` tag to a request counter. There are 200,000 customers, 20 endpoints, and 5 hosts. About how many series does that counter make?',
-      options: ['About 225 series, the sum of the three counts', 'About 200,000 series, one per customer', 'About 20 million series, the product of the counts', 'About 1,000 series, the number of hosts times endpoints'],
+      q: 'A team adds a `customer_id` tag, with 200,000 different values, to a request counter that already has host and endpoint tags. What happens?',
+      options: ['Series grow a little, as the new tag values are added to the old ones', 'Nothing changes, because tags are stored apart from the samples', 'Series multiply, because every tag combination is a new series', 'Only the customers with traffic add a series, so the cost stays flat'],
       answer: 2,
-      explain: 'Each unique combination of tag values is a series: 200,000 × 20 × 5 = 20,000,000. Series multiply, they do not add.',
+      explain: 'Each unique combination of tag values is its own series, so tag counts multiply. One high-cardinality tag can multiply the cost many times. Series do not add, and tags are not free.',
     },
     {
       q: 'Why do Prometheus-style stores delete old data by dropping 2-hour blocks, not rows?',
@@ -185,34 +172,11 @@ A float64 has 64 bits of detail, and a **gauge** (a metric that goes up and down
       answer: 3,
       explain: 'A block holds a fixed time window. When the whole window is older than retention, the file goes away at once. A row-by-row delete would have to rewrite compressed chunks and rebuild the index.',
     },
-  ]}
-/>
-
-<Ballpark
-  client:visible
-  title="Sizing a metrics store"
-  scenario="A fleet has 5,000 hosts. Each host exposes 200 series. A collector scrapes every 10 seconds. A time series database stores each sample in about 1.5 bytes."
-  steps={[
     {
-      prompt: 'How many series does the fleet have?',
-      unit: 'series',
-      answer: 1000000,
-      within: 1.1,
-      explain: '5,000 × 200 = 1,000,000 series.',
-    },
-    {
-      prompt: 'How many samples arrive per second?',
-      unit: 'samples/s',
-      answer: 100000,
-      within: 1.1,
-      explain: 'Each series gives one sample per 10 s, so 1,000,000 / 10 = 100,000 samples per second.',
-    },
-    {
-      prompt: 'How many GB per day does it take to store them at 1.5 bytes each?',
-      unit: 'GB/day',
-      answer: 13,
-      within: 1.3,
-      explain: '100,000 × 86,400 = 8.64 billion samples per day. At 1.5 bytes that is 12.96 GB, about 13 GB. Raw at 16 bytes it would be about 138 GB.',
+      q: 'A fleet has thousands of hosts, and each host exposes hundreds of metrics that are scraped every few seconds. What is the main storage problem for a plain SQL table?',
+      options: ['Each query needs a join across all the hosts', 'Samples arrive in a never-ending flood from millions of series, and each costs a full row', 'Hosts write the same row at once, so locks block the table', 'Metric values are too large to fit in a column'],
+      answer: 1,
+      explain: 'The write rate and the per-sample cost are the problem. A time series store packs each series down to a byte or two per sample. Joins and locks are not the issue, because samples are append-only.',
     },
   ]}
 />
