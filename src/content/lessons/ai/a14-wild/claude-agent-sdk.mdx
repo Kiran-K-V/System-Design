@@ -1,0 +1,305 @@
+---
+summary: 'Anthropic''s Claude Agent SDK post describes one loop (gather context, take action, verify work, repeat) and the tools for each stage. It is a design guide, not an internal design, and it publishes no numbers, so the depth here goes to what the loop implies: verification is the reward, and tool-result size sets the context budget.'
+requires: ['ai/a6-agents/agent-loop', 'ai/a6-agents/long-running-context']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai14SdkLoop from '../../../../components/anim/lessons/Ai14SdkLoop.tsx';
+import Ai14SdkVerifySim from '../../../../components/anim/lessons/Ai14SdkVerifySim.tsx';
+
+The primary source is one article: [Building agents with the Claude Agent SDK](https://claude.com/resources/articles/building-agents-with-the-claude-agent-sdk), written by Thariq Shihipar, dated September 29, 2025 (confirmed in the page metadata). It sits under "Best practices" in Claude Resources. The older `claude.com/blog/` link redirects to it. Anthropic describes the Claude Agent SDK as "a collection of tools that helps developers build powerful agents on top of Claude Code". The lesson on the [coding agent](/learn/ai/a13-cases/coding-agent/) already quotes two lines from this post. This lesson reads the whole post and does not repeat those quotes.
+
+Every item below is labelled. **Company claim** means the post says it. **Our reading** means we infer it. This source is thin on facts, so read the labels.
+
+## What they built and why it was hard
+
+**Company claim.** Anthropic built Claude Code to help its own developers write code. Then the team found that "Claude Code has become far more than a coding tool". They use it "for deep research, video creation, and note-taking", and "it has begun to power almost all of our major agent loops". So they renamed the Claude Code SDK to the Claude Agent SDK. The idea behind it, in the post's words: "The key design principle behind the Claude Agent SDK is to give your agents a computer, allowing them to work like humans do." A computer here means a terminal, files, and tools to search, edit, and run them.
+
+**Our reading.** What is hard about this? In code, the world answers back. A compiler complains and a test fails. A finance or email agent has no compiler. It must find its own context, pick from many tools, and decide for itself whether the work is right. The post's loop is an answer to those three problems, one stage each.
+
+**What kind of source is this?** It matters, so I say it plainly. The post is a design philosophy with practical advice. It is not a description of how Claude Code works inside. Look at the verbs. The email agent that carries the whole post is imagined: "we might define", "we might give it", "our email agent might have". The post gives no code for the loop, no prompt, no limit values, and no measured result from a real deployment. It does not say how many turns a typical run takes or how a subagent is scheduled. For mechanics, read the SDK docs (lesson [A6.1](/learn/ai/a6-agents/agent-loop/) used them for turn limits and budgets).
+
+So the question here is not "how is it built?" It is "what does the advice assume, and what does it cost to follow?" "Our reading" answers it.
+
+## The before
+
+**Company claim.** The post names the design it moves away from in one sentence: "When developing an agent, you want to give it more than just a prompt: it needs to be able to fetch and update its own context." A prompt is a fixed block of text. Everything the model knows must be put into it before the call.
+
+**Our reading.** The implied before is a one-shot pipeline: gather everything first, call the model once, return the answer. It has two weak points, and the post's loop targets both.
+
+The first is context. Load everything up front and you overfill the window, or you guess what the model will need. The post's fix: let the model fetch what it needs, when it needs it.
+
+The second is success. A one-shot pipeline has no step that asks "did that work?" Picture a task of 5 steps in a row, where each step is right 90% of the time. The chance that all five are right is 0.9 to the power 5, which is 0.59049, about 59% (lesson [A0.3](/learn/ai/a0-orientation/probabilistic-components/) built this rule). So 41 runs in 100 end wrong, and nobody is told. The 90% is an illustration, not a figure from the post. With no check, every step's error passes straight to the answer. The simulator later in this lesson starts from this case.
+
+## The design
+
+### The loop
+
+**Company claim.** "In Claude Code, Claude often operates in a specific feedback loop: gather context -> take action -> verify work -> repeat." The post says this gives a useful way to think about other agents and the capabilities they need.
+
+Lesson [A6.1](/learn/ai/a6-agents/agent-loop/) gave the code shape: model call, tool run, append the result. The post sorts what happens inside. Each turn is mostly one of three jobs: fetch information, change something, or check something. The next three sections take the stages in order.
+
+### Gather context
+
+**Agentic search** [mid] means the model searches by calling tools, such as `grep` (find lines in files that match a pattern) and `tail` (show the last lines of a file). It loads only what the search returns. A person debugging in a terminal works the same way.
+
+**Company claim.** "When Claude encounters large files, like logs or user-uploaded files, it will decide which way to load these into its context by using bash scripts like grep and tail. In essence, the folder and file structure of an agent becomes a form of context engineering." The post's email agent keeps old conversations in a folder called "Conversations" so it can search them.
+
+**Context engineering** [mid] is the work of choosing what goes into the model's window and when. The claim is that your folder layout is part of that work: name files so a search finds them, and split large data so one read does not flood the window. Lesson [A6.9](/learn/ai/a6-agents/long-running-context/) calls this just-in-time retrieval.
+
+**Semantic search** [mid] is the other way. You cut documents into chunks, turn each chunk into a vector (a list of numbers that stands for its meaning), and search by similarity (lessons [A5.1](/learn/ai/a5-rag/embedding-models/) and [A5.4](/learn/ai/a5-rag/chunking-contextual/)). **Company claim.** The post says it is usually faster than agentic search, but less accurate, harder to maintain, and less transparent. It advises you to start with agentic search and add semantic search only if you need speed or more variety in queries. The [coding agent lesson](/learn/ai/a13-cases/coding-agent/) quotes the full sentence. The post gives no speed or accuracy figure for either method.
+
+**Subagents.** **Company claim.** The SDK "supports subagents by default". The post gives two reasons. First, parallelism: "you can spin up multiple subagents to work on different tasks simultaneously". Second, context: subagents "use their own isolated context windows, and only send relevant information back to the orchestrator, rather than their full context". The **orchestrator** [mid] is the main agent that hands out the work. The email example: the agent starts several search subagents at once, each running a different query over the email history, and each returns "only the relevant excerpts rather than full email threads". Lesson [A6.10](/learn/ai/a6-agents/subagents/) teaches the mechanism, the brief, and the token cost. The post does not state that cost.
+
+**Compaction.** **Company claim.** "The Claude Agent SDK's compact feature automatically summarizes previous messages when the context limit approaches, so your agent won't run out of context." The post says it is "built on Claude Code's compact slash command". Lesson [A4.4](/learn/ai/a4-context/compaction/) teaches compaction and its two costs: a lossy summary and an extra model call. The post gives no trigger size.
+
+### Take action
+
+**Company claim.** "Tools are the primary building blocks of execution for your agent." The post adds that tools "are prominent in Claude's context window, making them the primary actions Claude will consider when deciding how to complete a task". So it says to design tools "to maximize context efficiency". Its examples for the email agent are `fetchInbox` and `searchEmails`, the agent's "primary, most frequent actions". Lesson [A6.5](/learn/ai/a6-agents/tool-design/) covers tool design.
+
+Three more ways to act:
+
+- **Bash and scripts.** Bash is "a general-purpose tool" for flexible work. The agent could download a PDF attachment, convert it to text, and search the text.
+- **Code generation.** "Code is precise, composable, and infinitely reusable." The post says file creation in Claude.ai "relies entirely on code generation": Claude writes Python scripts that build Excel, PowerPoint, and Word files. Running model-written code needs a safe box, which the post does not discuss (lesson [A7.4](/learn/ai/a7-agents-prod/sandboxes-code-execution/)).
+- **MCP.** The Model Context Protocol "provides standardized integrations to external services, handling authentication and API calls automatically". The examples are Slack, GitHub, Google Drive, and Asana (lesson [A6.6](/learn/ai/a6-agents/mcp/)).
+
+### Verify work
+
+**Company claim.** "Agents that can check and improve their own output are fundamentally more reliable—they catch mistakes before they compound, self-correct when they drift, and get better as they iterate." The post gives no measurement behind "fundamentally". It then names three approaches.
+
+**Rules.** The post calls clear rules the best form of feedback, and says to explain which rule failed and why. **Linting** [junior] is a program that checks code against style and error rules. The post says "it is usually better to generate TypeScript and lint it than it is to generate pure JavaScript because it provides you with multiple additional layers of feedback". For the email agent it suggests two rules: throw an error if the address is invalid, and throw a warning if the user has sent mail to that address before. **Our reading:** note the two levels. An error should stop the send. A warning tells the model something to weigh.
+
+**Visual feedback.** For visual tasks such as UI or HTML email, screenshot the result and give the image back to the model to check layout, styling, content hierarchy, and responsiveness. **Playwright** [junior] is a tool that drives a real browser from code, so an agent can open a page, resize it, and take screenshots. The post says a Playwright MCP server can automate this. It adds its own caution: "a single screenshot has limited viewport info".
+
+**LLM as judge.** Another model grades the output "based on fuzzy rules". **Company claim**, exact words: "This is generally not a very robust method, and can have heavy latency tradeoffs, but for applications where any boost in performance is worth the cost, it can be helpful." The example is a subagent that judges whether a draft's tone fits the user's past messages. The post gives no accuracy or latency number. Lesson [A8.4](/learn/ai/a8-evals/judges/) teaches how to measure whether a judge can be trusted.
+
+**Our reading:** each of the three brings a signal from outside the model's own answer. Rules are code. A screenshot shows what the output really looks like. A judge is the weakest, because it is another model call and shares some of the first model's blind spots. Lesson [A6.4](/learn/ai/a6-agents/loop-patterns/) gives the same order: code checks first, a model as judge last.
+
+### The whole loop, stage by stage
+
+Each step opens one stage and one tool. The caption says which parts are claims and which are our reading.
+
+<Ai14SdkLoop client:visible />
+
+## The numbers
+
+**Company claim, and what it contains.** The post has no latency, cost, token, pass-rate, or accuracy figure. I read the whole page and found none. The only quantity about the loop is "almost all of our major agent loops", which is a statement about adoption, not a measurement.
+
+| Statement in the post | Is there a number? | Label |
+|---|---|---|
+| "begun to power almost all of our major agent loops" | No: a share with no count | Company claim |
+| Semantic search "usually faster" than agentic search | No speed figure | Company claim |
+| LLM judge "can have heavy latency tradeoffs" | No latency figure | Company claim |
+| Agents that verify are "fundamentally more reliable" | No pass rate | Company claim |
+| Compaction runs "when the context limit approaches" | No trigger size | Company claim |
+
+What is **not published** at all: time per turn or per tool call, tokens or dollars per run, turns per run, size of a typical tool result, the compaction trigger, the number and cost of subagents, how often a verify step catches an error, how often a judge agrees with a person, and any before and after comparison of an agent with and without a verify stage.
+
+Be careful with numbers from other pages. Anthropic's multi-agent research write-up reports about 4 times the tokens of chat for agents and about 15 times for multi-agent systems (quoted in lessons [A6.1](/learn/ai/a6-agents/agent-loop/) and [A6.10](/learn/ai/a6-agents/subagents/)). That is a different post on a different system, so it is not evidence for this one. The numbers below are ours, and each is marked illustrative.
+
+## Our reading
+
+The post gives no figures, so the useful work is to ask what the loop implies. Three things follow, each with a worked number.
+
+### Verification is the reward
+
+In lesson [A13.6](/learn/ai/a13-cases/coding-agent/) a test run was called the reward: the signal that lets a loop end well. The post makes the same point for every agent. The loop can only be as good as the signal in its third stage.
+
+Here is the model. A task needs n steps in a row. Each attempt at a step is right with chance p. After each attempt a check runs. It flags a wrong attempt with chance d (the catch rate). It flags a right attempt by mistake with chance f (the false-alarm rate). A flagged attempt is retried, up to R retries. An unflagged attempt is accepted, right or wrong. Call q the chance that an attempt is flagged:
+
+<Math block tex="q = p\,f + (1-p)\,d" />
+
+A step then ends in one of three ways. It is accepted and right with chance <Math tex="p(1-f)\,(1+q+\dots+q^{R})" />. It is accepted and wrong with chance <Math tex="(1-p)(1-d)\,(1+q+\dots+q^{R})" />. Or it is still flagged after the last retry, with chance <Math tex="q^{R+1}" />. In that third case the run stops and says it failed. I call that a **loud failure**. The second case is a **silent failure** [mid]: the agent says "done" and is wrong. Silent failures are the dangerous ones, because nobody looks.
+
+Work one case, with illustrative values. Take n = 5, p = 0.9, R = 2.
+
+- **No verify step.** 0.9 to the power 5 is 59.0% correct. The other 41.0% are silent failures.
+- **A rules check** (illustrative: catches 95% of wrong attempts, falsely flags 2% of right ones). Then q = 0.9 x 0.02 + 0.1 x 0.95 = 0.113. One step ends right with chance 0.882 x (1 + 0.113 + 0.0128) = 99.3%. Over 5 steps that is 99.3% to the power 5, about **96.5% correct**, 2.8% silent, 0.7% loud.
+- **An LLM judge** (illustrative: catches 60%, falsely flags 15%). Then q = 0.195, one step ends right 94.3% of the time, and the task is about **74.7% correct**, **21.7% silent**, 3.7% loud.
+
+Two things to notice. First, the judge still beats no check at all (74.7% against 59.0%). That fits the post: "any boost in performance". Second, most of what the weak check leaves behind is silent. A weak verifier does not only lower the pass rate. It lets wrong answers pass as done.
+
+Also check retries. With R = 0 the rules check gives 53.4% correct, which is less than no check. A check with no retry only turns silent failures into loud ones, and false alarms stop good runs. The pass rate rises only when a flag leads to another attempt. Lesson [A6.4](/learn/ai/a6-agents/loop-patterns/) has a one-step version of this slider. Here the check runs after every step of a chain, which is closer to the post's picture.
+
+Try it. Each assumption is a slider. The three presets are made-up values. The post does not say how often rules, screenshots, or judges catch errors.
+
+<Ai14SdkVerifySim client:visible />
+
+The cost side. In this model the rules check costs 5% of an attempt and the judge costs a full attempt. With n = 5 and R = 2, a run costs about 5.9 attempt-units with rules and 12.2 with the judge, against 5 with no check. That is 1.18 times and 2.4 times. The post says the judge has "heavy latency tradeoffs" and gives no number, so the 2.4 is only our model of the direction. Measure the check's real time before you choose it.
+
+### Tool-result size sets the context budget
+
+**Company claim:** tools sit "prominent" in the window, so design them for context efficiency. **Our reading:** the number that matters most is the size of a tool result, because every later call re-reads it (lesson [A6.1](/learn/ai/a6-agents/agent-loop/)).
+
+Use illustrative values. The history starts at 3,000 tokens. Each call adds a tool result of r tokens plus 300 tokens of the model's own text. Over 20 calls, the input tokens sent are 20 x 3,000 + (r + 300) x (0 + 1 + ... + 19), and the sum is 190.
+
+| Tool result size r | Tokens added per call | Input tokens over 20 calls | Calls until a 200,000-token window is full |
+|---|---|---|---|
+| 4,000 (whole files) | 4,300 | 877,000 | 46 |
+| 800 (grep lines) | 1,100 | 269,000 | 180 |
+
+The 200,000 window is a round number we chose; real windows depend on the model. The same task re-reads 3.3 times fewer tokens with 800-token results. That fits the post putting grep and tail before any index and asking for context-efficient tools. It does not say how large its own tool results are.
+
+### Context budget per turn
+
+**Company claim:** subagents return only what is relevant, and compaction runs near the limit. **Our reading:** these are two levers on one budget. Subagents lower how fast the history grows. Compaction resets it when it gets full.
+
+Take the 4,000-token row. A search that needs 10 calls in the main window adds 10 x 4,300 = 43,000 tokens to the history. As a subagent, the parent adds a brief of 500 tokens and gets a summary of 1,500 tokens back (both illustrative): 2,000 tokens. The parent window grows 21.5 times less. The cost is more total tokens across all windows, as lesson [A6.10](/learn/ai/a6-agents/subagents/) shows. So the budget per turn is a design choice with three parts: how big each result is, how much of the work moves to a subagent, and when compaction fires.
+
+### Where each part is taught
+
+| Part of the post | Label | Lesson that teaches the general idea |
+|---|---|---|
+| Gather, act, verify loop | Company claim | [A6.1 The Agent Loop](/learn/ai/a6-agents/agent-loop/) |
+| Agentic search, files as context | Company claim | [A6.9 Context Management for Long-running Agents](/learn/ai/a6-agents/long-running-context/), [A13.6 Coding Agent](/learn/ai/a13-cases/coding-agent/) |
+| Semantic search | Company claim | [A5.4 Chunking and Contextual Retrieval](/learn/ai/a5-rag/chunking-contextual/) |
+| Subagents | Company claim | [A6.10 Subagents](/learn/ai/a6-agents/subagents/) |
+| Compaction | Company claim | [A4.4 Compaction](/learn/ai/a4-context/compaction/) |
+| Tools, MCP | Company claim | [A6.5 Tool Design](/learn/ai/a6-agents/tool-design/), [A6.6 MCP](/learn/ai/a6-agents/mcp/) |
+| Verify with rules, screenshots | Company claim | [A6.4 Loop Patterns](/learn/ai/a6-agents/loop-patterns/) |
+| LLM as judge | Company claim | [A8.4 Code Checks and LLM Judges](/learn/ai/a8-evals/judges/) |
+| Verification as the reward, token budget per turn | Our reading | [A6.1](/learn/ai/a6-agents/agent-loop/), [A6.9](/learn/ai/a6-agents/long-running-context/) |
+
+### What we would test before copying
+
+1. **Catch rate of your own check.** Collect 50 outputs you know are wrong. Run the check. The share it flags is your d. Collect 50 right outputs and measure f. The post gives you neither.
+2. **Tool-result size.** Log tokens per tool result in real runs. Look at the 90th percentile, not the mean.
+3. **Pass^k with and without verify.** Run each task several times in both setups (lesson [A6.1](/learn/ai/a6-agents/agent-loop/)). Count silent failures separately from loud ones.
+4. **Judge against people.** If you use a judge, measure its agreement with human labels before you trust it (lesson [A8.4](/learn/ai/a8-evals/judges/)).
+
+## What to copy and what not to
+
+The post says nothing about safety. It tells you to give an agent bash and a file system, and it never mentions a sandbox, permissions, or approval. That is a gap in the post, not a design choice we can read from it. Lessons [A7.4](/learn/ai/a7-agents-prod/sandboxes-code-execution/) and [A10.4](/learn/ai/a10-safety/tool-permissions/) cover the missing part.
+
+| Idea | Fits when | Does not fit when |
+|---|---|---|
+| Start with grep, not an index | Data is files you can search; content changes often | You need fast answers over a huge fixed corpus, or meaning-based matches |
+| Subagents for wide searches | The work splits into independent pieces and most results are noise | Pieces depend on each other, or the total token cost matters more than the window |
+| Compaction near the limit | Runs are long and history cannot be dropped | Runs are short; or a lost detail is costly (keep notes in files) |
+| Rules first in verify | You can write the check as code | The output is subjective: tone, taste |
+| Visual check | The output is something people look at | One screenshot hides the problem (mobile widths, interaction) |
+| LLM judge | Nothing else exists and a gain is worth the cost | You need a reliable gate; use it as a hint, and measure it |
+| "Give the agent a computer" | The agent runs in a sandbox with narrow rights | The agent touches real accounts with no limits |
+
+## Interview lens
+
+<Callout type="tip">
+Say it as a loop with a signal: "I think of an agent as gather, act, verify. For gather I start with file search like grep and add an index only if I need it. I use subagents for wide searches, so the main window stays small, and I compact near the limit. For verify I put rules first, then a render or screenshot, and an LLM judge last, because it is the least robust. I measure the check's catch rate. With no check, five steps at 90% give 59%. With a good check and retries, a lot more." This shows the loop, the order of verify, and a number you can derive.
+</Callout>
+
+<Callout type="mistake">
+Do not present this post as a description of how Claude Code is built, or quote numbers from it. It has none. Do not say "add an LLM judge and quality is fixed". The post itself calls that approach "not very robust", and a weak check lets wrong answers pass as done. Also do not skip the retry: a check with no second attempt only changes how the run fails.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An agent task needs 5 steps in a row. Each step is right 90% of the time, steps are independent, and nothing checks the work. About how often does the task end correct?',
+      options: [
+        'About 90%, because each single step is right 90% of the time',
+        'About 59%, because 0.9 multiplied by itself 5 times is 0.59',
+        'About 50%, because errors cancel out over several steps',
+        'About 41%, because 0.9 is lost once for every step in the run',
+      ],
+      answer: 1,
+      explain: 'All five steps must be right, so the chances multiply: 0.9 to the power 5 is 0.59049. The 41% is the share that fails, not the share that passes. Errors do not cancel out; each step multiplies the success rate by 0.9.',
+    },
+    {
+      q: 'Which of these is a company claim from the Agent SDK post, and not our own reading?',
+      options: [
+        'Compaction always fires once the context reaches 150,000 tokens',
+        'An LLM judge is the cheapest and most robust way to verify an agent',
+        'Subagents use isolated context windows and return only what matters',
+        'Agentic search beats semantic search on both speed and accuracy',
+      ],
+      answer: 2,
+      explain: 'The post says subagents use their own isolated context windows and return only relevant information. It gives no compaction trigger, calls a judge not very robust with heavy latency tradeoffs, and says semantic search is usually faster than agentic search.',
+    },
+    {
+      q: 'In the verify simulator, you set the catch rate to 0% and the false-alarm rate to 0%, and allow 3 retries. What happens to the 5-step task at 90% per step?',
+      options: [
+        'It reaches about 97% correct, because retries help on every single step',
+        'It reaches about 59% correct, but many more runs report a failure',
+        'It falls to about 30% correct, because every retry adds new errors',
+        'It stays near 59%, because the check never flags anything',
+      ],
+      answer: 3,
+      explain: 'Retries only run when the check flags an attempt. A check that never flags passes every attempt, right or wrong, so the run behaves as if there were no check. The result stays at 0.9 to the power 5, about 59%, with all failures silent.',
+    },
+    {
+      q: 'An agent makes 20 calls. The history starts at 3,000 tokens, and each call adds a tool result plus 300 tokens of model text. You cut the tool result from 4,000 tokens to 800. About how much less input does the whole run send?',
+      options: [
+        'About 3.3 times less, from 877,000 to 269,000 tokens',
+        'About 5 times less, because 4,000 divided by 800 is 5',
+        'About half, because the result is only part of each call',
+        'About the same, because only the last call is billed in full',
+      ],
+      answer: 0,
+      explain: 'Every call re-reads the whole history, so the input is 20 x 3,000 + (r + 300) x 190. For r = 4,000 that is 877,000. For r = 800 it is 269,000. The ratio is 3.3, not 5, because the 3,000-token start and the 300-token model text do not shrink.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai14-sdk-done-without-tests"
+  title="The agent said done and did not run the tests"
+  scenario="A coding agent is asked to fix a rounding bug in billing.py. It finishes with the message 'Done, the bug is fixed.' The next morning the nightly job fails on the same line. The repo has a test suite and a lint script. (Illustrative trace.)"
+  facts={[
+    'turn 1: grep -n "round(" billing.py            (found 3 matches)',
+    'turn 2: read billing.py lines 40-90',
+    'turn 3: edit billing.py line 61',
+    'turn 4: reply "Done, the bug is fixed." (no tool call)',
+    'tools available: grep, read, edit, run_tests, run_lint',
+    'run_tests calls in this run: 0',
+    'turns used: 4 of 30. No context limit was near.',
+  ]}
+  steps={[
+    {
+      prompt: 'Which stage of the loop was skipped?',
+      options: [
+        'Gather context, because it only grepped three matches',
+        'Take action, because one edit is not enough work',
+        'Verify work, because it never ran tests or lint',
+        'Compaction, because the history was never summarized',
+      ],
+      answer: 2,
+      explain: 'The trace shows gather (turns 1 and 2) and act (turn 3). Then the model ended the loop with no check. Tools to verify existed and were never called. Compaction was not needed: 4 turns of 30 and no limit near.',
+    },
+    {
+      prompt: 'What is the first fix?',
+      options: [
+        'Raise the turn limit so the agent has more room',
+        'Add an LLM judge that reads the diff and says if it looks right',
+        'Add an index so the agent finds more matches',
+        'Make the loop end only after run_tests passes, and feed back the failures',
+      ],
+      answer: 3,
+      explain: 'The post calls rules the best form of feedback, and a test run is a rule that can name what failed. The agent used 4 of 30 turns, so more turns do not help. A judge is the least robust option and adds latency. More search does not help: the gap is after the edit.',
+    },
+    {
+      prompt: 'How do you check that the fix works?',
+      options: [
+        'Run each task several times, and count wrong-but-done runs apart from stopped runs',
+        'Run one task once and see that it passes this time',
+        'Ask the model whether it feels more sure about its answers',
+        'Count how many more tokens each run uses than before',
+      ],
+      answer: 0,
+      explain: 'Runs vary, so one pass proves little (pass^k, lesson A6.1). The silent failure rate is the number this fix should cut. A model that says it is sure is the signal that failed. Token count is a cost, not a quality measure.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Anthropic: Building agents with the Claude Agent SDK](https://claude.com/resources/articles/building-agents-with-the-claude-agent-sdk) (September 29, 2025). The primary source. It has no numbers.
+- [Claude Agent SDK docs: how the agent loop works](https://code.claude.com/docs/en/agent-sdk/agent-loop). The mechanics the post leaves out: turns, budgets, and stop reasons.
+- [Anthropic: Writing effective tools for agents](https://www.anthropic.com/engineering/writing-tools-for-agents). The post links to it for tool design and context efficiency.
+- [Anthropic: Building effective agents](https://www.anthropic.com/engineering/building-effective-agents). The earlier guide the post says it follows.

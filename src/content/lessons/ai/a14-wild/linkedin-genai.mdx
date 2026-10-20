@@ -1,0 +1,301 @@
+---
+summary: 'LinkedIn''s 2024 post on its GenAI assistant is a list of costs: 80% of the target came in one month and the last stretch took four more, three groups of judges answer at three speeds, a tolerant YAML parser did what a retry could not, and 10 ms more per token cost 2 seconds. Read each claim, then do the sums.'
+requires: ['ai/a8-evals/eval-driven-design', 'ai/a3-llm-apis/structured-output']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai14LinkedinPipeline from '../../../../components/anim/lessons/Ai14LinkedinPipeline.tsx';
+import Ai14LinkedinParser from '../../../../components/anim/lessons/Ai14LinkedinParser.tsx';
+import Ai14LinkedinTiers from '../../../../components/anim/lessons/Ai14LinkedinTiers.tsx';
+import Ai14LinkedinLatency from '../../../../components/anim/lessons/Ai14LinkedinLatency.tsx';
+
+## What they built and why it was hard
+
+On 2024-04-25 the LinkedIn Engineering blog published "Musings on building a Generative AI product", by Juan Pablo Bottaro with Karthik R. ([the post](https://www.linkedin.com/blog/engineering/generative-ai/musings-on-building-a-generative-ai-product)). The post is more than two years old as of 2026-10-20, so models, prices, and tools have changed since. It names no model.
+
+**Company claim** (LinkedIn, 2024-04-25): "Over the last six months" the team built an assistant that turns every feed post and job posting into a starting point. A member can "get information faster", "connect the dots, e.g. assess your fit for a job posting", or "receive advice, e.g. improve your profile or prepare for an interview". Say you read a post about accessibility in design and tap a starter question. The system picks an AI agent for the question, calls internal APIs and Bing for facts, writes a reply, and attaches things like article links or profiles. A follow-up about careers goes to a different agent.
+
+This teardown reads one primary source. The post has no code, no model names, and few numbers. Every figure below is a **company claim**, not a measurement we made. Our arithmetic and opinion are marked **Our reading**. Made-up examples are marked illustrative.
+
+Five of the post's numbers carry this lesson: 80% of the target in one month and four more months to pass 95%; three groups of judges at three speeds; a parser that cut about 10% malformed outputs to about 0.01%; a 200-token reasoning step with 10 ms more per token adding 2 seconds; and small models for routing with a larger one for generation.
+
+### The 80/95 problem
+
+**Company claim:** "The team achieved 80% of the basic experience we were aiming to provide within the first month and then spent an additional four months attempting to surpass 95% completion of our full experience." The post adds that quality scores went up at first and then "quickly plateau[ed]", and that "the initial pace created a false sense of 'almost there,' which became discouraging as the rate of improvement slowed significantly for each subsequent 1% gain." For the generation step it says: "getting it 80% was fast, but that last 20% took most of our work", because the product expects "99%+ of your answers" to be great.
+
+Do the sums. The first stretch is 80 points in 1 month. The last is 15 points in 4 months. That is 4 times the time for under a fifth of the points. Per point, the first stretch took 1 / 80 = 0.0125 months and the last took 4 / 15 = 0.27 months, so each point cost about 21 times more. **Our reading:** treat 21x as a rough bound, not a measurement. The post says 80% of the "basic" experience and 95% of the "full" experience, so the two percentages are not on one scale. It says "attempting to surpass", so it does not say the 95% line was crossed. It does not say how completion is measured.
+
+Why does the last stretch cost so much? There are three reasons, and none needs a source to see.
+
+**First, the long tail.** Early failures are few in kind and large in size. Late failures are many in kind and small in size. Error analysis (lesson [Error Analysis](/learn/ai/a8-evals/error-analysis/)) is the habit of reading failed cases, naming each cause, and counting. Here is a tally. It is **illustrative**, made up to show the shape, for 1,000 test conversations of which 200 fail (an 80% pass rate). Fix the largest cause first. Assume each fix removes its whole cause, which is generous, and costs one equal sprint.
+
+| Fix | Failure type | Failures | Left | Pass rate | Gain |
+|---|---|---|---|---|---|
+| 1 | Picked the wrong agent or skill | 48 | 152 | 84.8% | 4.8 |
+| 2 | Retrieval missed the key fact | 40 | 112 | 88.8% | 4.0 |
+| 3 | Output format broken | 30 | 82 | 91.8% | 3.0 |
+| 4 | Wall of text, no structure | 22 | 60 | 94.0% | 2.2 |
+| 5 | Invented a company fact | 18 | 42 | 95.8% | 1.8 |
+| 6 | Harsh or flat tone | 12 | 30 | 97.0% | 1.2 |
+| 7 | Forgot an earlier turn | 9 | 21 | 97.9% | 0.9 |
+| 8 | Wrong language or locale | 6 | 15 | 98.5% | 0.6 |
+| 9 | Bad link in an attachment | 5 | 10 | 99.0% | 0.5 |
+| 10 | Stale data | 4 | 6 | 99.4% | 0.4 |
+| 11 | Six one-offs, six different causes | 6 | 0 | 100.0% | 0.6 |
+
+Five sprints take the score from 80% to 95.8%. The next four sprints add 3.2 points. Points per sprint fall from 4.8 to 0.4, a factor of 12, and the last six failures are six different causes. A cause that appears 4 times in 1,000 also gives few examples, so its fix is harder to find and to confirm.
+
+**Second, fixes interact.** The post says "our 'training' was mostly prompt engineering which was more of an art than a science", like "tweaking rules in expert systems". **Our reading:** a prompt is one shared text, so a rule added for one cause can shift behavior elsewhere. You need the whole test set to rerun after each edit.
+
+**Third, small gains need big samples.** At a 96% pass rate measured on 1,000 cases, the 95% range is about plus or minus 1.2 points (1.96 x the square root of 0.96 x 0.04 / 1,000). A gain of one point is inside the noise. To get the range down to plus or minus 0.5 points you need about 1.96<sup>2</sup> x 0.96 x 0.04 / 0.005<sup>2</sup> = 5,900 cases. The post says its annotators can grade up to 500 conversations a day. At that rate 5,900 cases is about 12 days of grading for one measurement. Late progress is slow in part because it is slow to see.
+
+## The before
+
+The post does not describe an earlier shipped LinkedIn product. **Our reading:** its "before" is a set of starting points the post names, and each one hit a limit.
+
+| Starting point | What went wrong (company claim) | What they did |
+|---|---|---|
+| Judge by eye | Without automatic evaluation, "engineers are left with eye-balling results and testing on a limited set of examples, and having a 1+ day delay to know metrics." Early on "everyone in the team chimed in (product, eng, design, etc.)". | A linguist team and tooling; model-based evaluators in progress |
+| Call raw internal APIs | The RPC APIs are "very convenient for humans" but "not very LLM friendly". | Wrap each API as a skill |
+| Retry on bad output | Detect, then re-prompt: it "adds a non-trivial amount of latency and also consumes precious GPU capacity". | A defensive parser |
+| Bound only time to first token | They "neglected that TBT would hurt us much more". A public ramp (a step that opens the product to more users) had tasks hitting timeouts. | More capacity, then bounds on both |
+| Many agents built by many people | Speed, but "fragmentation". Follow-ups could meet different models, prompts, or tools. | A small horizontal team for shared parts |
+
+Study the retry row. If 10% of calls need a retry, that is 10 extra model calls per 100 requests, and those 10 members wait for two calls instead of one. The post says "GPU clusters are not easy to come by and are costly".
+
+## The design
+
+### Three steps, and a model for each size of job
+
+**Company claim:** "Fixed 3-step pipeline" and "Small models for routing/retrieval, bigger models for generation". Step through it.
+
+<Ai14LinkedinPipeline client:visible />
+
+The post names the three steps. **Routing** "decides if the query is in scope or not, and which AI agent to forward it to". **Retrieval** is "recall-oriented": the agent "decides which services to call and how". **Generation** is "precision-oriented": it "sieves through the noisy data retrieved, filters it and produces the final response".
+
+Two words need a plain meaning. **Recall** is the share of the useful facts you managed to fetch. **Precision** is the share of what you used that was useful. Picture packing for a trip. Recall asks whether the passport is in the bag. Precision asks whether the bag holds only things you need. Retrieval should lean toward recall, because a fact you did not fetch cannot be used later. Generation should lean toward precision, because a fact in the answer that does not belong is a flaw the member sees.
+
+Why a small model for routing and retrieval? The post says tuning them "felt more natural given their classification nature: we built dev sets and fitted them with prompt engineering and in-house models". A dev set is a labeled list of examples you tune against (lesson [Golden Sets](/learn/ai/a8-evals/golden-sets/)). Routing picks one label from a short list, and retrieval picks which services to call. Both have a checkable right answer, so a small model can do them quickly and cheaply. Generation writes free text for a member, so it earns the larger model.
+
+Here is the size of the saving, as an **illustrative** sum. LinkedIn names no models or prices, so we use two public price points as stand-ins. On the [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing), as of 2026-10-20, Claude Haiku 5.5 costs $0.10 per million input tokens and $0.50 per million output tokens (prompts up to 100,000 tokens). Claude Sonnet 5.5 costs $2 and $10. A routing call that reads 1,500 tokens and writes 20 costs:
+
+- Haiku 5.5: (1,500 x $0.10 + 20 x $0.50) / 1,000,000 = $0.00016.
+- Sonnet 5.5: (1,500 x $2 + 20 x $10) / 1,000,000 = $0.0032.
+
+That is 20 times more for a decision a small model can make. The 20x comes from the stand-in prices, not from the post, which publishes no cost per request, model size, or latency per step.
+
+One more part: Embedding-Based Retrieval (EBR), "powered by an in-memory database", is "our 'poor man's fine-tuning' to inject response examples directly into our prompts". In plain words: store good example replies as vectors (lists of numbers that put similar meanings close together), find the ones nearest to the new question, and paste them into the prompt as examples. Lesson [Few-shot Examples](/learn/ai/a4-context/few-shot-examples/) covers the examples, and lesson [Embedding Models](/learn/ai/a5-rag/embedding-models/) covers the vectors. The post gives no index size or lookup time.
+
+### Many agents, one small team for the shared parts
+
+The team split the work into independent agents "developed by different people". **Company claim:** this bought speed and cost "fragmentation", because "subsequent interactions with an assistant might be managed by varied models, prompts, or tools". They answered with a small "horizontal" pod that owned the hosting service, the evaluation tooling, "global prompt templates" (identity, conversation history, jailbreak defense), and shared UI parts. Several "vertical" pods owned single agents such as job fit or interview tips. Their lesson: "Divide and conquer but limiting the number of agents". **Our reading:** this is the microservice trade. Splitting by owner speeds delivery, and the shared parts need an owner, or the product breaks into pieces that feel different. Lesson [Workflows vs Agents](/learn/ai/a6-agents/workflows-vs-agents/) asks when to use an agent at all.
+
+### Skills: wrap the API so a model can use it
+
+LinkedIn's data about people, companies, skills, and jobs is not in any model. So the pipeline calls internal APIs and puts the results in the prompt. Those APIs are RPC calls between microservices (an RPC, or remote procedure call, is a call from one service to a function in another). They are "very convenient for humans to invoke programmatically" but "not very LLM friendly". The post wraps each one in a **skill** with four parts: a description of what the API does and when to use it; the call configuration (endpoint, input schema, output schema); an LLM-friendly input and output schema, with "primitive typed (String/Boolean/Number) values" in "JSON schema style"; and the business logic that maps between that schema and the real one.
+
+A schema is a written description of the fields a call takes and the type of each. Here is an **illustrative** skill, not LinkedIn's:
+
+```yaml
+name: search_jobs
+description: Find job postings. Use when the member asks about open roles.
+input:
+  keywords: string   # example: design lead
+  location: string   # example: Berlin
+  remote: boolean
+maps_to: JobSearchRpc.find   # the glue code turns these fields into the real request
+```
+
+Why flatten the schema? A real RPC request may nest objects and use fields only the owning team understands. A model does better with a few plain fields and a sentence of advice. Lesson [Tool Design for Agents](/learn/ai/a6-agents/tool-design/) gives the same rules, and lesson [The Tool-calling Protocol](/learn/ai/a3-llm-apis/tool-calling-protocol/) shows the request and result round trip. The post says the model first picks a skill ("skill selection via planning") and then writes the parameters for it ("function call"). It says skills also wrap Bing search and news. **Our reading:** the "unified skill registry" the post lists as future work is close to what the open MCP protocol offers (lesson [MCP Servers and Clients](/learn/ai/a6-agents/mcp/)). The post does not mention MCP.
+
+The model must write the parameters in a fixed format so code can read them. The post chose YAML because it "is less verbose, and hence consumes fewer tokens than JSON". Count it yourself: a skill call with three parameters is 84 characters in YAML, 93 in compact JSON, and 123 in indented JSON. That counts characters, not tokens, so treat it as a direction. The post does not publish the token saving.
+
+### The defensive parser
+
+**Company claim:** "~90% of the time, the LLM responses contained the parameters in the right format, ~10% of the time the LLM would make mistakes", outputting data "invalid as per the schema supplied, or worse not even valid YAML". The mistakes were "trivial for a human to spot" but "caused the code parsing them to barf". The usual repair is to detect and re-prompt. They wrote "an in-house defensive YAML parser" instead: from "an analysis of various payloads" they found the common mistakes and "wrote code to detect and patch" them before parsing. They also put hints about common mistakes in the prompts "to improve the accuracy of our patching". Result: errors to "~0.01%".
+
+Is a drop from 10% to 0.01% believable? Do the sum. The ending rate is the malformed rate times the share the parser leaves broken:
+
+<Math block tex="\text{error after} = \text{malformed rate} \times \text{share left broken}" />
+
+To end at 0.01% from 10%, the share left broken must be 0.01 / 10 = 0.001. The parser must fix 999 of every 1,000 malformed outputs, which is 99.9%. **Our reading:** that sounds hard, and for wrong answers it would be. It is plausible here for one reason: the mistakes are mechanical. A model that wraps YAML in a code fence, leaves a colon unquoted, or cuts off the last line makes the same few errors again and again, and code can fix each one. The share left broken has two parts: mistakes of a kind nobody patched, and misses by the patches that exist. If the unseen kinds are 0.05% of mistakes and each patch repairs 99.95% of its kind (both assumed), the share left is about 0.1%, and 10% becomes 0.01%. The parser's score depends almost entirely on how short the tail of mistake kinds is. Try it, and watch what one unpatched kind does.
+
+<Ai14LinkedinParser client:visible />
+
+Two lessons from the sliders. Switch off the code-fence patch and the error jumps from 0.01% to about 3.2%, because that kind is a third of the mistakes. Raise the unseen share to 1% and the error is ten times worse, about 0.1%. Hints cut the malformed rate before the parser sees it, so every later number falls in proportion.
+
+Compare the retry route, assuming each retry fails independently. One retry takes 10% to 1% (0.1 x 0.1). Three retries reach 0.01% (0.1<sup>4</sup>), but they add 0.1 + 0.01 + 0.001 = 0.111 model calls per request, and one request in a thousand waits for three extra calls. The parser reaches the same rate with no extra call. Real retries do worse, because the same prompt tends to repeat the same mistake.
+
+Limits. The parser fixes shape, not meaning. A reply with valid YAML and the wrong city passes every patch. Lesson [Structured Output and Constrained Decoding](/learn/ai/a3-llm-apis/structured-output/) shows the other route, where the serving layer masks any token that would break the schema. The post does not say whether LinkedIn's serving stack offered that. It also does not say whether 0.01% counts all calls or only the schema-invalid ones.
+
+### Three tiers of evaluation, and the delay of each
+
+The post says evaluating answer quality was "more difficult than anticipated", in three parts: writing guidelines, scaling annotation, and automatic evaluation. Guidelines were hard because a job-fit answer must be "factual but also empathetic": "You are a terrible fit" is no help to a member changing careers. For annotation, an internal linguist team "built tooling and processes by which we could evaluate up to 500 daily conversations and get metrics around: overall quality score, hallucination rate, Responsible AI violation, coherence, style". The post does not define "Responsible AI violation". That score was "our main signpost" for trends and for being "ready to go live".
+
+The post's Figure 2 caption names three tiers: "Engineers perform fast, coarse evaluations to get directional metrics. Annotators give more granular feedback but have a ~1 day turnaround. Members are the final judges and give us scale, but some metrics can take 3+ days for a single change." Step through what that means for a team that changes a prompt.
+
+<Ai14LinkedinTiers client:visible />
+
+**Our reading**, mapped to the Evals module. The engineer tier is a golden set with code checks (lessons [Golden Sets](/learn/ai/a8-evals/golden-sets/) and [Code Checks and LLM Judges](/learn/ai/a8-evals/judges/)). The annotator tier is human labels, the ground truth that a model-based judge must be tested against. The member tier is the online test (lesson [Online Evals and A/B](/learn/ai/a8-evals/online-evals-ab/)). The three differ in cost, depth, and delay. The skill is to use the fast tier for most changes and the slow tiers for the changes that survive.
+
+Feedback delay is a cost of its own. In 10 working days you can wait for 10 annotator results or 3 member results (10 / 3, rounded down). If a team ships one change a day, 2 other changes are live before the first member result returns, and a metric move cannot be tied to one of them. The post says it is "building model-based evaluators to estimate the above metrics" for "much faster experimentation", with "some success on hallucination detection (but it wasn't easy!)". It publishes no accuracy for them.
+
+### Capacity and latency: the per-token bill
+
+Two words first. **Time to first token (TTFT)** is the wait from sending the request to seeing the first piece of the reply (lesson [Streaming Responses](/learn/ai/a3-llm-apis/streaming/)). **Time between tokens (TBT)** is the gap between one token and the next. Lesson [Prefill vs Decode](/learn/ai/a2-inference-cost/prefill-decode/) calls it time per output token. A model writes one token at a time, so a reply of N tokens takes about TTFT plus N x TBT.
+
+The two costs scale differently. A slowdown of 10 ms in TTFT adds 10 ms, once. A slowdown of 10 ms in TBT adds 10 ms for every token. **Company claim:** "we initially only bounded TTFT as that mapped to member latency directly... we neglected that TBT would hurt us much more, as any 'reasoning' token would multiple member latency (e.g. for a 200-token reasoning step, even a 10ms TBT increase means an extra 2s of latency)." A reasoning token is part of chain of thought, where the model writes its working before the answer (lesson [Reasoning Models and Thinking Budgets](/learn/ai/a4-context/reasoning-budgets/)). The member never sees those tokens, but waits for each one. The sum: 200 tokens x 10 ms = 2,000 ms = 2 s. The post says this made "one of our public ramps" sound "alerts left and right" about timeouts, and the team "quickly had to increase capacity".
+
+<Ai14LinkedinLatency client:visible />
+
+Why did TBT rise at all? **Company claim:** "when running large generative models, it's often the case that TimeToFirstToken (TTFT) & TimeBetweenTokens (TBT) increase with utilization. In the case of TBT it can sometimes be linear." It adds that "it's not uncommon to get 2x/3x the TokensPerSecond (TPS) if you are willing to sacrifice both of those metrics". Here is an **illustrative** trade, using lesson [Batching and Throughput](/learn/ai/a2-inference-cost/batching-throughput/). A GPU serves 8 streams at 25 ms per token: 8 / 0.025 = 320 tokens per second. Pack in 32 streams and each slows to 50 ms: 32 / 0.05 = 640 tokens per second, double the output. Each member waits twice as long per token, so a 200-token reasoning step goes from 5 s to 10 s. The numbers 8, 32, 25, and 50 are ours.
+
+Three more claims. **Cost:** early on the team "had to set timetables for when it was ok to test the product or not", because testing used so many tokens that it could "lock out developers from working". **Streaming:** "we actually stream within our pipeline end to end". The model output that picks the APIs "is progressively parsed" and API calls fire "as soon as parameters are ready". **Async:** the service is "fully async non-blocking", so no thread sits parked on a slow model call. The same idea is in lesson [Throughput vs Latency](/learn/backend/01-one-machine/throughput-vs-latency/).
+
+## The numbers
+
+Every figure below is a **company claim** from the same post, dated 2024-04-25, unless marked.
+
+| Figure | What it measures exactly | Label |
+|---|---|---|
+| Six months | How long the team had worked on the new assistant when the post was written | Company claim |
+| A few days | Time to get "the basic framework up and running" (routing, retrieval, generation) | Company claim |
+| 80% in month 1 | "80% of the basic experience we were aiming to provide" | Company claim |
+| 4 more months, 95% | Time spent "attempting to surpass 95% completion of our full experience" | Company claim |
+| 4x time, about 21x per point | Months for the last stretch against the first, and months per point | Derived from the two rows above; loose, because the scales differ |
+| Up to 500 per day | Conversations the annotators can grade a day | Company claim |
+| About 1 day, 3+ days | Turnaround of annotators; delay of some member metrics for one change | Company claim |
+| 1+ day | Delay to know metrics without automatic evaluation | Company claim |
+| About 90% and 10% | Share of LLM outputs with parameters in the right format, and with mistakes | Company claim |
+| About 0.01% | Share of those errors after the defensive parser | Company claim; the denominator is not stated |
+| 200 tokens, +10 ms, 2 s | A reasoning step, the TBT rise, and the extra latency | Company claim; the product is arithmetic |
+| 2x or 3x | Gain in tokens per second if TTFT and TBT are allowed to worsen | Company claim ("not uncommon") |
+| 20x cost of a Sonnet routing call over a Haiku one | Our stand-in sum, with prices as of 2026-10-20 | Our arithmetic, illustrative |
+
+**Not published:** model names and sizes; cost per request; TTFT and TBT values or bounds; member or request counts; how "80%" and "95%" are measured; quality and hallucination scores; the accuracy of the model-based evaluators; the parser's patch list and the share of each kind of mistake; and how traffic splits across agents.
+
+## Our reading
+
+What the post teaches, as a map to the track:
+
+- **The plateau is a planning fact.** A demo takes days and a product takes months. Plan from the second number, and set the bar first (lesson [Eval-Driven Design](/learn/ai/a8-evals/eval-driven-design/)) so you know when you are done.
+- **Cheap mistakes belong in code.** Fix mechanical format errors with a parser. Lesson [Structured Output](/learn/ai/a3-llm-apis/structured-output/) shows when the API can guarantee the shape instead.
+- **Feedback delay shapes habits.** With a 1-day or 3-day loop a team batches changes and cannot tell which one helped. Build the fast tier first.
+- **Per-token cost is a multiplier.** A bound on TTFT alone misses everything after the first token.
+
+What we would test before copying any of this:
+
+1. Your malformed rate, by kind, over a week of traffic. If one kind is 90% of your errors, a patch is cheap. If the tail is flat, it will not be.
+2. TBT under your real load, at the 95th percentile, with and without reasoning on.
+3. The points gained per fix over your last ten fixes. If it is falling like the tally, set a stopping rule.
+4. The agreement between your fast tier and your slow tier on the same 200 conversations. A fast tier that disagrees with the humans will mislead you quickly.
+
+The post is a company's own account. It reports what went wrong more openly than most, but we cannot check any number.
+
+## What to copy and what not to
+
+| Idea | Copy it when | Skip it when |
+|---|---|---|
+| Fixed 3-step pipeline | The flow is the same for most requests | The task needs open-ended planning |
+| Small model for routing and retrieval | The decision is a label or a service choice with a checkable answer | The routing itself needs deep reasoning |
+| Skills with flat, typed schemas | You expose many internal APIs to a model | One or two tools; a plain tool definition is enough |
+| Defensive parser | The mistakes are mechanical and few in kind | The API can enforce the schema, or the mistakes are about meaning |
+| Three evaluation tiers | Changes are frequent and the user signal is slow | A small product with few changes |
+| Bound TTFT and TBT both | You stream long or reasoning-heavy replies | Short, non-streamed replies |
+| End-to-end streaming | A later step can start from a partial result | Each step needs the complete output |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I would plan the schedule from the long tail, not the first demo. LinkedIn reports 80% in one month and four more months to pass 95%, and the cause is many small failure kinds and slow, noisy measurement. I use a fixed pipeline, a small model for routing and retrieval, and a larger one for generation. I wrap APIs as skills with flat schemas. I fix mechanical output errors with a tolerant parser, which needs to fix 99.9% of a 10% error rate to reach 0.01%. I run evaluation in three tiers, and I design for the delay of each. I bound time between tokens as well as time to first token, since 10 ms over a 200-token reasoning step is 2 seconds." That covers the schedule, the design, the parser, the evals, and the latency.
+</Callout>
+
+<Callout type="mistake">
+Do not present a vendor figure as a measurement. Do not say the parser "solves" bad output: it fixes shape, not meaning. Do not bound only time to first token for a product that streams reasoning. Do not compare the 80% and the 95% as if they were one scale. And do not copy a number such as 0.01% without asking what it is a share of.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Added seconds for +10 ms per token"
+  scenario="A reasoning step writes 200 tokens that the member never sees. The model's time between tokens is 25 ms at first (our assumption). Load rises and it becomes 35 ms, a 10 ms increase, as in the LinkedIn post."
+  steps={[
+    {
+      prompt: 'How long does the 200-token reasoning step take at 25 ms per token, in seconds?',
+      unit: 'seconds',
+      answer: 5,
+      within: 1.1,
+      explain: '200 tokens x 25 ms = 5,000 ms = 5 s.',
+    },
+    {
+      prompt: 'How long does it take at 35 ms per token, in seconds?',
+      unit: 'seconds',
+      answer: 7,
+      within: 1.1,
+      explain: '200 tokens x 35 ms = 7,000 ms = 7 s.',
+    },
+    {
+      prompt: 'How many seconds does the +10 ms per token add to the wait before the member sees text?',
+      unit: 'seconds',
+      answer: 2,
+      within: 1.1,
+      explain: '7 s minus 5 s = 2 s. Or directly: 200 tokens x 10 ms = 2,000 ms. A 10 ms rise in time to first token would add only 10 ms, once. The per-token rise is paid 200 times.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A team reaches 80% of its target in 1 month, then needs 4 more months to pass 95%. About how much more time does each percentage point cost in the second stretch?',
+      options: [
+        'About 4 times more, since 4 months is 4 times 1 month',
+        'About 21 times more, since 4 / 15 is far above 1 / 80',
+        'About the same, since quality gains are steady',
+        'About 80 times more, since the target is 80%',
+      ],
+      answer: 1,
+      explain: 'The first stretch took 1 / 80 = 0.0125 months per point. The last took 4 / 15 = 0.27 months per point, about 21 times more. The 4x figure compares total time, and ignores that the last stretch covers only 15 points.',
+    },
+    {
+      q: 'About 10% of a model\'s structured outputs are malformed. A parser must bring the failure rate to 0.01% of all calls. What share of the malformed outputs must it repair?',
+      options: [
+        '99%, which leaves 0.1% of all calls broken',
+        '90%, which leaves 1% of all calls broken',
+        '99.99%, since the target has four zeros',
+        '99.9%, leaving 1 in 1,000 mistakes',
+      ],
+      answer: 3,
+      explain: 'The rate after the parser is the malformed rate times the share left broken, so the share left is 0.01% / 10% = 0.001, which is 0.1%, so the parser fixes 99.9%. At 99% it leaves 0.1% of all calls broken, ten times too many.',
+    },
+    {
+      q: 'LinkedIn reports time-out alerts after chain-of-thought tokens entered its prompts, though time to first token had not changed. What is the cause?',
+      options: [
+        'Every hidden token pays the per-token slowdown',
+        'The reasoning tokens raised the time to first token',
+        'The parser had to repair more YAML in longer replies',
+        'The members were reading the reply more slowly',
+      ],
+      answer: 0,
+      explain: 'Time between tokens is paid once per token. A hidden reasoning step of 200 tokens at +10 ms adds 2 s before the member sees any text. The time to first token is paid once per request, and the parser is a separate step.',
+    },
+    {
+      q: 'A team ships one prompt change at the start of every day. Member feedback for a change arrives 3 days later, at the start of day 3, before that day\'s change ships. How many newer changes are live when the day-0 result arrives?',
+      options: ['0', '1', '2', '3'],
+      answer: 2,
+      explain: 'Changes shipped on day 1 and day 2 are already live, so 2. This is why a slow tier cannot say which change moved a metric. A fast tier narrows the gap, which is why LinkedIn is building model-based evaluators.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [LinkedIn Engineering, Musings on building a Generative AI product](https://www.linkedin.com/blog/engineering/generative-ai/musings-on-building-a-generative-ai-product) (2024-04-25): the primary source for every company claim above.
+- [LinkedIn Engineering, Behind the platform: the journey to create the LinkedIn GenAI application tech stack](https://www.linkedin.com/blog/engineering/generative-ai/behind-the-platform-the-journey-to-create-the-linkedin-genai-application-tech-stack) (2024-11-26): the same company's account of the shared stack under its GenAI features.
+- [Hamel Husain, Your AI Product Needs Evals](https://hamel.dev/blog/posts/evals/): a practitioner's three levels of evaluation: unit tests, human and model review, and A/B tests.
+- [Anthropic, Structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs): the provider route to a guaranteed output shape. You do not need it to follow this lesson.

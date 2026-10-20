@@ -1,0 +1,253 @@
+---
+summary: 'Character.AI says it serves about 20,000 queries per second for under one cent per hour of conversation. Its posts describe the parts: a small KV cache, a host-memory cache kept between turns, and int8 end to end. We split company claims from our reading and price the claim in GPU-hours.'
+requires: ['ai/a13-cases/chatgpt-assistant', 'ai/a2-inference-cost/kv-cache', 'ai/a2-inference-cost/quantization-small-models']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Ai14CharacterCostBars from '../../../../components/anim/lessons/Ai14CharacterCostBars.tsx';
+import Ai14CharacterLookup from '../../../../components/anim/lessons/Ai14CharacterLookup.tsx';
+import Ai14CharacterCacheSim from '../../../../components/anim/lessons/Ai14CharacterCacheSim.tsx';
+
+The sources are four posts on Character.AI's own blog, all read on 2026-10-20. The first is a short summary post and a longer technical post, both dated 2024-06-20. The second pair is "Optimizing AI Inference at Character.AI (Part Deux)" (2024-11-21) and a partner write-up by DigitalOcean and AMD (2026-01-13). The technical post first appeared on research.character.ai. That address now redirects to the blog home page, so we read the copy on blog.character.ai and checked it against an archived copy of the original. Every claim from a source is marked **Company claim**. Every inference of ours is marked **Our reading**. Lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/) read only the summary post and said the mechanism was not published. The technical post does describe it, so this lesson goes deeper.
+
+## What they built and why it was hard
+
+Character.AI lets people hold open-ended conversations with fictional characters. A user may chat for an hour. The service must answer each message in seconds, for millions of people at once.
+
+**Inference** is the work a trained model does to produce a reply. A **query**, in the post's word, is one request to the model. The post does not define it further.
+
+**Company claim** (summary post, 2024-06-20): "Character.AI serves around 20,000 queries per second – about 20% of the request volume served by Google Search, according to public sources." The technical post says "more than 20,000" and names its source for Google: about 105,000 queries per second, "according to third party estimates (Statista, 2024)". The summary post adds: "We manage to serve that volume at a cost of less than one cent per hour of conversation."
+
+Why is chat hard to serve cheaply? Because a chat is long. **Company claim** (technical post): "the majority of chats are long dialogues; the average message has a dialogue history of 180 messages." Every new message must be read together with all 180 before it. A model has no memory of its own, as lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/) showed. Compare a search query, which stands alone. A chat turn drags its whole past behind it. The cost of a turn depends on how well the system remembers that past.
+
+## The before
+
+Take a plain design. Each turn goes to any free GPU server. The server reads the full history, writes the reply, and forgets everything. Two problems follow.
+
+**Problem 1: the work repeats.** The first pass over a prompt is called **prefill**, and the work is heavy (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)). With a 180-message history, turn 181 repeats the prefill of messages 1 to 180, and so does turn 182. The post says "continuously refilling KV caches on each turn would be prohibitively expensive". The **KV cache** is the saved result of that first pass: a store of keys and values that the model computes for every token it has read (lesson [A2.3](/learn/ai/a2-inference-cost/kv-cache/)). With the cache, the model reads only what is new. Without it, it re-reads everything.
+
+**Problem 2: the cache is too big to keep.** Suppose the server does keep the cache in GPU memory. The post says: "The key bottleneck of LLM inference throughput is the size of the cache of attention keys and values (KV). It not only determines the maximum batch size that can fit on a GPU, but also dominates the I/O cost on attention layers." A **batch** is the set of chats the GPU serves in one step. A bigger batch gives more tokens per second for the same weights (lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/)). The cache decides how many chats fit. For scale, lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/) worked an example: a 70-billion-parameter model needs 1.31 GB of KV for one 4,000-token chat, so one 8-card server holds only 342 chats. Character.AI's model size is not published. The example shows the size of the problem, not their number.
+
+So there are two goals. Make each chat's cache smaller, so more chats fit. And keep the cache between turns, so a turn does not start from zero. The post attacks both, then makes the arithmetic cheaper with int8.
+
+Here are the company's own before and after figures. Step through them. The bars show an index, not dollars, because the post publishes no dollar figure for 2022.
+
+<Ai14CharacterCostBars client:visible />
+
+## The design
+
+### Lever 1: make the KV cache smaller
+
+**Company claim** (technical post): three techniques "reduce KV cache size by more than 20X without regressing quality. With these techniques, GPU memory is no longer a bottleneck for serving large batch sizes."
+
+**Multi-Query Attention (MQA).** A model layer has many **attention heads**. Each head looks at the text in its own way. Each head has a **query**, the question it asks, and a **key** and **value**, the labels and contents of every earlier token. The cache stores keys and values. In plain multi-head attention, every head has its own key and value, so the cache is big. **Grouped-Query Attention (GQA)** lets a group of query heads share one key and value. **MQA** lets all query heads share one. Picture a class where each student keeps a private copy of the textbook, then groups of students share a copy, then the whole class shares one.
+
+**Company claim**: "We adopt Multi-Query Attention (Shazeer, 2019) in all attention layers. This reduces KV cache size by 8X compared to the Grouped-Query Attention adopted in most open source models." **Our check**: the 70B model in lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/) has 8 KV heads. One shared head is one eighth of that, so 327,680 bytes per token falls to 40,960. The 8x fits a baseline of 8 KV heads. The price is model capacity. One shared key and value holds less than eight, so the model must be trained with MQA from the start. The post does not give a quality number for this step alone.
+
+**Hybrid attention horizons.** Normal attention lets every token look at all earlier tokens. This is **global attention**. **Local attention** lets a token look only at the last N tokens, a **sliding window**. A local layer never needs a cache longer than N. The post: "We interleave local attention (Beltagy et al., 2020) with global attention layers." It reports that "reducing attention horizon to 1024 on most attention layers does not have a significant impact on evaluation metrics, including the long context needle-in-haystack benchmark. In our production model, only 1 out of every 6 layers uses global attention." The needle test hides one fact in a long text and asks the model to find it. **Our arithmetic**: take a 9,000-token chat (180 messages of 50 tokens, our assumption). One layer in six keeps all 9,000 tokens. Five in six keep at most 1,024. The cache is 1/6 + 5/6 x 1,024 / 9,000 = 26% of full size, a cut of 3.8x. At 32,000 tokens the cut is 5.2x. The longer the chat, the more this helps.
+
+**Cross-layer KV sharing.** Neighbouring layers often learn similar keys and values. The post: "We tie the KV cache across neighboring attention layers, which further reduces KV cache size by a factor of 2-3x." Tied layers read one stored copy. For global layers, which dominate memory in long chats, the post ties "the KV cache of multiple global layers across blocks". It cites Brandon et al., 2024 and says "we find that sharing KV across layers does not regress quality."
+
+These three are **model design**, set when the model is trained. An engineer who only calls or hosts a model cannot add them. Lesson [A1.4](/learn/ai/a1-model-function/attention-cost/) explains the cost of attention that they cut.
+
+### Lever 2: keep the cache between turns
+
+This is the part the post calls one of its key innovations: "One of our key innovations is an efficient system for caching attention KV on host memory between chat turns." **Host memory** is the ordinary RAM of the server, not the fast but small memory on the GPU. Think of a desk and a filing cabinet. The GPU's own memory is the desk: quick, small. Host memory is the cabinet: slower, much bigger. Between turns, a dialogue's KV goes into the cabinet. When the user writes again, it comes back to the desk.
+
+The mechanism, step by step, in the post's words where we quote:
+
+1. **Save.** "For every prefilled prefix and generated message, we cache the KV values on host memory and retrieve them for future queries." A **prefix** is the first part of a prompt.
+2. **Organize.** "Similar to RadixAttention (Zheng et al., 2023), we organize cached KV tensors in a LRU cache with a tree structure." **LRU** means least recently used: when the cache is full, drop the entry that went longest without use. A **tree** lets dialogues that share an opening share its storage.
+3. **Index.** "The cached KV values are indexed by a rolling hash of prefix tokens." A **hash** turns a run of tokens into one short number. A **rolling** hash can be extended one token at a time at low cost, so a hash for every prefix of a long prompt takes a single pass.
+4. **Look up.** "For each new query, a rolling hash is calculated for each prefix of the context, and the cache is retrieved for the longest match. This allows reusing the cache even for partially matched messages." If a user edits a message in the middle, everything before the edit still matches.
+5. **Route.** "At a fleet level, we use sticky sessions to route the queries from the same dialogue to the same server." A **sticky session** is a rule that keeps one user on one server. Lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/) calls it session affinity and works through the hot-server trade-off, so we do not repeat it.
+6. **Capacity.** "Since our KV cache size is small, each server can cache thousands of dialogues concurrently."
+
+Step through one turn with and without the cache.
+
+<Ai14CharacterLookup client:visible />
+
+The size of the cache is what makes steps 1 to 6 work. This is why lever 1 comes first. A cache 20 times smaller means a server can hold 20 times more dialogues in the same RAM.
+
+**Company claim**: "Our system achieves a 95% cache rate, further reducing inference cost." The post does not say how a cache rate is counted. It could mean the share of turns with a hit, or the share of prompt tokens read from cache. These two differ a lot, and the post does not say which it means.
+
+### Lever 3: make each number smaller
+
+**Company claim**: "We use int8 quantization on model weights, activations, and attention KV cache." **Int8** stores each number in 8 bits, half of the 16 bits in the usual format (lesson [A2.6](/learn/ai/a2-inference-cost/quantization-small-models/)). Less data means less memory and less to read per step. The post adds that it trains the model this way: "Different from commonly adopted 'post-training quantization' techniques, we natively train our models in int8 precision, eliminating the risk of training/serving mismatch." Post-training quantization shrinks a finished model. Here the model learns with int8 from the start, so what it learns is what it serves. The post does not state how much quality, cost or speed int8 added by itself.
+
+### Later: speed, then a new stack
+
+The first post was about memory. **Company claim** (Part Deux, 2024-11-21): "In this post, we turn our focus to speed." It describes a custom int8 attention kernel. A **kernel** is a small program that runs on the GPU. The post says two ideas make it fast. The first fuses the step that converts int8 back to higher precision into the attention kernel, which avoids extra memory traffic. The second packs several query heads into one block of work, which suits MQA decoding because all those heads read the same key and value. The result: "up to 10% in prefill and 30% in decoding over a prior baseline that used a handwritten Triton attention kernel". Prefill and decode are the two phases from lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/). The benchmarks ran on one H100. Kernel internals are elective topics (E3), so we stop here.
+
+**Company claim** (DigitalOcean and AMD write-up, hosted on Character.AI's blog, 2026-01-13): "Character.ai leverages multiple models like Qwen, Mistral and more", and the write-up tunes "the Qwen3-235B Instruct FP8 model". The company "runs models using vLLM", on AMD MI325X GPUs. The target workload is "5600 / 140 (ISL / OSL)", which we read as about 5,600 input tokens and 140 output tokens per request. The headline is "~2x QPS per 8x MI325x server compared to a generic setup on other providers". The vLLM flags include `--enable-prefix-caching`, which the write-up describes as useful "for multi-turn chats that share a common prompt prefix". It also says Character.AI has "a concept of persistent user session to ensure the consistency of the following requests from the same user, to maximize KV cache hit rate". A footnote says the results come from "internal testing conducted by DigitalOcean and AMD".
+
+## The numbers
+
+Every figure in the posts. The label is **claim** for a company statement. None of them is independently measured.
+
+| Figure | What it measures, exactly | Source and date | Label |
+|---|---|---|---|
+| About or more than 20,000 queries per second | Request rate. "Query" is not defined | Summary and technical posts, 2024-06-20 | Company claim |
+| About 20% of Google Search | 20,000 against about 105,000 per second, a third-party estimate | Technical post, 2024-06-20 | Claim, plus third-party estimate |
+| Under one cent per hour of conversation | Serving cost. What it includes is not stated | Summary post, 2024-06-20 | Company claim |
+| 33x cost cut since late 2022 | "serving costs". The unit is not stated. Summary says "at least" | Both posts, 2024-06-20 | Company claim |
+| At least 13.5x cheaper than commercial APIs | Same traffic on "leading commercial APIs". Which APIs is not stated | Both posts, 2024-06-20 | Company claim |
+| $365 million against at least $4.75 billion a year | The post's example: 100 million daily users, 1 hour each, $0.01 an hour | Summary post, 2024-06-20 | Company claim (their arithmetic) |
+| KV cache cut by more than 20x | Against an unstated baseline, "without regressing quality" | Technical post, 2024-06-20 | Company claim |
+| MQA: 8x. KV sharing: 2 to 3x. 1 layer in 6 global, window 1,024 | Parts of the cut above. Against GQA for the 8x | Technical post, 2024-06-20 | Company claim |
+| 180 messages of history | Average history of a message | Technical post, 2024-06-20 | Company claim |
+| 95% cache rate | Not defined | Technical post, 2024-06-20 | Company claim |
+| Up to 10% faster prefill, 30% faster decode | New int8 kernel against a Triton kernel, end to end | Part Deux, 2024-11-21 | Company claim |
+| About 2x QPS per 8-GPU server | Qwen3-235B FP8, 5600 / 140 tokens, against a generic setup | DigitalOcean and AMD, 2026-01-13 | Partner claim, internal tests |
+
+**Not published.** The model size and its layer count. The number of GPUs or servers. KV bytes per token. The definition of "query" and of "cache rate". Any latency figure, such as time to first token. Any quality score for int8 or MQA, beyond the needle test. The GPU price Character.AI pays. What share of the 33x each technique gave. The baseline for the 20x.
+
+## Our reading
+
+### What "less than one cent" implies
+
+**Our reading.** The claim is a unit price, so convert it. At $0.01 per conversation hour, one million conversation hours cost $10,000. Prices as of 2026-10-20: a Lambda H100 SXM 80 GB on an 8-GPU on-demand instance costs $3.99 per GPU-hour ([Lambda pricing](https://lambda.ai/pricing)). $10,000 / $3.99 = 2,506 GPU-hours. So one conversation hour gets at most $0.01 / $3.99 = 0.0025 GPU-hours, which is **9.0 GPU-seconds**. Nine seconds of one H100 for an hour of chat.
+
+Now the fleet. 20,000 queries per second is 72 million per hour. How many conversation hours is that? It depends on how often a user sends a message, which the posts do not give. We assume a range, shown below. Conversation hours served per hour = 72 million / turns per hour. Cost per hour is that times $0.01. GPUs are that divided by $3.99.
+
+| Turns per conversation hour (assumed) | Conversation hours per hour | Cost ceiling per hour | H100s at $3.99 |
+|---|---|---|---|
+| 30 | 2.4 million | $24,000 | 6,015 |
+| 60 | 1.2 million | $12,000 | 3,008 |
+| 120 | 600,000 | $6,000 | 1,504 |
+| 240 | 300,000 | $3,000 | 752 |
+
+At one message a minute, the claim says the whole fleet costs at most about $12,000 an hour, which is 3,008 H100s at $3.99, or $8.8 million a month (730 hours). Compare the A13.2 drill. There, a 70B model with a 90% hit rate needed 12,536 GPUs for the same 20,000 queries per second. That is about four times more. So at least one of these must hold if the claim is right: the model is much smaller than 70B, the hit rate is higher, a turn is shorter, or Character.AI pays less than $3.99 per GPU-hour. The claim does not say which. Treat the rows as arithmetic on an assumption, not as Character.AI's fleet.
+
+A second check on the post's own arithmetic. 100 million users x 1 hour x 365 days x $0.01 is $365 million, or $3.65 per user. That matches. $4.75 billion / $365 million is 13.0, a little under the "13.5X" in the same post. Both say "at least", so they can agree.
+
+### The 20x puzzle
+
+**Our reading.** Multiply the three listed cuts for a 9,000-token chat: 8 (MQA) x 3.8 (hybrid, our arithmetic above) x 2 to 3 (sharing) is 61x to 92x, far above "more than 20X". The post does not say if the baseline already has some of these, which chat length it counts, or whether the three cuts stack. Do not reuse "20x" as a rule. Compute the cut for your own model and your own chat length.
+
+### Why the host-memory tier is believable
+
+**Our reading.** Take the 70B baseline of 327,680 bytes per token and cut it 20x: 16,384 bytes per token. A 9,000-token dialogue is 147 MB. A server with 1 TB of RAM could hold about 6,800 of them. That agrees with "thousands of dialogues", under assumptions of our own: the model shape, the 20x, and 1 TB of RAM are all guesses. Moving 147 MB from host memory to the GPU over an assumed 25 GB/s link takes about 6 ms. A 70B prefill of 8,000 tokens takes about 400 ms (lesson [A13.2](/learn/ai/a13-cases/chatgpt-assistant/), our model). So the copy is cheap beside the work it saves. We did not find a primary source for the link speed.
+
+### Which cache rate is 95%?
+
+Use the simulator. It models 8 servers with an LRU cache of whole dialogues, with randomly chosen turns. It compares the post's sticky sessions against sending each turn to a random server. All inputs are illustrative, and the logic is in a separate file with a node check.
+
+<Ai14CharacterCacheSim client:visible />
+
+Read three presets.
+
+- **Roomy cache.** 8,000 open dialogues, 1,000 per server, and room for 1,500. With 99% of turns sticky and 3% rewinding, sticky sessions reach a 96.4% cache rate and prefill 340 tokens per turn. Random routing reaches 18.9% and prefills 7,750. Sticky does 3.6% of the no-cache work, random 81.1%.
+- **Cache too small.** Drop the room to 600 dialogues per server, below the 1,000 each server must hold. Sticky falls to 57.9%. An LRU cache that is too small evicts a dialogue just before its next turn. Room well below the working set is a cliff, not a slope.
+- **Leaky routing.** Only 70% of turns follow the rule (the rest model deploys, failures, rebalancing). Sticky falls to 63.6%. A leaked turn misses, and it also fills another server with a copy that pushes out useful dialogues.
+
+The lesson: a 95% cache rate is reachable, and our model happens to reach 96.4%. That says nothing about their setup. The rate depends on three numbers: cache room per server against its dialogues, how well routing holds, and how many turns rewind. **Before you quote a cache rate, define it.** In our model the ceiling is 99%, because each new user message is never in the cache yet.
+
+### The stack in 2026
+
+**Our reading.** The 2024 design needs a model built for it: MQA in every layer, hybrid layers, tied KV, and int8 from training. None of that can be added to a model you did not train. The 2026 write-up describes Qwen3-235B and Mistral models served with vLLM, using its generic prefix cache and a "persistent user session". Those two facts fit together if some of the workload now runs on open-weight models. The posts do not say what share of traffic runs where, or whether the 2024 model is retired. We also cannot reconcile the write-up's own figures. It says two TP4 groups give "~2x QPS compared to DP1 / TP8 / EP8", and then "~45% better on throughput", and "~91% better compared to generic setup". TP and EP name how a model is split across GPUs. The text does not explain how 2x and 45% describe the same comparison. Read the 2x as somewhere between 1.45x and 2x.
+
+What carries over to any stack is the cache idea: keep the prefix, route by dialogue, and spill to host memory. What does not is the model design.
+
+### Business context
+
+**Company claim** (2024-06-20): "these sorts of inference improvements unlock the ability to create a profitable B2C AI business at scale". **Company claim** (2026-10-12): Character.ai "has initiated a voluntary Chapter 11 bankruptcy process to facilitate a court-supervised sale of the company", after "significant legal, regulatory, and operational headwinds". The platform "remains up and running". **Our reading**: this lesson does not say what caused the filing. The posts publish no revenue or cost totals, and they name legal and regulatory pressure, not GPU cost. The one lesson we take: cost per hour is half of unit economics. A design review also needs revenue per hour.
+
+## What to copy and what not to
+
+| Idea | When it fits | When it does not |
+|---|---|---|
+| Keep the KV between turns | Long chats, where history dwarfs each new message | Short one-shot calls with nothing to reuse |
+| Sticky sessions by dialogue | A cache that lives on one server | Skewed load with a few huge chats. Then add load-aware routing (A13.2) |
+| A host-memory tier under the GPU | KV is small enough that thousands of dialogues fit | Large KV per token, where the cabinet fills fast |
+| Match the longest prefix | Users edit or regenerate | Prompts that change early, so the prefix never matches |
+| MQA, hybrid layers, tied KV | You train your own model | You call an API or host a model you did not train |
+| Native int8 training | Same, and you can test quality loss | Teams without training budget. Use post-training methods and a golden set (lesson [A8.3](/learn/ai/a8-evals/golden-sets/)) |
+| Define "cache rate" first | Always | Never skip |
+
+For a team that hosts an open model, the practical copy is the first three rows: turn on prefix caching in the engine, route by dialogue, and watch your own hit rate by chat length. For a team that calls an API, the provider's prompt cache does this work (lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/)).
+
+## Interview lens
+
+<Callout type="tip">
+Say: "In long chats the history is the cost. I keep the KV between turns, in host memory under the GPU, indexed by a rolling hash of the prefix so an edit still matches its start. I route a dialogue to one server, and I check that the cache has room for the dialogues that server owns. The model shape sets how many fit, so MQA and tied layers, if I own the model. I would ask how 'cache rate' is counted before I trust 95%. And I turn any cost-per-hour claim into GPU-seconds: one cent is 9 GPU-seconds of an H100 at $3.99."
+</Callout>
+
+<Callout type="mistake">
+Do not repeat "20x smaller KV" or "95% cache rate" as facts. They are company claims with no stated baseline or definition. Do not say sticky sessions fix the cache without naming what happens when a server restarts or the cache is too small. Do not copy MQA or int8 training advice for a model you only host.
+</Callout>
+
+## Check yourself
+
+<Ballpark
+  client:visible
+  title="Cost per million conversation hours"
+  scenario="Character.AI claims under one cent ($0.01) per hour of conversation. A Lambda H100 SXM costs $3.99 per GPU-hour (as of 2026-10-20). Treat $0.01 as the cost, and assume a user sends one message a minute."
+  facts={['1 hour of conversation = 60 turns (our assumption)', '20,000 queries per second is the company claim', '1 hour = 3,600 seconds']}
+  steps={[
+    { prompt: 'What does one million conversation hours cost at $0.01 an hour?', unit: 'USD', answer: 10000, within: 1.1, explain: '1,000,000 x $0.01 = $10,000.' },
+    { prompt: 'How many H100 GPU-hours is that at $3.99?', unit: 'GPU-hours', answer: 2506, within: 1.1, explain: '$10,000 / $3.99 = 2,506 GPU-hours.' },
+    { prompt: 'How many GPU-seconds of one H100 does one conversation hour get?', unit: 'GPU-seconds', answer: 9, within: 1.15, explain: '$0.01 / $3.99 = 0.0025 GPU-hours. Times 3,600 seconds is 9.0 seconds.' },
+    { prompt: 'At 20,000 queries per second and 60 turns per hour, how many H100s does the claim allow?', unit: 'GPUs', answer: 3008, within: 1.15, explain: '20,000 x 3,600 = 72 million turns an hour. Divide by 60 for 1.2 million conversation hours an hour. Times $0.01 is $12,000 an hour. Divide by $3.99: 3,008 GPUs.' },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A dialogue has 180 messages and a user sends message 181. Which design makes the GPU prefill the fewest tokens?',
+      options: [
+        'Send the turn to any free server, which then reads all 181 messages again',
+        'Send it to the home server that already holds the cached KV',
+        'Send it to a random server, which keeps a copy of every dialogue sent',
+        'Send it to whichever server has the shortest queue at that moment',
+      ],
+      answer: 1,
+      explain: 'Only a server that holds the dialogue\'s KV can skip the 180 old messages and prefill the new one. A random or shortest-queue pick usually lands on a server with no copy, so it re-reads everything.',
+    },
+    {
+      q: 'Your team hosts an open-weight model with vLLM and did not train it. Which technique from the Character.AI posts can you adopt without retraining?',
+      options: [
+        'Multi-Query Attention in every layer of the hosted model',
+        'Native int8 training of all weights and activations in it',
+        'Tying the KV cache across neighbouring layers of the model',
+        'Prefix caching and routing each dialogue to one server',
+      ],
+      answer: 3,
+      explain: 'Prefix caching and routing are serving choices, so any hosted model can use them. MQA, KV tying and native int8 training change how the model is trained, so a model built without them cannot gain them by a flag.',
+    },
+    {
+      q: 'In the simulator, each server must hold 1,000 dialogues. Cutting its cache to room for 600 drops sticky routing from 96% to 58%. What explains the drop?',
+      options: [
+        'The LRU cache evicts a dialogue before its next turn arrives',
+        'Sticky sessions stop working when a server has under 1,000 slots',
+        'The rolling hash fails to match prefixes in a smaller cache',
+        'Rewound turns increase when the cache holds fewer dialogues',
+      ],
+      answer: 0,
+      explain: 'With 600 slots for 1,000 dialogues in uniform use, a dialogue is usually pushed out before it returns, so most turns miss. Routing and the hash still work. The share of rewound turns is a separate input.',
+    },
+    {
+      q: 'The post says "Our system achieves a 95% cache rate" and gives no definition. What is the safest use of that number?',
+      options: [
+        'Use it as a hit-rate target and size the whole fleet straight from that number',
+        'Treat it as proof that sticky sessions are enough on every serving stack',
+        'Define cache rate yourself, measure it by chat length, and compare',
+        'Ignore the cache and rely on the 33x cost claim to size the fleet instead',
+      ],
+      answer: 2,
+      explain: 'The share of turns that hit and the share of prompt tokens served from cache can differ a lot. A vendor number without a definition is a direction, not a target. Measure your own by slice.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Optimizing AI inference at Character.AI](https://blog.character.ai/optimizing-ai-inference-at-character-ai-2/): the technical post, 2024-06-20. MQA, hybrid attention, KV sharing, the inter-turn cache and int8. This is the primary source.
+- [Optimizing AI inference at Character.AI, summary post](https://blog.character.ai/optimizing-ai-inference-at-character-ai/): the 20,000 queries per second, one cent and 33x claims, with the 100-million-user example.
+- [Optimizing AI inference at Character.AI (Part Deux)](https://blog.character.ai/optimizing-ai-inference-at-character-ai-part-deux-2/): the int8 attention kernel. You do not need the kernel details to use the ideas here.
+- [How DigitalOcean and AMD delivered a 2x production inference performance increase](https://blog.character.ai/technical-deep-dive-how-digitalocean-and-amd-delivered-a-2x-production-inference-performance-increase-for-character-ai/): vLLM, Qwen3-235B and parallelism settings, from the partners.
+- [SGLang paper](https://arxiv.org/abs/2312.07104): the RadixAttention idea the post compares its cache to. Optional.

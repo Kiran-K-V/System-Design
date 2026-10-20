@@ -1093,7 +1093,7 @@ _Six teardowns, each with a loaded primary source. Agent teardowns only where th
 
 **A14.2 cursor: Cursor Codebase Indexing and Instant Apply**
 - requires: A5.8, A5.9, A2.2, A13.6
-- Write: Indexing: Merkle tree sync; 50,000 files about 3.2 MB of names and hashes; embeddings cached by chunk content; shared index via simhash with 92% average clone similarity; path proofs; first query median 7.87 s to 525 ms and p99 4.03 h to 21 s [C4].
+- Write: Indexing: Merkle tree sync; 50,000 files about 3.2 MB of names and hashes; embeddings cached by chunk content; shared index via simhash with 92% average clone similarity; content proofs (the page says "content proofs"); first query median 7.87 s to 525 ms and p99 4.03 h to 21 s [C4].
   Apply: Full-file rewrite with deterministic speculation; about 1000 tokens/s on a 70B fine-tune; about 9x over the earlier GPT-4 speculative-edits setup; served on Fireworks [C5].
 - Animate: Merkle sync step-through. Second: index-reuse before and after timeline. Then: Speculation accepting copied lines. Second: tokens/s bar compare.
 - Prove it: Diagnose. What leaks if the proof is skipped? Second: Ballpark. Time to rewrite a 400-line file.

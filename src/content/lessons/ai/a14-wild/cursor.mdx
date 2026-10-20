@@ -1,0 +1,361 @@
+---
+summary: 'A teardown of two Cursor engineering posts. Indexing syncs a Merkle tree, caches embeddings by chunk content, reuses a teammate index found by simhash, and proves file possession before it returns results. Apply rewrites whole files with speculative edits. Company claims and our reading are kept apart.'
+requires: ['ai/a5-rag/freshness-updates', 'ai/a5-rag/retrieval-permissions', 'ai/a2-inference-cost/prefill-decode', 'ai/a13-cases/coding-agent']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ballpark from '../../../../components/lesson/Ballpark.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Ai14CursorMerkle from '../../../../components/anim/lessons/Ai14CursorMerkle.tsx';
+import Ai14CursorReuse from '../../../../components/anim/lessons/Ai14CursorReuse.tsx';
+import Ai14CursorSpec from '../../../../components/anim/lessons/Ai14CursorSpec.tsx';
+import Ai14CursorSpeed from '../../../../components/anim/lessons/Ai14CursorSpeed.tsx';
+
+Two sources carry this lesson. The first is Cursor's post "Securely indexing large codebases" (Jeremy Stribling, 2026-01-27). The second is "Editing Files at 1000 Tokens per Second" (Aman Sanger, 2024-05-14), the post behind Cursor's fast apply. Its address says "instant-apply", which is why the lesson has that name. A third post, "Improving agent with semantic search" (2025-11-06), is linked from the first. We read all three pages in full on 2026-10-20.
+
+Two labels run through the lesson. **Company claim** means Cursor says it and we cannot check it. **Our reading** means we inferred it, and Cursor does not say it. The case [AI Coding Agent](/learn/ai/a13-cases/coding-agent/) already quotes two Cursor numbers in passing. This lesson goes into the machinery behind them.
+
+## What they built and why it was hard
+
+A coding agent answers questions about your code, so it must find the right code. One way is **semantic search**: the code is cut into chunks, each chunk becomes a vector, and a question is matched to the nearest vectors (lesson [Choosing Embedding Models](/learn/ai/a5-rag/embedding-models/)). Cursor says this matters a lot: "Semantic search is one of the biggest drivers of agent performance. In our recent evaluation, it improved response accuracy by 12.5% on average." That is a **company claim**. The indexing page does not say how the evaluation worked. The post it links to says a little more, which we cover in the numbers section.
+
+The index has to be built first, and that is slow. The indexing post says: "large repositories with tens of thousands of files can take hours to process if indexed naively, and semantic search isn't available until at least 80% of that work is finished." So a new engineer who opens a big repo waits hours with a weaker agent.
+
+The second problem is a different job. The agent has planned a change in chat. Now the change must be written into a file. Cursor's post calls this the apply step and says that "Frontier models such as GPT-4o struggle on large edits, with problems of laziness, inaccuracy, and high-latency." It adds: "Worst of all, existing models are slow at large edits, breaking the programmer out of flow." Both are waiting problems, and they share a cure: stop redoing known work. The index already exists for a teammate. The new file is mostly the old file.
+
+## The before
+
+**Indexing, the naive way.** When a project opens, the client uploads every file. The server cuts each file into chunks, embeds every chunk, and stores the vectors. When a second person opens a copy of the same repo, the work starts again from zero. Cursor's key observation is that "clones of the same codebase average 92% similarity across users within an organization." The page does not say how it measures similarity. Our reading: roughly nine files in ten are already indexed on the server, and the naive design ignores that.
+
+A naive sync after an edit has the same shape. The client can send its whole file list and let the server compare. The page gives the size of that list: "In a workspace with fifty thousand files, just the filenames and SHA-256 hashes add up to roughly 3.2 MB." Our arithmetic: 3.2 MB over 50,000 files is 64 bytes per file. A **hash** [junior] is a short fixed-size fingerprint of some data. SHA-256 makes a 32-byte one. Moving 3.2 MB on every small save is a poor trade for a one-line change.
+
+**Apply, the naive way.** Ask a frontier model to write the new file, or to write a diff. Cursor tried both. A full rewrite is simple but slow. On diffs, the post says "Most models fail to output accurate diffs, with the exception of Claude Opus." The post gives three reasons that models write diffs badly. They "think in fewer tokens", because a short diff gives fewer passes of thinking. Diffs are "out of distribution", because models have seen far more whole files than diffs. And a diff needs line numbers, and "models are notoriously bad at counting line numbers." So Cursor chose to rewrite the whole file and to make that rewrite fast.
+
+## The design
+
+### Step 1: find the change with a Merkle tree
+
+A **Merkle tree** [mid] is a tree of hashes. Each file gets a hash of its content. Each folder gets a hash computed from the hashes of its children. The top folder's hash is the **root**. Cursor says the tree "features a cryptographic hash of every file, along with hashes of each folder that are based on the hashes of its children."
+
+Picture a book where each chapter has a stamp that depends on its pages, and the book has a stamp that depends on its chapter stamps. To learn whether two copies are the same, compare one stamp. To find the changed page, walk down only where stamps differ.
+
+Why it works: a good hash gives the same output for the same content, and a different output if even one byte changes. So two equal root hashes mean two equal trees (up to a collision, which a 256-bit hash makes negligible). Two different roots mean something below differs. Cursor describes the edit side: "Small client-side edits change only the hashes of the edited file itself and the hashes of the parent directories up to the root of the codebase." And the sync side: the client compares its hashes with the server's "to see exactly where the two Merkle trees diverge. Entries whose hashes differ get synced. Entries that match are skipped." Entries missing on the client are deleted from the server, and entries missing on the server are added. The page adds that "the sync process never modifies files on the client side."
+
+Step through a small tree. It has 4 entries per folder and 3 levels, so 64 files. The hashes are made-up four-digit stand-ins.
+
+<Ai14CursorMerkle client:visible />
+
+Now the number. Let f be the entries per folder and d the depth. One changed file needs one comparison for the root, then f comparisons at each of d levels:
+
+<Math block tex="\text{comparisons} = 1 + f \times d" />
+
+For the toy tree: 1 + 4 x 3 = 13, against 64 files. The saving is small here. Scale it up. Take 16 entries per folder and 4 levels. That is 16^4 = 65,536 files, about the size of the page's 50,000-file example. One edit costs 1 + 16 x 4 = **65** comparisons. If each hash is 32 bytes, that is about 2 KB of hashes, against 3.2 MB for the full list. The ratio is about 1,500 to 1. This is **our arithmetic**. We assume raw 32-byte hashes and ignore message overhead and round trips. The page does not describe the protocol at that level. It also gives no sync interval.
+
+The cost grows with the logarithm of the repo, not with its size. It is the diff step of the pipeline in lesson [Freshness and Index Updates](/learn/ai/a5-rag/freshness-updates/). There the change feed was a database log. Here the feed is a hash walk, because the client has no log to read.
+
+### Step 2: cache embeddings by chunk content
+
+Once a file is known to have changed, it must be re-indexed. The post says: "When a file changes, Cursor splits it into syntactic chunks. These chunks are converted into the embeddings that enable semantic search. Creating embeddings is the expensive step, which is why Cursor does it asynchronously in the background."
+
+A **syntactic chunk** [mid] follows the shape of the code, such as one function or one class, and not a fixed count of characters. Lesson [Chunking and Contextual Retrieval](/learn/ai/a5-rag/chunking-contextual/) covers how to chunk.
+
+Then the key idea: "Cursor caches embeddings by chunk content. Unchanged chunks hit the cache." A **content-addressed cache** [mid] uses a hash of the content as the key. The value is the embedding. If the same text shows up again, the same key shows up, and the cache answers without calling the model. Git works the same way: its book says Git "is a content-addressable filesystem", a key-value store where the key comes from the content.
+
+Everyday picture: a translator keeps a notebook of sentences she has already translated. A new draft arrives. She looks up each sentence, and only the new ones cost her time.
+
+Worked example (ours). A file has 12 syntactic chunks. You change one function. Eleven chunks hash to keys already in the cache. One chunk does not. You pay for 1 embedding, not 12. Now see why the chunk shape matters. Suppose chunks were fixed windows of 500 tokens. Insert 3 lines at the top. Every window after the insert shifts, so all of them get new content and new keys. A miss on 12 of 12. With syntactic chunks the insert leaves the other 11 functions intact. This is **our reasoning**. The page says the chunks are syntactic and the cache is keyed by content. It does not run this comparison.
+
+The page does not say how large the cache is, what its hit rate is, or whether it is shared between users. That last point matters for the security section below.
+
+### Step 3: reuse a teammate's index with a simhash
+
+The Merkle tree makes small syncs cheap. It does not help the first sync, when the server knows nothing about this copy. Cursor's answer is to find a teammate's index that is almost the same, and start from it.
+
+The first problem is finding it. You cannot compare 50,000 hashes against every index on the server. You need one short value per codebase, built so that similar codebases get similar values. A normal hash cannot do this. Change one file, and a normal hash of the file list flips about half its bits. The tool for this job is a **simhash** [senior], a "similarity hash". Here is how a textbook simhash works. The page does not give Cursor's exact scheme, so treat this as the idea, not as their code.
+
+1. Give each item a fixed-size hash. Here an item is a file's content hash. Take 8 bits for the demo.
+2. Keep one counter per bit position. For each item, add 1 to the counter if the bit is 1, and subtract 1 if it is 0.
+3. The final fingerprint has a 1 where the counter is above zero, and a 0 elsewhere.
+
+Each item votes on each bit. A few changed items change a few votes. Most counters keep their sign. Here is a worked example with five files (ours, run by script):
+
+```
+set A  10110010 10010110 11110011 00110010 10100110
+counters   3  -3   3   3  -5  -1   5  -3   -> 10110010
+set B  (last file replaced by 01001101; 4 of 5 files shared)
+counters   1  -1   1   3  -3  -1   3  -1   -> 10110010
+set C  (five unrelated hashes)
+counters  -5   1  -1  -5  -1  -3   3  -1   -> 01000010
+```
+
+Sets A and B differ by 0 bits. Sets A and C differ by 4 of 8 bits, which is what random sets do on average. The number of bits that differ between two fingerprints is their **Hamming distance** [mid]. Small distance means similar sets. With 8 bits and 5 items this is a toy. A real scheme uses more bits and many more items.
+
+The page says how the fingerprint is used. The client builds the Merkle tree of its copy, "derives a value called a similarity hash (simhash) from that tree", and uploads it. The server "uses it as a vector to search in a vector database composed of all the other current simhashes for all other indexes in Cursor in the same team (or from the same user)". That is nearest-neighbour search, as in lesson [ANN Indexes and Billion-Scale Search](/learn/ai/a5-rag/ann-indexes/). For each result, the server checks "whether it matches the client similarity hash above a threshold value". If it does, that index becomes the starting index for the new codebase. The page does not give the threshold, the bit width, or the search library.
+
+The copy runs in the background. Meanwhile the client can already search. In the page's words: "the client is allowed to make new semantic searches against the original index being copied, resulting in a very quick time-to-first-query for the client."
+
+Look at the scope. The search covers indexes "in the same team (or from the same user)". Reuse never crosses a team boundary. That is a first limit. The second is the proof.
+
+### Step 4: prove you hold the file
+
+Here is the catch. A 92% match means 8% of files differ. Say the teammate's copy has files you do not have: a private branch, a local notes file, a folder you have no access to. If the server hands you results from their index, you could read chunks of files that are not on your disk. The page states the two rules: "Results need to reflect the user's local codebase, even when it differs from the copied index. And the client can never see results for code it doesn't already have."
+
+Cursor's fix reuses the tree. "Each node in the tree is a cryptographic hash of the content beneath it. You can only compute that hash if you have the file." When a workspace starts from a copied index, "the client uploads its full Merkle tree along with the similarity hash. This associates a hash with each encrypted path in the codebase." The server stores this tree "as a set of content proofs". Then, "during search, the server filters results by checking those hashes against the client's tree. If the client can't prove it has a file, the result is dropped."
+
+Think of a library desk that gives you the notes on a book only if you can show you already hold that edition. The test is not "who are you". The test is "do you already have this".
+
+When the client's tree and the server's tree reach the same root, the sync is complete. At that point, "the server deletes the content proofs and future queries run against the fully synced index."
+
+Compare it with lesson [Permissions in Retrieval](/learn/ai/a5-rag/retrieval-permissions/). There, an access list says who may read each chunk. Here the filter asks what the caller already holds. The page says the server "filters results". It does not say whether the filter runs before or after the nearest-neighbour search. That lesson shows why it matters: a post-filter can leave too few results.
+
+First, the payoff. The Diagnose puzzle at the end asks what leaks without the proof.
+
+<Ai14CursorReuse />
+
+Cursor says the effect "compounds with the size of the repo". Our arithmetic gives 15 times faster at the median, about 90 times at the 90th percentile, and about 690 times at the 99th. The bars use a log scale, so a bar twice as long is not twice the time.
+
+### Step 5: the apply step
+
+Back to the second post. The planning stage is a chat with a strong model. The apply stage turns the plan into a file. Cursor's idea is to split the work: "Applying the change to the current file should be straightforward and instant." So it trained a model just for apply.
+
+The training data is mostly synthetic. The page starts from a few real apply prompts and many "cmd-k" prompts (edit instructions on a selected region), has GPT-4 write a chat answer for each, then has a model "apply" it. It mixes this with the real data and fine-tunes Deepseek Coder Instruct and Llama 3 models. The page says: "We find that our best model (llama-3-70b-ft) almost matches claude-3-opus-diff and outperforms gpt-4-turbo and gpt-4o."
+
+Quality check, with a warning. The evaluation set is "~450 full-file edits of files under 400 lines", graded with Claude-3 Opus. The page itself says: "These scores likely bias towards outputs of Claude models." The numeric scores sit in charts, and we quote none. Lesson [SFT and LoRA](/learn/ai/a11-finetuning/sft-lora/) covers fine-tuning in general.
+
+### Step 6: speculative edits
+
+Now the speed. Start with why a model is slow at writing a long file. As lesson [Prefill vs Decode: TTFT and TPOT](/learn/ai/a2-inference-cost/prefill-decode/) taught, decode makes one token per pass, and each pass reads all the model weights from memory. For a 70B model in BF16 that lesson derived a floor of about 48 tokens a second on 2 H100 GPUs and about 96 on 4, for one user. A 400-line file is about 4,000 tokens at 10 tokens a line (our assumption). At 96 tokens a second that is about 40 seconds.
+
+**Speculative decoding** [senior] is a way around that, in plain words. Elective E3.4 teaches it in full. You do not need it here. The idea has three parts.
+
+1. A cheap guess supplies the next several tokens.
+2. The big model runs once over all the guessed positions together and says, for each position, which token it would have written.
+3. Keep the guessed tokens up to the first one the model disagrees with. At that spot, use the model's own token. Throw away the rest of the guess.
+
+Checking 30 positions in one pass costs only a little more than making 1 token, because the pass is limited by reading weights, not by arithmetic. So every accepted guess token is nearly free. The output is exactly what slow decoding would have written. The original paper (Leviathan and others) shows "a 2X-3X acceleration compared to the standard T5X implementation, with identical outputs" on a different model and task.
+
+Normally a small draft model makes the guess. For an edit you already have a very good guess: the old file. Cursor's words: "With code edits, we have a strong prior on the draft tokens at any point in time, so we can speculate on future tokens using a deterministic algorithm rather than a draft model." They call it **speculative edits**. Cursor says it "is equivalent to a full-file-rewrite, while being up to 9x faster."
+
+Step through a toy. A 10-line file, 10 tokens per line. The new file keeps lines 1 to 4 and 7 to 10, and writes 3 new lines in place of lines 5 and 6.
+
+<Ai14CursorSpec client:visible />
+
+The toy shows the shape. Copied text is cheap. New text costs one token per pass. A file that changes little speeds up a lot. A file that is rewritten from scratch speeds up not at all. The page does not say how the guess finds its place again after an edit. It says only "deterministic algorithm". Fireworks, Cursor's inference partner, "built out api support for our custom speculation logic".
+
+## The numbers
+
+Every row is a **company claim** unless the label says otherwise.
+
+| Figure | What it measures, exactly | Source and date |
+|---|---|---|
+| 12.5% | "improved response accuracy by 12.5% on average" with semantic search. The indexing page gives no method. The linked post says on average 12.5% higher accuracy in answering questions, 6.5% to 23.5% by model, on Cursor's own offline set, Context Bench, with and without semantic search. It does not say points or relative, nor sample size. | Indexing post, 2026-01-27. Semantic search post, 2025-11-06 |
+| Hours, and 80% | Large repos "can take hours to process if indexed naively". Semantic search "isn't available until at least 80%" of the work is finished. | Indexing post |
+| 92% | Average similarity of clones across users within an organization. The measure is not stated. | Indexing post |
+| About 3.2 MB | Filenames and SHA-256 hashes for 50,000 files. | Indexing post |
+| 7.87 s to 525 ms | Median repo, time-to-first-query. | Indexing post |
+| 2.82 min to 1.87 s | 90th percentile. | Indexing post |
+| 4.03 h to 21 s | 99th percentile. | Indexing post |
+| About 1000 tokens (3500 char/s) | Fast-apply speed on the 70B model. The page title says "1000 Tokens per Second". The body text has a stray footnote mark in place of the unit. Speed is rewritten characters per second of rewrite latency, and the page says the latency includes time to first token. | Apply post, 2024-05-14 |
+| About 13x | Speedup "over vanilla inference using Llama-3-70b". | Apply post |
+| About 9x | Speedup "over our previous GPT-4 speculative edits deployment". | Apply post |
+| Up to 9x | The speculative edits section says it "is equivalent to a full-file-rewrite, while being up to 9x faster". The baseline is not named there. | Apply post |
+| 4 to 5x | "a 4-5x speedup over the next fastest model", for Llama-3 with Fireworks. | Apply post |
+| About 450 edits, under 400 lines | The evaluation set, graded by Claude-3 Opus. | Apply post |
+
+**Read the 9x with care.** The post uses "9x" twice. The opening compares to the earlier GPT-4 speculative setup. The speculative edits section says "up to 9x faster" than a full-file rewrite and names no baseline. The opening also says 13x against plain Llama-3-70b. Our reading: the two 9x figures are probably one measurement, but the page does not say so. We use the first.
+
+**Our arithmetic from those ratios.** If fast apply runs at about 1,000 tokens a second, then 13x slower is about 77 tokens a second, and 9x slower is about 111. The post does not publish those two speeds. We only divide. The 77 is close to the one-token-per-pass floor (48 to 96 tokens a second) that lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) derived for a 70B model. That supports the reading that plain decoding was the baseline, but the hardware was not published. See the bars.
+
+<Ai14CursorSpeed />
+
+How much must speculation accept per pass? If one plain pass makes 96 tokens a second (the 4 H100 floor) and apply runs at 1,000, then each pass must gain about 1,000 / 96 = **10 tokens** on average. This is **illustrative**. It assumes a 4 H100 BF16 setup that the page does not state, and it ignores that a longer pass costs slightly more. It shows why copying works: you would need ten accepted tokens a pass, and a copied line is about ten tokens.
+
+**Not published.** Number of files in the repos behind the percentiles. How many users, or what share of sessions, reuse an index. The simhash width and threshold. The embedding model. Chunk size. Cache hit rate. Sync interval. The cost of indexing. The hardware behind 1,000 tokens a second. Tokens accepted per pass. How the guess realigns after an edit. Numeric apply accuracy scores. No price appears on either page, so this lesson quotes none.
+
+## Our reading
+
+**1. The index is a cache of derived data, and the Merkle tree is its invalidation rule.** Lesson [Freshness and Index Updates](/learn/ai/a5-rag/freshness-updates/) taught that every index goes stale and needs a change feed. A client-side repo has no log, so Cursor derives the feed by walking hashes. The cost per edit is about 1 + f x d comparisons, plus embedding the changed chunks. The cache by content removes most of the embedding cost.
+
+**2. Index reuse is a permission problem in disguise.** The server holds derived data (vectors and chunk text) built from a person's code. Handing it to a second person is a read of that code. The usual answer is an access list. Cursor has no list to consult, because there is no central owner of "who may read this repo". So it asks the caller to prove possession. This fits when the set of files you may read equals the set of files you hold. It does not fit when a person may read a file they have not downloaded.
+
+**3. The proof is a claim, not a challenge.** As the page describes it, the client uploads a tree of hashes and the server checks results against it. Our reading: the server cannot see whether the client computed those hashes from files or copied them from somewhere. A challenge-response step would close that gap, for example by asking for a hash of the file content joined with a random value. The page does not describe one. This is the first thing to ask about before copying the design. The risk is small if hashes are never shared. It grows if a hash list can leak.
+
+**4. A shared embedding cache can answer "does this text exist somewhere?"** If the content-keyed cache is shared across users, a fast reply can tell a caller that someone already indexed that exact text. The page does not say how the cache is scoped. Scope it to the team, or add a per-team secret to the key.
+
+**5. During the copy, some results are missing.** The client sees "results only for code it shares with the copied index". Its own different or new files (about 8% on average) are absent until the background sync ends. The agent loop must tolerate this. Falling back to `grep` on the live disk is a clean way, as the coding-agent case argued.
+
+**6. The tail gained the most.** The p99 fell 690 times, the median 15 times. Our reading: the "before" time is uploading and embedding everything. The "after" time is hashing the repo, uploading the tree, and one search. The page does not break down the 525 ms or the 21 s.
+
+**7. Apply needed control of the serving stack, and the post is old.** The post says "It is not possible to build speculative edits into any of anthropic's models, so we need to train and deploy a performant custom model." That is a 2024 statement about Llama 3 and GPT-4. Our reading: a team that only calls a closed API cannot add its own guess logic. We did not check any provider for a feature that accepts a predicted output. Check before you build, and do not read 1,000 tokens a second as a current figure.
+
+## What to copy and what not to
+
+| Idea | Copy it when | Do not copy it when |
+|---|---|---|
+| Merkle sync to find changes | Many files, small frequent edits, no change log to read | One huge file changes completely each time. The tree stops at the file, so you still need a chunk-level diff |
+| Embedding cache keyed by chunk content | Edits leave most chunks unchanged and chunks follow code structure | Chunks are fixed windows that shift on every insert, or the cache is shared across trust boundaries without thought |
+| Reuse a similar index by simhash | Many near-identical copies inside one team | Every user has unique content, or the sharing scope is wider than one trust boundary |
+| Proof of possession before results | Access is defined by what you already hold | Access is defined by a role or a group. Use an access list (lesson [A5.9](/learn/ai/a5-rag/retrieval-permissions/)) |
+| Speculation from the old text | The output is mostly a copy of the input | The output is new text, such as a first draft |
+| Tuned small model for one narrow job | The job is narrow, latency matters, and you can host it | You cannot host it, or you cannot test it (no eval set) |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "Indexing a repo is slow, so I sync with a Merkle tree and compare hashes top-down, which costs about 1 plus entries-per-folder times depth, not the number of files. I cache embeddings by chunk content so unchanged chunks are free. A new teammate reuses a similar index found with a simhash. Because a similar index holds files they do not have, I filter results by a proof that the client holds each file, and I would ask how the proof resists a replayed hash list. For an edit I rewrite the whole file with speculative decoding, using the old file as the guess, and I say the gain depends on how much of the file is copied." That shows the cost model, the leak, and the limit.
+</Callout>
+
+<Callout type="mistake">
+Do not say "similar index, so reuse it" and stop. A 92% match means 8% of the files differ, and those are the leak. Do not quote "9x" without the baseline. Do not present a vendor number as a measurement you made. And do not claim the proof is a full security guarantee: the page describes hash possession, not a challenge.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="ai14-cursor-skipped-proof"
+  title="What leaks if the proof is skipped?"
+  scenario="A team reuses indexes by simhash but, to save time, skips the content proofs. Bob joins and his clone is matched to Alice's index. Alice has local files that Bob does not. (Illustrative numbers and names.)"
+  facts={[
+    'Alice clone:    2,000 files, 160 of them only on her disk',
+    'Bob clone:      1,840 files, all of them also in Alice clone',
+    'overlap:        1,840 / 2,000 = 92%, above the match threshold',
+    'Bob uploaded:   simhash only, no Merkle tree',
+    'Bob query:      "where is the signing key rotated"',
+    'top hit:        payments/keys/rotation-notes.md (Alice only)',
+    'Bob disk:       no such file',
+  ]}
+  steps={[
+    {
+      prompt: 'What leaked, and why?',
+      options: [
+        'The embedding model memorized the file during training',
+        'The copied index has Alice files and nothing checks what Bob holds',
+        'The simhash was wrong and matched the wrong team',
+        'Path encryption failed and revealed the folder name',
+      ],
+      answer: 1,
+      explain: 'The index copied for Bob is Alice index, with all 2,000 files. Search returns the best chunk, and nothing asks whether Bob holds that file. The model did not memorize anything. The match was in the right team and above the threshold, so the simhash did its job. Hiding the path would not help, because the chunk text itself came back.',
+    },
+    {
+      prompt: 'Why does the simhash match not protect Bob and Alice from this?',
+      options: [
+        'A simhash is too short to compare two codebases at all',
+        'The threshold should have been 100%, so the copy never happens',
+        'The vector database stores simhashes in plain text',
+        'Similar is not the same: 92% overlap allows 8% different files, and the hash does not say which',
+      ],
+      answer: 3,
+      explain: 'A simhash is a lossy summary built to tolerate differences. That is why reuse works at all. It says two sets are close, not which items differ. A 100% threshold would stop nearly all reuse, since clones average 92%. The storage format is not the problem here.',
+    },
+    {
+      prompt: 'What fix matches Cursor design?',
+      options: [
+        'Raise the threshold to 99% so fewer files can differ',
+        'Encrypt the chunk text with the same key for every user',
+        'Drop any hit whose file hash is not in the Merkle tree Bob uploaded',
+        'Ask Alice to approve each of Bob queries by hand',
+      ],
+      answer: 2,
+      explain: 'The page filters results against the client tree: if the client cannot prove it has the file, the result is dropped. At 99% on 2,000 files, up to 20 files could still differ, so a higher threshold only shrinks the leak. A single shared key does not stop a user from reading what the server returns. Hand approval does not scale to a query stream.',
+    },
+  ]}
+/>
+
+Now the second drill. It uses the page's own eval size: files under 400 lines.
+
+<Ballpark
+  client:visible
+  title="Time to rewrite a 400-line file"
+  scenario="A full-file rewrite writes every line of a 400-line file again. Assumption (ours): 10 tokens per line. This matches the page, since 3,500 characters a second at 1,000 tokens a second is 3.5 characters a token, so a 35-character line is 10 tokens. Speeds: Cursor claims about 1,000 tokens a second for fast apply, and about 13 times slower for plain Llama-3-70b (about 77 tokens a second, our division). The page speed includes time to first token."
+  steps={[
+    {
+      prompt: 'How many tokens does a 400-line file hold at 10 tokens per line?',
+      unit: 'tokens',
+      answer: 4000,
+      within: 1.05,
+      explain: '400 lines x 10 tokens = 4,000 tokens. The same file is about 14,000 characters at 35 characters a line.',
+    },
+    {
+      prompt: 'How long does the rewrite take at 1,000 tokens a second, in seconds?',
+      unit: 's',
+      answer: 4,
+      within: 1.05,
+      explain: '4,000 tokens / 1,000 tokens a second = 4 s. This is a company claim for Cursor deployment in 2024. The page counts time to first token inside its speed, so for a file of this size we do not add a start-up time on top. The page does not say what file sizes its 3,500 characters a second covers.',
+    },
+    {
+      prompt: 'How long does the same rewrite take at about 77 tokens a second (plain Llama-3-70b), in seconds?',
+      unit: 's',
+      answer: 52,
+      within: 1.1,
+      explain: '4,000 / 77 = 52 s, which is 4 s x 13. Nearly a minute is long enough to break a programmer out of flow, as the post says.',
+    },
+    {
+      prompt: 'The post says Cursor is working toward rewriting files up to 2,500 lines. At 1,000 tokens a second and 10 tokens a line, how long is that rewrite, in seconds?',
+      unit: 's',
+      answer: 25,
+      within: 1.05,
+      explain: '2,500 lines x 10 = 25,000 tokens. At 1,000 tokens a second that is 25 s. Time grows with file length, which is why the post also plans a smaller distilled model for lower latency.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A Merkle tree has 16 entries in every folder and 4 levels, so 65,536 files. One file is edited. About how many hash comparisons does a top-down walk make to find it?',
+      options: [
+        'About 16, the children of the root folder only',
+        'About 65, the root plus 16 at each level',
+        'About 4,096, every file in the largest top-level folder',
+        'About 65,536, one for every file in the tree',
+      ],
+      answer: 1,
+      explain: 'One comparison for the root, then all 16 children of the diverging folder at each of 4 levels: 1 + 16 x 4 = 65. Sixteen would stop after one level. The full file count is what the tree avoids.',
+    },
+    {
+      q: 'Why does an embedding cache keyed by chunk content survive an edit better than one keyed by file path and line range?',
+      options: [
+        'Hashes of content are smaller than file paths, so the cache fits in memory',
+        'A content key skips the model for every chunk on the first index run',
+        'The cache can then be shared safely between any two users',
+        'An unchanged chunk gives the same key even if the file around it shifted',
+      ],
+      answer: 3,
+      explain: 'The key depends only on the text. If an insert moves a function down 3 lines, its text and key do not change, so it still hits. A path and line key would miss. Key size is not the point. The first run still has to embed everything. Sharing across users is a separate risk, not a benefit.',
+    },
+    {
+      q: 'Cursor says its fast-apply model is about 9x faster than its previous GPT-4 speculative edits deployment. What does the same post say about plain Llama-3-70b decoding?',
+      options: [
+        'About 13x slower than fast apply, as the page puts the ratio',
+        'About 9x slower than fast apply, the same ratio as the GPT-4 setup',
+        'About the same speed, since both use a 70B model',
+        'The page gives no comparison with plain decoding at all',
+      ],
+      answer: 0,
+      explain: 'The post says "a ~13x speedup over vanilla inference using Llama-3-70b and a ~9x speedup over our previous GPT-4 speculative edits deployment". The two ratios have different baselines. Mixing them up is the usual error.',
+    },
+    {
+      q: 'In speculative edits, a model rewrites a file where 95% of the lines are unchanged. Which tokens still cost about one forward pass each?',
+      options: [
+        'The copied lines, because each must be checked one at a time',
+        'The first line of the file, because the guess starts there',
+        'The new lines it writes, which have no old text to copy',
+        'None of them, because speculation removes all passes',
+      ],
+      answer: 2,
+      explain: 'Copied text is accepted in groups, many tokens for one pass. New text has no matching old text, so the model writes it token by token, like plain decoding. The cost of an edit is the cost of its new text.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Cursor: Securely indexing large codebases](https://cursor.com/blog/secure-codebase-indexing) (2026-01-27): the primary source for indexing, with the Merkle sync, simhash reuse, content proofs, and latency percentiles.
+- [Cursor: Editing Files at 1000 Tokens per Second](https://cursor.com/blog/instant-apply) (2024-05-14): the primary source for fast apply and speculative edits.
+- [Cursor: Improving agent with semantic search](https://cursor.com/blog/semsearch) (2025-11-06): the post behind the 12.5% claim, with the offline set and the A/B test.
+- [Leviathan and others: Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192): the original idea, with identical outputs. You do not need it to follow this lesson, and elective E3.4 covers the method.
+- [Pro Git: Git Objects](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects): a clear picture of a content-addressable store.
