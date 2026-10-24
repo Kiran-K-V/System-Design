@@ -180,6 +180,10 @@ export const syllabus: ModuleOutline[] = [
       { slug: 'robinhood', title: 'Robinhood' },
       { slug: 'flash-sale', title: 'Flash Sale' },
       { slug: 'chatgpt', title: 'ChatGPT-style App' },
+      { slug: 'upi-payments', title: 'UPI Payments' },
+      { slug: 'irctc-tatkal', title: 'IRCTC Tatkal Booking' },
+      { slug: 'hotstar-live-streaming', title: 'Live Sports Streaming' },
+      { slug: 'food-delivery-dispatch', title: 'Food Delivery Dispatch' },
     ],
   },
   {

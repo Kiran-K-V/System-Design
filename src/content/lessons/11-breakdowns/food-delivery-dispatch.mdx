@@ -1,0 +1,306 @@
+---
+summary: 'A food order has three sides: customer, restaurant, and rider. Dispatch predicts when the kitchen will finish, matches many orders and riders in one short window, and never promises an ETA it cannot keep.'
+requires: ['11-breakdowns/uber', '11-breakdowns/yelp', '06-async/backpressure-dlq']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import DispatchBuild from '../../../components/anim/lessons/DispatchBuild.tsx';
+import DispatchBatching from '../../../components/anim/lessons/DispatchBatching.tsx';
+
+## The problem
+
+You open Swiggy or Zomato at 9 pm in Indiranagar and order a chicken biryani. Three parties now depend on each other.
+
+- **The customer** wants the food hot and wants to know when it will arrive.
+- **The restaurant** wants to cook at its own pace. It has other orders on the stove.
+- **The rider** wants to pick up quickly and move on to the next order. A rider is paid for deliveries, not for waiting.
+
+A system with three sides like this is a **three-sided marketplace** [junior]. Think of a wedding caterer, a hall, and a band. Each one has its own schedule, and the day works only when all three line up.
+
+Compare this with the Uber lesson. In [Uber](/learn/11-breakdowns/uber/), the driver is ready now and the rider is waiting now. The system only has to pick a nearby driver. Here, the food is **not ready yet**, and nobody knows exactly when it will be. That one fact changes the design.
+
+- Send the rider too early, and the rider stands outside the restaurant doing nothing. That wastes a person who could deliver another order.
+- Send the rider too late, and the biryani sits on the counter and goes cold. The customer waits and is unhappy.
+
+This case adds three ideas.
+
+1. **Predict kitchen time, then time the rider.** The rider should arrive as the food is ready.
+2. **Match in batches.** Collect orders for a short window, then solve one problem for all orders and all riders. Also let one rider carry two nearby orders.
+3. **Build the ETA from parts, and protect it.** When riders are scarce, for example in heavy rain, say no or say "later" at the door. Do not accept an order you cannot deliver on time.
+
+The geo index and the driver lock are in the Uber lesson, so this lesson does not teach them again. Restaurant search is the Yelp lesson ([Yelp](/learn/11-breakdowns/yelp/)). Proximity search is lesson [10.1](/learn/10-advanced/proximity-search/).
+
+<Callout type="deep" title="What the company says and what we infer">
+The facts about how Swiggy matches orders come from one public paper: "Batching and Matching for Food Delivery in Dynamic Road Networks" (Joshi, Singh, Ranu, Bagchi, Karia, Kala; ICDE 2021). Two of its authors list Swiggy as their workplace. Its experiments use data that Swiggy provided. We call these claims **the paper says**.
+
+We could not open a Swiggy Bytes post or a Zomato engineering post for this lesson. So we make **no claim** about how Swiggy or Zomato predict preparation time, compute the ETA, or handle rain. Those parts are **our reading**: a design that fits the requirements. It is not what either company runs.
+</Callout>
+
+## Requirements
+
+**Functional.**
+
+1. A customer places an order from one restaurant.
+2. The restaurant accepts the order and marks it ready.
+3. The system assigns a rider, and the rider picks up and delivers.
+4. The customer sees a delivery time estimate and the live status.
+
+**Below the line.** Finding restaurants and menus (search, see the Yelp lesson), payments, ratings, refunds, and coupons. Name them and move on.
+
+**Non-functional.**
+
+- **Time the pickup.** The rider should reach the restaurant at about the time the food is ready.
+- **Keep the promise.** The paper says that in food delivery, once an order is placed, the service must deliver it within the promised time. It gives about 45 minutes as a typical promise. The paper contrasts this with ride-hailing, where refusing a ride is an allowed choice. So we must say no *before* we accept the order.
+- **Fresh enough locations.** A rider's position may be a few seconds old (see the Uber lesson).
+- **Decision time.** A match must come back within a few minutes at most. The paper's experiments use windows of one to three minutes.
+- **Bursts.** Lunch, dinner, a cricket match night, and heavy rain all change demand or supply quickly.
+
+We do not need big numbers for this lesson. The design is about *timing and matching*, not about raw volume.
+
+## Core entities
+
+- **Customer**: has an address.
+- **Restaurant**: has a location, a menu, and a kitchen that can be busy or quiet.
+- **Order**: items, a state (placed, accepted, preparing, ready, picked up, delivered), and a predicted ready time.
+- **Rider**: has a status (free, going to a restaurant, carrying orders) and a latest location.
+- **Delivery**: ties one rider to one to three orders, with a planned route.
+
+The paper says Swiggy allows at most 3 orders per rider, and that batches above 3 orders are rarely seen in its data. We keep the same limit.
+
+## API
+
+```
+POST  /orders                 { restaurantId, items, addressId }   -> Order (with ETA)
+PATCH /orders/:id             { status: "accepted" | "ready" }     -> Order
+POST  /riders/location        { lat, long }                        -> ok
+PATCH /deliveries/:id         { status: "picked_up" | "delivered" } -> Delivery
+GET   /orders/:id             -> status, rider position, ETA
+```
+
+The restaurant and rider ids come from the session token, not the body (lesson [3.5](/learn/03-api-design/auth/)). Make `POST /orders` safe to retry with an idempotency key (lesson [3.4](/learn/03-api-design/idempotency/)). Otherwise a double tap on a bad network places two biryanis.
+
+## High-level design
+
+<DispatchBuild client:visible />
+
+This is **a design that fits the requirements**. It is not the architecture of Swiggy or Zomato. The first four steps are ordinary services. The interesting parts are steps 2, 4, 6, and 7: the prediction, the timer, the ETA, and the check at the door.
+
+## Deep dives
+
+### Predicting kitchen time, then timing the rider
+
+**FPT** [junior] means food preparation time: the time from "restaurant accepted" to "food packed and ready". Picture a friend arriving by train. You do not leave home when the train leaves its start station. You leave so that you reach the platform when the train arrives. You need two things: when the train arrives (the kitchen) and how long your walk is (the rider travel).
+
+The paper gives the delivery time as one rule, which we say in words. Two things happen **in parallel**. One is the rider getting assigned and travelling to the restaurant. The other is the kitchen cooking. The food leaves only when *both* are done, so take the **later** of the two. Then add the drive to the customer.
+
+This rule shows both failures.
+
+- **Rider is faster than the kitchen:** the rider waits. The delay for the customer is the kitchen time, but the rider's time is wasted.
+- **Kitchen is faster than the rider:** the food waits. The delay for the customer is the rider time, and the food gets cold.
+
+The best case is that both finish at the same moment. The paper calls the lowest possible time for an order the *shortest delivery time*. It is reached only if a rider is already waiting or arrives just in time. It measures a plan by how much *extra* time it adds above that floor.
+
+**The prediction (our reading).** A model must guess FPT before the kitchen is done. A design that fits could use the following signals.
+
+- How fast this restaurant usually cooks these dishes.
+- How many other orders are in its kitchen right now.
+- The hour of the day and how busy the place is.
+- Signals from the restaurant app, such as "accepted" or "ready".
+
+Treat the restaurant's own "ready" button with care. A restaurant may press it early or late. So it is one signal, not the truth. Because the guess is never exact, store it as a **range**, not one number. The wider the range, the less sure you are.
+
+**The timer (our reading).** Matching picks a rider early, but pickup is a different moment. The dispatch timer waits and then sends the "go now" request at: predicted ready time, minus rider travel time. As the kitchen gives new signals, the timer is moved. A restaurant that slows down moves the timer later. A timer must survive a restart, so keep it in a durable timer system (see Temporal, lesson [8.9](/learn/08-technologies/temporal/)). A timer kept only in memory would vanish in a crash, and the rider would never leave.
+
+**Which error costs more?** Idle riders cost money and capacity. Cold food costs customers. A design can lean one way, for example by adding a small buffer to the predicted ready time. State this choice aloud in an interview. It is a product decision, not a math result.
+
+The error does not stay in one place. A wrong FPT moves the timer, the ETA, and the matching cost together. So log both the predicted and the true ready time, and watch the gap over time. This is the same habit as in lesson [7.5](/learn/07-reliability/observability/).
+
+### Batched assignment
+
+**Matching** [mid] means pairing two groups so that the total cost is as small as possible. Picture a teacher pairing students for a project. If she pairs students one at a time as they walk in, the last student may be left with a bad partner. If she waits until the whole class is in the room, she can find better pairs overall. Here the two groups are orders and riders. The "cost" is extra delivery time.
+
+**Greedy** [junior] assignment means taking the best choice for *this* order right now, and never looking back. It is fast and simple. The paper notes that greedy choices can be good one by one and poor together.
+
+**Batching** has two meanings in this lesson. Keep them apart.
+
+- **A time window.** Collect orders for a short window, then decide for all of them together. The paper calls this an *accumulation window*.
+- **Order batching.** One rider carries two or three orders. This works when the restaurants are close and the customers are in about the same direction.
+
+<DispatchBatching client:visible />
+
+In the animation, greedy picks the best rider for order 1 at once. That choice leaves only a far rider for order 2, and nothing for order 3. The window version sees all three orders first, so it can give the close order to one rider and the two neighbor restaurants to the other.
+
+**What the paper says about the method.**
+
+- The paper frames rider assignment as a *minimum-weight perfect matching* on two groups. In plain words: pair every order with a rider so that the sum of the costs is smallest.
+- It proves the full problem is **NP-hard** [senior] and cannot be approximated well in reasonable time. NP-hard means that no known method finds the best answer quickly as the input grows. So it uses a fast heuristic called FoodMatch. A heuristic is a method that finds a good answer, not always the best one.
+- To avoid building the whole table of all order and rider pairs, it searches outward from each order and keeps only the likely candidates.
+- It treats order batching as grouping nearby orders, and it stops merging when the grouped route becomes too costly.
+- On data provided by Swiggy, the authors report about 30% less delivery time than their baseline methods. We quote this as the authors' claim from their own experiments.
+
+One detail matters for fairness. The paper's own *greedy* baseline also works inside a window. It picks the cheapest order and rider pair, one pair at a time. The new idea is to solve the whole window at once.
+
+**Why a short wait can pay off.** The paper says a longer window makes an order wait longer for its assignment, but it gives the solver more orders to choose from. The paper says it is hard to prove how long the window should be, and it tests it by experiment. Its default windows are one to three minutes, shorter in a city with fewer orders. We use the same idea: **choose the window by experiment, and make it shorter when orders are few**.
+
+**The guard rail (our reading).** Do not let batching hurt one customer for the benefit of another. Add rules: a maximum number of orders per rider (3 here), a maximum extra detour for the first customer, and a bound on how far a rider may be from a restaurant. The paper uses the promised delivery time (45 minutes) to set that last bound. It also marks an order as rejected if it stays unassigned too long (30 minutes in the paper's setup).
+
+**Riders keep moving.** A rider's position changes while the solver works. So treat a rider's position as a good estimate, and re-check right before the offer goes out. The Uber lesson shows how to lock a rider so two matchers do not offer the same person.
+
+### The ETA, and what to do when riders run short
+
+**ETA** [junior] means estimated time of arrival: the number the customer sees. It is a *prediction*, not a measurement. A good one is built from the same parts as the delivery time rule.
+
+| Part | Who knows it | How it goes wrong |
+|---|---|---|
+| Wait for a rider | The matching system | A busy zone, or a window that just closed |
+| Rider travel to the restaurant | The routing source and the rider's position | Traffic, a flyover, rain |
+| Food preparation | The prep-time model | A rush at the kitchen, a missing item |
+| Travel to the customer | The routing source | A gate, a long lift, a wrong pin |
+
+Take the later of "rider reaches the restaurant" and "food ready". Then add the last part. Show the ETA as a single number, but keep the parts inside, so you can see which part moved when the ETA changes. Refresh it as the order moves forward.
+
+**Why not use the average?** An average of past delivery times ignores *this* kitchen and *this* hour. A fixed average will be wrong at every peak. This is our reading, and the table above shows the reason: each part changes with the situation.
+
+**Short supply.** Heavy rain does three things at once. Fewer riders go out. Riders move slowly. More people order in. Demand goes up while supply goes down. If the system keeps accepting orders, every order waits longer, and every ETA turns out wrong.
+
+The paper's point about *serviceability* [mid] is the key. **Serviceability** means whether the system can actually deliver an order to this address right now. In ride-hailing, a "no cars" answer is normal. In food delivery, an accepted order must be delivered. So the "no" has to happen **at the door**, before the order is accepted. This is the same idea as lesson [6.4](/learn/06-async/backpressure-dlq/): push back at the edge, instead of letting a queue grow inside.
+
+We have no primary source for how Swiggy or Zomato do this. This is a design that fits.
+
+1. **Measure per zone.** Compare open orders with free riders in each small area (cells from lesson [10.1](/learn/10-advanced/proximity-search/)).
+2. **Pull the levers, mildest first.**
+   - Show a longer ETA that is honest.
+   - Shrink the delivery radius, so far orders (which tie up a rider longest) stop first.
+   - Pause new orders from restaurants that are already backed up.
+   - Stop new orders in the zone for a while, and tell the customer.
+3. **Widen again slowly.** If you open the gates the moment the numbers improve, the system will flip back and forth. Wait until supply has been stable for a while. This habit of using different thresholds to close and to reopen is called **hysteresis** [senior].
+
+**Never promise an ETA you cannot keep.** A longer honest ETA hurts a little. A broken promise hurts more, because the customer stops trusting the number.
+
+<Callout type="deep" title="Why not a wider radius in the rain?">
+A wider radius brings in more restaurants, so it raises demand. In the rain you want less demand, not more. A wider radius is for the opposite case: riders are idle and orders are few. The same lever works in both directions. Which way you turn it depends on what is short.
+</Callout>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Send the rider at order time | Simple, no prediction needed | Idle riders when cooking is slow | Kitchens are fast and predictable |
+| Send at predicted ready time minus travel | Rider arrives as food is ready | Needs a model, and errors move the timer | Prep time varies a lot |
+| Greedy, one order at a time | Instant decision | Poor global result, stranded orders | Very few orders or riders |
+| Window plus matching | Better total result | A short wait, more compute | Many orders and riders in one area |
+| Batch two orders on one rider | Fewer riders, lower cost | Later food for one customer | Restaurants and customers are close |
+| Stop or slow orders at the door | The promise holds | Lost orders in the moment | Supply is short, as in rain |
+| Accept all and hope | No lost orders at first | Late orders, unhappy customers | Rarely right |
+
+## Interview lens
+
+<Callout type="tip">
+Start with the new fact: "the food is not ready when the order is placed, so I predict preparation time and send the rider at ready time minus travel time". Then say why you wait for a short window and match many orders at once, and name the cost: the first order waits a little. Finish with the promise: "if riders run short, I refuse or stretch the ETA before accepting, because an accepted order must be delivered".
+</Callout>
+
+<Callout type="mistake">
+Do not say "assign the nearest rider" and stop. That ignores kitchen time, batching, and riders who are about to be free. Do not claim you can find the best assignment exactly, because the full problem is NP-hard. Do not use one average as the ETA. Do not state how Swiggy or Zomato run any of this unless you have a source.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A biryani takes much longer than expected, and the rider was sent at order time. What goes wrong?',
+      options: [
+        'The food goes cold on the counter while the customer waits there',
+        'The rider waits at the shop, so no other order can be taken',
+        'The matching problem has no answer, so the order is dropped',
+        'The ETA is shown twice because two timers fire at the same time',
+      ],
+      answer: 1,
+      explain: 'A rider sent at order time reaches the restaurant before the food is ready, so the rider stands idle. Cold food is the opposite error, where the rider is late. Neither failure drops the order or fires a second timer.',
+    },
+    {
+      q: 'Why does a delivery system hold new orders for a short window instead of assigning each order the moment it arrives?',
+      options: [
+        'The database can only accept one write for each window of time',
+        'Riders need the window to finish their last delivery on the road',
+        'Seeing many orders at once allows a better overall pairing',
+        'A window removes the need to predict the kitchen time for orders',
+      ],
+      answer: 2,
+      explain: 'With many orders and riders in view, the solver can give up a small gain on one order for a better total. The price is a short wait for the first order. The window does not change database writes, and it does not replace the prep-time prediction.',
+    },
+    {
+      q: 'Why is "refuse at the door" the right place to protect the promised delivery time?',
+      options: [
+        'An accepted order must be delivered, so refusing later is too late',
+        'The customer app cannot show any error after the payment screen',
+        'Riders refuse every order that was placed more than a minute ago',
+        'Matching cannot run at all unless the whole zone is already closed',
+      ],
+      answer: 0,
+      explain: 'In food delivery a refusal after acceptance breaks the promise and wastes the cooked food. A check at the door is the cheap place to say no. The other options describe limits that do not exist.',
+    },
+    {
+      q: 'Heavy rain means fewer riders and more orders. Which action fits that situation?',
+      options: [
+        'Widen the delivery radius so that many more restaurants are listed',
+        'Add a long timer so that riders always leave sooner than needed',
+        'Switch to greedy assignment so that every decision is instant',
+        'Shrink the radius and show a longer ETA until supply recovers',
+      ],
+      answer: 3,
+      explain: 'Supply is short, so cut demand and be honest about time. A wider radius adds orders. Early riders waste capacity, and greedy assignment does not add riders.',
+    },
+    {
+      q: 'Why does a design that batches two orders on one rider also need a guard rail?',
+      options: [
+        'Batching makes the food cook more slowly in the restaurant kitchen',
+        'One customer could wait much longer for the other one’s sake',
+        'Two orders cannot share one single entry in the order database',
+        'A batched rider cannot be tracked on the live map by customers',
+      ],
+      answer: 1,
+      explain: 'Batching saves rider capacity, but it can make one customer wait for the sake of the other. A cap on orders and on extra detour keeps it fair. Batching does not change cooking, storage, or tracking.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="dispatch-cold-food-rain"
+  title="Cold food on a rainy night"
+  scenario="On a rainy evening, customers complain that biryani arrives cold and late. The ETA in the app said 35 minutes and the real time was far longer. Restaurant staff say riders arrived late for pickup."
+  facts={['demand in the zone:   far above normal', 'free riders in the zone: far below normal', 'serviceability check:  off, every order is accepted', 'delivery radius:       unchanged', 'ETA source:            same rule as on dry days']}
+  steps={[
+    {
+      prompt: 'What is the most likely root cause?',
+      options: [
+        'The prep-time model is the only part that is wrong',
+        'The system accepted more orders than riders could deliver on time',
+        'Customers placed their orders at the wrong hour',
+        'The restaurants cooked too fast and finished before pickup',
+      ],
+      answer: 1,
+      explain: 'Supply fell and demand rose, and nothing at the door pushed back. Every order waited for a rider, so food went cold and every ETA was wrong. Restaurants that cook fast do not explain late riders, and one wrong model would not fit the whole zone.',
+    },
+    {
+      prompt: 'Which fix is best?',
+      options: [
+        'Raise the window length so that matching has more time to think',
+        'Send every rider to the restaurant at order time to save a step',
+        'Make the serviceability check react to the supply gap, with a longer honest ETA and a smaller radius',
+        'Remove the ETA from the app so no promise is made',
+      ],
+      answer: 2,
+      explain: 'The promise must be checked at the door. A smaller radius and a longer ETA cut the demand and tell the truth. A longer window makes each order wait more. Early riders add idle time. Hiding the ETA hides the problem and does not fix it.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Batching and Matching for Food Delivery in Dynamic Road Networks (arXiv abstract)](https://arxiv.org/abs/2008.12905), the Swiggy-linked paper behind the matching and batching claims. You do not need to read the proofs.
+- [The same paper as a PDF](https://arxiv.org/pdf/2008.12905), with the delivery time rule, the greedy baseline, and the window settings.

@@ -9,6 +9,7 @@ Site: **Uptime** (brand constant `SITE` in `src/layouts/Layout.astro`). Subject:
 | Module | State |
 |---|---|
 | All modules 0 to 12 | Done. 97 lessons. |
+| Module 11 India additions (2026-10-24) | Done. `upi-payments`, `irctc-tatkal`, `hotstar-live-streaming`, `food-delivery-dispatch`. Existing case studies got Indian examples and rupee amounts. New direction: **Indian reader first**; prefer Indian examples (UPI, IRCTC, IPL, Swiggy-style) and rupees in new text. Never state a company claim without a fetched source. |
 
 Module 6 to 8 reusable components: `AsyncQueueViz`, `AsyncPartitionViz` (queue and consumer-group visuals), `Rel*` (retry, breaker, token bucket, trace waterfall), `TechParts`. Prefix new components per module to avoid collisions between parallel writers. Lessons in Modules 6 to 8 link back with `/learn/<id>/` markdown links; never link forward to an unwritten lesson (write "lesson 9.5" as plain text).
 

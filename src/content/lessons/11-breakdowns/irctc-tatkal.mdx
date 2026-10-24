@@ -1,0 +1,268 @@
+---
+summary: 'A train seat is a row of legs between stations, so a booking claims a range and overlapping ranges collide. Waitlists promote in a fixed order inside one atomic step, and a public opening time is a predictable spike that an admission queue and bot checks can absorb.'
+requires: ['11-breakdowns/ticketmaster', '11-breakdowns/flash-sale', '07-reliability/rate-limiting']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import IrctcBuild from '../../../components/anim/lessons/IrctcBuild.tsx';
+import IrctcSegments from '../../../components/anim/lessons/IrctcSegments.tsx';
+
+## The problem
+
+It is 9:59 on a weekday. You want a seat on the Delhi to Patna train for tomorrow. The **Tatkal** quota opens at 10:00 for AC classes. A **quota** is a block of seats set aside for one kind of buyer, like the seats reserved for ladies or for the Defence in a cinema hall. Tatkal means "instant". It is the last-minute block. At 10:00 sharp, a huge crowd presses "Book" in the same second.
+
+The earlier ticket lessons fit part of this. Seats are a scarce row, so a conditional update claims one without double booking ([Ticketmaster](/learn/11-breakdowns/ticketmaster/)). A crowd needs a waiting room ([Flash Sale](/learn/11-breakdowns/flash-sale/)). A train adds three new ideas:
+
+1. **A seat is not one unit.** The train runs through many stations. One seat can carry Ravi from Delhi to Kanpur, and then Dev from Kanpur to Patna. What you sell is a range of the journey.
+2. **A full train still sells tickets.** A booking with no seat goes onto a waitlist. When someone cancels, the waitlist moves up on its own. The order must be fair and exact.
+3. **The spike has a known start time.** Everyone knows 10:00. You can plan for it, and so can the bots.
+
+We describe a design that fits the requirements. We do not claim it is what IRCTC or Indian Railways runs inside. They have not published that, and we will say clearly which facts are public.
+
+## Requirements
+
+**Functional.**
+
+1. Search a trip: from one station to another, on a date, in a class (for example Sleeper or Third AC), and see if seats remain.
+2. Book a trip for up to four passengers in the Tatkal quota. A booking gets a **PNR**, the Passenger Name Record. It is the reference number on your ticket, like the receipt number you quote at a counter. The result for each passenger is confirmed (**CNF**), **RAC**, or **WL**. We define RAC and WL below.
+3. Cancel a booking, and promote waiting passengers when a seat frees up.
+4. Prepare the **chart**, the final list of who travels in which berth.
+
+**Below the line.** Payments internals, refunds in detail, food orders, the other quotas, fares, and the time table.
+
+**Non-functional.** A seat is never given to two people for the same leg. Booking is strongly consistent. Searches may be slightly stale. The system must survive a crowd that arrives in the same second, at an opening time that is public. A bot must not beat a real person just because it is faster.
+
+**Public facts we use.** These come from IRCTC's own help pages and from the quota list on the Indian Railways site. Booking opens one day before the journey date. AC classes open at 10:00 and non-AC classes at 11:00. A Tatkal booking has at most four passengers. A verification code is required during booking. Online cancellation is allowed only before the chart is prepared. A booking where every passenger is still waitlisted at charting loses its names from the chart, and those passengers may not board. A news report from the government broadcaster says that from mid-2025 online Tatkal needs an Aadhaar-linked account and an OTP, and that authorised agents are barred in the first 30 minutes. We could not read the original circular, so treat that last point as reported. We use no throughput figures, because we found no source we could read.
+
+## Core entities
+
+- **Train run.** A train on one date, with an ordered list of stations. Between two neighbouring stations is a **leg**.
+- **Seat.** A seat or berth in a coach of a class.
+- **Leg claim.** One row per seat per leg: free, held, or sold, with a holder and an expiry time for holds.
+- **Booking.** A PNR, the trip (from, to), the passengers, and a status.
+- **Waitlist entry.** A passenger or booking waiting for a seat, with its trip and a sequence number.
+
+## API
+
+```
+GET  /trips?from=&to=&date=&class=        → classes, seats free, waitlist length
+POST /bookings   { train, date, from, to, class, passengers[] }   → pnr, status per passenger
+POST /bookings/{pnr}/cancel
+GET  /bookings/{pnr}                       → status, coach and berth if confirmed
+```
+
+The booking call carries an idempotency key, as in lesson [3.4](/learn/03-api-design/idempotency/), so a retry after a timeout cannot book twice.
+
+## High-level design
+
+Step through the build. Each step names the requirement it meets. This is a design that fits the requirements.
+
+<IrctcBuild client:visible />
+
+## Deep dive 1: a seat is a row of legs
+
+Picture a train that runs A to B to C to D. It has three legs: A to B, B to C, C to D. Ravi boards at A and leaves at C. He sits on the first two legs and not on the third. After C, the same seat is empty. Dev can board at C and ride to D in that seat. The seat is full all the way, yet nobody sat in it twice at the same time.
+
+So the thing you sell is not "a seat". It is **a seat for a range of legs**. A booking from A to C needs every leg between A and C: A to B and B to C. Two bookings **overlap** when they share at least one leg. Ravi (A to C) and Meena (B to D) overlap on B to C. Ravi and Dev (C to D) touch at station C but share no leg, so they do not overlap.
+
+First, the naive design. It keeps one counter per train or per seat: how many seats are left. It cannot see legs. Switch between the two designs and step through.
+
+<IrctcSegments client:visible />
+
+The counter fails in both directions. It refuses Dev, who would fit, so seats run half empty. If you patch it to admit Dev, it also admits Meena, who clashes. The data model must have one row per seat per leg. Then a booking is a **range claim**: take every leg in the range, or take none. This is the conditional update from the [Ticketmaster](/learn/11-breakdowns/ticketmaster/) lesson, stretched over several rows:
+
+```sql
+BEGIN;
+UPDATE leg_claims
+SET holder = $pnr, hold_expires_at = now() + interval '10 minutes'
+WHERE train_run = $run AND seat = $seat
+  AND leg >= $from_leg AND leg < $to_leg
+  AND (holder IS NULL OR hold_expires_at < now());
+-- the application checks: rows changed = number of legs in the trip
+-- if not, ROLLBACK. If yes, COMMIT.
+```
+
+If the count is short, one leg was taken. Roll back and no leg stays claimed. This is the all-or-nothing rule from lesson [4.4](/learn/04-data/transactions/). A second booking that wants one of the same legs waits on that row, then re-checks the condition and finds it held. A hold can lapse by its own timestamp, with no sweeper job. That is the same implicit expiry as before.
+
+Two details keep this correct.
+
+- **Take the legs in a fixed order**, lowest leg first. Two bookings that want overlapping legs in different orders can deadlock, which means each waits for a row the other holds. A fixed order prevents it ([lesson 9.4](/learn/09-patterns/contention/)).
+- **Take it per seat, not per train.** The search first finds a seat that is free on all legs. Then it claims that seat. If the claim fails, it tries the next seat. Which seat to try first is a design choice. A good habit is to prefer a seat whose free run is the closest fit for the trip, so long free runs stay whole for long trips. Otherwise short trips chop every seat into small gaps that no long trip can use.
+
+A small alternative is one number per seat: a row of bits, one per leg, where 1 means taken. A claim is "if none of my bits are set, set them all", written as one conditional update. It is the same idea with a smaller row.
+
+**Search is a read of the same rows.** "Seats from A to D" means seats free on every leg of A to D. The result is a hint. The claim is the judge, just like the seat map in the Ticketmaster lesson. Cache it for a short time and accept that it is a little stale.
+
+**We found no published description of how Indian Railways stores this.** The leg model is our reading of what the rules force. If trips are sold between any two stations, ranges must be the unit. Treat the rest as a design.
+
+## Deep dive 2: waitlist and RAC
+
+When no seat is free on every leg of your trip, you can still buy a ticket in a lower state. **WL** means waitlist. It is a place in a queue, like a token at a clinic. You have no seat yet. **RAC** is "Reservation Against Cancellation". Railways lists it as its own quota code. In practice it means you can travel and you have a seat to sit on, which you may have to share, until a cancellation gives a full berth. We use it here as a middle state between waiting and confirmed.
+
+So a passenger is in one of these states: confirmed, RAC, WL. People cancel often, so the states move. A cancellation frees a range of legs on a seat. The system then **promotes**, which means it moves a waiting passenger up a state. The picture is a queue at a bank counter. When a counter frees up, the person at the head of the line goes next. Nobody argues, because the order is known.
+
+**The promotion rule.** A design that fits: keep a queue per train run and class. Entries ahead of the line are RAC, then WL, each in sequence-number order. A cancellation frees legs on one seat. The promoter walks the queue from the front. It picks the first entry whose whole trip lies inside the freed legs. That entry is confirmed on that seat. If no entry fits, the legs return to the free pool for new bookings. The exact Railways rules (which quota gets a freed seat, how partial fits work) are not ours to claim. This is the shape of the logic.
+
+A cancelled seat may fit only part of a longer waiting trip. It may also fit a short trip with room to spare. So order alone is not enough. The fit check is part of the rule, and the leftover legs go back to the pool.
+
+**Why the order must be deterministic.** Deterministic means the same input always gives the same result. If two promoters could pick different people for the same free seat, results would depend on timing. A passenger would see someone behind them in the line jump ahead. You cannot explain or test that. So the rule has one total order: sequence number, and nothing random.
+
+**Why the promotion must be atomic.** Atomic means one step that nothing can interrupt. The promotion has three changes: free the legs, pick the waiting entry, and give it the seat. If they are separate steps, bad things fit between them.
+
+- Two cancellations are handled by two workers at once. Both read the same head of the queue. Both promote the same passenger. One seat stays empty, and the next passenger in line stays waiting.
+- The legs are freed, and before the promoter runs, a fresh booking claims them. A person who just arrived beats someone who waited.
+- The worker crashes after freeing the legs and before the promotion. The seat is lost.
+
+The fix: do the whole promotion in one transaction, and run promotions for one train run one at a time. A queue keyed by train run does this (lessons [6.1](/learn/06-async/queues/) and [6.2](/learn/06-async/pubsub-logs/)). One worker owns a key. Order is kept inside a key. Different trains run in parallel.
+
+**After the chart.** Online cancel is allowed only before charting. When the chart is prepared, the list freezes. A booking where all passengers are still waitlisted loses its names from the chart and may not board. That is the end of the waitlist for that booking: it becomes a refund. Railways has changed how many hours before departure the chart is made, more than once, so we quote no number. Your design should hold that time as a setting, not a constant in the code.
+
+## Deep dive 3: a fixed-time spike
+
+The Tatkal window is a **predictable spike**. In the flash sale the start was a marketing choice. Here it is a rule on a public page: AC at 10:00, non-AC at 11:00. A known start has two effects.
+
+First, you can prepare. Add capacity ahead of the time, warm caches, and do not deploy a change at 9:55. Autoscaling that reacts after the load arrives is too slow, because the crowd is full size within seconds.
+
+Second, bots prepare too. A script can log in early, fill the form, and fire at 10:00:00. A human cannot match it. Three layers help.
+
+1. **Admission queue.** Let requests into the booking path at a rate it can take. It is the waiting room from the [Flash Sale](/learn/11-breakdowns/flash-sale/) lesson. It is also a rate limiter that holds people instead of rejecting them (lesson [7.4](/learn/07-reliability/rate-limiting/)). The booking service and its seat rows see a rate we chose.
+2. **Bot defence.** A human check (IRCTC requires a verification code during booking), a verified account, and an OTP step make a script costlier. Each check adds friction for real people too, so use only what you need.
+3. **Per-user limits.** Cap how many bookings one account or device can make in the window, and the passengers per booking (Tatkal allows four). A limit works only if accounts are costly to create. That is why a verified identity matters. Our reading: the Aadhaar rule above is aimed at this. Railways has also barred agents from the first minutes of the window, which is the same idea at the business level.
+
+None of these replaces the range claim. The admission queue protects the system. The conditional claim protects the data. Fair treatment of real users is a product choice on top of both.
+
+**Fairness inside the queue.** If the queue admits people in arrival order, a faster connection wins. If it admits them at random from everyone who arrived in the first few seconds, speed matters less. It is a product decision with a trade-off. Random admission feels fair to humans and is harder to game by timing. Order of arrival is simpler to explain.
+
+## Trade-offs
+
+| Decision | Choice here | You gain | You pay |
+|---|---|---|---|
+| Inventory unit | One row per seat per leg | Exact. Seats are reused across the trip | Many rows per seat. A multi-row claim |
+| Range claim | One transaction, all legs or none | No partial holds, no clash | Contention on shared legs near busy stations |
+| Seat choice | Closest fit first | Long free runs stay whole | A more complex search |
+| Waitlist | Fixed order, one worker per train run | Fair, testable, no lost seats | Promotions for one train are serial |
+| Chart time | A setting | Policy can change without code | A freeze point where cancels turn into refunds |
+| Admission | Queue before booking | Booking load is bounded | People wait. A queue to run |
+| Bot defence | Verified account plus checks | Scripts cost more | Friction for real people |
+
+<Callout type="tip">
+Say the new idea first: "The unit of inventory is a seat on a range of legs. A booking claims every leg in its range in one transaction, or none. Two bookings contend only if their ranges share a leg." Then waitlist: "A cancellation frees legs. A promoter picks the first waiting entry that fits, in sequence order, in the same transaction as the free." Then the spike: "It starts at a known time, so I prepare capacity and put an admission queue in front." Always add "this is a design that fits, not a claim about their system."
+</Callout>
+
+<Callout type="mistake">
+Do not keep one seat counter per train. It refuses trips that fit and cannot see clashes. Do not promote the waitlist in separate read and write steps. Do not use random or timing-based order for promotion. Do not claim you know how IRCTC works inside. And do not say the admission queue prevents double booking. It limits traffic. The range claim decides who gets the seat.
+</Callout>
+
+<Callout type="deep" title="Why ranges overlap only when they share a leg">
+Think of each trip as a half-open interval: it includes its first leg and stops before its last station. Ravi's A to C covers the legs starting at A and at B. Dev's C to D covers the leg starting at C. Because a trip stops before its end station, two trips that meet at a station do not share a leg. That one rule is why a seat can be sold again at the station where the first passenger gets off. It is also the rule behind every interval scheduling problem, such as booking a meeting room.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'On a train that runs A, B, C, D, which legs must a booking from A to C claim on its seat?',
+      options: [
+        'A to B and B to C',
+        'Only the leg that starts at A',
+        'All three legs, because the seat is on the train',
+        'Only B to C, because it is the middle one',
+      ],
+      answer: 0,
+      explain: 'A booking claims every leg between its start and end station. A to C covers A to B and B to C. Claiming all three would block Dev, who rides C to D. Claiming fewer would let a clash through.',
+    },
+    {
+      q: 'Why does a single seats-left counter per train fail for trips between stations?',
+      options: [
+        'Counters are too slow for a crowd that arrives together',
+        'It has no legs, so it refuses trips that fit or admits clashes',
+        'It forgets its value when the server restarts and starts again',
+        'It cannot be changed by two requests that arrive in one second',
+      ],
+      answer: 1,
+      explain: 'The counter holds one number and no legs. Once it reads zero it refuses Dev, who needs only a free leg. If you let Dev in, it also lets in Meena, who clashes with Ravi. Speed and restarts are not the issue.',
+    },
+    {
+      q: 'Ravi books A to C and Dev books C to D on the same seat. What happens at the database?',
+      options: [
+        'Dev waits at the database until Ravi decides to cancel',
+        'Both fail, because the seat is already held by someone',
+        'Dev succeeds, as the ranges share no leg',
+        'Dev takes the A to B leg by mistake and Ravi loses it',
+      ],
+      answer: 2,
+      explain: 'Ravi holds A to B and B to C. Dev needs only C to D, which is free. Ranges that meet at a station but share no leg do not overlap, so both bookings stand.',
+    },
+    {
+      q: 'Two seats are freed by two cancellations at the same moment. Why must promotion be atomic and ordered for one train run?',
+      options: [
+        'It lets each worker pick any waiting passenger it likes at the time',
+        'It makes the cancellation page load faster for the people who cancel',
+        'It lets new bookings take freed seats ahead of the people waiting',
+        'It stops one passenger being promoted twice while the next one waits',
+      ],
+      answer: 3,
+      explain: 'If two workers read the same head of the queue, both promote the same passenger and one seat sits empty. One owner per train run, with the free and the promotion in one transaction, prevents that. Letting new bookings jump in would be unfair to those waiting.',
+    },
+    {
+      q: 'The Tatkal window starts at a public time. How does a fixed start change the design compared with a surprise spike?',
+      options: [
+        'You can prepare capacity early, but the queue and bot checks stay',
+        'You can skip the queue, because the crowd is known in advance of the start',
+        'You can drop the range claim, because the queue handles every clash',
+        'You must rely on autoscaling that starts only after the crowd has arrived',
+      ],
+      answer: 0,
+      explain: 'A known start lets you prepare capacity and caches. The crowd is still far larger than the seats, and bots also know the time, so the queue and checks stay. The queue limits traffic. It does not decide seats, and autoscaling reacts too late.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="irctc-double-promotion"
+  title="One passenger, two seats, one empty"
+  scenario="Two passengers cancel at nearly the same moment on a full train. Two promoter workers run at once. Waitlist entry WL1 is confirmed on a seat, then confirmed again on the second freed seat. WL2 stays waiting. One freed seat now has a holder who is a duplicate, and the other looks free to nobody."
+  facts={[
+    'worker 1  reads queue head = WL1',
+    'worker 2  reads queue head = WL1',
+    'worker 1  confirms WL1 on seat 12',
+    'worker 2  confirms WL1 on seat 31',
+    'WL2       still waiting',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the root cause?',
+      options: [
+        'The workers read the head, then wrote, as separate steps with a gap between',
+        'WL1 cancelled and re-booked at the same time',
+        'The chart was prepared too early',
+        'WL2 has a shorter trip than WL1',
+      ],
+      answer: 0,
+      explain: 'Both workers read the same head before either wrote. The check and the write were not one step, the same gap as read-then-write on a seat. Chart timing and trip length do not explain a duplicate confirm.',
+    },
+    {
+      prompt: 'Which change fixes it without making all trains wait on one another?',
+      options: [
+        'Run one worker for the whole system',
+        'Route promotions by train run so one worker owns each, and do the pick and confirm in one transaction',
+        'Let each worker pick a random waiting entry',
+        'Add a retry that confirms WL2 if WL1 is already confirmed',
+      ],
+      answer: 1,
+      explain: 'A key per train run keeps order inside one train and lets other trains run in parallel. The transaction makes pick and confirm one step. One global worker would stall every train. Random picks break the fixed order, and a retry patches the symptom after the damage.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [IRCTC help: Tatkal booking](https://contents.irctc.co.in/en/TatkalBooking.html) (opening times, passenger limit, verification code)
+- [IRCTC help: Waitlisted e-ticket](https://contents.irctc.co.in/en/Waitlisted_E-Ticket.html) (charting, cancellation before the chart, dropped waitlisted names)
+- [Indian Railways: Quota codes](https://www.indianrail.gov.in/quota_Code.html) (the list of quotas, including Tatkal and RAC)
+- [All India Radio: Aadhaar for online Tatkal](https://www.newsonair.gov.in/aadhaar-authentication-made-mandatory-for-online-tatkal-ticket-booking-from-july-15) (a news report of the 2025 rule; the rule text itself was not readable)

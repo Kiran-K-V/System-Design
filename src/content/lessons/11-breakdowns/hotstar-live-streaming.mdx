@@ -1,0 +1,265 @@
+---
+summary: 'A live match is a moving window of short segments that every viewer wants at the same second, so capacity is warmed on the schedule, admission is shaped by a gate, and extras are shed before the video.'
+requires: ['11-breakdowns/youtube', '05-caching/invalidation-stampede', '07-reliability/rate-limiting']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import LiveStreamBuild from '../../../components/anim/lessons/LiveStreamBuild.tsx';
+import LiveStreamSpike from '../../../components/anim/lessons/LiveStreamSpike.tsx';
+
+## The problem
+
+It is the last over of an IPL final. Tens of millions of phones across India are watching the same stream. A wicket falls. In the next few seconds, millions of people who had the app open in the background jump back in. Millions more open it for the first time to see what the noise is about.
+
+The YouTube lesson ([11.8](/learn/11-breakdowns/youtube/)) showed how a finished video reaches a screen. That design fails here, for three reasons:
+
+- The video does not exist yet. The match is still being played, so there is no finished file to cut up and store.
+- Everyone wants the **same** piece at the **same** moment. A YouTube audience is spread across millions of videos and many hours. This audience is packed onto one stream and one second.
+- The jump is not a slow climb. It arrives in seconds, and it arrives at moments we can name in advance: the toss, the start of an innings, a wicket, a final over.
+
+Three new ideas fix this. The first is how a **live** stream is shaped. The second is to **prepare capacity before the match**, because reacting is too slow. The third is **graceful degradation**: when load is too high, switch off the extras and protect the video.
+
+One note on sources. Hotstar has published little detail of its inner design, and its own blog returned errors when I fetched it. The company figures below come from a written report of a 2019 conference talk by Hotstar engineers (linked in Further reading). I mark each one "the talk says". Everything marked "a design that fits the requirements" is my own design, not a description of Hotstar.
+
+## How a live stream differs from a video on demand
+
+Five words first. Each has a picture.
+
+**Concurrency.** Concurrency is how many viewers are watching at the same instant. Think of the people inside a stadium at one moment, not the people who bought a ticket all season. It is the number that decides how big the system must be. Total viewers over a day matters much less.
+
+**Segment.** A segment is a short slice of video, a few seconds long, stored as a small file. The YouTube lesson explained why (a player can start on any segment). For a recorded video there are hundreds, and they all exist before anyone presses play.
+
+**Manifest.** The manifest is a small text file that lists the addresses of the segments in order. Think of a menu card that the player reads to know what to ask for next.
+
+**Origin and edge.** The origin is the machine group that owns the real files. An edge is a cache server near viewers that keeps copies. A request an edge can answer itself is a **hit**. One it must send to the origin is a **miss**. Picture one central kitchen (the origin) and many corner shops (the edges).
+
+Now the live twist. In a recorded video, the manifest is written once and never changes. In a live stream, the manifest is **rewritten every few seconds**. The packager cuts a new segment, adds it to the end of the list, and drops the oldest from the front. The list is a **moving window**: a camera strip that always shows the last few segments, like a news ticker. A player keeps asking for the manifest again, reads the newest address, and fetches that segment.
+
+Two things follow.
+
+**The same newest segment is wanted by everyone.** With millions of viewers, nearly every request in a given second is for the same one file. That is the best case for a cache: one copy serves a whole city. But look at the first moment. The new segment has just been written. No edge has it. Every edge sees a flood of requests for a file it does not hold. If each request goes to the origin, the origin is crushed by a **stampede**, the same crowd of misses that lesson [5.5](/learn/05-caching/invalidation-stampede/) described for a hot cache key.
+
+The fix is the one from that lesson, **request coalescing**: the edge lets the first miss go to the origin and makes all the others wait for that one answer. A good CDN does this. So the origin sees one request per edge per segment, however many viewers there are. The manifest needs the same care. It changes every few seconds, so it must be cached for only about that long. A manifest that is cached too long makes players ask for a segment that is already out of date, and one that is not cached at all sends every viewer to the origin.
+
+**A late viewer joins the window, not the start.** Someone who opens the app mid-over is shown the live edge of the window. They can also be given a few segments back, for a short rewind. They do not download history. This is why a joining crowd is cheap for the video path and expensive for the *other* paths (sign-in, the home page, the plan check), which is where the trouble comes.
+
+## Requirements
+
+Follow the six-step method from lesson [0.3](/learn/00-orientation/design-method/).
+
+**Functional, above the line:**
+
+1. Watch the live match, with adaptive quality (lesson [11.8](/learn/11-breakdowns/youtube/) covers adaptive bitrate).
+2. Sign in and have the plan checked before play.
+3. See ads and a personalised home page.
+
+**Below the line:** live comments (see [11.7](/learn/11-breakdowns/live-comments/)), scoreboards and stats, downloads, recording and replay, payments.
+
+**Non-functional.** These are assumptions for the interview, not company data:
+
+- Availability over everything for the video. A viewer who sees the match a few seconds late is fine. A viewer who sees an error is not.
+- Spikes arrive in seconds at predictable moments.
+- Not all features are equal. Video and sign-in are critical. Ads and personalisation are not.
+- Start-up must be fast. A late joiner should see video quickly.
+
+## Core entities
+
+- **Match**: `match_id`, start time, expected audience (a planning number).
+- **Stream**: the live feed for a match, with its rolling manifest.
+- **Segment**: a few seconds of video, with a sequence number that grows.
+- **Session**: a signed-in viewer, with plan and device.
+
+## API
+
+- `POST /sessions` signs in and returns a token and the plan.
+- `GET /matches/{id}/play` checks the plan and returns the manifest address.
+- The manifest and the segments come from the edge, not from this API.
+- `GET /home` returns the personalised home page. This one is optional.
+
+## High-level design
+
+Step through the picture. Each step adds one requirement.
+
+<LiveStreamBuild client:visible />
+
+The picture is a design that fits the requirements. It is not Hotstar's own diagram. Look at where the heavy traffic goes. Video bytes flow from the origin to the edges to viewers. The account service handles small requests, but they arrive in a rush when a crowd joins. That is why the gate stands in front of it.
+
+## Deep dives
+
+### Capacity must be ready before the spike
+
+Autoscaling is a program that watches a load number and starts more servers when it rises. Think of a restaurant that calls in extra cooks only after the queue forms outside. That works when the queue grows over an hour. It fails when the queue forms in ten seconds.
+
+Three delays stack up. The scaler must notice. Then a new server must be ordered, then it must boot and load the app and become healthy. The talk says Hotstar measured a reaction time of about a minute and a half and noted that the app itself needed about a minute to boot. The talk also lists limits it hit with plain autoscaling: not enough capacity of the chosen server type, one type per scaling group, and caps on how many servers can be added in one step. Our reading: a wicket does not wait ninety seconds.
+
+So the strategy has two parts, and both come from the talk:
+
+- **Pre-warm.** Before the match, start the fleet at the size you expect to need. The talk says the team used fully built machine images (a ready copy of the server, so boot is faster) and scaled on concurrency, not on CPU. Our reading: concurrency is a better signal because it moves first. CPU only rises after viewers have already arrived.
+- **Test it.** The talk describes an in-house load-test tool, called Project HULK, and rehearsals called gamedays, where the team practises a live match with faults added, such as slow scale-up or a failed CDN. It also says a test once caused an outage of its own, because test traffic shared a public cloud network with other users. Our reading: a load test is a real load. Run it with care.
+
+The talk reports that the team planned for roughly double its record at the time. A plan with headroom is the point of pre-warming.
+
+The picture compares the two ways. Switch the toggle and step through both.
+
+<LiveStreamSpike client:visible />
+
+What does pre-warming cost? Idle servers when a match is dull. That is the price of safe peaks. Reactive scaling is not thrown away: it still covers the part you did not predict, such as an unexpected thrill, or a match that goes to a super over.
+
+### Shaping admission with a gate
+
+Pre-warming covers the load you expected. Some load will still be too much. When you cannot add capacity, the next best act is to **limit how fast people are let in**, before the hurt part is hurt.
+
+A **gate** is a small, cheap front door that decides who gets through now. It can use a rate limiter (lesson [7.4](/learn/07-reliability/rate-limiting/)) to admit new sign-ins at a speed the account service can survive. People it turns away get a quick, friendly "try again in a moment" and the player retries after a random short delay. The random delay matters: a thousand phones that all retry at the same instant create the next spike. (Lesson [7.2](/learn/07-reliability/timeouts-retries/) calls this jitter.)
+
+Why a gate and not just more servers? A gate is cheap, it answers in a millisecond, and it protects the origin and the database behind it. A crowd at a stadium gate is slower to enter, but nobody is crushed. Order matters too: people who are already watching must not be kicked out to let new ones in. Admit new joiners only when there is room.
+
+Note that the talk I read does not describe a gate. This section is our own design, a design that fits the requirements.
+
+### Degrade the extras, not the video
+
+Suppose the gate and the fleet are both under pressure. Something must give. **Graceful degradation** means you decide in advance what gives, so the system loses its least valuable features first. Picture a ship in a storm. The crew throws the cargo overboard, not the lifeboats.
+
+The talk says Hotstar did this: with no time to fix faults mid-match, the team could turn off recommendations and personalisation to keep the critical parts, video streaming and subscription, running. It adds that fixing a problem in the middle of a match takes too long. Our reading: so the switches must exist and be tested before the match.
+
+Here is a ranking that fits our requirements:
+
+| Layer | Examples | When load is high |
+|---|---|---|
+| Critical | Video segments, sign-in, plan check | Protect last |
+| Useful | Home page, ads | Simplify, serve a default |
+| Nice to have | Recommendations, extras | Switch off first |
+
+Build each switch as a **flag** (a setting that can be changed without a new release) and rehearse it at a gameday. Use the circuit breaker and load-shedding ideas from lesson [7.3](/learn/07-reliability/circuit-breaker/): a failing extra must not slow the video path. Put the extras behind their own limited pool of workers so that a slow ad service cannot use up the threads the video path needs.
+
+### Ads at scale
+
+Ads pay for the match, so this deserves a short look. The simple way is for the phone to download ads in the background while it plays the stream. The report of a Hotstar talk on ad insertion says Hotstar chose the other way, **server-side ad insertion**: the server stitches the ad into the same stream of segments. Its reason, as the article reports it: on poor networks a background download competes with the live video and pushes the quality down, and can cause pauses and rebuffering. It adds that most viewing is on mobile, and much of it on weak reception. Ad breaks are signalled by a marker in the stream, so the server knows where to place an ad.
+
+Our reading, not stated in the source: this moves work from phones to the server. Different groups of viewers may need different ads, so the stitched streams multiply, and the cache has less in common to reuse. That is a trade-off to name in an interview.
+
+## Scale feel
+
+You do not need arithmetic here. Hold two ideas. First, the talk reports a record of about 25 million people watching at one instant in 2019, up from about 18.6 million earlier that year. Concurrency, not daily total, is what sizes the system. Second, the audience is mostly on phones, and peaks are far above the average of a match. A system sized for the average fails at the peak. Size for the peak, and then for the next record.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Reactive autoscaling only | Low cost on quiet days | Misses fast spikes | Slow, smooth growth |
+| Pre-warm on the schedule | Capacity ready at the moment | Idle servers on dull matches | Predictable big events |
+| Gate on sign-in | Protects the account service | Some viewers wait | Joining crowds |
+| Degrade extras first | Video survives overload | Fewer features for a while | Always, with rehearsal |
+| Server-side ads | Smooth video on weak networks | More server work, less sharing | Mobile-heavy audiences |
+| Short manifest cache | Players see new segments fast | More edge requests | Live streams |
+
+## Interview lens
+
+<Callout type="tip">
+Say it in this order: "A live stream is a moving window of short segments, and the manifest changes every few seconds. Everyone wants the newest segment, so the edge needs request coalescing. Spikes are predictable and fast, so I pre-warm on the match schedule and load-test it, and keep reactive scaling for the surprise. A gate shapes sign-ins, and I shed extras before video." Name the three ideas, then give the one reason for each.
+</Callout>
+
+<Callout type="mistake">
+Do not say "just autoscale". Do not treat all features as equal under load. Do not let every client retry at once after an error. Do not size for the average audience. And do not claim to know how Hotstar built its gate or its manifest path: the sources do not say.
+</Callout>
+
+<Callout type="deep" title="Why not make the manifest cache long?">
+A long manifest cache means fewer requests to the origin. But the player reads a list of old segments and lags behind the live edge, or asks for something that is gone. A manifest that lives only as long as one segment keeps viewers at the live edge. The price is more traffic to the edges every few seconds. This is a tuning choice, not a law.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why does the first request for a new live segment risk a stampede on the origin?',
+      options: [
+        'Segments are too large for the origin to send even one time',
+        'Viewers must sign in again to fetch each new segment of video',
+        'Every edge misses the new file at once',
+        'The manifest forbids any caching of segments in live matches',
+      ],
+      answer: 2,
+      explain: 'The segment has just been written, so every edge misses at the same moment. Request coalescing lets one miss reach the origin per edge. Segment size, sign-in, and the manifest are not the cause.',
+    },
+    {
+      q: 'A wicket falls and load jumps within seconds. Why is reactive autoscaling a poor fit?',
+      options: [
+        'New servers arrive after the spike is over',
+        'Autoscaling cannot add any servers while a match is running',
+        'More servers always make every video segment much larger',
+        'The CDN switches itself off whenever a scaler is in use',
+      ],
+      answer: 0,
+      explain: 'Noticing, ordering, and booting servers takes longer than the spike. Autoscaling can add servers at any time, and server count does not change segment size or the CDN.',
+    },
+    {
+      q: 'The ad service becomes slow in a busy match. What should happen first?',
+      options: [
+        'Slow down the video segments so the ads can catch up with them',
+        'Stop admitting every new viewer for the rest of the whole match',
+        'Add more edge caches for the sign-in path and nothing else',
+        'Shed the ads and serve a default page',
+      ],
+      answer: 3,
+      explain: 'Ads are not critical to watching, so they are shed first and the video is protected. Slowing video harms the main goal. Blocking all joiners is too harsh, and edge caches do not help the sign-in path.',
+    },
+    {
+      q: 'Why should a phone retry after a short random delay when the gate turns it away?',
+      options: [
+        'The gate only works for phones that wait for exactly ten seconds',
+        'Random delays keep phones from returning together',
+        'A random delay makes the stream play at a much higher quality',
+        'Random delays are needed to refresh the manifest on the edge',
+      ],
+      answer: 1,
+      explain: 'If every phone retries at the same instant, the crowd re-forms and makes the next spike. Random delay spreads the returns. Delay does not change quality or the manifest.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="live-sports-wicket-errors"
+  title="Errors at every wicket"
+  scenario="During a big match, the app shows errors for a minute after each wicket, then recovers. The scaler's graphs show servers being added each time, just after the errors begin."
+  facts={[
+    'scaling rule:     add servers when CPU is high',
+    'errors begin:     seconds after a wicket',
+    'servers arrive:   after the errors',
+    'home page:        calls three extra services',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the main cause of the errors?',
+      options: [
+        'Capacity is added only after the spike has already hit',
+        'The edges are caching the manifest for too long',
+        'The origin cannot store any more segments',
+        'Viewers are using the wrong adaptive bitrate',
+      ],
+      answer: 0,
+      explain: 'The servers arrive after the errors, so the rule reacts too late for a spike that takes seconds. The manifest, storage, and bitrate are not what the facts point to.',
+    },
+    {
+      context: 'The team agrees. Wickets are not a surprise. The match schedule is known days ahead.',
+      prompt: 'Which change helps most, and keeps the cost sensible?',
+      options: [
+        'Remove autoscaling and keep one fixed fleet all year',
+        'Pre-warm for scheduled matches, load-test, and shed extras under load',
+        'Make every viewer wait ten minutes before the stream starts',
+        'Move all video segments into the database',
+      ],
+      answer: 1,
+      explain: 'Pre-warming puts capacity in place for known peaks, tests prove it, and shedding the extras protects the video if load still rises. A fixed year-round fleet wastes money, and the other options hurt viewers or the design.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [How Hotstar.com dealt with 25 million concurrent viewers (re:Invent 2019 session report)](https://dev.classmethod.jp/articles/reinvent-2019-cmy302/) (the source of every company figure on autoscaling, pre-warming, load tests, and degradation above. It is a third-party write-up of the talk, not a Hotstar page.)
+- [Hotstar's server-side ad insertion talk, as reported by The Broadcast Knowledge](https://thebroadcastknowledge.com/tag/hotstar/) (the reason for server-side ads on weak mobile networks)
+- [RFC 8216: HTTP Live Streaming](https://www.rfc-editor.org/rfc/rfc8216) (how a live playlist slides forward as new segments arrive). You do not need the spec to follow this lesson.

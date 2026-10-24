@@ -1,0 +1,234 @@
+---
+summary: 'UPI connects every bank and app through one central switch, moves money in two legs (debit, then credit), never lets the payer app decide success, and settles up later, so a lost answer needs a status check and an auto-reversal, not a retry.'
+requires: ['11-breakdowns/payment-system', '03-api-design/idempotency', '09-patterns/multi-step']
+---
+
+import Callout from '../../../components/lesson/Callout.astro';
+import Quiz from '../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../components/lesson/Diagnose.tsx';
+import UpiBuild from '../../../components/anim/lessons/UpiBuild.tsx';
+import UpiTimeout from '../../../components/anim/lessons/UpiTimeout.tsx';
+
+## The problem
+
+You pay a chai stall ₹40 with a UPI app. The screen spins. Then it shows "Failed". Your bank SMS says ₹40 was debited. The stall owner says nothing arrived. You are not sure whether to pay again.
+
+This is the daily pain of a payment system that spans many companies. The money sits in two different banks. The app is a third party. No single computer sees the whole payment. The [payment system](/learn/11-breakdowns/payment-system/) lesson showed how one company keeps its own books safe. In UPI the books are split across companies that do not trust each other's servers.
+
+This case study teaches two main ideas. The first is a **central switch** that every bank and app connects to. The second is a **two-leg flow** (take the money out, then put it in) and what to do when one leg gets no answer. It also shows why the payer app never decides success itself, and why a separate check called reconciliation exists.
+
+## Requirements
+
+**Functional.**
+
+1. A payer sends money to a payee using a short address, not a bank account number and IFSC code.
+2. The money leaves the payer's bank account and enters the payee's bank account.
+3. Both people see the result: success, failure, or pending.
+
+**Below the line.** Collect requests (a payee asks you for money), mandates and auto-pay, QR code details, UPI Lite, credit on UPI, fraud scoring, and international use.
+
+**Non-functional.** I give no throughput number. I could not confirm an official peak figure, and a made-up number would mislead you.
+
+- Money is never lost and never created, even when any step times out.
+- A payment is never taken twice from the payer by mistake.
+- It must work between any bank and any app. That is called **interoperability**: a payer on app A with bank X can pay a payee on app B with bank Y, with no special deal between A and B.
+- It feels instant to the user, but the interbank money may move later.
+- The volume is very large and has sharp peaks, such as festival days. The design must degrade gracefully, by slowing down and not by losing money.
+
+## Core entities
+
+- **VPA** (virtual payment address): a short name such as `ravi@okbank`. Think of it as an email address for money. The part after `@` names the app's bank partner. You share the VPA, so you never share your account number. The network looks up which bank account sits behind it.
+- **Payer app / payee app**: the app on each phone. Apps like PhonePe, Google Pay, or Paytm are called **third-party apps** (TPAP). A TPAP cannot hold a link to the network by itself. It works through a bank that does, as described next.
+- **PSP** (payment service provider bank): the bank or company that holds the app's connection to the network. Think of the PSP as the sponsor who signs the app into the club. The app talks to its PSP. The PSP talks to the switch.
+- **Switch**: the central computer system in the middle, run by NPCI (the National Payments Corporation of India). Every request goes through it. A switch is like the railway junction where every line meets, so a train from any city can reach any other city.
+- **Remitter bank** (payer's bank, also called the issuer): the bank that holds the payer's account. It checks the UPI PIN and takes the money out.
+- **Beneficiary bank** (payee's bank): the bank that holds the payee's account. It puts the money in.
+- **Transaction**: a transaction id, amount, payer VPA, payee VPA, status, and the time of each leg.
+
+The **UPI PIN** is a secret number you set for your bank account in the app. You type it for each payment. It is how you tell your bank "I approve this debit". The phone is also tied to your registration. Two checks guard the money: something you hold (the registered phone) and something you know (the PIN).
+
+## API
+
+Apps and banks do not call each other directly. The calls are between each party and the switch. You do not need exact names. These are the kinds of calls in the middle:
+
+| Call | Purpose |
+|---|---|
+| Pay request | Payer's PSP to the switch: payer, payee VPA, amount, transaction id. |
+| Debit and credit requests | Switch to a bank: take money out, or put money in. |
+| Status check | Ask for the final state of one transaction id. |
+| Result notice | Switch to both PSPs, then to both apps. |
+
+NPCI's public technical docs are not open to scripts. A vendor guide for banks that join the switch describes the same shape: the switch sends one request to the payer's or payee's bank to debit or credit, and another to ask for a transaction's status.
+
+## Why a switch: hub and spoke
+
+Suppose there is no switch. India has hundreds of banks. If every bank must talk to every other bank, each bank builds and runs a link to all the rest. Adding the next bank means building links to everyone. Every pair needs its own rules, tests, and security setup. Most pairs would never be built, so most payments would not work.
+
+With a switch, each bank builds one link, to the switch. A new bank joins by building one link. This layout is called **hub and spoke**. The hub is the switch and each spoke is one connection. It is the same idea as a phone exchange: you do not run a wire to every house you might call.
+
+The hub brings a second gain. The switch sets one set of rules for all: one message format, one way to look up a VPA, one place to record each payment's state. It also brings a cost. The hub is a single point of failure and a hot spot for load, so it is built to be very available, and the rules it enforces must be strict. Lesson [7.1](/learn/07-reliability/failure-modes/) covers that kind of failure.
+
+## High-level design
+
+Step through the build. Each step adds one box for one requirement.
+
+<UpiBuild client:visible />
+
+Read the order. The payer's PSP never contacts the payee's bank. The switch drives both legs and keeps the state. This is how the system stays correct when one bank is slow.
+
+## Deep dive: two legs, debit then credit
+
+A UPI payment is two money movements, not one. The **debit leg** takes money out of the payer's account. The **credit leg** puts the same money in the payee's account.
+
+The order is debit first, then credit. If you credited first and the debit failed, you would have created money out of nothing. If you debit first and the credit fails, you hold the payer's money and can return it. So debit-first is the safe order. It is the same thinking as the saga in lesson [9.5](/learn/09-patterns/multi-step/): each step has an undo. Here the undo of a debit is a **reversal**, which is a new movement that returns the money. It is not a database rollback, because the two banks do not share a database.
+
+Each leg is a call across a network. A call can fail in three ways: it answers yes, it answers no, or it gives no answer. The third way is the hard one. A yes and a no are clear. Silence is not clear. The bank may have done the work and lost the reply, or it may never have received the request.
+
+## Deep dive: the timeout and pending state
+
+Say the debit request goes out and no answer returns. This is the puzzle from the chai stall. Compare two apps.
+
+<UpiTimeout client:visible />
+
+The naive app guesses. Silence feels like failure, so it shows Failed. The user pays again. The bank does what it is told, and the customer pays twice.
+
+The correct design does four things.
+
+1. **Show pending.** A **pending** state means "the outcome is not known yet". It is a real state in the machine, not a failure. The app sends no new debit while the payment is pending.
+2. **Check the status.** The network asks the bank for the state of the same transaction id. This is the same rule as the idempotency lesson [3.4](/learn/03-api-design/idempotency/): a repeat of the same id must not be a new payment. A **status check** is a read. It cannot move money, so it is always safe to repeat. A new debit is a write, so it is not.
+3. **Reverse on a failed credit.** If the debit happened and the credit cannot be done, the money goes back to the payer. The RBI, India's central bank, sets outer limits for this, covered next.
+4. **Deem when answers stay missing.** Sometimes the status check also gets no clear answer. NPCI's rules then let the network record a payment as approved or declined on the bank's behalf, a **deemed** result, and fix any mismatch later when the bank's own records arrive. I could not open the NPCI circulars, so I do not state the exact conditions or time limits here. The idea to remember is that the network picks a safe default and then checks it later, and it does not leave the payer hanging forever.
+
+The status check loop also has a cost. If every app and PSP asks for status again and again, the checks themselves flood the system. So the network limits how often and how many times a payment may be checked. I could not confirm the exact limits, so I give none. Lesson [7.2](/learn/07-reliability/timeouts-retries/) explains why unlimited retries turn a small slowdown into an outage.
+
+### What the RBI requires for stuck money
+
+The RBI circular on turnaround time for failed transactions (September 2019, in force from 15 October 2019) sets outer limits. For a UPI transfer where money was debited but not credited to the payee, the beneficiary bank must reverse it automatically by the next day, which the circular writes as T+1 (T is the day of the payment). For a UPI payment to a merchant where the merchant gets no confirmation, the limit is within T+5 days. Past those limits the customer is owed ₹100 for each day of delay. The circular says the refund must be made on the bank's own initiative, without the customer complaining first. It also says these are outer limits and banks should resolve faster.
+
+## Why the payer app never decides success
+
+Your phone is the least trustworthy part of the system. It can lose signal, be killed by the OS, or be changed by a hacker. If the app could say "paid", a tampered app could say it for free. The network also has the only complete view: the app does not know what the banks did.
+
+So the rule is: **the money state lives in the banks and the switch. The app only shows it.** The app can ask for the state, show "pending", and refresh. It cannot create a success or a failure. When you reopen the app after a crash, it asks the network again. This is the same lesson as the payment-system case: the synchronous reply is a hint, not the truth.
+
+## Deep dive: settlement and reconciliation
+
+When the app says "success", the customer's view is done. The banks, however, still owe each other. If every payment moved real money between banks at once, the banks would make a huge number of tiny transfers. Instead, the switch adds up what each bank owes the others and the banks settle the **net** amount at intervals, using accounts at the RBI. A vendor engineering write-up describes this batching; I did not check it against an NPCI document, so read it as a general picture. The important idea is that **the instant success is a promise, and the real transfer happens later.**
+
+**Reconciliation** is the job that makes sure the promises add up. Each side keeps its own record. The switch sends reports of what it processed. Each bank matches the report line by line with its own ledger (the [payment system](/learn/11-breakdowns/payment-system/) lesson built a ledger). It flags three kinds of mismatch: a payment in the report with no entry at the bank, an entry at the bank that is not in the report, and the same payment with a different amount or state. A mismatch is usually a timeout that ended unclear. Reconciliation finds it, and the reversal or the late credit then fixes it. This is also how a debit with no credit gets caught even when no status check ever came back.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Central switch (hub and spoke) | One link per bank, one set of rules, any app to any bank | A critical hub that must not fail, and a strict shared standard | Many parties must interoperate |
+| Direct bank-to-bank links | No central party | Links grow with every new bank | Only a few parties |
+| Debit first, then credit | A failed credit can be undone by returning money | Two legs, and a reversal path to build | Always for push payments |
+| Show pending on silence | No wrong failure, no double debit | A user may wait and feel unsure | Whenever an answer is unknown |
+| Guess failure on silence | Looks fast | Double debits and angry users | Never |
+| Instant view, batched settlement | Fast for the user, fewer interbank transfers | Gap between the promise and real money, so reconciliation is needed | High volume of small payments |
+
+<Callout type="tip">
+In an interview, tell the timeout story in order: "The debit leg got no answer, so I mark the payment pending and block a new debit. A status check with the same transaction id finds the truth. If the credit failed, an automatic reversal returns the money. The app only shows what the switch says." Then add: "Reconciliation catches whatever the checks missed."
+</Callout>
+
+<Callout type="mistake">
+Do not say "retry the debit". A retry of an unknown write can take the money twice. Do not let the client app decide success or failure. Do not say interbank settlement is instant: the customer sees it instantly, but banks settle in batches. Do not quote timeout seconds or limits you cannot source.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A UPI debit request gets no answer. What should the payer app show, and why?',
+      options: [
+        'Failed, because silence means that the bank refused the debit',
+        'Success, because the user already typed the PIN in',
+        'Pending, because the debit may have happened already',
+        'Nothing at all, until the user closes and reopens the app',
+      ],
+      answer: 2,
+      explain: 'Silence is unknown, not a refusal. The bank may have taken the money and lost only the reply. Showing Failed tempts a second payment. Pending blocks a new debit until a status check finds the truth.',
+    },
+    {
+      q: 'Why does the status check solve the stuck payment when a retry of the debit does not?',
+      options: [
+        'It only reads, so repeating it cannot move money',
+        'It is faster than a debit, so it finishes first always',
+        'It always makes the bank reverse the debit at once',
+        'It swaps the transaction id for a brand new one',
+      ],
+      answer: 0,
+      explain: 'A read has no side effect, so it is safe to repeat. A second debit is a write and may take the money again. The check uses the same id and does not create a new payment. It does not reverse anything by itself.',
+    },
+    {
+      q: 'What is the main gain of a central switch over direct bank-to-bank links?',
+      options: [
+        'It removes the need for banks to keep own records',
+        'It makes every payment settle in real money at once',
+        'The switch can never fail, so no backup is needed',
+        'Each bank builds one link and reaches all others',
+      ],
+      answer: 3,
+      explain: 'Hub and spoke makes a link count grow with the number of banks, not with every pair of banks. The switch is a single point of failure, so it needs strong availability. Banks still keep records and settle later.',
+    },
+    {
+      q: 'The customer saw instant success, yet the banks settle the real money later. What closes the gap and catches debits that never got a credit?',
+      options: [
+        'The payer app, by re-checking its screen state each hour',
+        'Reconciliation, which matches reports against ledgers',
+        'A bigger timeout on every call, so no answer is lost',
+        'The payee, who must confirm receipt by hand',
+      ],
+      answer: 1,
+      explain: 'Reconciliation compares two independent records and flags mismatches, so a lost reply or late credit is found and fixed. The app does not hold the truth. A longer timeout still cannot rule out a lost answer. Asking the payee does not scale.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="upi-payments-failed-but-debited"
+  title="Failed screen, money gone"
+  scenario="A user paid ₹500 to a shop. The app showed Failed after a wait. The user paid again and it succeeded. Later the bank statement shows two debits of ₹500, and the shop got one payment."
+  facts={[
+    'time      event                         app shows',
+    '14:00:01  pay request sent              spinner',
+    '14:00:02  payer bank: debit done        (reply lost)',
+    '14:00:16  app timer ends, no reply      Failed',
+    '14:00:30  user taps Pay again           spinner',
+    '14:00:31  new debit, new credit         Success',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the root cause?',
+      options: [
+        'The payee bank was slow, so the credit leg ran twice',
+        'The app treated silence as failure and allowed a new payment while the first was unresolved',
+        'The switch debited the account two times for a single request',
+        'The user typed the wrong PIN the first time',
+      ],
+      answer: 1,
+      explain: 'The first debit did happen at 14:00:02, and only its reply was lost. The app guessed Failed at 14:00:16 and let the user start a new payment. Nothing shows the switch repeated a request, and the first debit shows the PIN was fine.',
+    },
+    {
+      prompt: 'Which fix goes in the design?',
+      options: [
+        'Show Pending, send no new debit, and ask the network for the status of the same transaction first',
+        'Raise the app timer so that the reply always arrives in time',
+        'Hide the Pay button for a fixed time after every failure',
+        'Let the app mark the first payment as failed on the server',
+      ],
+      answer: 0,
+      explain: 'A status check on the same id finds the first debit, and an auto-reversal returns the money if the credit never happened. A longer timer only moves the problem. A hidden button is a guess. The app must not write the result, because the network owns the state.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [RBI: Harmonisation of Turn Around Time (TAT) and customer compensation for failed transactions](https://www.rbi.org.in/Scripts/NotificationUser.aspx?Id=11693) (the T+1, T+5, and ₹100 per day rules, in the primary text)
+- [Oracle: Bank UPI switch financial APIs](https://docs.oracle.com/en/industries/financial-services/banking-payments/14.8.0.0.0/inuug/bank-upi-switch-financial-apis.html) (a vendor guide that shows the switch sending debit, credit, and status requests to banks)
+- [Setu: UPI 103, the settlement](https://setu.co/blog/upi-103-the-settlement) (an engineering view of batched settlement; not checked against NPCI)
