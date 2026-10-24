@@ -6,7 +6,6 @@ requires: ['ai/a3-llm-apis/limits-retries-idempotency', '06-async/queues']
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
 import Ai3BatchWalk from '../../../../components/anim/lessons/Ai3BatchWalk.tsx';
 import Ai3BatchCalc from '../../../../components/anim/lessons/Ai3BatchCalc.tsx';
@@ -95,7 +94,7 @@ A batch job is a distributed job, so give it the properties from [lesson A3.6](/
 
 - **Make submit idempotent.** Creating a batch twice costs twice. Save your own job row with a unique `job_id` before you submit. Then store the returned batch id on that row. After a crash, look up the row. Do not submit again if it holds a batch id.
 - **Design the `custom_id`.** Use a stable key such as `job_id:item_id`, within 64 characters. A retry batch then reuses the same ids. A write to your store keyed by `custom_id` overwrites instead of duplicating.
-- **Chunk by limits.** 250,000 requests need at least 3 batches. Respect the queue cap, and submit in waves.
+- **Chunk by limits.** A job bigger than one batch must be split into several. Respect the queue cap, and submit in waves.
 - **Validate first.** Send a handful of requests to the sync API with the same params.
 - **Check completeness.** After download, compare the set of `custom_id` values with your input set. Anything missing or not `succeeded` goes to the retry list.
 
@@ -122,8 +121,6 @@ Cheaper capacity that can be late is a common cloud pattern. Spot instances work
 | Anthropic typical finish | under 1 hour for most batches | Anthropic batch page |
 | Anthropic max per batch | 100,000 requests or 256 MB | same page |
 | Anthropic results retention | 29 days from creation | same page |
-| 10M input + 2M output on Sonnet 5.5, sync | 10 x $2 + 2 x $10 = $40 | derived |
-| Same, as a batch | $20 | derived |
 
 ## Trade-offs
 
@@ -137,7 +134,7 @@ Cheaper capacity that can be late is a common cloud pattern. Spot instances work
 ## Interview lens
 
 <Callout type="tip">
-Say: "This job has no user waiting, so I would run it as a batch. It costs 50% less and uses separate limits, so it does not hurt live traffic. I would key each request with a stable custom_id, poll for the status, join results by id, and resubmit failures. I would keep a job row so a restart does not submit twice." Then give one number. Take 10M input and 2M output tokens: that is $40 sync and $20 batch on Sonnet 5.5.
+Say: "This job has no user waiting, so I would run it as a batch. It costs 50% less and uses separate limits, so it does not hurt live traffic. I would key each request with a stable custom_id, poll for the status, join results by id, and resubmit failures. I would keep a job row so a restart does not submit twice." Then name the cost: the same job is half price as a batch.
 </Callout>
 
 <Callout type="mistake">
@@ -145,35 +142,6 @@ Do not use batch for anything a user is waiting on. Do not assume the results ar
 </Callout>
 
 ## Check yourself
-
-<Ballpark
-  client:visible
-  title="A 10M-token backfill"
-  scenario="You must run 10,000 documents through Sonnet 5.5. Each has 1,000 input tokens and 200 output tokens. Sonnet 5.5 costs $2 per 1M input tokens and $10 per 1M output tokens. Batch is 50% of that (as of 2026-10-16). Ignore caching."
-  steps={[
-    {
-      prompt: 'What is the sync cost in dollars?',
-      unit: 'dollars',
-      answer: 40,
-      within: 1.1,
-      explain: 'Input: 10,000 x 1,000 = 10M tokens x $2 = $20. Output: 10,000 x 200 = 2M tokens x $10 = $20. Total $40.',
-    },
-    {
-      prompt: 'What is the batch cost in dollars?',
-      unit: 'dollars',
-      answer: 20,
-      within: 1.1,
-      explain: 'The discount is 50% on all usage in the batch. $40 x 0.5 = $20. The batch prices are $1 per 1M input and $5 per 1M output, which gives $10 + $10.',
-    },
-    {
-      prompt: 'The backfill grows to 250,000 requests. At least how many batches do you need?',
-      unit: 'batches',
-      answer: 3,
-      within: 1.1,
-      explain: 'One batch holds up to 100,000 requests. 250,000 / 100,000 = 2.5, which rounds up to 3. Check the 256 MB limit and the queue cap too.',
-    },
-  ]}
-/>
 
 <Diagnose
   client:visible
@@ -209,6 +177,18 @@ Do not use batch for anything a user is waiting on. Do not assume the results ar
 <Quiz
   client:visible
   questions={[
+    {
+      id: 'a3-7-q-split',
+      q: 'A backfill has more requests than one batch may hold. What is the right design?',
+      options: [
+        'Raise the request count in one batch until the API accepts it',
+        'Split it into several batches, submit in waves, join on custom_id',
+        'Switch to the sync loop, since batch cannot handle large jobs at all',
+        'Send each request as its own batch so no limit can ever apply',
+      ],
+      answer: 1,
+      explain: 'A batch has a size cap, and the queue has its own cap. Chunk the job and respect both. One request per batch hits the queue and rate caps. A sync loop gives up the discount and the separate limits.',
+    },
     {
       id: 'a3-7-q-fit',
       q: 'Which job is the best fit for a batch API?',

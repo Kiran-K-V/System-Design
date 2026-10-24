@@ -6,14 +6,13 @@ requires: ['ai/a2-inference-cost/gpu-memory-math', 'ai/a2-inference-cost/prefill
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import Math from '../../../../components/lesson/Math.astro';
 import Ai2QuantWalk from '../../../../components/anim/lessons/Ai2QuantWalk.tsx';
 import Ai2QuantPick from '../../../../components/anim/lessons/Ai2QuantPick.tsx';
 
 ## The problem
 
-A 70B model in BF16 holds 70e9 x 2 bytes = 140 GB of weights (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). An H100 has 80 GB. So you rent two H100s, which leaves 160 - 140 = 20 GB for the KV cache and everything else. Weights take 87% of the memory you pay for (derived).
+A 70B model in BF16 needs about 140 GB for its weights (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). An H100 has 80 GB. So you rent two H100s, and the weights fill almost all of that memory. Little is left for the KV cache and everything else.
 
 The second cost is speed. Decode reads every weight once per generated token, and it is limited by memory bandwidth, not by arithmetic (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)). A step cannot finish faster than the time to read the weights. Fewer bytes per weight means less to read and less to store.
 
@@ -35,9 +34,9 @@ Memory follows directly from bytes per parameter:
 | INT8 or FP8 | 1 | 256 | 70 GB | 1 card, 10 GB free |
 | INT4 | 0.5 | 16 | 35 GB | 1 card, 45 GB free |
 
-The sizes and "free" figures are derived. They are 70 x 2, 70 x 1, 70 x 0.5, and 80 minus the weights. For BF16, that is 2 x 80 - 140. They count weights only. Scale factors, activations, and runtime buffers take more. Treat INT4 as a lower bound on size.
+The sizes are parameters times bytes. The "free" figures are card memory minus the weights. They count weights only. Scale factors, activations, and runtime buffers take more. Treat INT4 as a lower bound on size.
 
-Free memory is where the KV cache lives. In BF16, one token of Llama 3 70B holds about 320 KiB of KV (lesson [A2.3](/learn/ai/a2-inference-cost/kv-cache/)). So 45 GB free is roughly 45e9 / 327,680 = 137,000 tokens of cache at most. And 10 GB is about 30,000 (derived). The INT8 card runs, but it has little room for long contexts or many users. This lesson counts the KV cache at BF16. Quantizing it is a separate choice.
+Free memory is where the KV cache lives. Each token of context adds to the KV cache (lesson [A2.3](/learn/ai/a2-inference-cost/kv-cache/)). More free memory means more tokens of cache. The INT8 card runs, but it has little room for long contexts or many users. This lesson counts the KV cache at BF16. Quantizing it is a separate choice.
 
 ### See the rounding
 
@@ -54,7 +53,7 @@ Select a model, a card, and a number of cards. The bars show weight size per pre
 What to notice:
 
 1. **70B on one H100.** INT8 and INT4 fit. BF16 does not. The INT8 bar leaves a thin gap.
-2. **405B.** In BF16 it needs 810 GB: eleven 80 GB cards, more than one 8-GPU node holds (derived). In INT4 it is 202.5 GB, three cards.
+2. **405B.** In BF16 it needs more memory than one 8-GPU node holds. In INT4 it shrinks to a few cards.
 3. **Mixtral.** Memory follows the 47B total parameters, not the 13B used per token (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)).
 
 ## Which methods exist
@@ -67,7 +66,7 @@ Rounding each weight to the nearest value is the simplest method. It loses more 
 
 ### What you gain and what you do not know
 
-In a memory-bound decode step, time follows bytes read. Going from 2 bytes to 0.5 bytes cuts the read by 4x. So 4x is an upper bound on the decode speedup. Real servers lose some of it to dequantization work and to KV reads. Measured speedups above come from the papers' own setups.
+In a memory-bound decode step, time follows bytes read. Going from 2 bytes to 0.5 bytes cuts the read to a quarter. So the byte ratio is an upper bound on the decode speedup. Real servers lose some of it to dequantization work and to KV reads. Measured speedups above come from the papers' own setups.
 
 What you pay is quality. Rounding changes the model's output. **We give no quality-loss number here, because none we loaded is specific to your model and task.** Run your eval (lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/)) at each precision. Look at the cases that matter, not only the average score.
 
@@ -79,7 +78,7 @@ The other way to cut bytes is to start with fewer parameters. A model trained lo
 
 ### Real data: Shopify
 
-Shopify's engineering post on product understanding reports 40 million LLM calls and about 16 billion tokens per day. That is about 400 tokens per call (derived). They fine-tuned open vision models, applied FP8 quantization, used key-value caching, and served with Triton and a Kafka-based pipeline. Selective field extraction cut median latency from 2 seconds to 500 ms and GPU usage by 40%. The latency and GPU figures are the company's claims about one system. The post does not split the gains between FP8 and the other changes. So we cannot say how much FP8 alone gave.
+Shopify's engineering post on product understanding reports 40 million LLM calls and about 16 billion tokens per day. They fine-tuned open vision models, applied FP8 quantization, used key-value caching, and served with Triton and a Kafka-based pipeline. Selective field extraction cut median latency from 2 seconds to 500 ms and GPU usage by 40%. The latency and GPU figures are the company's claims about one system. The post does not split the gains between FP8 and the other changes. So we cannot say how much FP8 alone gave.
 
 ## Trade-offs
 
@@ -94,7 +93,7 @@ Shopify's engineering post on product understanding reports 40 million LLM calls
 ## Interview lens
 
 <Callout type="tip">
-Give the arithmetic: "70B at BF16 is 140 GB, so two H100s with 20 GB spare. At INT8 it is 70 GB on one card with 10 GB spare. At INT4 it is 35 GB with 45 GB for KV. Decode reads fewer bytes, so it speeds up by up to the byte ratio. I would pick the precision by running my eval, because quality loss depends on the model and task."
+Say it in words: "At BF16 a 70B model needs two H100s with almost no spare memory. At INT8 it fits on one card with a little spare. At INT4 it leaves plenty of room for KV. Decode reads fewer bytes, so it speeds up by up to the byte ratio. I would pick the precision by running my eval, because quality loss depends on the model and task."
 </Callout>
 
 <Callout type="mistake">
@@ -134,49 +133,32 @@ Do not quote a quality loss from memory, such as "INT4 loses 1%". You have no so
   ]}
 />
 
-<Ballpark
-  client:visible
-  title="GPUs for a 70B model"
-  scenario="Llama 3 70B has 70 billion parameters. H100 cards have 80 GB. Count weights only. Use 1 GB = 1e9 bytes."
-  steps={[
-    {
-      prompt: 'How many GB are the weights in BF16?',
-      unit: 'GB',
-      answer: 140,
-      within: 1.1,
-      explain: '70e9 x 2 bytes = 140e9 bytes = 140 GB. That needs 2 cards.',
-    },
-    {
-      prompt: 'How many GB are left on ONE H100 after INT8 weights?',
-      unit: 'GB',
-      answer: 10,
-      within: 1.1,
-      explain: 'INT8 weights are 70 GB. 80 - 70 = 10 GB for KV cache, activations, and buffers.',
-    },
-    {
-      prompt: 'How many GB are left on ONE H100 after INT4 weights?',
-      unit: 'GB',
-      answer: 45,
-      within: 1.1,
-      explain: 'INT4 weights are 70e9 x 0.5 = 35 GB. 80 - 35 = 45 GB. This ignores scale factors, so the real figure is a little lower.',
-    },
-  ]}
-/>
-
 <Quiz
   client:visible
   questions={[
     {
       id: 'a26-q-405',
-      q: 'Llama 3.1 405B is stored in INT4 at 0.5 bytes per parameter. How many 80 GB H100 cards hold its weights alone?',
+      q: 'A huge model needs a whole 8-GPU node in BF16. What does INT4 change about the GPUs you need?',
       options: [
-        '3 cards, since 202.5 GB / 80 GB is about 2.5, rounded up',
-        '2 cards, since INT4 weights cost about 0.5 GB per billion parameters',
-        '5 cards, since 405 GB / 80 GB is about 5.1, rounded down to 5',
-        '1 card, because 4-bit values need no more than one card per model',
+        'It needs far fewer cards, because each weight takes a quarter of the bytes',
+        'It needs the same cards, since card memory is fixed by the model design',
+        'It needs more cards, because 4-bit values must be stored with extra copies',
+        'It needs no cards, because 4-bit models run on the CPU only',
       ],
       answer: 0,
-      explain: '405e9 x 0.5 = 202.5 GB. 202.5 / 80 = 2.53, so 3 cards. Option 3 uses the parameter count as GB (1 byte each) and then rounds the wrong way. Two cards hold only 160 GB.',
+      explain: 'Weight memory is parameters times bytes per parameter. INT4 cuts the bytes to a quarter, so fewer cards hold the weights. Scale factors add a little overhead, but not more cards.',
+    },
+    {
+      id: 'a26-q-spare',
+      q: 'A 70B model moves from BF16 on two cards to INT8 on one card. What is the main risk of the INT8 setup?',
+      options: [
+        'The model forgets how to read, since INT8 removes its vocabulary',
+        'The card cannot read weights at all, because INT8 is not a memory format',
+        'Little memory is left for the KV cache, so long contexts suffer',
+        'The model gets slower than BF16, since fewer bytes means more reads',
+      ],
+      answer: 2,
+      explain: 'The weights fit, but they use most of the card. The KV cache needs the rest, and long prompts or many users can run out. Fewer bytes means fewer reads, not more.',
     },
     {
       id: 'a26-q-speed',

@@ -6,7 +6,6 @@ requires: ['ai/a3-llm-apis/api-anatomy', '07-reliability/timeouts-retries', '03-
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
 import Ai3LimitWalk from '../../../../components/anim/lessons/Ai3LimitWalk.tsx';
 import Ai3LimitStorm from '../../../../components/anim/lessons/Ai3LimitStorm.tsx';
@@ -47,11 +46,11 @@ The API uses a token bucket. Capacity refills continuously up to the maximum. It
 
 <Ai3LimitWalk client:visible />
 
-What the walk shows. Which bucket runs dry first depends on the shape of your requests. With 4,000 input and 500 output tokens, input binds at 500 requests a minute, though RPM allows 1,000. That is arithmetic from the table, not a measured result.
+What the walk shows. Which bucket runs dry first depends on the shape of your requests. Large prompts can drain the input-token bucket long before the request-count bucket runs dry. So a 429 can arrive while your request rate looks low.
 
 ### Cache-aware ITPM, and what it does and does not mean
 
-On most Claude models, only uncached input counts toward ITPM. `cache_read_input_tokens` does not count. `input_tokens` and `cache_creation_input_tokens` do. The page's example has 2M ITPM and an 80% cache hit rate. With that setup, you can process 10M total input tokens per minute. The formula is 2M / (1 - 0.8) = 10M. A cache is also a rate-limit tool. Lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/) covers how caching works.
+On most Claude models, only uncached input counts toward ITPM. `cache_read_input_tokens` does not count. `input_tokens` and `cache_creation_input_tokens` do. The page's example has 2M ITPM and an 80% cache hit rate. With that setup, the same limit lets you process several times more total input per minute. A cache is also a rate-limit tool. Lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/) covers how caching works.
 
 Do not assume other providers do the same. OpenAI's [prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching) says the opposite: cached input tokens still count toward its tokens-per-minute (TPM) limit (as of 2026-10-16). Caching there cuts cost, not rate-limit usage. Read your provider's page, and check the response headers, before you plan around it.
 
@@ -94,7 +93,7 @@ What to notice. Fixed timers and unjittered backoff keep clients in lockstep. So
 
 ### Retry amplification
 
-Each layer that retries multiplies the others. Take a user tap, a job worker with 3 attempts, and a gateway with 3 attempts. The SDK also makes 3 attempts, which is 1 try and 2 retries. If the provider fails every call, one tap causes 3 x 3 x 3 = 27 provider calls. Count each layer you own. Retry in one place, usually the one closest to the provider, and let the rest fail fast.
+Each layer that retries multiplies the others. Take a user tap, a job worker that retries, and a gateway that retries. The SDK retries too. If the provider fails every call, the retries multiply, and one tap can cause dozens of provider calls. Count each layer you own. Retry in one place, usually the one closest to the provider, and let the rest fail fast.
 
 ### An LLM call is not idempotent
 
@@ -128,10 +127,7 @@ A queue in front of the model, with a worker rate set below the limit, is better
 | Quantity | Value | Source |
 |---|---|---|
 | Opus 5.5, Start tier | 1,000 RPM, 2M ITPM, 400K OTPM | Anthropic rate limits page, 2026-10-16 |
-| Effective input at 80% cache hits on 2M ITPM | 10M tokens per minute | same page |
 | SDK default retries | 2, honors `retry-after` | Anthropic errors page |
-| Attempts per request with 3 layers of 3 tries | 27 | derived |
-| Requests per minute when input binds, 4,000 in and 2M ITPM | 500 | derived |
 
 ## Trade-offs
 
@@ -140,14 +136,14 @@ A queue in front of the model, with a worker rate set below the limit, is better
 | Retry with `retry-after` and jitter | Rides out brief limits | Added latency | Interactive calls with spare budget |
 | Queue and pace below the limit | No 429 storms, smooth load | Added delay, a queue to run | Background work |
 | Raise your tier | More headroom | Cost and approval | Sustained demand |
-| Prompt caching | Cheaper, and ITPM stretches up to 5x at 80% hits | Prompt layout work | Large shared prefixes |
+| Prompt caching | Cheaper, and ITPM stretches further | Prompt layout work | Large shared prefixes |
 | Request log plus tool keys | Safe replays, no repeated effects | A table and a write per step | Any agent with side effects |
 | Fail over to another provider | Survives outages | Second prompt, second eval | Hard availability targets |
 
 ## Interview lens
 
 <Callout type="tip">
-Say it in order: "I would read the 429 body first. A rate limit gets backoff with jitter and `retry-after`, at one layer. A spend-cap error gets no retry and a page to a human. For tool calls, I log the model response before I run the tool. I pass a key built from the logged tool id downstream." Then give one number. That number is 27 attempts from three layers of three.
+Say it in order: "I would read the 429 body first. A rate limit gets backoff with jitter and `retry-after`, at one layer. A spend-cap error gets no retry and a page to a human. For tool calls, I log the model response before I run the tool. I pass a key built from the logged tool id downstream." Then name the trap: retries multiply across layers.
 </Callout>
 
 <Callout type="mistake">
@@ -187,44 +183,32 @@ Do not retry the model call and call the system idempotent, because the output c
   ]}
 />
 
-<Ballpark
-  client:visible
-  title="The retry multiplier"
-  scenario="A user tap goes to your job worker (3 attempts), then to your gateway (3 attempts), then to the Anthropic SDK (1 try and 2 retries). The provider is returning 529 for every call. 100 taps arrive per second."
-  steps={[
-    {
-      prompt: 'How many provider calls does one tap cause at most?',
-      unit: 'calls',
-      answer: 27,
-      within: 1.1,
-      explain: 'The layers multiply: 3 x 3 x 3 = 27.',
-    },
-    {
-      prompt: 'How many provider calls per second do 100 taps cause?',
-      unit: 'calls per second',
-      answer: 2700,
-      within: 1.1,
-      explain: '100 x 27 = 2,700 calls a second, against a provider that is already failing. Ignoring the delay between tries, which spreads them out, this is the worst-case rate.',
-    },
-    {
-      prompt: 'You remove retries from the worker and the SDK, and keep 3 attempts in the gateway. How many provider calls does one tap cause now?',
-      unit: 'calls',
-      answer: 3,
-      within: 1.1,
-      explain: 'One layer with 3 attempts gives 3 calls. That is 9 times fewer than 27.',
-    },
-  ]}
-/>
-
 <Quiz
   client:visible
   questions={[
     {
       id: 'a3-6-q-cache-itpm',
-      q: 'A Start-tier organization has 2,000,000 ITPM on a model where cache reads do not count. 80% of its input tokens are cache reads. About how many total input tokens per minute can it process?',
-      options: ['2.0M', '10M', '8.0M', '4.0M'],
+      q: 'On a model where cache reads do not count toward ITPM, what does a high cache hit rate do to your rate limit?',
+      options: [
+        'It lowers your limit, because cached tokens are held in reserve',
+        'It lets you process far more total input under the same limit',
+        'It has no effect, since all input tokens count the same way',
+        'It raises your tier, since caching is a paid upgrade of limits',
+      ],
       answer: 1,
-      explain: 'Only the 20% uncached share counts. 2M / 0.2 = 10M total input tokens per minute. The figure 8M is only the cached part.',
+      explain: 'Only uncached input counts toward ITPM here, so cache reads are free headroom. Other providers may count cached tokens, so read the provider page.',
+    },
+    {
+      id: 'a3-6-q-layers',
+      q: 'A job worker, a gateway, and the SDK each retry a failing provider call. What is the best fix?',
+      options: [
+        'Add more retries at the top layer so the user tap succeeds',
+        'Keep retries in every layer, since each one guards a different failure',
+        'Retry in one layer near the provider, and let the rest fail fast',
+        'Remove all retries, since the provider will recover on its own',
+      ],
+      answer: 2,
+      explain: 'Retries at each layer multiply, so one failure becomes a storm against a provider that is already struggling. One layer keeps the safety net without the multiplication.',
     },
     {
       id: 'a3-6-q-crash',

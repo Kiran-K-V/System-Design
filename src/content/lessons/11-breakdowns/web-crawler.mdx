@@ -6,7 +6,6 @@ requires: ['06-async/queues', '06-async/backpressure-dlq', '10-advanced/big-data
 import Callout from '../../../components/lesson/Callout.astro';
 import Quiz from '../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../components/lesson/Diagnose.tsx';
-import Ballpark from '../../../components/lesson/Ballpark.tsx';
 import CrawlerBuild from '../../../components/anim/lessons/CrawlerBuild.tsx';
 import CrawlerQueues from '../../../components/anim/lessons/CrawlerQueues.tsx';
 
@@ -41,15 +40,9 @@ This case adds four ideas. One is a **URL frontier** [mid] (the list of URLs sti
 
 Assume 10 billion pages. Assume the average page costs 2 MB of transfer with its inline resources. Of that, the HTML is about 30 KB (assumptions).
 
-- Total transfer: 10,000,000,000 x 2 MB = 20,000,000,000 MB = **20 PB**.
-- Time budget: 5 days x 86,400 s = 432,000 s.
-- Required rate: 10,000,000,000 / 432,000 = about **23,000 pages per second**.
-- Required bandwidth: 23,148 x 2 MB = about 46 GB per second, which is about **370 Gbit/s**.
-- Per machine: assume a 200 Gbit/s network card that we can use at 30%. That is 60 Gbit/s = 7.5 GB/s, so 7.5 GB / 2 MB = **3,750 pages per second**.
-- Machines: 23,148 / 3,750 = 6.2, so at least **7**. Use 8 for headroom. 10,000,000,000 / (8 x 3,750) = 333,333 s, about 3.9 days.
-- Stored HTML only: 10,000,000,000 x 30 KB = **300 TB**.
+The page count and the deadline fix the shape of the system. The crawl must sustain tens of thousands of pages per second (~23,000 for 10 billion pages in 5 days). That is petabytes of transfer, far more than one network card can carry. So the fetchers must be spread over a fleet of machines, and a handful is enough for raw bandwidth. Storing only the HTML is far smaller than the transfer, because pages carry images and scripts that we do not keep.
 
-Two lessons come out of this. First, one machine needs 10,000,000,000 / 3,750 = 2.7 million seconds, about 31 days. So the fetchers must be spread over many machines. Second, the limit that matters in practice is not bandwidth. It is politeness, as the deep dive shows.
+The limit that matters in practice is not bandwidth. It is politeness, as the deep dive shows.
 
 ## Core entities
 
@@ -89,11 +82,11 @@ The Stanford information retrieval book describes a common design. Front queues 
 
 A simple version fits in Redis (lesson [8.2](/learn/08-technologies/redis/)). One key per host holds a rate limit or lock, set with an expiry of one second. Compare with the rate limiters of lesson [7.4](/learn/07-reliability/rate-limiting/). A fetcher that cannot take the key picks another host.
 
-Do the math on what politeness costs. At 1 request per second per host, the crawler needs at least 23,148 hosts in flight. The goal is to reach 23,148 pages per second. A host with 10,000,000 pages needs 10,000,000 / 86,400 = about **116 days** by itself. So set a page budget per host, or crawl its pages at a lower priority.
+Politeness has a cost. At 1 request per second per host, a crawler that wants tens of thousands of pages per second must keep tens of thousands of different hosts in flight. A huge host cannot be finished fast. A host with 10 million pages would take months at that pace. So set a page budget per host, or crawl its pages at a lower priority.
 
 **`robots.txt`.** Before the first fetch from a host, download `/robots.txt` and cache the rules. The robots.txt rules say a crawler should not use a cached copy for more than 24 hours. They also say a parser must read at least 500 KB of the file. If the file is unreachable because of server or network errors, the crawler must assume **complete disallow**. These errors are status 500 to 599. If the file is simply unavailable (a client error such as 404), the crawler may access any resource. Mix these up and you either crawl a site that said no, or skip a site that said yes. Note the order: a failing server blocks you, a missing file frees you.
 
-**DNS.** Each fetch needs the host's IP address (lesson [2.2](/learn/02-networking/dns/)). If a lookup takes about 20 ms (assumption) and you do 23,148 per second, that is 23,148 x 0.02 = about **463 lookups in flight** all the time. Cache the answer per host and honor its TTL. One lookup then serves thousands of pages on the same host. Run a local resolver cache so workers share the result.
+**DNS.** Each fetch needs the host's IP address (lesson [2.2](/learn/02-networking/dns/)). At tens of thousands of fetches per second, lookups would pile up and the resolver would become a bottleneck. Cache the answer per host and honor its TTL. One lookup then serves thousands of pages on the same host. Run a local resolver cache so workers share the result.
 
 ### Fault tolerance: stages, queues, retries
 
@@ -109,12 +102,12 @@ There are two different duplicates.
 
 **The same URL, seen twice.** Many pages link to the same page. Without a check, the crawl loops forever. First **normalize** the URL. Lower-case the host, drop the fragment (the part after `#`), sort query parameters, and remove tracking parameters. Then check whether it has been seen.
 
-An in-memory set of 10 billion URLs does not fit on one machine. Hash each URL to 8 bytes and the hashes alone are 10,000,000,000 x 8 B = **80 GB**. Two ways to hold that:
+An in-memory set of 10 billion URLs does not fit on one machine. Even if you hash each URL to 8 bytes, the hashes alone take tens of GB. Two ways to hold that:
 
 - A sharded key-value store, split by hash (lesson [4.7](/learn/04-data/sharding/)). Exact, but each check is a network call.
-- A **Bloom filter** (lesson [10.3](/learn/10-advanced/big-data-structures/)). With a 1% false positive rate, the filter needs about 9.6 bits per item. So 10,000,000,000 x 9.6 bits = about **12 GB**. A Bloom filter never says "unseen" about a URL it has seen, so it never causes a repeat fetch. But 1% of new URLs are wrongly called "seen". That is about 100 million pages never crawled. For a crawl of the web that loss is often acceptable. State it as a choice.
+- A **Bloom filter** (lesson [10.3](/learn/10-advanced/big-data-structures/)). With a 1% false positive rate, the filter needs only about 10 bits per item, several times less memory than the hashes. A Bloom filter never says "unseen" about a URL it has seen, so it never causes a repeat fetch. But 1% of new URLs are wrongly called "seen". That is about 100 million pages never crawled at this scale. For a crawl of the web that loss is often acceptable. State it as a choice.
 
-**Different URLs, the same page.** Mirrors, tracking links, and print versions have different URLs and the same content. Store a **content hash** [mid]: a fixed-size fingerprint of the page text, such as a 32-byte SHA-256. Index it, and skip pages whose hash is already known. 10,000,000,000 x 32 B = **320 GB**. This finds exact copies only. Pages that differ slightly need other near-duplicate methods; the Stanford book has a chapter on it.
+**Different URLs, the same page.** Mirrors, tracking links, and print versions have different URLs and the same content. Store a **content hash** [mid]: a fixed-size fingerprint of the page text, such as a 32-byte SHA-256. Index it, and skip pages whose hash is already known. This index is also large at this scale. This finds exact copies only. Pages that differ slightly need other near-duplicate methods; the Stanford book has a chapter on it.
 
 **Crawler traps.** Some sites build endless links, such as a calendar with a "next month" link forever. Limit link depth (15 to 20 hops is a common assumption) and the number of pages per host. Normalizing URLs removes many accidental traps.
 
@@ -148,7 +141,7 @@ An in-memory set of 10 billion URLs does not fit on one machine. Hash each URL t
 ## Interview lens
 
 <Callout type="tip">
-Do the arithmetic early: "10 billion pages in 5 days is about 23,000 pages per second, which is 8 machines". Then say the real limit: "per-site politeness, so I keep one queue per host and a timer for each". Name the `robots.txt` rule for 5xx versus 4xx. Mention the Bloom filter trade-off with its false positive rate.
+Do the arithmetic early: "10 billion pages in 5 days is tens of thousands of pages per second, so many fetchers". Then say the real limit: "per-site politeness, so I keep one queue per host and a timer for each". Name the `robots.txt` rule for 5xx versus 4xx. Mention the Bloom filter trade-off with its false positive rate.
 </Callout>
 
 <Callout type="mistake">
@@ -161,10 +154,15 @@ Do not use one global queue and breadth-first search. Do not keep all seen URLs 
   client:visible
   questions={[
     {
-      q: 'A crawl must fetch 10 billion pages in 5 days. Roughly how many pages per second is that?',
-      options: ['About 23,000', 'About 2,300', 'About 230,000', 'About 2,300,000'],
+      q: 'A crawl must fetch 10 billion pages in 5 days. What does that deadline force on the design?',
+      options: [
+        'Spread fetching over many machines',
+        'Use one fast machine with more threads',
+        'Skip robots.txt to save time',
+        'Store every page twice for speed',
+      ],
       answer: 0,
-      explain: '5 days is 432,000 seconds. 10,000,000,000 / 432,000 is about 23,000. A value ten times lower comes from forgetting that the crawl is 5 days, not 50.',
+      explain: 'The deadline needs tens of thousands of pages per second. One machine cannot reach that, so fetchers run on a fleet. More threads do not add network bandwidth, and skipping robots.txt breaks politeness.',
     },
     {
       q: 'A host answers the robots.txt request with a 503 error. What do the robots.txt rules require of the crawler?',
@@ -199,34 +197,16 @@ Do not use one global queue and breadth-first search. Do not keep all seen URLs 
       answer: 2,
       explain: 'The problem is runs of URLs from one host in a single queue. Separate queues with a ready time per host let a fetcher pick a different host while one waits. More threads make the burst worse, and caching or compression does not change request timing.',
     },
-  ]}
-/>
-
-<Ballpark
-  client:visible
-  title="Size the crawl"
-  scenario="10 billion pages, 2 MB each. The crawl must end in 5 days. One machine moves 7.5 GB per second of page data. A Bloom filter at a 1% false positive rate takes about 9.6 bits per URL."
-  steps={[
     {
-      prompt: 'How many pages per second are needed?',
-      unit: 'pages per second',
-      answer: 23148,
-      within: 1.2,
-      explain: '5 x 86,400 = 432,000 seconds. 10,000,000,000 / 432,000 is about 23,000.',
-    },
-    {
-      prompt: 'How many machines, at 7.5 GB per second each? A page is 2 MB.',
-      unit: 'machines',
-      answer: 6.2,
-      within: 1.2,
-      explain: 'One machine does 7.5 GB / 2 MB = 3,750 pages per second. 23,148 / 3,750 is about 6.2, so you need at least 7.',
-    },
-    {
-      prompt: 'How many GB does the Bloom filter for 10 billion URLs take?',
-      unit: 'GB',
-      answer: 12,
-      within: 1.2,
-      explain: '10,000,000,000 x 9.6 bits is 96,000,000,000 bits. Divide by 8 for bytes: 12,000,000,000 bytes, about 12 GB.',
+      q: 'The crawler can fetch far faster than sites allow. What usually sets the real crawl speed?',
+      options: [
+        'Politeness limits on each host',
+        'The speed of the disks that hold the stored pages',
+        'The size of the Bloom filter in memory',
+        'The number of fetcher threads on each machine',
+      ],
+      answer: 0,
+      explain: 'Each host accepts only a slow trickle of requests. Overall speed comes from crawling many hosts in parallel. Bandwidth and threads can be added. A site\'s patience cannot.',
     },
   ]}
 />

@@ -5,7 +5,6 @@ requires: ['ai/a2-inference-cost/kv-cache', 'ai/a3-llm-apis/streaming', '11-brea
 
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
-import Ballpark from '../../../../components/lesson/Ballpark.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
 import Math from '../../../../components/lesson/Math.astro';
 import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
@@ -274,39 +273,15 @@ Trigger on KV pool use and queue wait, not GPU utilization. Morikawa: "The combi
 - **Autoscaling and cold start.** Scale on queue depth and KV use, and keep a **warm pool**, since new GPUs may not exist. Loading 140 GB of weights at an assumed 2 GB/s takes 70 seconds, so keep weights on local disk. Engine internals are in elective E3, which this lesson does not require.
 - **Quotas and metrics.** A token bucket per tenant, and TTFT, TPOT, goodput, hit rate, and KV use per tenant.
 
-**The failure: goodput falls while throughput rises.** A team raises the batch size for more tokens per second. Throughput goes up and customers complain. Every stream in a batch shares one decode step, which reads the weights once and every chat's KV once: (140 GB + b x 1.31 GB) / (8 x 3.35 TB/s x 0.4), for 4,000-token chats. The TPOT target is 50 ms.
+**The failure: goodput falls while throughput rises.** A team raises the batch size for more tokens per second. Throughput goes up and customers complain. Every stream in a batch shares one decode step. That step reads the weights once and every chat's KV once. A bigger batch means more KV to read, so each step gets slower. Tokens per second keep rising for a while, but at some batch size each stream's step time passes the TPOT target (50 ms here). Past that point throughput is up a few percent and goodput falls toward zero. Real streams spread around the mean, so the drop is a slope. The sign is the point. **Choose the batch size from goodput, not tokens per second**, and alert on SLO attainment (lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/)).
 
-| Batch b | Step time | Tokens per second | Meets 50 ms? | Goodput |
-|---|---|---|---|---|
-| 100 | 25 ms | 3,955 | yes | 3,955 |
-| 200 | 38 ms | 5,331 | yes | 5,331 |
-| 302 | 50 ms | 6,042 | yes | 6,042 |
-| 342 (memory limit) | 55 ms | 6,232 | no | 0 |
-
-From 302 to 342, throughput rises 3% and goodput falls to zero in this model. Real streams spread around the mean, so the drop is a slope. The sign is the point. **Choose the batch size from goodput, not tokens per second**, and alert on SLO attainment (lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/)).
-
-**Prove it.** Size a fleet at 20,000 queries per second, the rate Character.AI claims. We do not know what it counts as a query or which model it runs. Our assumptions: a query is one chat turn with a 4,000-token history and 150 output tokens, the replica is the 8-card 70B replica, kernels reach 40% of peak, the fleet runs at 70% busy, and decode and prefill share GPU time.
-
-<Ballpark
-  client:visible
-  title="GPUs and monthly cost at 20,000 QPS"
-  scenario="One replica is 8 H100 cards with 70B BF16 weights and 342 resident chats of 4,000 tokens. Decode step = (140 GB + 342 x 1.31072 GB) / (8 x 3.35 TB/s x 0.4) = 54.9 ms. A turn makes 150 output tokens. A hit prefills in 13 ms, a miss in 190 ms. Target busy share 70%. $3.99 per GPU-hour, 730 hours per month."
-  facts={['20,000 turns per second, 4,000-token history', 'Hit rate 90%, then 50%']}
-  steps={[
-    { prompt: 'How many replicas are busy decoding? One answer is 150 tokens x the step time, 54.9 ms. Streams in flight = 20,000 x that. Divide by 342 per replica.', unit: 'replicas', answer: 481, within: 1.15, explain: 'One answer takes 150 x 0.0549 = 8.24 s. 20,000 x 8.24 = 164,600 streams in flight (Little\'s law). 164,600 / 342 = 481 replicas.' },
-    { prompt: 'At a 90% hit rate, how many replicas of prefill work are there? Use 20,000 x (0.9 x 13 ms + 0.1 x 190 ms).', unit: 'replicas', answer: 615, within: 1.15, explain: '0.9 x 0.013 + 0.1 x 0.190 = 0.0307 s per turn. 20,000 x 0.0307 is about 615 replica-seconds per second.' },
-    { prompt: 'Add decode and prefill, divide by the 70% target, and convert to GPUs. How many GPUs?', unit: 'GPUs', answer: 12536, within: 1.15, explain: '(481 + 615) / 0.7 is about 1,567 replicas (with unrounded inputs), or 12,536 GPUs. Monthly: 12,536 x $3.99 x 730 = $36.5 million.' },
-    { prompt: 'A router change drops the hit rate to 50%. How many GPUs now?', unit: 'GPUs', answer: 28736, within: 1.15, explain: 'Prefill per turn is 0.5 x 13 + 0.5 x 190 = 101.5 ms, so about 2,030 replica-seconds. (481 + 2,030) / 0.7 is about 3,592 replicas, or 28,736 GPUs and about $83.7 million a month. The hit rate is the biggest lever.' },
-  ]}
-/>
-
-Sanity check (our reading, not a claim about Character.AI): $36.5 million a month is $0.0007 per turn. "Under one cent per hour of conversation" fits only if an hour holds under about 14 turns, or their model is far smaller than 70B.
+Fleet size at a rate like Character.AI's 20,000 queries per second comes from three things: how many streams are decoding at once, how much prefill work the misses add, and how busy you let the GPUs run. The cache hit rate is the biggest lever. A router change that halves the hit rate roughly doubles the prefill work, and the fleet grows by about the same factor.
 
 ## Staff answer vs senior answer
 
 | Question | Senior answer | Staff answer |
 |---|---|---|
-| Bottleneck? | "GPUs are scarce, so batch and queue" | KV memory: 13 TB for 10,000 chats, 342 chats per replica, 240 GPUs, $957.60 an hour |
+| Bottleneck? | "GPUs are scarce, so batch and queue" | KV memory: weights are a fixed cost per replica, so KV room sets chats per replica and the fleet size |
 | Routing? | "Sticky sessions" | Cost-based: cache overlap against queue. Knows what affinity does under skew |
 | Long chats | "Truncate" | Chunked cuts, a length trigger set from KV and miss cost, versioned summaries |
 | Launch spike | "Autoscale" | Nothing to scale into: a written shed ladder, running chats protected, an honest wait |
@@ -339,18 +314,6 @@ Do not say "add GPUs" first, because there may be none. Do not use round-robin f
 </Callout>
 
 ## Check yourself
-
-<Ballpark
-  client:visible
-  title="KV memory for 10,000 chats"
-  scenario="Llama 3.1 70B in BF16: 80 layers, 8 KV heads, head width 128. Weights are 140 GB. Cards have 80 GB and the engine uses 92% of each. A replica is 8 cards. 10,000 chats are open at once, each with 4,000 tokens, and nothing is shared."
-  facts={['KV bytes per token = 2 x layers x KV heads x head width x 2 bytes', '$3.99 per GPU-hour (Lambda, as of 2026-10-19)']}
-  steps={[
-    { prompt: 'How many GB of KV do all 10,000 chats need?', unit: 'GB', answer: 13107, within: 1.1, explain: '2 x 80 x 8 x 128 x 2 = 327,680 bytes per token. Times 4,000 is 1.31072 GB per chat. Times 10,000 is 13,107.2 GB.' },
-    { prompt: 'How many chats fit in the KV room of one 8-card replica?', unit: 'chats', answer: 342, within: 1.1, explain: '8 x 80 x 0.92 = 588.8 GB usable. Minus 140 GB of weights leaves 448.8 GB. 448.8 / 1.31072 = 342.4, so 342.' },
-    { prompt: 'What does the fleet cost per hour, in dollars?', unit: 'USD per hour', answer: 957.6, within: 1.1, explain: '10,000 / 342 = 29.2, so 30 replicas. 30 x 8 = 240 GPUs. 240 x $3.99 = $957.60 per hour.' },
-  ]}
-/>
 
 <Quiz
   client:visible
@@ -398,6 +361,28 @@ Do not say "add GPUs" first, because there may be none. Do not use round-robin f
       ],
       answer: 2,
       explain: 'Running chats already hold KV, and finishing them frees memory. Refusing them forces a recompute later. A cold region needs about 3.4 times the GPU time per turn.',
+    },
+    {
+      q: 'Memory is the first limit when you size a fleet for many open 70B chats. Which fact explains it?',
+      options: [
+        'Each open chat holds KV that grows',
+        'Each open chat needs its own copy of the weights',
+        'Prefill is compute-bound, so memory never matters',
+        'GPU memory is cheap, so only FLOPs limit a fleet',
+      ],
+      answer: 0,
+      explain: 'Each open chat holds KV in GPU memory, and each replica also holds the weights. KV room, not FLOPs, caps chats per replica. Chats share one copy of the weights.',
+    },
+    {
+      q: 'A router change drops the cache hit rate on a big chat fleet. What happens to the GPUs you need?',
+      options: [
+        'It must grow, since misses add prefill work',
+        'It shrinks, since misses are shorter than hits',
+        'It stays the same, since decode work is unchanged',
+        'Only the network bill changes, since prefill is free',
+      ],
+      answer: 0,
+      explain: 'A miss re-reads the whole history, so prefill work per turn rises. Decode work is the same, but total GPU time is not. Prefill is never free.',
     },
   ]}
 />
