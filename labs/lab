@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Uptime labs CLI. Run it from inside a lab folder, for example: cd L04-cache-stampede && ./lab up
+set -euo pipefail
+
+if [[ ! -f compose.yaml ]]; then
+  echo "Run this from a lab folder, for example: cd L04-cache-stampede && ./lab up" >&2
+  exit 1
+fi
+
+dc() { docker compose "$@"; }
+hint_file=.hints-seen
+
+wait_healthy() {
+  for _ in $(seq 1 60); do
+    if dc exec -T app python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "App did not start. Check: docker compose logs app" >&2
+  dc logs --tail 30 app >&2
+  exit 1
+}
+
+case "${1:-help}" in
+  up)
+    dc build --quiet
+    dc --profile tools build --quiet
+    dc up -d --wait db redis
+    dc up -d app
+    wait_healthy
+    echo "Lab is up. Next: ./lab break (in this terminal) and ./lab watch (in a second terminal)."
+    ;;
+  restart)
+    dc up -d --force-recreate app
+    wait_healthy
+    echo "App restarted with your latest code."
+    ;;
+  break)
+    echo "Flash sale started: 300 requests per second. Run ./lab watch in a second terminal. Ctrl-C to stop."
+    dc run --rm k6 run --quiet -e DURATION=10m /lab/load.js
+    ;;
+  watch)
+    dc run --rm tools python /lab/tools/watch.py
+    ;;
+  check)
+    # Start clean: stop the app, end its leftover queries (Postgres keeps running
+    # them after the client is gone), empty the cache, then start the app again.
+    dc stop app >/dev/null 2>&1
+    dc exec -T db psql -U postgres -qAtc "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE datname = 'postgres' AND pid <> pg_backend_pid()" >/dev/null
+    dc exec -T redis redis-cli FLUSHALL >/dev/null
+    dc up -d --force-recreate app
+    wait_healthy
+    dc exec -T app python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/products/42/summary')" >/dev/null
+    echo "Running a 40 second flash sale and measuring..."
+    started=$(date +%s)
+    dc run --rm k6 run --quiet -e DURATION=40s --summary-export /out/summary.json /lab/load.js >/dev/null 2>&1 &
+    k6_pid=$!
+    status=0
+    dc run --rm tools python /lab/tools/check.py "$started" || status=$?
+    wait "$k6_pid" || true
+    exit "$status"
+    ;;
+  hint)
+    total=$(python3 -c "import json; print(len(json.load(open('lab.json'))['hints']))")
+    seen=$(cat "$hint_file" 2>/dev/null || echo 0)
+    next=$(( seen < total ? seen + 1 : total ))
+    echo "$next" > "$hint_file"
+    python3 -c "import json,sys; h=json.load(open('lab.json'))['hints']; n=int(sys.argv[1]); print(f'Hint {n} of {len(h)}: {h[n-1]}')" "$next"
+    ;;
+  solution)
+    APP_DIR=solution dc up -d --force-recreate app
+    wait_healthy
+    echo "Running the reference fix. ./lab restart goes back to your code."
+    ;;
+  down)
+    dc --profile tools down -v
+    rm -f "$hint_file"
+    ;;
+  *)
+    echo "Usage: ./lab up | break | watch | restart | check | hint | solution | down"
+    ;;
+esac

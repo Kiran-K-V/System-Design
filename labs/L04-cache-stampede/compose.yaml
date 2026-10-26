@@ -1,0 +1,56 @@
+name: uptime-l04
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: lab
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "max_connections=120"]
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres && psql -U postgres -tAc 'SELECT 1 FROM products LIMIT 1' | grep -q 1"]
+      interval: 2s
+      retries: 90
+    cpus: 1.5
+    mem_limit: 1g
+
+  redis:
+    image: redis:7-alpine
+    mem_limit: 128m
+
+  app:
+    build: ../shared/app-image
+    environment:
+      DATABASE_URL: postgresql://postgres:lab@db:5432/postgres
+      REDIS_URL: redis://redis:6379/0
+    # The learner edits ./app/cache.py. `./lab restart` loads the edit.
+    # APP_DIR=solution runs the reference fix instead.
+    volumes:
+      - ./${APP_DIR:-app}:/app:ro
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_started }
+    mem_limit: 512m
+
+  tools:
+    build: ../shared/tools-image
+    environment:
+      DATABASE_URL: postgresql://postgres:lab@db:5432/postgres
+      APP_URL: http://app:8000
+      LAB_ID: L04
+    volumes:
+      - ./:/lab:ro
+      - ../shared:/shared:ro
+    profiles: ["tools"]
+
+  k6:
+    image: grafana/k6:0.57.0
+    user: "0"
+    volumes:
+      - ./:/lab:ro
+      - ../shared/out:/out
+    profiles: ["tools"]
