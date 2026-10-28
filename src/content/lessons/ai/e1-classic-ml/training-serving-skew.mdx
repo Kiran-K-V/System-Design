@@ -1,0 +1,289 @@
+---
+summary: 'Training-serving skew means the model sees different feature values in production than it saw in training, with no error raised. It comes from different code, data that changes over time, and joined tables that get overwritten. Log the features you served, share one definition, and measure three gaps.'
+requires: ['ai/e1-classic-ml/features-store']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE1SkewPipes from '../../../../components/anim/lessons/AiE1SkewPipes.tsx';
+import AiE1SkewGaps from '../../../../components/anim/lessons/AiE1SkewGaps.tsx';
+
+## The problem
+
+You work at a food-delivery company. Some customers see a "pay on delivery" option at checkout and some do not. A model decides who sees it. It predicts how likely a cash order is to be refused at the door. Refused orders waste a rider's trip, so the team wants the option only for safe customers. (The company and the numbers in this lesson are made up for teaching. The patterns are real.)
+
+You train the model on three months of orders. The offline test is good. The area under the curve, or AUC, is 0.84. AUC is a score from 0.5 to 1.0 that says how well the model puts the bad cases above the good ones. 0.5 is a coin flip. Lesson E1.6 opens this metric. For now, read 0.84 as "good".
+
+You ship it. Within a week the refused-order rate is no better than before the model. A dashboard of live AUC says 0.71. Nothing crashed. No error is in the logs. The model returns a number for every request, and every number looks like a probability.
+
+This is the most common way a classic ML system goes wrong in production. The model is fine. The inputs it gets at serving time are not the inputs it learned from. The gap has a name: **training-serving skew**. This lesson answers four questions.
+
+1. What exactly is skew, and why can no test catch it?
+2. Where does it come from?
+3. How do you stop it from entering?
+4. How do you measure it, so that you know when it comes back?
+
+Lesson E1.3 taught the feature store: one place where features live, an offline copy for training and an online copy for low-latency reads. A feature store is the tool. This lesson is about the failures it is meant to prevent, and about what to do when you do not have one.
+
+## Question 1: what exactly is skew?
+
+**Training-serving skew** is a difference between how the model performs in training and how it performs in serving. Google's Rules of Machine Learning gives it this definition and says that its team has seen skew hurt real production systems. The source of the difference is that the input values differ.
+
+Think of a recipe tested in a home kitchen. The cook measures with a steel cup. The restaurant kitchen measures with a ladle that holds a bit less. The recipe is the same, the dish is not. The recipe never failed. The measuring changed.
+
+Why does it exist at all? Because training and serving are two different jobs.
+
+| | Training | Serving |
+|---|---|---|
+| When | Hours or days before the model is used | At the moment of the request |
+| Shape of work | Batch: scan millions of rows, join tables | Online: one request, one lookup |
+| Who writes it | Often a data scientist, in SQL or a notebook | Often a backend engineer, in the service language |
+| Data it reads | A warehouse copy of the past | Live stores and caches |
+
+Two jobs, two codebases, two sets of data. They both promise to compute "orders in the last 7 days". Each one can mean something a little different.
+
+Why can no test catch it? Look at where the offline numbers come from. The holdout set, the rows you keep back to test the model, goes through the same training pipeline as the training rows. If that pipeline says 9, the holdout says 9. So the test checks the model against a world that only exists offline. The serving path is never in the test.
+
+Here is the example in motion. One user, one feature, two pipelines.
+
+<AiE1SkewPipes client:visible />
+
+Notice that no step raised an error. The service returned 6. It is a valid count. The model took it. This is a **silent failure**: the system keeps working, and it gets a little worse. Google's rules call this out as a problem that happens more for ML systems than for other software, because the model adjusts and the behaviour decays slowly instead of stopping.
+
+## Question 2: where does skew come from?
+
+Google's rules name causes in a short list. We use three, and add one note on the fourth.
+
+### Cause 1: different code
+
+**What it is.** The feature is written twice. Once for training and once for serving. The two versions are meant to match and do not.
+
+**Picture.** Two translators work from one book into two languages. Each one makes choices. Months later the two versions disagree on a word.
+
+**Why it happens.** The jobs are different (batch and online), and the people and languages differ. The warehouse has a function for "count orders". The service has a counter in a cache. Someone decides, with good reason, that a cancelled order should not count online. Nobody tells the person who wrote the SQL.
+
+**Example.** The animation above. Training counts 9 and serving counts 6. Other common versions: one side rounds a number and the other truncates it. One side lowercases text and the other does not. One side treats a missing value as 0 and the other as "unknown". Time zones are a favourite. A warehouse job cuts the day at midnight UTC. The service cuts it at midnight India time, five and a half hours earlier. A "today" feature then holds different orders.
+
+### Cause 2: the data changes between training and serving
+
+**What it is.** The same code reads data that has moved on. The feature is correct for its time and wrong for now.
+
+**Picture.** A weather forecast model trained on summer data and used in monsoon. The inputs mean something different.
+
+**Why it happens.** The world changes, and some features age faster than others. A feature such as "trending dishes in this city right now" is stale in hours. A feature such as "customer's home city" lasts for months. Data also arrives late. An order that was cancelled at 6 pm shows up in the warehouse at 9 pm. A training job that runs at midnight sees the full picture. The service at 6:05 pm did not.
+
+**Example.** A feature uses the restaurant's average prep time. Training data came from a quiet month. Serving is during a festival rush. The model reads a prep time of 12 minutes, learned from calm days, while the true number now is 25.
+
+Google's rules treat this as a normal effect to measure and not as a bug. We come back to this in Question 4.
+
+### Cause 3: the joined table changes
+
+**What it is.** The model needs a feature that lives in another table, so the pipeline joins the table on a key. The table is overwritten over time. A join at training time reads today's value. A join at serving time also reads today's value. But the training rows are from the past, so they got a value from the future.
+
+**Picture.** You write an exam question paper with the answer key stapled on, because you looked up the key today. The student in the past never had it.
+
+**Why it happens.** Most tables keep only the latest value per key. A table of restaurant ratings is updated every night. When you build the training set for orders from March, a naive join attaches the rating from today, not the rating on the day of the order.
+
+**Example.** Google's rules say it directly: between training and serving time the features in the table may be changed, and the model's prediction for the same item may then differ. This is the cause that lesson E1.3 solved with point-in-time joins: for each training row, fetch the value that was true at that row's timestamp.
+
+### The fourth: a feedback loop
+
+The third item in Google's definition is a feedback loop between the model and the algorithm. The model changes what users see, users react, and the reactions become the next training data. This one is about what data you collect, not about how features are computed. Lessons E1.5 and E1.6 return to it. For this lesson, keep the other three.
+
+## The naive fix and why it fails
+
+The first idea is "be careful". Write the SQL and the service code from one spec and review them together.
+
+It fails for three reasons.
+
+- **Drift over time.** Both pieces are correct on the day you ship. In a year, three people have changed each side. No test ties the two together.
+- **No test sees it.** As we saw, offline evaluation runs on the training path.
+- **The silent part.** A wrong value is still a valid value. Nothing throws.
+
+The second idea is "retrain more often". It does not help. Retraining on a skewed pipeline trains on the same skew.
+
+The real fixes change the structure so that the two paths cannot drift apart, and they add a measurement that says when they have.
+
+## The real fix: three moves
+
+Google's rules give three moves that fit one after another. Save what you served. Share the code. Measure the gaps.
+
+### Move 1: log the features you served, and train on the log
+
+**What it is.** At serving time, write down the exact feature values the model used, together with the request id. When the label arrives later (the order was refused or accepted), join it to the logged row by request id. Train on these logged rows.
+
+**Picture.** A restaurant that wants to improve a dish does not rebuild the order from memory. It keeps the kitchen ticket. The ticket records what was actually cooked.
+
+**Why it works.** The training row is now the very same row the model saw at serving time. Cause 1, cause 2, and cause 3 all disappear for these rows, because no second pipeline exists. Google's rules say the best way to make sure you train like you serve is to save the features used at serving time and pipe them to a log for training. They also say that the YouTube home page switched to logging features at serving time and saw significant quality improvements and a reduction in code complexity.
+
+**Example.** The checkout service computes `orders_7d = 6`. It writes `{request_id, user_id, orders_7d: 6, ...}` to a log topic. Hours later the order outcome arrives, and a job joins on `request_id`. The model now learns that "6" went with "refused".
+
+What this costs you:
+
+- **Storage and write volume.** You store every feature of every scored request. Do it off the request path (put the log write on a queue, so a slow log never slows checkout). Lesson [observability](/learn/backend/07-reliability/observability/) has the pattern.
+- **You cannot add a feature to the past.** A new feature is empty in old logs. You wait for logs to fill, or you backfill with an offline computation and accept some skew for the backfilled rows.
+- **Selection.** You only have rows for requests that were scored. Customers the old model never scored have no log. Lesson E1.6 shows why this bias matters.
+- **A partial log is still useful.** The rules say that even if you cannot log every example, log a small fraction. You can then check that serving and training agree.
+
+### Move 2: reuse code between training and serving
+
+**What it is.** Write each feature once. Run the same definition in the batch job and in the service.
+
+**Picture.** One recipe card, photocopied into both kitchens.
+
+**Why it works.** Cause 1 needs two copies of the logic. With one copy, there is nothing to diverge. Google's rules say batch and online processing differ (a batch job can join tables, a request must look things up), but you can build an object that holds the result of every lookup or join in a human-readable form, and then run one shared method that turns it into the format the model expects. They add a corollary: do not use two different programming languages between training and serving, because that makes sharing code nearly impossible.
+
+**Example.** Uber describes this in its Michelangelo platform. Modelers write feature expressions in a small domain-specific language, and the post says the same expressions are applied at training time and at prediction time. For batch features it says the same data and batch pipeline is used for both training and serving. This is a company claim about its own platform. It tells you the design, not how well it worked.
+
+For slow-changing tables, there is a weaker option. The rules say you can snapshot the table hourly or daily to get reasonably close data, and then note that this still does not completely resolve the issue.
+
+### Move 3: measure the skew
+
+Moves 1 and 2 reduce skew. They do not prove it is gone. A refactor can break the shared code. A log field can be renamed. The only way to know is to measure.
+
+## Question 3: how do you measure skew?
+
+Google's rules split skew into three gaps. Each gap compares two numbers (here AUC), and each has a different meaning.
+
+1. **Training data against holdout data.** Same time period, same pipeline, but the model has seen one set and not the other. Some difference is normal. A big one means the model memorised rows.
+2. **Holdout data against next-day data.** The holdout is from the past. Next-day data is the first data after the training window. The rules say you should tune regularisation to maximise next-day performance. A large drop here suggests some features are time-sensitive and are ageing.
+3. **Next-day data against live data.** This is the key one. If you apply the model to an example in the training data and to the same example at serving, it should give exactly the same result. So a gap here is, in the rules' words, probably an engineering error.
+
+The reason to split them is that each gap points at a different owner and a different fix. Try it. Pick a cause and watch which gap lights up.
+
+<AiE1SkewGaps client:visible />
+
+The cause is not always unique to one gap. A changed join table and different code both show up in gap 3. To tell them apart you need one more step: take the logged serving values and recompute each feature offline for the same request. The feature whose two values disagree is the culprit. That is the last step of the animation above, and it is the practice to keep: **a per-feature mismatch rate between served values and recomputed values**. It tells you not only that skew exists but which feature carries it.
+
+Evaluation also has to respect time. Google's rules say that if you build a model from data up to January 5, you test it on data from January 6 onward. Performance on the new data will be a little lower, but it should not be radically lower. A random split mixes the future into training and hides gap 2 completely.
+
+### What to watch for silent failure
+
+Skew is one case of a wider habit: watch the data itself. Google's rules give two stories. A table that was joined into a model had not been updated for six months. Refreshing it alone gave a 2% boost in install rate, which was more than any other launch that quarter. And a feature column that was filled in 90% of examples suddenly dropped to 60% after an implementation change. The rules advise tracking statistics of the data and inspecting it by hand now and then. Lesson E1.7 builds the monitors. Lesson E1.6 covers coverage as a metric.
+
+## Numbers you set before you build
+
+Every design names a quality bar, a latency budget and a cost. For skew, set these.
+
+- **Quality bar.** A limit on the gap between next-day and live, and a limit on the per-feature mismatch rate. The right numbers depend on the model. Pick them from a first measurement and tighten them over time. The limits in the widget above are illustrative.
+- **Latency.** Logging must not sit on the request path. A queue write that returns at once costs very little. A synchronous write to a slow store can add its latency to every checkout.
+- **Cost.** Log storage grows with request volume times feature count. If that is too much, log a fixed sample. A sample is enough to measure the gaps, as the rules note, even if it is not enough to train on.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Log serving features and train on logs | Training rows equal serving rows. Causes 1 to 3 vanish for those rows | Storage, a delay before new features have data, bias toward what was scored | Most systems with an online model |
+| One shared feature definition | Nothing to diverge | A shared library or platform, one language, one owner | You have many models or many features |
+| Feature store with offline and online copies | Reuse, point-in-time joins, one place to monitor | Another system to run | Many teams, many models (lesson E1.3) |
+| Snapshot slow tables hourly or daily | Cheap, close to correct | Not exact | Tables change slowly and exact match does not matter |
+| Compare logged and recomputed values | Finds the exact feature that is wrong | A batch job and storage for two copies | Always, at least on a sample |
+| Do nothing and trust offline AUC | No work | The silent failure in this lesson | Never for a model that drives a decision |
+
+## What experienced teams know
+
+1. **Log the serving features.** Google's [Rules of Machine Learning](https://developers.google.com/machine-learning/guides/rules-of-ml) say the YouTube home page switched to logging features at serving time and saw significant quality improvements and less code complexity. It is a company claim without figures in the text.
+2. **A stale table can cost more than a bad model.** The same source tells of a table not updated for six months, where refreshing it gave a 2% gain in install rate. Check data freshness before you tune the model.
+3. **Coverage drops are failures too.** The same rules describe a feature column populated in 90% of examples that fell to 60%. Watch the fraction of requests where each feature is present.
+4. **Same example, same score.** The rules say a model applied to a training example and the same example at serving should give the same result. Turn that into a test that replays logged requests through the offline path.
+5. **Share the feature expressions.** Uber's [Michelangelo post](https://www.uber.com/en-US/blog/michelangelo-machine-learning-platform/) says the same expressions are applied at training time and prediction time, and that its feature store held about 10,000 features at the time of writing. The post does not use the word skew.
+6. **Snapshots are close, not exact.** For a slowly changing table the rules suggest hourly or daily snapshots, and warn that this does not fully resolve the problem.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "Skew is a difference between the feature values the model trained on and the values it sees live. It has three sources: different code for training and serving, data that changes between the two, and joined tables that get overwritten. I would log the features at serving time and train on the log, share one feature definition, and track three gaps: train to holdout, holdout to next day, and next day to live. The last one should be near zero, and if it is not, I compare the logged values with an offline recompute to find the feature." Then name one silent failure you have seen, such as a counter that skips cancelled orders.
+</Callout>
+
+<Callout type="mistake">
+Do not say "offline AUC was high, so the model is good". Offline AUC runs through the training pipeline, so it cannot see a bug on the serving path. Do not propose "retrain more often" as the fix, because retraining on a skewed pipeline repeats the skew. And do not describe it as a model problem: gap 3 is an engineering gap, and a better model does not close it.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A model has strong offline AUC and weak live AUC. Which explanation fits training-serving skew best?',
+      options: ['The serving path computes a feature with different logic than training', 'The model has too few layers, so it underfits the data', 'The holdout set was too small, so the score is noisy', 'Users in production are more varied than the testers were'],
+      answer: 0,
+      explain: 'Skew means the same feature name holds different values in the two paths. An underfit model would also look weak offline. A small holdout would not give a steady gap to live. Varied users are a real effect, but it is not what the term names.',
+    },
+    {
+      q: 'Why can the usual offline evaluation not catch a bug that lives only in the serving code?',
+      options: ['Offline evaluation is too slow to run on production data', 'The holdout rows come from the training pipeline, which has no serving bug', 'The metric AUC ignores the values of the features', 'Serving code is always correct, so no test is needed'],
+      answer: 1,
+      explain: 'The holdout is built by the same pipeline as the training rows, so it never runs the serving code. Speed is not the issue, and AUC does depend on features. Serving code can be wrong like any other code.',
+    },
+    {
+      q: 'You log the exact features your service used for each request and train on those logged rows. Which source of skew does this remove for those rows?',
+      options: ['Overfitting, because logged rows are more varied', 'Label delay, because outcomes arrive at once', 'Feature differences between training code and serving code', 'Drift in user behaviour over the following months'],
+      answer: 2,
+      explain: 'The training row is then the same row the model saw live, so there is no second pipeline to differ. Logging does not change overfitting or label delay, and user behaviour still drifts.',
+    },
+    {
+      q: 'The gap between next-day performance and live performance is wide, but the gaps before it are small. What does this most likely point at?',
+      options: ['The model memorised the training rows', 'A pipeline or data error between offline and live paths', 'A normal effect that needs no action', 'A feature that ages quickly over a few days'],
+      answer: 1,
+      explain: 'The same example should score the same offline and live, so a wide last gap suggests an engineering error. Memorising shows in the first gap, and fast-ageing features show in the second gap.',
+    },
+    {
+      q: 'A team joins a restaurant-ratings table, which is overwritten every night, onto three months of old orders to build training data. What goes wrong?',
+      options: ['Old orders get today\'s rating, which was not known at that time', 'The join runs slower, which delays training by a day', 'The ratings are anonymised, so the model cannot use them', 'Old orders lose their labels because the key changes'],
+      answer: 0,
+      explain: 'A table that keeps only the latest value gives past rows a value from their future. Serving then reads a different value. Speed and labels are not the issue. A point-in-time join, taught in lesson E1.3, fixes it.',
+    },
+  ]}
+/>
+
+## Prove it
+
+<Diagnose
+  client:visible
+  id="e1-skew-live-auc-gap"
+  title="Offline AUC high, live AUC poor"
+  scenario="A restaurant-ranking model is live for a week. The team logs the features the service used and scores the model on outcomes. Numbers are illustrative."
+  facts={[
+    'AUC on training data:   0.88',
+    'AUC on holdout data:    0.86',
+    'AUC on next-day data:   0.85',
+    'AUC on live serving:    0.74',
+    '',
+    'feature          logged median   offline recompute median',
+    'prep_time_min    31              24',
+    'rating_30d       4.2             4.2',
+    'orders_7d        6.0             6.0',
+  ]}
+  steps={[
+    {
+      prompt: 'Which gap is wide, and what kind of problem does it suggest?',
+      options: [
+        'Train to holdout: the model memorised its training rows',
+        'Holdout to next day: some features age fast',
+        'Next day to live: an error in the pipelines or the data',
+        'None: a small drop from offline to live is normal',
+      ],
+      answer: 2,
+      explain: 'The first two gaps are 0.02 and 0.01, which is normal. The drop from 0.85 to 0.74 happens only when the model meets live requests. The same example should score the same, so look for an engineering error.',
+    },
+    {
+      context: 'You compare, for the same requests, the feature values the service logged with values recomputed offline. Only one feature disagrees.',
+      prompt: 'What do you do first?',
+      options: [
+        'Retrain the model on more data and compare again',
+        'Lower the decision threshold, so more requests pass',
+        'Trace how prep_time_min is computed on each path and make them one definition',
+        'Drop the three features and retrain with a simpler model',
+      ],
+      answer: 2,
+      explain: 'The logged median is 31 and the recompute gives 24, so the two paths define prep time differently. Fix the definition, then retrain on logged values. More data or a simpler model leaves the mismatch in place. A new threshold hides it.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Rules of Machine Learning (Google)](https://developers.google.com/machine-learning/guides/rules-of-ml): the section "Training-Serving Skew" is the source for the causes, the three moves, and the three gaps. The rule numbers are 29, 31, 32 and 37, if you want to find them. You do not need the rest to follow this lesson.
+- [Meet Michelangelo: Uber's Machine Learning Platform](https://www.uber.com/en-US/blog/michelangelo-machine-learning-platform/): how one company shares feature definitions between training and prediction.

@@ -1,0 +1,435 @@
+---
+summary: 'A bad model answer has a cause you can find. Capture the exact request, shrink it to a repro, rerun it to measure variance, read the logprobs, check the tokens, decide whether retrieval or the model is to blame, and bisect the prompt. Temperature 0 does not give identical runs, so you debug a rate, not a single output.'
+requires: ['ai/a1-model-function/tokens', 'ai/a1-model-function/sampling-decoding']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai15DebugLadder from '../../../../components/anim/lessons/Ai15DebugLadder.tsx';
+import Ai15DebugFlip from '../../../../components/anim/lessons/Ai15DebugFlip.tsx';
+
+## The problem
+
+A grocery app has a support bot. A customer asks, "Where is my refund for order 8841?" The bot answers, "Your refund arrives within 24 hours." The policy says 5 to 7 days for UPI refunds. The customer waits one day, then writes an angry message.
+
+An engineer opens the playground, pastes the question, and presses run. The answer is right: "5 to 7 days". She runs it again. Right again. She writes "cannot reproduce" in the ticket and closes it.
+
+Two days later, the same wrong answer appears for another customer. The model did not change. The prompt did not change. So why is the bug there one day and gone the next?
+
+A web service bug is usually a steady fact: same input, same wrong output. You step through the code and find the line. A model bug is different. The same input can give different outputs, and the "code" is a pile of numbers that you cannot step through. You need a different method.
+
+This lesson gives you that method. It has seven steps, and each step clears one suspect:
+
+1. Capture the exact request.
+2. Shrink it to a minimal repro.
+3. Rerun it to see the variance.
+4. Read the logprobs.
+5. Check the tokens.
+6. Decide: retrieval or model?
+7. Bisect the prompt.
+
+Earlier lessons taught the parts. Lesson [A1.1](/learn/ai/a1-model-function/tokens/) taught tokens. Lesson [A1.5](/learn/ai/a1-model-function/sampling-decoding/) taught sampling and showed that temperature 0 is not exact. Lesson [A8.2](/learn/ai/a8-evals/error-analysis/) taught how to read many traces and count failure types. Lesson [A9.1](/learn/ai/a9-llmops/tracing/) taught how to record each request. This lesson starts where those end: you have one bad trace, and you must find out why.
+
+One rule about where to start. A single bad answer is an anecdote. Error analysis tells you which failure types are common. Debug the common ones first. Then use the steps below on one example of each type.
+
+## The method at a glance
+
+Step through one case. A bot says "24 hours" instead of "5 to 7 days". Watch the five suspects at the bottom. Each step clears one, or points at the cause.
+
+<Ai15DebugLadder client:visible />
+
+The rest of the lesson explains each step, why it exists, and where it fails.
+
+## Step 1: capture the exact request
+
+**What it is.** A model call is a function. Its inputs are everything you send, not only the user's text. To debug it, you need all of the inputs, saved at the moment of the call. Save the final request, the one that left your server.
+
+**Picture.** A doctor cannot treat "my stomach hurts" from memory a week later. She needs the chart: the time, the dose, the other drugs. A bug report that says "the bot said something wrong" is the same as the memory.
+
+**Why it matters.** The playground bug in the story is common. The playground copy of a request is missing the system prompt, the examples, the retrieved text, and the real settings. So it is a different request, and it passes. A practitioner field guide by Tian Pan says logs must capture the full input, "including system prompt, conversation history, retrieved context", so that you can "replay the exact call that produced the failure". It is one author's guide, not a study. But the rule is hard to argue with.
+
+**What to save.** Lesson [A9.1](/learn/ai/a9-llmops/tracing/) shows how to put this on a trace. For debugging, check that your record holds these items:
+
+```json
+{
+  "request_id": "7f3a-0042",
+  "release_id": "rel-9c41ab",
+  "model_requested": "<the exact ID you sent>",
+  "model_answered": "<the model name the reply says>",
+  "params": { "temperature": 0, "top_p": 1, "max_tokens": 400, "seed": 42 },
+  "system": "<full system prompt text>",
+  "tools": ["<tool names and their description text>"],
+  "messages": ["<every turn, in order>"],
+  "retrieved": [
+    { "id": "refund-policy-v3", "rank": 1, "score": 0.82, "text": "<chunk text>" }
+  ],
+  "response": {
+    "text": "<full answer>",
+    "stop_reason": "end_turn",
+    "usage": { "input_tokens": 1840, "output_tokens": 22 },
+    "provider_fingerprint": "<if the API returns one>"
+  }
+}
+```
+
+Three items are easy to forget. First, the **response model**, the model name the reply says it came from. It can differ from the one you asked for when you call a moving name. Lesson [A9.3](/learn/ai/a9-llmops/versioning/) explains this and the release id. Second, the **retrieved text**, with its rank. Without it, you cannot tell a retrieval bug from a model bug (Step 6). Third, the **stop reason**. A reply that hit the length limit looks like a normal reply that ended early.
+
+If you run a model yourself, add one more item: the final string after the chat template. A chat template is the code that turns a list of messages into one long text with special markers. A Hugging Face model card named "broken-model-fixed" lists three bugs in one model's files. The first: "The original model did not define a chat template". The second: the config had no valid `pad_token_id`, "which makes batching unsafe". The third: `reasoning_effort` "is not a native Transformers generation parameter", so a setting people thought was on did nothing. In all three, the text or settings the model got were not what the developers thought. Print what the model really received.
+
+## Step 2: shrink it to a minimal repro
+
+**What it is.** A **repro** is the smallest setup that still shows the bug, and that anyone can run with one command. Turn the saved request into a file. Write a short script that loads the file, calls the model with the same pinned model ID and settings, and prints the answer.
+
+**Picture.** A mechanic who hears a rattle wants to hear it again with the radio off, on the same road, at the same speed. Fewer moving parts make the sound easier to trace.
+
+**Why it matters.** You will run the request dozens of times in the next steps. If one try takes a minute of manual work, you will skip steps. If it takes three seconds, you will do them all. A repro also lets a teammate help, and later becomes a test case.
+
+```python
+# repro.py: run the saved request N times and count the answers.
+import json, sys, collections
+
+req = json.load(open(sys.argv[1]))          # the saved request
+n = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+
+counts = collections.Counter()
+for _ in range(n):
+    answer = call_model(req)                # your client; same model ID, same params
+    counts[answer.strip()[:80]] += 1        # group by the start of the answer
+
+for text, c in counts.most_common():
+    print(f"{c:>3}  {text}")
+```
+
+**How to cut.** Remove things that are clearly unrelated, one cut at a time, and rerun after each cut. Good first cuts: old chat turns, tools the question does not use, and long retrieved text that is off-topic. If the bug stays, keep the cut. If it vanishes, put the part back: it matters. Do not cut the parts you suspect yet. Step 7 handles those with more care.
+
+Two traps. First, a repro that fails only sometimes still counts, but you need many runs to know (Step 3). Second, never "improve" the request while you shrink it. Fix typos later. A fixed typo may be the thing that made the bug go away.
+
+## Step 3: rerun it to see the variance
+
+**What it is.** Run the repro many times, 20 for a start, and count the outcomes. You are measuring a **failure rate**, not hunting one output.
+
+**Picture.** A coin that lands heads three times does not prove a rigged coin. You flip it many times. A model call is a weighted coin flip at every token.
+
+**Why it matters.** Lesson [A1.5](/learn/ai/a1-model-function/sampling-decoding/) showed that the model gives a list of scores, and a sampler picks from it. So one run shows you one draw. The rate tells you what kind of bug you have:
+
+| Result of 20 reruns | What it suggests | Where to look next |
+|---|---|---|
+| Fails 20 of 20 | A steady cause in the input | Tokens (Step 5), context (Step 6), prompt (Step 7) |
+| Fails some, like 6 of 20 | A close call: the model is torn between answers | Logprobs (Step 4), then conflicting context or a pulling example |
+| Fails 1 of 20 | Rare tail or a near tie that seldom flips | Count more runs. Check whether it matters, using error analysis |
+| Fails 0 of 20 | You may not have the real request | Go back to Step 1 |
+
+Two cautions. First, "fixed" needs the same count of runs. A bug that fails 30% of the time still passes five runs in a row about once in six tries. So compare 20 runs to 20 runs. Second, do not compare a fix on one example. Lesson [A8.3](/learn/ai/a8-evals/golden-sets/) shows how to keep the case in a test set so that the next change does not bring it back.
+
+### Why temperature 0 is not the end of variance
+
+You might ask: set temperature to 0 and the variance goes away? Often it does not, on a hosted API.
+
+Both big vendors say so. Anthropic's glossary says: "Even with temperature set to 0, the results will not be fully deterministic, and identical inputs might produce different outputs across API calls." The OpenAI seed recipe says: "Determinism is not guaranteed". It calls the `seed` parameter "a best effort to sample deterministically". It also says the `system_fingerprint` value "represents the backend configuration that the model runs with". Log that value. If failures cluster on one fingerprint, you have a lead.
+
+The cause is in lesson [A1.5](/learn/ai/a1-model-function/sampling-decoding/), so here is the short version. A GPU adds numbers in an order that depends on the **batch**: the group of requests the server runs at one time. Your request shares a batch with other people's requests. In the Thinking Machines study "Defeating Nondeterminism in LLM Inference", the authors say the common "concurrency plus floating point" story "is not entirely wrong", but misses the full picture. The main cause, they say, is that "the load (and thus batch-size) nondeterministically varies". A kernel that gives the same result for any batch size is **batch invariant**. Most kernels are not.
+
+Their test: the same prompt at temperature 0, 1,000 times. They got 80 different outputs. The first 102 tokens matched in every run. At token 103, 992 runs wrote "Queens, New York" and 8 wrote "New York City". With batch-invariant kernels, all 1,000 runs matched. The price was speed: on one GPU with Qwen3-8B, the default setup took 26 seconds and the first deterministic one took 55 seconds. A better attention kernel brought that to 42 seconds.
+
+Here is the point for debugging. The runs did not drift at random. They split at one token, where two choices were close. That is the same fact as a near tie in the logprobs of Step 4. Try the widget. It is a made-up model of one position where the top two tokens are close. Drag the gap down and watch the temperature-0 flip chance rise. Then raise the number of close calls and watch many small chances add up over a long answer.
+
+<Ai15DebugFlip client:visible />
+
+What to notice:
+
+1. **A gap larger than the noise never flips.** Most tokens in an answer are like this. They are stable at temperature 0.
+2. **At temperature 1, a small gap is a coin flip.** The odds come straight from the logprobs.
+3. **One tiny chance becomes a likely event across many positions.** This is why long answers differ even when each close call is rare.
+
+What this means in practice:
+
+- Expect to debug a rate. Do not expect a bit-exact replay on a hosted model.
+- If you must have exact replay for an audit or a hard bug, run an open model on your own server with batch-invariant kernels turned on, and accept the slowdown.
+- Do not write a test that fails when two calls differ. Write one that checks the property you care about, and run it several times.
+
+## Step 4: read the logprobs
+
+**What it is.** A **logprob** is the natural log of the probability the model gave a token. It is zero or negative. A value near 0 means high probability. Take `exp(logprob)` to get the probability back. The Google blog on Gemini logprobs says it plainly: "a logprob score closer to 0 indicates higher model confidence in its choice."
+
+**Picture.** A student answers an exam question. You cannot see her mind, but you can ask, "What was your second choice, and how close was it?" If the first choice was 52% and the second 43%, she guessed. If it was 99% to 0.5%, she knew.
+
+**Why it matters.** The final text hides the model's doubt. Logprobs show the doubt at each token. They tell you if a failure is a close call or a confident mistake. Those two need different fixes.
+
+**What the APIs give.** This part changes, so it carries a date. As of 2026-10-28:
+
+- OpenAI's chat API takes `logprobs=True` and a `top_logprobs` count, as its cookbook shows. It returns the logprob of each chosen token and of the top alternatives. Not every model supports it, so check the page of your model.
+- Gemini on Vertex AI takes `response_logprobs=True` and a `logprobs` number. The Google blog says the accepted value is "between 1 and 20".
+- For Anthropic, we did not find a logprobs option in the Messages API request parameters we read. Check the live reference before you rely on this.
+
+If your API gives no logprobs, use Step 3 as a stand-in. The failure rate over many runs is a rough measure of how close the choice is.
+
+```python
+# Print the chosen token and its top alternatives. Field names follow the OpenAI SDK.
+import math
+
+resp = client.chat.completions.create(
+    model=req["model"], messages=req["messages"],
+    temperature=0, logprobs=True, top_logprobs=3,
+)
+for t in resp.choices[0].logprobs.content:
+    alts = ", ".join(f"{a.token!r} {math.exp(a.logprob):.0%}" for a in t.top_logprobs)
+    print(f"{t.token!r:>10} {math.exp(t.logprob):>4.0%}   top: {alts}")
+```
+
+**How to read it.** Do not read every token. Find the first token where a wrong run and a right run differ, and look there.
+
+| What the logprobs show at the first bad token | Meaning | Next move |
+|---|---|---|
+| Top two are close, like 52% and 43% | The model is torn | Look for conflicting context or a pulling example (Steps 6 and 7) |
+| Wrong token at 95% or more | The model was sure | The input pushes it. Look at the context, the prompt, and the tokens |
+| Wrong token deep in the tail at temperature above 0 | Sampling luck | Lower temperature, or add a check and a retry |
+
+One caution from the OpenAI cookbook: "confidence measures certainty in the classification, not whether the classification is correct". A model can be sure and wrong. The same recipe shows a use of logprobs in retrieval apps: ask for a yes or no field named `has_sufficient_context_for_answer`, and read its logprob as a guard. It advises to check any threshold against your own evals first.
+
+## Step 5: check the tokens
+
+**What it is.** Lesson [A1.1](/learn/ai/a1-model-function/tokens/) taught that the model sees token ids, not letters. A **tokenization bug** is a failure caused by how the text was cut up. The check takes a minute: print the exact string you sent, with `repr()` so that spaces and newlines show, and look at the pieces.
+
+**Picture.** You hand someone a sentence cut into word-chunks with scissors. If a cut lands in an odd place, the reader sees a different word than you wrote.
+
+**Why it matters.** A few failure types come straight from the cuts. Check the tokens when the failing text has one of these:
+
+- **Letters inside words.** A blog post on the "how many R's in strawberry" question shows the GPT-4 tokenizer cutting the word into "str", "aw", and "berry". In the post's words, "the LLM doesn't have access to individual characters, it just sees the tokens". The same chat model said 2 R's on the plain prompt, and 3 when it ran Python. Spaced letters also gave 3, but the author saw mixed results. A tool call beats token-level guessing. Do not try to fix this with a stronger prompt.
+- **Long numbers.** A study of number tokenization (Singh and Strouse) tested GPT-3.5 and GPT-4. It found that "right-to-left tokenization (enforced by comma separating numbers at inference time) leads to largely improved performance". So when a model fumbles big sums, write `1,234,567`, not `1234567`, and compare.
+- **Stray whitespace.** John Cook's post on a chess prompt notes that a trailing space "is tokenized as an individual character, but the spaces in front of the e's are tokenized with the e's". That is one blogger's observation, not a controlled study. But a template that ends in a space or a newline is a real risk. Print it with `repr()`.
+- **Rare names and IDs.** Order numbers, SKUs, and unusual names split into odd pieces. The extreme case is the "glitch token". In 2023, researchers found tokens such as " SolidGoldMagikarp" that GPT models handled badly. At temperature 0, GPT-3 davinci-instruct-beta, asked to repeat that string, answered "distribute". We did not test current models. The lesson still holds: if only one odd string fails, test with a plain word in its place.
+
+**How to see the tokens.** For OpenAI models, the open-source `tiktoken` library shows the pieces. For Claude, the `messages/count_tokens` endpoint returns a count, not the pieces, and the docs call the count "an estimate". It is free, with a rate limit. A count is still useful: if you move to a model with a different tokenizer, recount. The Anthropic docs say that Claude 4.7 and later models use a tokenizer that gives about 30 percent more tokens for the same text. Lesson [A9.3](/learn/ai/a9-llmops/versioning/) covers what that means for a model swap.
+
+Tokens are a low-chance suspect for most bugs. Check them fast, clear them, and move on. This is why the ladder spends one minute here.
+
+## Step 6: retrieval or model?
+
+**What it is.** If your app fetches text and puts it in the prompt (RAG, from lessons in module A5), a bad answer has two possible homes. The **retrieval** step may have fetched the wrong text. Or the **model** may have misused the right text. The fixes are in different code, by different people. Find the home first.
+
+**Picture.** A student fails an open-book exam. Did she get the wrong book, or did she read the right book badly? You cannot tell from the wrong answer. You have to look at her desk.
+
+**Why it matters.** A team that blames the model rewrites the prompt for weeks, while the right page was never in the context. A team that blames retrieval retunes the search, while the model ignores good pages.
+
+**Three checks, in order.**
+
+1. **Read the retrieved chunks in the saved trace.** Is the answer in them? If not, retrieval failed. You may need to fix the chunks, the index, or the ranking (lessons in module A5). Ragas defines **context recall** as how many of the relevant pieces "were successfully retrieved", and notes that computing it "always requires a reference to compare against". So you need a known good answer for the question.
+2. **Run the golden test.** Replace the retrieved text with only the one right chunk, and rerun 20 times. The Latitude guide on failure analysis puts it this way: "If the model gets the answer right with that injected context, retrieval is the problem." It also says to change one layer at a time.
+3. **Compare the two runs.** Use the table below.
+
+| Answer in retrieved text? | Right with only the right chunk? | Verdict | Where to work |
+|---|---|---|---|
+| No | Yes | Retrieval missed it | Chunking, search, reranking |
+| Yes | Yes | Context assembly: noise, a conflicting chunk, or position | Drop stale chunks, rerank, reorder, trim |
+| Yes | No | Model or prompt | Steps 4 and 7 |
+| No | No | Both are weak | Fix retrieval first, then the prompt |
+
+The second row is the trickiest and the most common. All the facts are there, but the model fails. Two things cause it. One is a **conflict**: an old policy and a new one both appear, and the model flips between them. The other is **position**. The "Lost in the Middle" study found that "performance is often highest when relevant information occurs at the beginning or end of the input context" and "significantly degrades when models must access relevant information in the middle of long contexts". So the order of chunks can change the answer. Lesson [A1.6](/learn/ai/a1-model-function/hallucination-context/) covers the context window, and [A5.10](/learn/ai/a5-rag/rag-evaluation/) covers how to measure retrieval and generation apart.
+
+## Step 7: bisect the prompt
+
+**What it is.** The failing prompt has several parts: instructions, examples, rules, retrieved text, history. **Bisecting** means removing or changing parts to find the one that carries the bug. It is `git bisect` for prompts.
+
+**Picture.** A string of holiday lights goes dark. You test half the string. The dark half holds the bad bulb. You split that half again, until one bulb is left.
+
+**Why it matters.** Without it, you edit the prompt by feel and hope. With it, each test cuts the suspects in half. The Latitude guide describes the same plan, called input ablation: "Strip the prompt down to its smallest form, then add parts back one by one until the failure returns." Tian Pan's guide defines ablation as "removing or substituting components of a prompt one at a time", and warns that "few-shot examples are frequently the culprit". An example does not only show a format. It also pulls the model's answer toward its own content. Lesson [A4.2](/learn/ai/a4-context/few-shot-examples/) covers examples.
+
+**The probes.** Each probe is one change, tested with 20 runs:
+
+| Probe | Change | What a result tells you |
+|---|---|---|
+| Remove | Delete one part (one example, one rule) | The failure rate drops: that part causes it |
+| Halve | Remove half of the examples or rules | Narrow the search by half per test |
+| Reorder | Move the part to the start, or to the end | The rate changes: position matters |
+| Replace | Swap an example for a neutral one | Content, not format, causes the pull |
+| Restore | Add the part back | The failure returns: you proved the cause |
+
+Run each probe 20 times, as in Step 3, because the failure is a rate. Seven parts need about three halving probes, and each probe is 20 runs. That is 60 runs. It is cheap next to a week of guessing.
+
+One rule: change one thing per probe. This is the same rule as lesson [A9.3](/learn/ai/a9-llmops/versioning/) gives for releases. When you remove an example and reword a rule in one go, you cannot say which change did it.
+
+When you find the cause, do two more things. Fix it at the cause, not with a patch on top. And add the case to the golden set, so that the bug cannot return unseen.
+
+## The debug checklist
+
+Copy this into your team's runbook or ticket template.
+
+```text
+DEBUG MODEL BEHAVIOR: checklist
+
+0. Is this a common failure type? (error analysis counts) If not, note it and stop.
+1. CAPTURE   Saved request has: model ID asked + answered, all params, system prompt,
+             tool text, every message, retrieved chunks with rank, stop reason, usage,
+             provider fingerprint. I am NOT using the playground copy.
+2. REPRO     One file + one command. Same pinned model, same params. Unrelated parts cut.
+             Still fails after each cut.
+3. RERUN     20 runs. Failures: __ of 20. Steady (20/20) or partial?
+             Same count of runs after any fix.
+4. LOGPROBS  First token where a bad run and a good run differ: ______
+             Top two odds: __% vs __%. Close call, or sure and wrong?
+             (No logprobs from the API? Use the rerun rate instead.)
+5. TOKENS    repr() of the exact prompt checked for: trailing space or newline, long
+             numbers, rare names or IDs, letter-level questions. Tokenizer changed
+             since last release?
+6. SPLIT     Answer in the retrieved chunks? Y / N
+             Golden test (only the right chunk), 20 runs: __ wrong
+             Verdict: retrieval / context assembly / model or prompt
+7. BISECT    One change per probe, 20 runs each: remove, halve, reorder, replace.
+             Cause found: ______   Restored it and the failure came back? Y / N
+8. FIX       Fixed at the cause. 20 runs: __ wrong (was __).
+             Case added to the golden set. Trace linked in the ticket.
+```
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Debug from the saved request | The real bug, every time | Logging work and storage for full inputs, with privacy care | Always for production bugs |
+| 20 reruns per probe | Rates, not guesses | Cost and time per probe | Any partial failure |
+| Read logprobs | See doubt at each token | Only some APIs give them, and larger responses | The failure is partial, or the answer has a short key token |
+| Rerun rate instead of logprobs | Works on any API | Less detail, more runs | The API has no logprobs |
+| Batch-invariant serving | Exact replay | Slower serving (55 s vs 26 s in one test) | Audits and hard bugs on a model you host |
+| Golden-chunk test | A clean split of retrieval and model | You need a known right chunk | A RAG app with a failing answer |
+| Bisect before a rewrite | A named cause | A few dozen runs | The prompt has several parts |
+
+## What experienced teams know
+
+1. **Temperature 0 is a hope, and the vendors say so.** Anthropic's [glossary](https://platform.claude.com/docs/en/about-claude/glossary) says identical inputs "might produce different outputs across API calls". The OpenAI [seed recipe](https://developers.openai.com/cookbook/examples/reproducible_outputs_with_the_seed_parameter) says "Determinism is not guaranteed". Log the provider fingerprint when the API returns one. If bad answers cluster on one fingerprint, you have a lead.
+
+2. **Runs split at one token.** In the [Thinking Machines study](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference), 1,000 runs matched for 102 tokens, then split at token 103. Our reading: that is a near tie, and logprobs show it. So find the first token where a good run and a bad run differ, and look only there. Do not read the whole answer.
+
+3. **A confident model can be wrong.** The OpenAI [logprobs recipe](https://developers.openai.com/cookbook/examples/using_logprobs) says confidence "measures certainty in the classification, not whether the classification is correct". A 99% logprob on a wrong token means the input pushed it there. Do not use logprobs as a truth meter. Use them to tell a close call from a confident error.
+
+4. **Change the shape of the task, not only the prompt.** In the [strawberry post](https://blog.legoktm.com/2024/08/10/how-many-rs-are-in-the-word-strawberry.html), the same chat model gave 2 R's on the plain prompt and 3 once it ran Python. If the cause is how text is cut into tokens, a better prompt will not help. A tool call will. This is one blogger's test of one model on one day, so treat it as an example, not a rate.
+
+5. **Examples pull.** The Tian Pan [field guide](https://tianpan.co/blog/2026-04-15-debugging-llm-failures-field-guide) says few-shot examples are "frequently the culprit", because they also change how the model reasons. It is a practitioner view with no numbers. But it fits the ladder: when a prompt has examples, remove them one at a time before you rewrite the rules.
+
+6. **Check that each setting did something.** The [broken-model-fixed](https://huggingface.co/syedahmedsoftware/broken-model-fixed/blob/main/README.md) card lists a missing chat template, an invalid padding id, and a `reasoning_effort` field that the library ignores. No error was raised for any of them. A setting that is ignored in silence is a bug. Print the final prompt, and test that a setting changes the output.
+
+## Interview lens
+
+<Callout type="tip">
+Say it as a ladder: "First I get the exact saved request from the trace, not the playground copy. I make a one-command repro and rerun it 20 times to get a failure rate. A steady failure points at the input. A partial failure points at a close call, so I read the logprobs at the first token where good and bad runs differ. I check the tokens for odd whitespace, numbers, and rare names. Then I split retrieval from the model with a golden-chunk test, and bisect the prompt one change at a time. I add the case to the golden set." This shows method, evidence, and a regression test.
+</Callout>
+
+<Callout type="mistake">
+Do not say "I set temperature to 0, so it is deterministic" or "I could not reproduce it, so it is not a bug". Do not test a fix on one run. Do not rewrite the prompt before you know whether retrieval fetched the right text. And do not read high logprob as proof that the answer is correct.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'debug-temp-zero-claim',
+      q: 'A teammate says: "Temperature is 0, so the model is exact, so this failure must be in the prompt." What is wrong with that claim?',
+      options: [
+        'Temperature 0 turns off the safety checks, so the results drift',
+        'A prompt cannot cause a failure unless the temperature is above 0',
+        'Hosted servers can return different text at temperature 0',
+        'Temperature changes only the length of an answer, not its words',
+      ],
+      answer: 2,
+      explain: 'Vendor docs say temperature 0 is not fully deterministic, and the Thinking Machines study found 80 different outputs in 1,000 runs. The cause is a batch size that changes with server load. The other options are not true: temperature does change word choice, and prompts cause many failures at any temperature.',
+    },
+    {
+      id: 'debug-fails-twenty-of-twenty',
+      q: 'You rerun a saved request 20 times and it fails 20 times. Which cause fits best?',
+      options: [
+        'A steady part of the input: the prompt, the context, or the tokens',
+        'Bad luck in sampling, since a failure that repeats must be random',
+        'A near tie between two tokens at the point where the answer goes wrong',
+        'A change in server batch size that happens at the start of each run',
+      ],
+      answer: 0,
+      explain: 'A failure in every run means the input pushes the model the same way each time. A near tie or a batch size effect would give mixed results, such as 6 failures in 20. A failure that repeats 20 times is the opposite of luck.',
+    },
+    {
+      id: 'debug-logprob-near-zero-wrong',
+      q: 'The first wrong token in a bad answer has a logprob of about -0.03. What does that tell you?',
+      options: [
+        'The model was unsure, so more reruns will find the cause',
+        'The token is rare, so the tokenizer is the likely cause',
+        'The token is right, since a high probability means the answer is correct',
+        'The model was sure, so look at the input for what pushed it',
+      ],
+      answer: 3,
+      explain: 'A logprob of -0.03 is about 97% probability. The model was confident, so this is not a close call. Confidence is not correctness, so the cause is in the input: the context, the prompt, or the examples. Reruns would just repeat the same token.',
+    },
+    {
+      id: 'debug-right-chunk-alone-works',
+      q: 'A RAG bot answers well when given only the right document, but fails when it gets five retrieved documents. What is the best next step?',
+      options: [
+        'Switch to a larger model, because this one cannot read documents well',
+        'Inspect which retrieved documents conflict with or bury the right one',
+        'Set the temperature to 0 so that the failing answer goes away for good',
+        'Delete the system prompt and test again to see what the bot does',
+      ],
+      answer: 1,
+      explain: 'The model can answer with the right context, so it is not the main fault. Something in the other four documents, such as an old version or a bad position, changes the answer. Lowering temperature does not remove a conflict, and a larger model may fail in the same way.',
+    },
+  ]}
+/>
+
+## Prove it
+
+<Diagnose
+  client:visible
+  id="ai15-leave-policy-trace"
+  title="Read the trace"
+  scenario="An HR bot says employees get 12 days of annual leave. The 2025 handbook says 18. Below is the saved trace and what the engineer measured with the repro."
+  facts={[
+    'request 52c9   temperature=0   retrieved: 2 chunks',
+    'chunk 1 (rank 1)  leave-policy-2019.pdf  "Annual leave: 12 days."',
+    'chunk 2 (rank 2)  handbook-2025.pdf      "Annual leave: 18 days."',
+    'answer: "You get 12 days of annual leave."',
+    '10 reruns of the saved request: 9 say 12 days, 1 says 18 days',
+    'logprobs at the number token:   "12" -0.36 (70%)   "18" -1.20 (30%)',
+    'golden test, 2025 chunk only, 10 runs: 10 say 18 days',
+  ]}
+  steps={[
+    {
+      prompt: 'What do the 9-in-10 split and the logprobs say?',
+      options: [
+        'A tokenizer bug, since the number token is the point of the split',
+        'Sampling luck at temperature 0, since one run gave a different number',
+        'The model leans to 12 but is unsure, because it sees both numbers',
+        'The model cannot read numbers, because it picks 12 over 18',
+      ],
+      answer: 2,
+      explain: 'A 70% to 30% split is a close call, not a sure answer. The two chunks give two numbers, so the model is torn. Luck would not give a steady 9 in 10 pattern, and the model read both numbers fine when only one chunk was present.',
+    },
+    {
+      prompt: 'What does the golden test show?',
+      options: [
+        'The model weights are at fault, because they prefer the number 12',
+        'The model answers right with clean context, so the fault is in what retrieval puts in',
+        'The prompt is at fault, because it never says which year wins',
+        'The test is useless, since a single chunk is not a real request',
+      ],
+      answer: 1,
+      explain: 'With only the 2025 chunk, 10 of 10 runs are right. So the model can do the task. The 2019 policy, a stale chunk ranked first, is the cause. A prompt note might help, but the test points at the context.',
+    },
+    {
+      prompt: 'Which fix goes at the cause?',
+      options: [
+        'Retire or demote the 2019 policy in the index, then add this case to the golden set',
+        'Add "always answer 18" to the system prompt, so the number is fixed',
+        'Raise the temperature, so that the answer averages out across runs',
+        'Switch to another model, and hope that it prefers the newer chunk',
+      ],
+      answer: 0,
+      explain: 'The cause is a stale document in the index, ranked first. Remove it or rank by date, then keep the case as a test. Hard-coding 18 breaks the day policy changes. A higher temperature makes the answer less steady, and a new model may still see two conflicting chunks.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Thinking Machines: Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference): why batch size changes the numbers, and what the fix costs.
+- [OpenAI cookbook: using logprobs](https://developers.openai.com/cookbook/examples/using_logprobs): reading token confidence, and its limits.
+- [Latitude: LLM failure modes and root cause analysis](https://www.latitude.so/blog/llm-failure-modes-root-cause-analysis-guide): input ablation and the golden-document test.
+- [Liu and others: Lost in the Middle](https://arxiv.org/abs/2307.03172): how the position of relevant text changes the answer.
+- [Singh and Strouse: Tokenization counts](https://arxiv.org/abs/2402.14903): how number tokenization changes arithmetic.

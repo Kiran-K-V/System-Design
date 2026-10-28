@@ -1,0 +1,461 @@
+---
+summary: 'An ad auction prices from the click probability, so the number must be a true probability, not just a good ranking. Calibrate per segment, undo downsampling, handle late labels, shard the sparse embedding tables, and gate every deploy on calibration and revenue. Drills: ETA with a skewed error cost, and dynamic pricing.'
+requires: ['ai/e1-classic-ml/offline-online-metrics', 'ai/e1-classic-ml/online-learning', '11-breakdowns/ad-click-aggregator']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import AiE1AdBuild from '../../../../components/anim/lessons/AiE1AdBuild.tsx';
+import AiE1AdCalibPlot from '../../../../components/anim/lessons/AiE1AdCalibPlot.tsx';
+import AiE1EtaLoss from '../../../../components/anim/lessons/AiE1EtaLoss.tsx';
+
+## The problem
+
+A user opens a page. The page has one ad slot. Fifty advertisers want it. Who wins?
+
+A **second-price auction** (the winner pays what the runner-up would have needed to bid, not their own bid) is a common answer. Most ad systems rank by **expected value per impression**: the bid for a click, times the chance that this user clicks this ad on this page. That chance is the **pCTR**, the predicted click-through rate. Say it is 2%. Then a $1.00 click bid is worth two cents of expected revenue.
+
+Here is the part that matters for the whole lesson. The pCTR is not only a ranking score. It is a **price input**. The auction multiplies it by money. If the model says 4% when the truth is 2%, the auction thinks this ad is worth twice as much as it is. It wins slots it should lose. It charges advertisers for value that never arrives. Advertisers see cost per click rise, cut their bids, and leave.
+
+So an ad model has to be a good ranker and an honest probability. The second job is harder, and a dashboard that shows only the first job will not warn you. This lesson is about the second job.
+
+The lesson answers six questions:
+
+1. What is the quality bar, when ranking quality alone can hide a pricing error?
+2. What does the architecture look like, from feature read to model sync?
+3. How do you keep the probability honest when no-click examples are downsampled and clicks arrive late?
+4. How do you store and update embedding tables that are far too large for one machine?
+5. How do you read features fast enough, and avoid training-serving skew?
+6. How do you roll out a new model without a 3% revenue surprise?
+
+Then two drills reuse the same machinery: ETA prediction, where one error direction costs more, and dynamic pricing.
+
+<CrossTrackLink id="11-breakdowns/ad-click-aggregator">
+The backend case study builds the counting side of ads. A click service redirects the user, a durable log keeps every click, a stream job counts per ad per minute, and a batch job fixes late and duplicate events. This lesson sits next to it. That pipeline reports how many clicks happened. The model here predicts how many will happen, before the auction runs. The click log from that case is also the label source for the model.
+</CrossTrackLink>
+
+## Requirements and the quality bar
+
+The product is the click-probability service inside an ad auction. All traffic and latency numbers below are **illustrative** unless a source is named.
+
+**Functional**
+
+- FR1: for each auction, score every candidate ad with a click probability.
+- FR2: learn from the clicks and non-clicks that follow, continuously.
+- FR3: report predicted against observed click rate per segment, so people can see bias.
+
+**Out of scope.** Candidate retrieval (lesson E1.5 covers the cascade; here the candidates are given), the bidding strategy of advertisers, budget pacing, and fraud filtering of clicks (lesson E1.12).
+
+**Non-functional, in words.** Fast (the auction has a tight deadline, so scoring gets a slice of it). Fresh (user interest moves, so the model must keep up). Honest (the number is a probability). Safe to change (a deploy must not cost money).
+
+**The bar.** Two metrics carry it. Both come from lesson E1.6; here is how they work for ads.
+
+- **Logloss** scores each prediction by how much probability it gave to what happened. A model that says 2% for a click that happened is punished. A model that says 2% for 1,000 impressions and gets 20 clicks is rewarded. Lower is better. Logloss is a **proper scoring rule**: the model gets the best score only by reporting its true belief. That makes it a good training and comparison metric for probabilities.
+- **Calibration error** asks a plainer question. Group predictions that are near 2%. Did about 2% of those impressions get a click? **Expected calibration error** (ECE) averages the gap between predicted and observed rate over such groups, weighted by how many impressions fall in each. The scikit-learn documentation states the idea: among samples given a score near 0.8, about 80% should be positive ([scikit-learn, probability calibration](https://scikit-learn.org/stable/modules/calibration.html)).
+
+Our bar, a choice of ours and not a source: logloss no worse than the current model, and calibration error under a stated band **in every segment that carries money**. A segment is a slice such as country, device, ad format, or new versus old advertiser. The average can look fine while one large segment is off by 30%.
+
+**Why not AUC?** **AUC** measures ranking: take a random clicked impression and a random non-clicked one, and AUC is the chance the model scored the clicked one higher. It ignores the size of the scores. Multiply every prediction by 2 and the ranking is the same, so AUC is the same. The auction would now double every price. Google's ads team states the dependence plainly: "Accurate and well-calibrated predictions are not only essential to run the auction, they also allow for a loosely coupled overall system design separating concerns of optimizations in the auction from the machine learning machinery" ([McMahan et al., Ad Click Prediction: a View from the Trenches](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/41159.pdf)). Our reading: AUC tells you the model orders ads well. Only calibration tells you the auction can trust the number.
+
+## Eval plan
+
+Per lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/), the eval comes before the design. The method follows lessons E1.6 (offline against online) and E1.8 (A/B testing models).
+
+**Offline.** Use a **time-split** test set: train on days 1 to N, test on day N+1. A random split leaks the future, because one user's clicks sit on both sides. Report logloss, calibration error, and AUC, each **per segment**. Add a **reliability plot**: predicted rate on one axis, observed rate on the other. A calibrated model sits on the diagonal. The widget later in this lesson draws one.
+
+**Why offline can mislead for ads.** The log was produced by the old model. It only contains clicks on ads the old model chose to show. A new model that wants to show different ads is judged on data that has no answer for them. Google notes that the feedback loop in such a system makes it impossible, "without strong additional assumptions", to give theoretical guarantees for the effect of calibration ([McMahan et al.](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/41159.pdf)). So an offline win is a reason to test online, and never a reason to ship.
+
+**Online.** Revenue per thousand auctions is the headline. The guardrails are advertiser-facing: cost per click, spend per advertiser against budget, and the share of advertisers whose cost per click moved more than a set band. A model that lifts revenue by overcharging is a loan against next month's budgets. See lesson [A8.5](/learn/ai/a8-evals/trajectory-evals/) for the online-eval patterns and lesson E1.8 for the A/B design.
+
+**The slice that matters.** New ads and new advertisers (cold start: few clicks, noisy predictions), small segments, and the high-pCTR tail, where an error in absolute terms is largest.
+
+## Budgets
+
+**Latency.** An auction has a deadline in the tens of milliseconds end to end (the exact value varies by product, so this is **illustrative**). Scoring gets a slice. Inside it, feature reads are the largest stage: network calls to a store for the user, the ad, and the page, repeated for every candidate. Embedding lookups come next: memory reads from large tables, often on other machines. The dense network is small, and calibration is one table lookup. The conclusion: in ad ranking the wall clock goes mostly to **reading data**, not to the neural network. This is the opposite of the LLM case in the core track. The DLRM authors say the model is "memory-capacity and bandwidth intensive", because embeddings hold most of the parameters ([Naumov et al., DLRM](https://arxiv.org/html/1906.00091v1)).
+
+**Dollars.** Serving cost per thousand auctions depends on the compute price, the batch size, and how memory-bound the work is. I could not load a primary price page I could cite, so I give no dollar figure. State it as a formula: instance price per hour, divided by auctions scored per hour at target load, times one thousand. Embedding memory sets the instance count more often than compute does.
+
+## Core entities and API
+
+**Entities.** `Impression` (request id, ad id, features used, model version, predicted and calibrated pCTR), `Click` (request id, time), `Example` (impression plus label and label wait), `ModelVersion` (weights, calibration map, keep rate, status).
+
+**API.** `POST /score` takes a user context and a list of ad ids and returns one calibrated pCTR per ad plus the model version. `GET /calibration?segment=...` returns predicted and observed rate for dashboards and the rollout gate. Impressions and clicks flow on streams into joined examples.
+
+## A naive design and where it breaks
+
+The first build is a gradient-boosted or logistic model trained nightly on yesterday's clicks. Features are computed in SQL for training and re-written in Java for serving. No-click examples are downsampled so training fits on one machine. A click is labelled when it shows up in the table. Here is where it breaks.
+
+| Break | What happens | Why |
+|---|---|---|
+| Prices drift upward | The auction overvalues clicks; advertisers see higher cost per click. | No-click examples were dropped, so the model learned a base rate far higher than reality. |
+| Prices drift downward on new ads | New ads underbid and rarely win. | Clicks that happen hours after the impression were labelled as misses. |
+| A feature means two things | Offline wins, online losses. | The SQL and Java versions of one feature differ. This is training-serving skew, covered in lesson E1.4. |
+| Yesterday's model on today's trend | A sale starts at noon; the model sees it tomorrow. | Nightly batch training. |
+| Memory error | New ids crash or collide. | A fixed-size embedding table cannot grow, so ids are hashed together. |
+
+The first three rows are all about the probability being wrong, and AUC will not show any of them. The rest of the lesson fixes each row.
+
+## High-level design
+
+Step through the build. Each step names the requirement it meets.
+
+<AiE1AdBuild client:visible />
+
+Read the picture in four rules.
+
+1. **The calibration layer is a first-class box.** It sits between the raw model score and the auction. It is fitted per segment and monitored per segment.
+2. **Log what you predicted.** Each impression stores the features that were used and the pCTR that was shown. Without this, you cannot rebuild training examples that match serving, and you cannot measure calibration later.
+3. **The label joiner owns time.** It decides how long to wait before calling an impression a non-click. That one parameter trades label accuracy against freshness.
+4. **Deploys go through a gate** that reads calibration and revenue, not AUC alone.
+
+**The model shape.** The common deep shape for ad CTR is the **DLRM** (Deep Learning Recommendation Model), published by Facebook researchers. Here is how it works. Each sparse feature, such as an ad id or a user id, gets a learned vector called an **embedding**: a row in a big table, looked up by id. Dense numbers such as age of the ad or time of day go through a small network called the **bottom MLP** (multi-layer perceptron: a stack of linear layers with non-linear steps between them). The model then takes the **dot product of every pair** of these vectors, which captures "this kind of user likes this kind of ad". It joins those products with the dense vector, passes them through a **top MLP**, and ends with a **sigmoid** (a function that squeezes any number into the range 0 to 1) to give a probability ([Naumov et al.](https://arxiv.org/html/1906.00091v1)). A **picture**: the embedding tables are a huge phone book of learned profiles; the networks are a small clerk who compares two entries and writes a score. The **why**: sparse ids are the strongest signal in ads, and a plain network cannot digest a million-way category without a table. The **example**: an ad id seen 10,000 times has a learned vector close to ads that attract similar users.
+
+## Deep dive 1: calibration under delayed labels and class imbalance
+
+Two things push the pCTR off the truth. They look alike on a dashboard and have different fixes.
+
+### Imbalance and downsampling
+
+**What it is.** Clicks are rare. Google says typical CTRs are "much lower than 50%", so positives are scarce and clicks are "relatively more valuable in learning CTR estimates" ([McMahan et al.](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/41159.pdf)). Training on every no-click example costs a great deal of compute and storage. So teams **downsample**: keep every click and a fraction of no-clicks. The fraction is the keep rate.
+
+**Picture.** A town where 1 in 50 people owns a boat. You survey every boat owner but only 1 in 10 other people, to save on postage. If you then report "the share of boat owners" from your survey, you will say it is far too high.
+
+**Why it is a problem.** The model sees a world with many more clicks than the real one. Its output is a probability for the downsampled world. The auction would read it as a probability in the real one. The learned rate rises sharply when the keep rate is small. The widget below shows it.
+
+**Fix 1: correct at serving.** Undo the sampling with a formula. If the model gives q and the keep rate is r, the true estimate is
+
+<Math block tex="p = \frac{q\,r}{q\,r + 1 - q}" />
+
+In words: shrink the odds of a click by the keep rate. Monolith, ByteDance's online-training system, does this: "we apply log odds correction during serving, making sure that the online model is an unbiased estimator of the original distribution" ([Liu et al., Monolith](https://arxiv.org/html/2209.07663v2)). Google's approach is different. It weights each kept no-click example by 1 divided by the keep rate during training, so the loss matches the full data ([McMahan et al.](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/41159.pdf)). Both work. One fixes the output after training. The other fixes the loss during training. Pick one and document it. Doing both, or neither, is the usual bug.
+
+### Delayed labels
+
+**What it is.** A click can arrive minutes, hours, or days after the impression. Monolith's authors describe it: "a user may take a few days before they decide to buy an item they were presented days ago" ([Liu et al.](https://arxiv.org/html/2209.07663v2)). Conversion-style labels (a purchase after a click) are the extreme case.
+
+**Picture.** A pollster closes the phone lines at noon and reports the vote. Late voters are not counted. The result looks like a quiet election.
+
+**Why it is a problem.** An impression with no click yet looks the same as a true no-click. If you label it no-click and train on it, the model learns that these ads are less clickable than they are. The newest data is the most affected, which is the data that online learning reads first. Your model is biased low exactly where freshness matters most.
+
+**Options.** Wait longer: hold the impression in the joiner until most clicks have arrived. This costs freshness. Monolith's joiner keeps pending features in memory and spills older ones to an on-disk store, so a long wait does not exhaust memory ([Liu et al.](https://arxiv.org/html/2209.07663v2)). Or use two-pass labels: emit a no-click early, then a corrected positive if a click arrives. This is faster, but the model trains briefly on wrong labels.
+
+Notice what the log-odds fix does not do. It cannot see clicks that were never labelled. Delay needs its own fix.
+
+### Try it
+
+Move the sliders. First keep the no-click share low and leave the fix off. Then turn the fix on. Then add late clicks.
+
+<AiE1AdCalibPlot client:visible />
+
+What to see. With a low keep rate and no fix, every dot sits far above the diagonal. The auction overvalues clicks by a large factor. The fix puts the dots back on the line. Late clicks push the dots below the line, and the fix does not help. This is why calibration is monitored from real outcomes, not assumed from a formula. The widget fits the training log exactly and uses six invented ad groups, so the sizes are **illustrative**.
+
+### The calibration layer
+
+Even with both fixes, models drift. Google describes a **calibration layer** that maps predicted CTR to observed rate on each slice of data. A flexible form uses **isotonic regression**: it fits a step-wise rising curve by least squares, so it cannot reorder predictions. Google reports the piecewise form "significantly reduced bias for predictions at both the high and low ends of the range" ([McMahan et al.](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/41159.pdf)). A layer fitted on the whole population can fix the average and still miss small segments. So fit and monitor per segment, with a minimum count before a segment gets its own map. Calibration is cheap to fix after training and expensive to discover in production.
+
+## Deep dive 2: sparse embedding tables
+
+**What it is.** The embedding tables from the DLRM section hold one vector per id. There are tables for user ids, ad ids, advertisers, pages, and cross features. The DLRM authors say embeddings "contribute the majority of the parameters, with several tables each requiring in excess of multiple GBs of memory" ([Naumov et al.](https://arxiv.org/html/1906.00091v1)). In Monolith's production model there were around 1,000 tables, with very uneven sizes ([Liu et al.](https://arxiv.org/html/2209.07663v2)). Monolith also states that production models are "usually several terabytes in size".
+
+**Picture.** A library where each book is a user. New readers arrive every minute. Most readers visit once. A few visit every day.
+
+**Why it is hard.** Three problems, three answers.
+
+1. **It does not fit on one machine.** Split the tables across machines. This is **model parallelism**: different machines hold different parts of the model. The DLRM authors split the embedding tables this way. They keep the small MLPs replicated, called **data parallelism**: every machine holds a full copy and processes different examples. Because the pieces live in different places, a step needs an **all-to-all** exchange: each machine sends the vectors it looked up to the machines that own the matching examples ([Naumov et al.](https://arxiv.org/html/1906.00091v1)). Our reading: this is the same pattern as sharding a database and then running a scatter-gather query, with a collective network step in the middle. Lesson E2.3 and E2.4 treat the parallelism side in depth.
+2. **Ids keep growing.** A fixed-size table cannot add ids, so a common shortcut hashes ids into a smaller table. Two ids then share one vector. This is a **collision**. Monolith's authors argue that collisions hurt because "a small group of users or items have significantly more occurrences", so popular ids collide with rare ones and corrupt both ([Liu et al.](https://arxiv.org/html/2209.07663v2)). Their answer is a **collisionless** table built on cuckoo hashing, a hash scheme that gives each key its own slot by moving an older key to its other slot when there is a clash. The paper reports that the collisionless table gave higher AUC in tests on a public movie data set and on an internal ads model (a **paper claim**, on their own data).
+3. **Memory is finite.** So admit and evict. Monolith filters ids "before they are admitted" by how often they occur, since ids that appear only a handful of times "have limited contribution", and it expires ids after a set inactive period ([Liu et al.](https://arxiv.org/html/2209.07663v2)). Our reading: this is a **cache policy** on a learned dictionary. Frequency admission is the "do not cache one-hit wonders" rule from the backend track. TTL expiry is the same idea as a key TTL.
+
+<CrossTrackLink id="05-caching/eviction">
+Eviction decides which entry leaves a full cache. A TTL expires an entry after a fixed time. Both appear again in the embedding table: ids that are rare or stale are dropped to save memory, with a tunable threshold per table.
+</CrossTrackLink>
+
+**Syncing to serving.** Training runs on one set of machines and serving on another. The new vectors must reach serving fast, without stopping it. Sending a multi-terabyte model whole would, as the Monolith authors put it, "pose huge pressure to both the network bandwidth and memory". So they track a **touched-keys set**: the ids whose vectors changed since the last sync. They send only those, at a "minute-level" interval ([Liu et al.](https://arxiv.org/html/2209.07663v2)). Dense layers move slower, so they sync daily, at night. In their data, a faster sync gave better online AUC, and a live ads A/B test of online against batch training showed gains on each of seven days (a **paper claim**; the paper's own baseline and data apply).
+
+One more finding is worth keeping for the interview. Monolith snapshots training state once a day and reports that losing up to a day of updates after a failure gave "nearly no loss of model quality". The paper frames it as **trading reliability for freshness**. Our reading: fast sync is a bigger win than frequent backups, for this kind of model.
+
+## Deep dive 3: feature reads at auction rate, and skew
+
+**What it is.** A feature is an input signal, such as the user's click rate on this ad category over the last 7 days. An **online feature store** answers "give me these features for this id" quickly. Lesson E1.3 built it. Here is the part that is specific to ads.
+
+**Picture.** A waiter must bring each of fifty dishes to a table within a minute, and each dish needs ingredients from different shelves. The kitchen layout, not the cooking, sets the speed.
+
+**Why it is a bottleneck.** One auction scores many candidate ads. Each candidate needs ad-side features, and the user needs features once. Auctions arrive at a high rate. So read load on the store is the product of the auction rate and the candidates per auction, times the lookups per candidate. You cannot cut this by adding GPUs. You cut it by changing the access pattern.
+
+- **Batch the reads.** One call per entity type per auction, not one per candidate.
+- **Cache the slow-moving ones.** Ad-side features change rarely. A local cache with a short TTL absorbs most reads. User features change faster and go to the store.
+- **Co-locate.** Put the hot embeddings and features on or next to the scoring machine. This is the same idea as read replicas from the backend track.
+- **Degrade, do not fail.** If the store is slow, fall back to a default value and flag the request, or use a cheaper model. Never let a feature timeout fail the auction.
+
+**Training-serving skew.** Lesson E1.4 taught this in depth. In ads, the cure is to **log the served features**. Write the exact feature values used for each impression into the impression log. Train from those values, not from a recomputation. Monolith's design does this: the online joiner concatenates features with labels from user actions, using a unique key per request ([Liu et al.](https://arxiv.org/html/2209.07663v2)). A recomputed feature may use data that did not exist at serving time. A logged one cannot.
+
+<Callout type="deep" title="Why a fallback value is dangerous">
+When the store times out and you fill a missing feature with zero or the mean, the model scores a different world than it trained on. Its pCTR can move in a way that looks small but is biased for every request that fell back. Track the fallback rate per feature. If it passes a set threshold, route to a safer model. A feature outage is a calibration incident that looks like an infrastructure incident.
+</Callout>
+
+## Failure modes and an incident drill
+
+| Failure | What happens | Detect | Do |
+|---|---|---|---|
+| Miscalibration after a deploy | Auction overvalues or undervalues ads; cost per click moves | Predicted over observed rate per segment, with a band | Roll back; refit calibration; add the segment to the gate |
+| Feature outage or fallback | Many requests score with default values | Fallback rate per feature; shift in score distribution | Cheaper model or cached features; alert at a low fallback rate |
+| Label pipeline stall | No new examples; online model goes stale, or trains only on non-clicks | Label lag; share of positive examples against baseline | Pause online updates; serve the last good model |
+| Delayed-label bias | New ads underpredicted | Predicted against observed rate, by ad age | Longer wait window; two-pass labels |
+| Embedding collision or eviction burst | Popular ids lose their vectors | Embedding table hit rate; sudden score shift | Raise admission threshold carefully; restore from snapshot |
+| Feedback loop | The model learns only what it already shows | Exploration traffic share; coverage of new ads | Keep a small exploration slice with logged propensity |
+| Sync mismatch | Sparse and dense parts are from different versions | Version tags on both parts; score drift | Version both; refuse to serve mismatched parts |
+
+**Incident drill: revenue drops 3% after a deploy, AUC is flat.** Illustrative numbers. Work through it.
+
+<Diagnose
+  client:visible
+  id="e1-ad-click-revenue-3pct"
+  title="Revenue down 3%, AUC flat"
+  scenario="A new CTR model went to 10% of traffic yesterday. The offline report said AUC +0.1% and logloss better. The canary shows revenue per 1,000 auctions down 3%, and cost per click down for advertisers. No code outside the model changed. (Illustrative numbers.)"
+  facts={[
+    'offline AUC: +0.1%. offline logloss: slightly better',
+    'canary: revenue per 1,000 auctions -3%; cost per click -4%',
+    'canary click rate (clicks per impression): unchanged',
+    'mean predicted pCTR / observed click rate: 0.93 canary, 1.00 control',
+    'ratio by segment: new ads 0.78, old ads 0.97',
+    'training change: no-click keep rate changed from 10% to 5%',
+    'serving change: log-odds correction still uses keep rate 10%',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The model ranks ads worse, so users click less',
+        'The correction at serving no longer matches the training keep rate',
+        'A feature outage filled in default values for many requests',
+        'The advertisers cut their bids at the same time as the deploy',
+      ],
+      answer: 1,
+      explain: 'The click rate is unchanged, so ranking did not get worse. Predicted over observed is 0.93: the model underpredicts, which lowers prices and revenue. The training keep rate halved but the serving fix still assumes the old rate, so the correction is wrong by a fixed factor. A feature outage would show a fallback rate, which is not in the facts. Bids would not move a calibration ratio.',
+    },
+    {
+      prompt: 'Why did the offline report not catch it?',
+      options: [
+        'Offline data has too few rows to show any bias',
+        'AUC and ranking-based checks ignore a uniform scale error',
+        'The offline test uses a different model from the canary',
+        'Offline logloss is not affected by the keep rate at all',
+      ],
+      answer: 1,
+      explain: 'A fixed multiplicative error keeps the order of scores, so AUC does not move. The offline test computed logloss on the downsampled data, where the model was consistent with its own training, so it looked fine. Only a calibration check on a full, non-downsampled slice would show it.',
+    },
+    {
+      prompt: 'What should happen first, and what keeps it from happening again?',
+      options: [
+        'Roll back now, and ship the keep rate inside the model version',
+        'Raise the bids of the affected advertisers until revenue recovers',
+        'Wait three more days of canary data before making any decision',
+        'Retrain on more clicks until the ratio returns to 1.00 by chance',
+      ],
+      answer: 0,
+      explain: 'The loss is live and the cause is known, so stop it first by rolling back. Then fix the structure: the keep rate belongs to the model version as metadata, and the gate checks predicted over observed on a full slice per segment. Changing bids hides the bug. Waiting continues the loss. More training does not change a mismatched constant.',
+    },
+  ]}
+/>
+
+The loss in this drill is a pricing loss, not a ranking loss. Every ad is under-valued by the same factor, new ads by more, so the auction shifts spend toward old ads. The lesson: keep every constant that connects training and serving inside the model version, and gate on predicted over observed.
+
+## Drill: ETA prediction
+
+**The task.** A food-delivery app shows "arrives in 32 min" at checkout. Take 15 minutes. Predict the delivery time for each order.
+
+**The bar.** This is a **regression** problem (predict a number, not a probability). Illustrative: late rate (orders that arrive after the promise) at most a set share, and MAE (mean absolute error, the average gap in minutes) as a secondary number. A/B tested by region.
+
+**Why it is not a plain regression.** Errors are not symmetric. Early by 5 minutes is fine. Late by 5 minutes brings complaints, refunds, and lost repeat orders. A model trained for the lowest MAE aims at the **median**: half of orders arrive late by construction. A skewed cost needs a skewed loss.
+
+**The loss.** The **quantile loss**, also called **pinball loss**, charges a weight of alpha for each minute under the truth and 1 minus alpha for each minute over, and its best answer is the alpha-quantile of the outcome. At alpha 0.5 it equals half the mean absolute error ([scikit-learn, pinball loss](https://scikit-learn.org/stable/modules/model_evaluation.html)). If a late minute costs three times an early minute, the best promise is the 75th percentile of the delivery time. Uber's DeepETA team uses an **asymmetric Huber loss**, a loss that is smooth for small errors, linear for large ones so that outliers do not dominate, and has a parameter that sets "the relative cost of underprediction versus overprediction" ([Uber Engineering, DeepETA](https://www.uber.com/blog/deepeta-how-uber-predicts-arrival-times/), company claim for the design; the post gives no MAE figures).
+
+**The features.** Route distance and expected travel time from a routing engine, traffic, time of day and day of week, weather, restaurant prep time (often the biggest and noisiest piece), courier supply, and order size. Uber's design takes the routing engine's estimate, which is "a sum of segment-wise traversal times along the best path", and trains a model on the **gap** between that estimate and the real trip, so the model can be changed without rebuilding the routing engine. The post also states that the model "must return an ETA within a few milliseconds at most" ([Uber Engineering](https://www.uber.com/blog/deepeta-how-uber-predicts-arrival-times/)). Our reading: restaurant prep time and the long tail are why a ride-hailing recipe needs adapting for food.
+
+**Try it.** Slide the cost of lateness up. Switch between training for MAE and for cost.
+
+<AiE1EtaLoss client:visible />
+
+What to see. At a late cost of 3x, the median promise has the lowest MAE and half of all orders are late. The quantile promise is a few minutes longer. Its MAE is higher, but its late rate is half, and its total cost is lower. The model that looks worse on the dashboard is better for the business.
+
+**The failure.** Here is the trap the plan asks about. A new model ships and MAE improves. Complaints rise.
+
+<Diagnose
+  client:visible
+  id="e1-eta-mae-complaints"
+  title="MAE improves, complaints rise"
+  scenario="A new ETA model replaced the old one in one region. The A/B dashboard shows MAE down by a good margin. Support tickets that say 'late' went up in the same region. (Illustrative numbers.)"
+  facts={[
+    'MAE: old 8.9 min, new 8.1 min',
+    'late rate (arrived after the promise): old 27%, new 41%',
+    'mean promised ETA: old 36 min, new 31 min',
+    'training loss: squared error (old: quantile at 0.75)',
+    'complaints tagged late: +22%',
+  ]}
+  steps={[
+    {
+      prompt: 'Which explanation fits the facts?',
+      options: [
+        'The new model is less accurate on average, so MAE is misleading',
+        'The new model aims near the middle, so more orders land after the promise',
+        'Users in this region changed their ordering habits at random',
+        'The routing engine returned worse distances during the test',
+      ],
+      answer: 1,
+      explain: 'MAE did improve, so average accuracy is better. The promise is 5 minutes shorter and the late rate is much higher, which fits a model that targets the middle of the outcome and not a safe upper point. The old model used a quantile loss on purpose. Random habit change or worse distances would not move the promised ETA down.',
+    },
+    {
+      prompt: 'What is the right fix?',
+      options: [
+        'Add 5 minutes to every promise, with no change in training',
+        'Train again with a loss that charges late minutes more, and gate on late rate',
+        'Remove the late complaints from the data set so the trend flattens',
+        'Switch the dashboard to report squared error rather than MAE',
+      ],
+      answer: 1,
+      explain: 'The cost of lateness should live in the loss, and the late rate should be a release gate next to MAE. A flat add-on hides the shape of the tail: some orders are very late. Deleting complaints removes the signal. Squared error has the same blind spot as MAE.',
+    },
+  ]}
+/>
+
+The A/B design: split by region or by time, because users in one city share couriers, so a per-user split leaks across arms (lesson E1.8). Report MAE, late rate, mean lateness, and complaints. Gate on late rate.
+
+## Drill: Dynamic pricing as ETA plus CTR
+
+**The task.** A ride or delivery marketplace sets a price per trip. Take 15 minutes. The idea: dynamic pricing is the two models in this lesson, stacked.
+
+**The pieces.**
+
+- A **demand model**: the chance a user accepts at price p. This is a calibrated probability, just like pCTR. If it is biased, expected revenue is wrong. If it says 60% accept at a price where 40% do, the system raises prices to a level that kills demand.
+- A **supply and time model**: how long until a courier arrives, an ETA. A high price with a long wait loses the user anyway.
+- An **optimizer** that picks the price that maximises expected value: price times accept probability, minus the cost of delays. It is the auction's multiplication again, with a price in place of a bid.
+
+**The bar.** Revenue per session, and guardrails. The guardrails are the hard part and the reason this is a drill and not a copy of ads.
+
+- **Caps and smoothing.** A maximum price multiplier, and a limit on how fast the price can move, so users do not see a jump from one minute to the next.
+- **Fairness checks.** Look for price gaps between areas or groups that you cannot explain by cost. A model can learn a proxy (an area code that correlates with income) and charge more to people who have fewer options. Compare price and accept rate across slices before launch, and after.
+- **Emergency rules.** A kill switch that holds prices at a base level during a disaster or an outage. The model is trained on normal days.
+- **Experiment hygiene.** Users in the same area share supply, so price tests leak across arms. Randomise by region and time block, and measure the effect on supply too.
+
+**The failure.** A calibrated demand model gets worse after a promotion ends, because the training data came from the promotion. Its accept probability is too high, so prices rise too far, and revenue falls. The cure is the same monitor as for ads: predicted over observed accept rate per segment, with a band. I give no price figures here because I have no primary source for any specific marketplace's numbers. All of this section is design reasoning, not a company claim.
+
+## Staff answer vs senior answer
+
+| Topic | Senior answer | Staff answer |
+|---|---|---|
+| Model | "Train a DLRM." | A DLRM is the shape. The product is a calibrated probability the auction can price from |
+| Metric | AUC and logloss | Logloss, plus calibration error per segment, plus a gate on predicted over observed |
+| Imbalance | "Downsample the negatives." | Downsample, then correct in one named place (loss weight or serving fix), and store the keep rate in the model version |
+| Labels | "Join clicks to impressions." | Pick the wait window as a trade of freshness against bias, and monitor bias by ad age |
+| Embeddings | "Hash the ids." | Collisionless table, admission by frequency, expiry, minute-level sparse sync, daily dense sync |
+| Features | "Use a feature store." | Log served features; batch and cache reads; degrade with a flag, never fail the auction |
+| Deploys | "A/B test it." | Shadow, then canary, gated on calibration and advertiser cost per click, with one-switch rollback |
+| Offline eval | "It beat the baseline." | The log was made by the old model, so an offline win only earns an online test; keep an exploration slice |
+
+## What experienced teams know
+
+1. **Calibration is what lets the auction and the model be built separately.** Google's ads team says well-calibrated predictions allow a "loosely coupled" design where the auction and the learning system are separate concerns ([McMahan et al.](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/41159.pdf)). Our reading: when the contract between the two is "a true probability", each team can change its side without a joint release.
+2. **Downsampling needs a named correction.** Google weights kept no-click examples at training. Monolith applies a log-odds correction at serving ([Liu et al.](https://arxiv.org/html/2209.07663v2)). Our reading: both are valid; the mistake is zero or two corrections, or a constant that changed on one side only, as in the drill.
+3. **The feedback loop limits what you can prove.** Google notes that, without strong assumptions, the loop between the model and its own data prevents theoretical guarantees about the effect of calibration ([McMahan et al.](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/41159.pdf)). Our reading: treat offline results as a hypothesis, and keep exploration traffic that you log with its selection probability.
+4. **Sparse ids need their own memory system.** Monolith reports a collisionless table with admission by frequency and expiry, and says production models reach several terabytes ([Liu et al.](https://arxiv.org/html/2209.07663v2), paper claim on ByteDance data). Our reading: size the embedding tier as a database, with growth, eviction, and a restore plan.
+5. **Freshness can beat backup frequency.** The Monolith paper reports minute-level sparse sync and a daily snapshot with "nearly no loss of model quality" after a failure ([Liu et al.](https://arxiv.org/html/2209.07663v2), paper claim). Our reading: for a model whose value decays fast, spend the budget on sync, not on snapshots, and test the failure case before you trust it.
+6. **Match the loss to the cost of each error.** Uber's DeepETA chose an asymmetric Huber loss with an asymmetry parameter ([Uber Engineering](https://www.uber.com/blog/deepeta-how-uber-predicts-arrival-times/), company claim). Our reading: if you cannot say which error is worse, you have not chosen a loss.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Downsample no-clicks | Smaller, faster training | A correction you must keep in sync | Click rate is low and data is large |
+| Correct at serving (log-odds) | Training code untouched | The keep rate must reach serving with the model | One fixed keep rate per model |
+| Weight at training | Output is already honest | Higher gradient variance | You control the training loop |
+| Long label wait | Fewer false no-clicks | Slower learning | Late clicks are common |
+| Short label wait, two-pass labels | Fresh updates | Brief training on wrong labels | Freshness is worth more than purity |
+| Collisionless embedding table | Full signal per id | Memory and a hash-table engine | Many ids, uneven frequency |
+| Hashed (collision) table | Fixed size, simple | Popular and rare ids share a vector | Small team, quality loss is tolerable |
+| Minute-level sparse sync | Fresh model | Network and bookkeeping | Interest changes fast |
+| Per-segment calibration | Honest in the slices that matter | More maps to fit and monitor | Segments carry money |
+| Shadow then canary deploy | Catches pricing bugs early | Slower release | Always, for pricing models |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "The pCTR is a price input, so my bar is logloss and calibration per segment, not AUC. I would use a DLRM-shaped model with sharded embedding tables. I downsample no-clicks, correct that in one named place, and store the keep rate in the model version. I choose the label wait as a trade of freshness against bias. I log served features to avoid skew. A new model goes shadow, then canary, gated on predicted over observed rate and advertiser cost per click, with a one-switch rollback." Then name the exploration slice and the feedback loop.
+</Callout>
+
+<Callout type="mistake">
+Do not report AUC as the quality of an ad model. Do not downsample and forget the correction, or correct twice. Do not label every unclicked impression as a no-click at once. Do not recompute features for training that you could have logged. Do not use MAE alone to judge an ETA model when late costs more than early.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An ad model doubles every predicted click probability but keeps the same order. What happens to AUC and to the auction?',
+      options: [
+        'AUC falls by half, and the auction is unaffected',
+        'AUC is unchanged, and the auction overvalues every ad',
+        'AUC doubles, and the auction picks better winners',
+        'AUC is unchanged, and the auction is unaffected',
+      ],
+      answer: 1,
+      explain: 'AUC depends only on the order of scores, so it does not move. The auction multiplies the probability by a bid, so a doubled probability doubles each ad\'s apparent value and the prices that follow. This is why calibration is a separate check.',
+    },
+    {
+      q: 'Why do ad teams downsample no-click examples, and what must they do afterwards?',
+      options: [
+        'To remove noise, and then retrain once with all the data',
+        'To make clicks rarer, and then raise the bids to match',
+        'To cut training cost, and then undo the shift in the learned rate',
+        'To balance the log for AUC, and then drop the calibration layer',
+      ],
+      answer: 2,
+      explain: 'Dropping most no-clicks keeps training affordable but makes clicks look far more common, so the learned rate is too high. A correction, either a loss weight or a log-odds fix at serving, restores a true probability. Raising bids or dropping calibration would hide the shift, not remove it.',
+    },
+    {
+      q: 'A click arrives two days after its impression. The joiner already labelled the impression as no click. What is the effect on the model?',
+      options: [
+        'None, because one click is too small to matter',
+        'It underpredicts, mostly for the newest data',
+        'It overpredicts, because it saw too many clicks',
+        'It overpredicts for old ads and underpredicts for new ads',
+      ],
+      answer: 1,
+      explain: 'A late click that is labelled as a miss teaches the model that the ad is less clickable than it is. The newest data has the most clicks still on their way, so the bias is largest there. The log-odds fix cannot undo it because it never sees those clicks.',
+    },
+    {
+      q: 'Why do large ad models store sparse embedding tables across many machines but copy the small dense networks to every machine?',
+      options: [
+        'Tables need many machines; the small dense part is copied',
+        'Tables change faster, so each machine keeps its own copy',
+        'Dense layers hold most parameters, so they need the memory',
+        'Copying tables costs less network than copying dense layers',
+      ],
+      answer: 0,
+      explain: 'The embedding tables hold most of the parameters and can run to several terabytes, so they are split across machines. The dense networks are small but compute-heavy, so every machine holds a copy and works on different examples. This needs an exchange step between the two.',
+    },
+    {
+      q: 'A late delivery costs three times as much as an early one. Which promised ETA is best, and why?',
+      options: [
+        'The median, because it has the lowest average error',
+        'The mean, because it balances early and late minutes equally',
+        'A high quantile, because lateness costs more than earliness',
+        'The shortest time seen, because it wins the most orders',
+      ],
+      answer: 2,
+      explain: 'With a skewed cost the best point sits at a quantile set by the ratio of costs, here above the median. The median minimises average error, not cost, and leaves half the orders late. The shortest time would make most orders late.',
+    },
+  ]}
+/>
+
+## Further reading
+
+You do not need all of it. Start with the Google paper, then DLRM, then Monolith.
+
+- [Ad Click Prediction: a View from the Trenches (Google)](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/41159.pdf): subsampling with weights, calibration layers, and what did not work.
+- [Deep Learning Recommendation Model for Personalization and Recommendation Systems (Meta)](https://arxiv.org/html/1906.00091v1): the DLRM shape and its parallel scheme.
+- [Monolith: Real Time Recommendation System With Collisionless Embedding Table (ByteDance)](https://arxiv.org/html/2209.07663v2): collisionless tables, online joiner, minute-level sync.
+- [DeepETA: How Uber Predicts Arrival Times (Uber)](https://www.uber.com/blog/deepeta-how-uber-predicts-arrival-times/): post-processing a routing ETA with an asymmetric loss.
+- [scikit-learn: probability calibration](https://scikit-learn.org/stable/modules/calibration.html): reliability curves and isotonic regression.

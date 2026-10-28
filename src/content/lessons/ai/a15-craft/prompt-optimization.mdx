@@ -1,0 +1,389 @@
+---
+summary: 'Hand-tuning a prompt stalls because wording matters more than it should and every fix can break another case. Treat the prompt as a parameter and your eval set as the score, then let a tool search: propose, score, keep the best. DSPy and GEPA do this. The danger is overfitting, so split train, dev, and a held-out test, and score the test once.'
+requires: ['ai/a4-context/prompts-as-code', 'ai/a8-evals/golden-sets']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai15OptLoop from '../../../../components/anim/lessons/Ai15OptLoop.tsx';
+import Ai15OptPareto from '../../../../components/anim/lessons/Ai15OptPareto.tsx';
+
+## The problem
+
+A team runs a bot that sorts help-desk tickets into six queues: billing, refund, outage, login, privacy, and other. The prompt is two paragraphs. It scores 71 of 100 on the team's test tickets. An engineer spends three weeks making it better. Each fix is a sentence: "Read the whole ticket, not only the subject line." "If the ticket mentions a card number, use privacy." The score goes 71, 78, 76, 79, 79. It stops moving.
+
+Then a teammate runs a script overnight. The script asks a model to rewrite the prompt, scores each rewrite on the tickets, and keeps the best. In the morning the best rewrite scores 90. The prompt is now four times longer and the team does not know why it works. They ship it. A week later, the real queue accuracy is lower than before.
+
+Both halves of that story are common. The script found real gains that three weeks of hand-tuning missed. The script also fooled the team, because it had seen the same 100 tickets too many times. (The numbers in this story are an illustration, not data from a real team.)
+
+This lesson answers six questions:
+
+1. Why does hand-tuning stall?
+2. What is the search loop?
+3. What does DSPy add?
+4. How does GEPA search more cleverly?
+5. What about the "improve my prompt" buttons from model vendors?
+6. How does a search fool you, and how do you stop it?
+
+You know the pieces. A prompt is versioned code ([lesson A4.1](/learn/ai/a4-context/prompts-as-code/)). Few-shot examples are samples inside it ([lesson A4.2](/learn/ai/a4-context/few-shot-examples/)). A golden set is a trusted list of cases with known-good labels ([lesson A8.3](/learn/ai/a8-evals/golden-sets/)). This lesson joins them: the prompt is what you change, the golden set is the score, and a program does the changing.
+
+## Question 1: why does hand-tuning stall?
+
+Think of tuning a guitar by ear in a noisy room. You turn one peg. Another string goes flat. You turn that one. The first drifts. You can keep going for an hour and never settle, because you have no meter and each change has side effects.
+
+Hand-tuning a prompt works the same way. There are three causes.
+
+**Side effects.** A sentence you add for one ticket type changes how the model reads every other ticket. You fix the French ticket and break the sarcastic one. Lesson [A4.1](/learn/ai/a4-context/prompts-as-code/) showed this as a patched prompt that grows until nobody can reason about it.
+
+**Wording matters more than it should.** A **prompt sensitivity** result is a score change caused by a change that does not alter the meaning. Researchers tested this on prompt format: separators, spacing, and casing, with the same few-shot examples and the same task. In the [FormatSpread study](https://arxiv.org/abs/2310.11324), scores moved by up to 76 accuracy points on one open model (LLaMA-2-13B). With GPT-3.5, the study found a median spread of 6.4 accuracy points across 320 formats and 53 tasks. It also found that more examples or a bigger model did not remove the effect. Those are 2023 models, so your model may do better. The point is that you cannot know without measuring.
+
+Plain wording matters too. Google DeepMind's 2023 OPRO paper scored instructions on grade-school math problems (GSM8K) with one model, PaLM 2-L. The empty instruction scored 34.0. "Let's think step by step." scored 71.8. An instruction the optimizer found, "Take a deep breath and work on this problem step-by-step.", scored 80.2 ([OPRO paper, Table 1](https://arxiv.org/abs/2309.03409)). Old model, one task. The point is that good prompts are hard to guess.
+
+**You are one person with a few ideas.** A person tries maybe a dozen rewrites. A machine can try hundreds. It does not need to be smarter. It needs a score to climb, and you already have one.
+
+## Question 2: what is the search loop?
+
+A **parameter** is a value you can change to change the output. In a neural network, parameters are the weights, and training adjusts them to lower a **loss**: a number that says how wrong the model is. A prompt is a parameter too. It is text, not a number. But you can change it, and a changed prompt gives a changed score.
+
+Your eval set plays the role of the loss. It is a fixed list of inputs with checks (code checks or judges, from [lesson A8.4](/learn/ai/a8-evals/judges/)) that give each output a score. A **metric** is the function that turns one output into that score.
+
+For now, call the cases the search runs on the **train** cases. Question 6 adds two more piles.
+
+Now you can write the search as three steps:
+
+1. **Propose.** Make a new candidate prompt. Often a second model writes it. That model sees the current prompt, and sometimes the cases it failed.
+2. **Score.** Run the candidate on the eval cases and compute the metric.
+3. **Keep the best.** If the candidate beats the current prompt, it becomes the current prompt. Otherwise throw it away.
+
+Repeat until the budget runs out. The **budget** is a cap on model calls or time, because every round costs money. A tool that runs this loop is a **prompt optimizer**.
+
+Think of climbing a hill in fog. You cannot see the top, but you can feel whether a step goes up. The eval set is the altitude meter. The proposer picks the next step.
+
+<Ai15OptLoop client:visible />
+
+Look at the last two steps. The train score rose by 14 points and the held-out score rose by 7. That gap is what any search produces. Question 6 returns to it.
+
+How is it different from fine-tuning? In [lesson A11.4](/learn/ai/a11-finetuning/reinforcement-finetuning/), reinforcement fine-tuning also uses a score to improve a model. But it changes the model weights. Prompt search leaves the weights alone and changes only the text. So it works on a model behind an API that you cannot fine-tune, and the result is a text file that you can read and diff.
+
+## Question 3: what does DSPy add?
+
+The loop above has a weak spot. The "prompt" in a real system is not one block of text. A pipeline may call a model three times, once to rewrite a query, once to pick a tool, and once to write the answer. Each call has its own prompt. You would have to search all of them, and keep them in step.
+
+**DSPy** is an open-source Python framework from Stanford that treats this as a program. Its idea is to separate *what each step must do* from *the words used to ask the model*, and let a tool write the words. DSPy has three building blocks.
+
+**A signature.** DSPy's documentation defines it as "a declarative specification of input/output behavior of a DSPy module". Declarative means you say what, not how. A signature names the inputs and outputs: `ticket -> queue`. The field names carry meaning, so `ticket` is different from `answer`. Think of a function signature in a typed language, which names a function's inputs and outputs without showing its body. The body here is the prompt, and DSPy writes it.
+
+**A module.** A module is a building block that turns a signature into a model call using a prompting technique. `dspy.Predict` is the plain one. `dspy.ChainOfThought` asks the model to write out its reasoning first. `dspy.ReAct` lets the model call tools in a loop. You swap one for another without changing the signature. The DSPy docs say that in many cases, swapping in `ChainOfThought` for `Predict` alone improves quality.
+
+**An optimizer.** An optimizer takes your program, a metric, and your training cases. It changes the instructions, the examples, or both, and returns a better program. DSPy calls this step **compiling**, like a compiler that produces tuned code from your source. Three optimizers matter here:
+
+- **BootstrapFewShot** builds few-shot examples. It runs your program on training cases and keeps the good traces as demonstrations.
+- **MIPROv2** proposes new instructions and picks few-shot examples, "optimizing both instructions and few-shot examples jointly", in the words of its documentation. It uses Bayesian optimization, a method that picks the next thing to try from what earlier tries scored.
+- **GEPA** rewrites instructions by reading failures. Question 4 covers it.
+
+Here is a short sketch you can copy. It sorts tickets, scores each answer with a check that also writes a text note, and runs GEPA. I ran it with a stub model to check that it constructs and calls correctly, but I did not run a real optimization. The model names are placeholders. Use your own.
+
+```python
+import dspy
+from typing import Literal
+
+Queue = Literal["billing", "refund", "outage", "login", "privacy", "other"]
+
+# 1. Signature: what goes in, what comes out. No prompt text.
+class Triage(dspy.Signature):
+    """Route one support ticket to the right queue."""
+    ticket: str = dspy.InputField()
+    queue: Queue = dspy.OutputField()
+
+# 2. Module: how to ask. Try dspy.Predict or dspy.ReAct by swapping this line.
+program = dspy.ChainOfThought(Triage)
+
+# 3. Metric: a score AND a note that says why. GEPA reads the note.
+def metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
+    ok = pred.queue == gold.queue
+    note = "Correct." if ok else f"Wrong queue. Expected '{gold.queue}', got '{pred.queue}'."
+    return dspy.Prediction(score=float(ok), feedback=note)
+
+# 4. Data: three separate piles. Shuffle once with a fixed seed, then never mix them.
+rows = load_labeled_tickets()            # your golden set: [{"ticket": ..., "queue": ...}, ...]
+data = [dspy.Example(**r).with_inputs("ticket") for r in rows]
+train, dev, test = data[:120], data[120:200], data[200:]
+
+dspy.configure(lm=dspy.LM("anthropic/claude-haiku-5-5"))             # the model that does the task
+reflector = dspy.LM("anthropic/claude-sonnet-5-5", temperature=1.0, max_tokens=16000)  # the model that rewrites the prompt
+
+# 5. Optimizer: reads failures on train, picks winners on dev.
+optimizer = dspy.GEPA(metric=metric, auto="light", reflection_lm=reflector)
+best = optimizer.compile(program, trainset=train, valset=dev)
+
+# 6. Score ONCE on test. Do this after you stop tuning.
+def score(p, cases):
+    return sum(metric(x, p(**x.inputs())).score for x in cases) / len(cases)
+
+print("seed", score(program, test), "optimized", score(best, test))
+```
+
+Two details are worth reading twice. The `feedback` note is what lets GEPA reflect, and it is cheap to write. And `valset=dev` matters: in the DSPy code, if you pass no `valset`, GEPA uses the training cases for both jobs, and you lose your only protection against overfitting.
+
+How many cases do you need? DSPy's optimization guide says "you can often get substantial value out of 30 examples", and then "aim for at least 300 examples". Those are the framework authors' guidance, not a law. A team that applied GEPA to a production classifier found that more was not always better. See the field notes below.
+
+## Question 4: how does GEPA search more cleverly?
+
+The loop in Question 2 has a naive proposer: "here is the prompt, write a better one". It sees no reasons. A rewrite is a blind guess, and most guesses fail.
+
+**GEPA** (short for Genetic-Pareto) fixes the blind guess. It comes from a 2025 paper by researchers at UC Berkeley and others, "GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning". Version 2 was posted on 14 February 2026 ([arXiv:2507.19457](https://arxiv.org/abs/2507.19457)). It has two ideas.
+
+**Idea 1: reflect on failure traces.** A **trace** is the saved record of one run: the prompt, the model's reasoning, each tool call and its result, and the final output. A bare score says "0.6". A trace says "the model read only the subject line and missed the card number in the body". GEPA gives a stronger model a few traces, plus your metric's text note, and asks: what went wrong, and what rule would fix it? The paper describes this as to "reflect on them in natural language to diagnose problems, propose and test prompt updates". Picture a coach who watches the game film before writing the new plan, and not one who only reads the final score.
+
+The loop, in the paper's own algorithm, runs like this:
+
+1. Pick a candidate prompt from the pool.
+2. Run it on a small **minibatch**, a handful of train cases, and collect traces and notes.
+3. Ask the reflector to rewrite one prompt in the program.
+4. Score the rewrite on the same minibatch. If it did not improve, drop it.
+5. If it improved, score it on the **dev** cases, a second pile used to choose between candidates, and add it to the pool.
+
+Step 4 is a cheap filter. Most rewrites die there, before they cost a full dev run.
+
+**Idea 2: keep a Pareto set, not one winner.** Question 2 said "keep the best". Which best? The best average can hide a lot. Suppose prompt P1 passes four of six dev cases. Prompt P2 passes three, but it is the only prompt that passes the privacy case. If you keep only P1, the search forgets how to solve privacy.
+
+A **Pareto set** keeps every prompt that is not beaten everywhere. We say prompt A **dominates** prompt B when A scores at least as well on every case and better on one. A prompt that no other prompt dominates stays. The GEPA paper builds this per case: for each dev case, it notes which prompts score highest, keeps every prompt that leads somewhere, drops dominated ones, and then picks the next parent at random, weighted by how many cases the prompt leads. The paper says it keeps this front "to avoid local optima that afflict greedy prompt optimization". A **local optimum** is a peak that looks like the top but is not.
+
+Try it. Toggle between the two keep rules. The numbers are made up, and the rule is a simplified version of the paper's.
+
+<Ai15OptPareto client:visible />
+
+What do the paper's numbers say? These numbers come from version 2 of the paper. The authors compared GEPA with GRPO, an RL method, on Qwen3 8B, a small open model. GRPO ran 24,000 rollouts. A **rollout** is one full run of the system on one case. GEPA used between 1,839 and 7,051 rollouts across six tasks (Table 1). On those six tasks, the average test score was 54.85 for GEPA and 48.91 for GRPO, from a baseline of 45.23. On the IFBench instruction-following task, GEPA reached 38.61 after 678 rollouts, while GRPO reached 35.88 after 24,000. The abstract rounds this to "up to 35x fewer rollouts". The same table shows MIPROv2 at 47.84 on the same model. On GPT-4.1 mini, GEPA's aggregate was 65.22 against 58.67 for MIPROv2 (Table 2).
+
+These are the authors' own results on six benchmarks and two models. They are not your task. Version 1 of the paper (July 2025) said four tasks and a 10% average gain over GRPO. Version 2 says six tasks and 6%. Cite the version you read.
+
+One more point from the paper: GEPA "evolves only the set of prompts, whereas the underlying LLM weights remain fixed". It is the cheap cousin of reinforcement fine-tuning. It has a limit RL does not have. A prompt can only steer what the model can already do.
+
+## Question 5: what about the vendor "improve my prompt" buttons?
+
+Model vendors ship prompt rewriters inside their consoles. As of 2026-10-28, two examples are public.
+
+**Anthropic's prompt improver** (Console, announced 14 October 2024). It takes your prompt and rewrites it with five techniques: adding a chain-of-thought section, putting examples in a standard XML format, adding reasoning to those examples, rewriting for clarity, and adding a prefill (text that starts the model's reply). You can then give feedback in plain words and repeat. Anthropic says its testing "increased accuracy by 30% for a multilabel classification test" and brought word-count adherence "up to 100%" on a summary task. That is a vendor claim. The footnote describes one test: Claude 3 Haiku matching article titles to sentences from 500 Wikipedia articles.
+
+**OpenAI's prompt optimizer** is a dashboard chat that rewrites a prompt "according to current best practices". A version tied to datasets could use your labels, critiques, and graders. OpenAI's page says it is deprecating that dataset-backed optimizer with the Evals platform. Evals goes read-only on 31 October 2026 and shuts down on 30 November 2026. The page also says to "always evaluate and manually review optimized prompts before using them in production", because it is "possible for the optimized prompt to perform worse than your original on specific inputs". Tools like these come and go.
+
+How do these differ from DSPy and GEPA? A vendor improver is a **one-shot rewrite** with best-practice rules. It is quick, needs no code, and works with no eval set. It does not run a score-and-keep loop against your data, so it cannot tell you whether the new prompt is better. A search tool needs an eval set and gives you a number.
+
+Use an improver as a proposer. Take its output as one more candidate and score it against your current prompt on your own dev cases.
+
+## Question 6: how does a search fool you?
+
+Think of a student who gets the exam questions in advance, studies only those, and scores 100%. The student has learned the questions, not the subject. This is **overfitting**: a result that fits the cases it was tuned on and does not carry to new ones.
+
+A prompt search is an overfitting machine. It tries hundreds of prompts and keeps the one that scores highest on the cases it can see, so the winning score is biased upward. A reflective optimizer adds to this. It reads each failure and writes a rule for it, so it can copy the failing cases into the prompt.
+
+Two public cases show it.
+
+**A production classifier, Decagon, 25 March 2026.** Decagon (a customer-support AI company) ran GEPA on a binary classifier and tried many settings. Their post says GEPA "has a tendency to overfit to training examples by encoding edge cases into increasingly verbose prompts". Going from 50 to 500 samples made the prompt 75% longer while performance fell. They report that 20 to 100 samples worked best for their task, and say this may be specific to it. Unconstrained runs made prompts over 5,000 characters. A hard cap of 1,500 characters cost 0.8% in performance. This is one company and one task.
+
+**A small developer test, July 2026.** Simon Willison, a developer, had a coding agent run DSPy on the system prompt of his Datasette Agent. The README says the report was AI-generated, so treat its details as unaudited. On 20 train questions and 10 held-out questions, GEPA took the train score from 90.0 to 95.0 and the held-out score from 95.0 to 85.0. The prompt grew from about 2,400 to about 8,800 characters. Ten test questions means one question is worth 10 points, so this is an anecdote. The two cases share a small set, a growing prompt, and a train gain that did not carry over.
+
+### The naive way: tune and test on the same cases
+
+The common first design uses one pile of cases. The search tunes on the pile. The team reads the final score on the same pile. That score is the number the search was climbing. It is not an estimate of future accuracy. The Question 2 animation shows the result: 76 on the cases the search saw, 68 on cases it did not.
+
+### The real fix: three piles and one look
+
+Split your golden set into three parts, and give each part one job.
+
+| Pile | Who reads it | Job | You look at it |
+|---|---|---|---|
+| Train | The optimizer, including its reflection step | Source of the failures it learns from | Often |
+| Dev | The optimizer's selection step, and you | Choose between candidates, tune the metric, pick when to stop | Often |
+| Test | Only you, at the end | One honest score of the final prompt | **Once** |
+
+**Why three, not two?** Dev gets used up. Each time you pick a winner or tweak the metric by its dev score, a little of dev leaks into the prompt. The test pile is untouched, so its score is not biased by the search. [Lesson A8.3](/learn/ai/a8-evals/golden-sets/) taught the same split for golden sets.
+
+**What sizes?** DSPy's guide recommends an unusual split for most prompt optimizers: 20% train and 80% validation, because "prompt-based optimizers often overfit to small training sets". It says the GEPA optimizer follows the usual machine learning rule instead: make the train set large, and keep the validation set "just large enough to reflect the distribution of the downstream tasks". Those two pieces of advice differ, so read the guide for the optimizer you use. Size the test set so its score is trustworthy (lesson [A8.3](/learn/ai/a8-evals/golden-sets/) covers how many cases that takes).
+
+Five habits protect the test number:
+
+1. **Split first, by a fixed rule.** If cases come in time order or from customers, split so that test holds different customers or later weeks. A random split can put near-duplicate cases in both piles.
+2. **Debug the metric before you run the search.** The optimizer will climb whatever you measure. If the metric has bugs, it will exploit them. Read real traces first.
+3. **Watch prompt length.** A prompt that grows many times over, with a rule for each failure, is a warning. Cap the length, or review the diff by hand.
+4. **Review the new prompt like a code change.** Read it. Does any rule contradict another? Does it name a customer or an order? Put it through the same pull request and release steps as any prompt ([lesson A9.3](/learn/ai/a9-llmops/versioning/)).
+5. **Score test once.** If you tune again after you read the test score, test has become dev. Make a fresh test set for the next round.
+
+## What a run costs
+
+No primary source we found states the dollar cost of a prompt-optimization run, so this lesson gives none. The cost is the number of model calls, times the tokens per call, times the price per token ([lesson A9.2](/learn/ai/a9-llmops/cost-engineering/) covers prices). Call counts are public. In DSPy, GEPA's budget is a count of metric calls, with `auto` presets of "light", "medium", and "heavy". In the paper's Qwen3 8B runs, GEPA used 1,839 to 7,051 rollouts. Decagon's baseline run (50 train and 50 dev cases) was about 150 LLM calls, with 10 to 20 of them on the reflection model. Do a small run first, count the calls, and multiply by your own prices.
+
+## When to use this
+
+Use prompt search when most of these are true. Copy the list into your design doc.
+
+```text
+Prompt search: go / no-go
+
+[ ] I have a metric a program can compute, or a judge I have checked (A8.4).
+[ ] I debugged the metric on real outputs. It does not reward shortcuts.
+[ ] I have at least ~30 labeled cases for train, and a separate dev and test.
+    (DSPy guide: 30 can help, 300 is the target. Your task may differ.)
+[ ] Test cases were set aside before the first run. Nobody tuned on them.
+[ ] Hand-tuning has stalled: fixes break other cases, or I cannot tell why.
+[ ] I cannot or will not fine-tune the model (closed model, small budget).
+[ ] I have a strong model for reflection, and a call budget I can afford.
+[ ] A person will read the new prompt before release, and diff it.
+[ ] I will score test once, record it, and keep the old prompt for rollback.
+
+Skip it, or fix the data first, when:
+[ ] the metric is a vague 1-to-5 score from an unchecked judge
+[ ] the failures are in retrieval or tools, not in the prompt (fix those)
+[ ] the eval set is a handful of cases, or all easy
+[ ] the task changes every week, so the prompt has no stable target
+```
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Hand-tune the prompt | Full understanding, no tooling | Stalls, side effects, one person's few ideas | The prompt is short and the eval set is tiny |
+| Vendor prompt improver | One click, no code, no data needed | No score loop, tied to one vendor, can change or vanish | You want a candidate to score against your own cases |
+| DSPy with MIPROv2 or BootstrapFewShot | Searches instructions and examples together, reusable program | A framework to learn, a metric to write | Multi-step programs, or when examples matter most |
+| GEPA | Learns from failure traces, few rollouts in the paper's tests | Needs a good reflection model, can overfit and bloat the prompt | You have rich failure text and a modest case count |
+| Fine-tuning ([A11](/learn/ai/a11-finetuning/when-to-finetune/)) | Changes the weights, can beat prompting | Data, training, a model you now host or version | Prompt search has plateaued and you have the data |
+
+## What experienced teams know
+
+1. **Debug the metric before you optimize it.** In Willison's DSPy run, two of three baseline failures were scorer bugs: a correct answer of "none" had no literal "0" in it, and a tie was handled one way only. His report says that "at this scale, eval quality dominates optimizer quality". The report is AI-generated and covers a single run, so take it as an example, not a measurement. Source: [Datasette Agent DSPy report](https://github.com/simonw/research/tree/main/dspy-datasette-agent-prompts).
+
+2. **More cases can make a GEPA prompt worse, and a weak reflector does nothing.** Decagon went from 50 to 500 samples and the prompt grew 75% while performance dropped. A hard length cap acted as a guard. A small model as reflector left the prompt at its seed, while frontier models wrote real rewrites at 5 to 10% of the run cost. It is one company and one task, so measure on yours. Source: [Decagon, 25 March 2026](https://decagon.ai/blog/optimizing-gepa-for-production).
+
+3. **Read the split rules of your optimizer.** DSPy's guide recommends 20% train and 80% validation for most optimizers and the usual large-train split for GEPA. In the DSPy source, GEPA uses the train set for both jobs when you pass no `valset`. Add your own test pile on top. Sources: [DSPy optimization guide](https://dspy.ai/learn/optimization/overview/) and the [DSPy GEPA source](https://github.com/stanfordnlp/dspy/blob/main/dspy/teleprompt/gepa/gepa.py).
+
+4. **A tuned prompt is tuned to one model.** FormatSpread found that a format's score "only weakly correlates between models". The GEPA authors saw a prompt tuned on Qwen3 8B gain 9 points on GPT-4.1 mini, so transfer can happen, but you must check. Re-run the dev score, or the search, when the model changes (lesson A15.3 covers migration). Sources: [FormatSpread](https://arxiv.org/abs/2310.11324) and the [GEPA paper](https://arxiv.org/abs/2507.19457).
+
+5. **Treat an optimizer's output as a pull request.** The optimized prompt in Willison's run added advice that conflicted with a rule elsewhere in the same prompt, and the held-out score dropped. His report says optimized prompts "need regression review just like code". Source: the Datasette Agent report above.
+
+## Interview lens
+
+<Callout type="tip">
+Say it as a loop: "A prompt is a parameter and my eval set is the score. When hand-tuning stalls, I let an optimizer search: propose a rewrite, score it, keep the best. With DSPy I declare the task as a signature and compile it. GEPA reads failure traces and keeps a Pareto set, so it learns from why a case failed and does not drop a prompt that solves a rare case. I split train, dev, and test. I score test once, I cap prompt length, and I review the new prompt like code." That shows the idea, the tool, and the guard.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the optimizer raised the score from 74 to 91, so we ship". Ask which cases that score came from. Do not call a vendor "improve my prompt" button an evaluation: it rewrites, it does not measure. And do not claim a number like "35 times fewer rollouts" will hold for your task. It is the paper's result on its own benchmarks.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'promptopt-which-number-to-trust',
+      q: 'A search ran 40 rounds and kept the prompt with the best train score each time. Which number best tells you how it will do on new tickets?',
+      options: [
+        'The final train score, since it is the highest one',
+        'The best train score seen in any single round',
+        'One score on held-out cases the search never saw',
+        'The mean of the train score and the dev score',
+      ],
+      answer: 2,
+      explain: 'The search climbed the train score, so that number is biased upward, and the best round is the most biased of all. The dev score also picked winners, so it leaks too. Only cases the search never touched give an honest estimate, and you read that score once.',
+    },
+    {
+      id: 'promptopt-why-pareto-set',
+      q: 'GEPA keeps a Pareto set of prompts, not only the one with the best average. Why does that help the search?',
+      options: [
+        'A weak-average prompt may solve a case others miss',
+        'It removes the need to score prompts on cases',
+        'It guarantees the final prompt passes every test case',
+        'It lets the search skip the reflection model call',
+      ],
+      answer: 0,
+      explain: 'A prompt with a lower average can be the only one that passes a hard case. Keeping it lets later rewrites combine its lesson with others. A Pareto set still needs scores, still calls the reflector, and gives no guarantee on the test set.',
+    },
+    {
+      id: 'promptopt-dspy-signature',
+      q: 'In DSPy, what does a signature describe?',
+      options: [
+        'The exact wording of the final prompt text',
+        'The weights the optimizer is allowed to train',
+        'The call budget the optimizer may spend',
+        'The inputs and outputs of one step',
+      ],
+      answer: 3,
+      explain: 'A signature is a declarative spec of input and output behavior, such as ticket to queue. The optimizer and module decide the wording. DSPy does not train weights in this flow, and the budget is a setting on the optimizer.',
+    },
+    {
+      id: 'promptopt-vendor-improver-before-ship',
+      q: 'A vendor console rewrites your prompt in one click. What should you do before you ship the rewrite?',
+      options: [
+        'Ship it as is, because the vendor already tested the improver',
+        'Score it beside the old prompt on your held-out cases',
+        'Ask the improver to grade its own rewrite, then ship it',
+        'Score it only on the examples written inside the prompt',
+      ],
+      answer: 1,
+      explain: 'A vendor test covers the vendor task, not yours, and OpenAI notes that an optimized prompt may do worse on some inputs. Scoring on your own held-out cases is the only check that matches your traffic. A self-grade adds no new evidence, and prompt examples are cases the model has already seen.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai15-dev-up-prod-down"
+  title="Dev score up, production down"
+  scenario="A team runs GEPA to improve a ticket-sorting prompt. The score on their 60 labeled tickets jumps. They ship. A week later, production accuracy is lower than before the change. (Illustrative numbers.)"
+  facts={[
+    'cases: 60 tickets, one week of March, 41 from three big customers',
+    'GEPA run: trainset = those 60, no separate valset (it reuses train)',
+    'seed prompt, on the 60:      74%',
+    'optimized prompt, on the 60: 91%',
+    'prompt length: 1,900 chars -> 7,400 chars',
+    'production sample, one week in October:',
+    '  seed prompt: 74%   optimized prompt: 70%',
+    'held-out test set: none',
+  ]}
+  steps={[
+    {
+      prompt: 'What best explains a rise to 91% on the 60 tickets and a fall to 70% in production?',
+      options: [
+        'The model provider quietly swapped the model weights in October',
+        'Overfitting: the long prompt fits quirks of those 60 tickets',
+        'The metric was too strict, so scores read lower than they were',
+        'GEPA cannot be used on a classification task of this kind',
+      ],
+      answer: 1,
+      explain: 'The search tuned and selected on the same 60 tickets, mostly from three customers. Its 91% measures how well it fits those tickets. The much longer prompt is a sign it added rules for them. A weight swap would also hit the seed prompt, and the seed held at 74%.',
+    },
+    {
+      prompt: 'Which missing step would have caught this before release?',
+      options: [
+        'Using a bigger reflection model to write the rewrites',
+        'Running more rounds of search on the very same cases',
+        'Adding more rules to the prompt for each failed ticket',
+        'Scoring once on held-out tickets from other weeks',
+      ],
+      answer: 3,
+      explain: 'A held-out test set the search never saw would have shown the drop before users did. More rounds and more rules push the fit to the 60 tickets further. A bigger reflector writes better rules for the same few cases, which does not fix a narrow sample.',
+    },
+    {
+      prompt: 'What is the best next move?',
+      options: [
+        'Gather varied new tickets, split dev and test, re-run',
+        'Keep the new prompt, since 91% beats 74% on the dev set',
+        'Re-run the search on the same 60 tickets with more budget',
+        'Give up on prompt search and go back to hand-tuning',
+      ],
+      answer: 0,
+      explain: 'The fix is in the data and the split, so repair those first. Keeping the prompt trusts a number that has already failed. More budget on the same 60 tickets overfits more. The method is not the problem here, so dropping it throws away a tool that works when it is fed a fair split.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning](https://arxiv.org/abs/2507.19457) (the method, the Pareto set, and the comparison with GRPO and MIPROv2)
+- [DSPy: optimization overview](https://dspy.ai/learn/optimization/overview/) (data sizes, the 20/80 split, and when to iterate)
+- [Quantifying Language Models' Sensitivity to Spurious Features in Prompt Design](https://arxiv.org/abs/2310.11324) (FormatSpread, how much formatting moves a score)
+- [Decagon: Optimizing GEPA for production](https://decagon.ai/blog/optimizing-gepa-for-production) (one company's ablations, including overfitting)
+- [Large Language Models as Optimizers (OPRO)](https://arxiv.org/abs/2309.03409) (a model proposes prompts and a score keeps the best)
+- [Anthropic: the prompt improver](https://claude.com/blog/prompt-improver) and [OpenAI: the prompt optimizer](https://developers.openai.com/api/docs/guides/prompt-optimizer) (the vendor tools in Question 5)

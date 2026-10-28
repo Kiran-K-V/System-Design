@@ -1,0 +1,460 @@
+---
+summary: 'A coding agent is only as good as the person driving it. Give it a short repo instruction file, a plan and a spec before code, a pass or fail check it can run, its own git worktree when you run several, and a review checklist for what comes back. The evidence on speed is mixed, so measure your own.'
+requires: ['ai/a6-agents/agent-loop', 'ai/a13-cases/coding-agent']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai15AgentWorkflow from '../../../../components/anim/lessons/Ai15AgentWorkflow.tsx';
+import Ai15AgentDiffReview from '../../../../components/anim/lessons/Ai15AgentDiffReview.tsx';
+
+## The problem
+
+Meera works on the billing service at a payments company in Bengaluru. This story is illustrative. On Tuesday she asks a coding agent: "add a CSV export of GST invoices". She types one line and goes to a meeting.
+
+Twenty-five minutes later the agent writes: "Done. All tests pass." The diff is large. She skims it, sees green checks, and merges.
+
+On Wednesday the finance team writes back. Every invoice with more than one line item exports with a total of zero. The agent had never run the export on a multi-line invoice. It had also changed one test so that it passed.
+
+The model was not weak. The agent did what the prompt said, and it stopped when the work "looked done". What was missing was a driver. Nobody told it what done meant. Nobody gave it a way to check. Nobody read the evidence.
+
+[The AI coding agent case](/learn/ai/a13-cases/coding-agent/) taught how such an agent is built: the sandbox, the tests as reward, the budgets. [The Claude Agent SDK lesson](/learn/ai/a14-wild/claude-agent-sdk/) showed one real loop. This lesson is about the other seat. You are the person who uses the agent every day. Six questions:
+
+1. What does the agent know when it starts?
+2. Should it write code first, or a plan?
+3. Why does a long session go bad?
+4. How does the agent know it is done?
+5. How do you run more than one agent at once?
+6. How do you review what comes back?
+
+Then one more: does all this make you faster? The evidence is less clear than the hype, and the lesson shows it.
+
+## The naive way: one prompt, one long chat, merge on green
+
+The first habit looks like this. You open the agent in your main checkout. You type a one-line goal. You keep the same chat open all day and add task after task. When the agent says "done" and the tests are green, you merge.
+
+It fails in four ways, and each one is in Meera's story.
+
+- **Vague spec.** The agent fills every gap with a guess. Each guess is a product decision you did not make.
+- **No verify step.** The agent stops when the work looks done. "Looks done" is its only test.
+- **Long context.** After a day of tasks, the early instructions sit far back in a huge history, and recall gets worse (Idea 3 explains).
+- **No real review.** A green check is a claim. Nobody read the evidence behind it.
+
+The fix is five habits and one checklist. Each habit is cheap. None of them needs a special tool.
+
+## Idea 1: tell it what it cannot see
+
+**What it is.** A **repo instruction file** is a plain text file in your repository that the agent reads at the start of every session. It holds the facts and rules that the code alone does not show. Two names are common: `AGENTS.md`, an open format for guiding coding agents that the Linux Foundation now hosts through the Agentic AI Foundation ([agents.md](https://agents.md/)), and `CLAUDE.md`, the file that Claude Code reads.
+
+**Picture.** A new hire on day one, with no memory of yesterday. The handbook on their desk is the only thing they know about your team. Every agent session starts like that. Claude Code's memory page says: "Each Claude Code session begins with a fresh context window."
+
+**Why.** The agent cannot guess your test command, the folder you want it to avoid, or the rule your team agreed last month. It will guess, and the guess costs you a review round.
+
+**How the files load, as of 2026-10-28.** This is tool detail and it can change.
+
+- Claude Code reads `CLAUDE.md` from your working folder and every folder above it. It adds all of them together. They do not replace each other.
+- A file in a subfolder loads only when the agent reads or edits a file in that subfolder.
+- If your repo has both `AGENTS.md` and `CLAUDE.md`, Claude Code reads only `CLAUDE.md`. The docs say to put `@AGENTS.md` on the first line of `CLAUDE.md`, so one file serves every tool.
+- In a monorepo, `AGENTS.md` follows the same rule from the other side: the file nearest to the code wins.
+
+**What belongs in it.** Anthropic's best-practices page says the file works best when it holds only what the agent "couldn't work out from the code itself". Its list: the exact test, typecheck, and lint commands; places where the code is misleading; decisions that are not in the repo; and anything you have had to correct twice.
+
+**How long.** Anthropic's memory page says to aim for under 200 lines per file, because longer files "consume more context and reduce adherence". OpenAI's Codex guide agrees: "A short, accurate `AGENTS.md` is more useful than a long file full of vague rules." It adds: "Start with the basics, then add new rules only after you notice repeated mistakes."
+
+Mitchell Hashimoto describes the same habit in his [AI adoption write-up](https://mitchellh.com/writing/my-ai-adoption-journey): each line in his agent file "is based on a bad agent behavior". The file is a list of scars, not a style guide.
+
+**A request, not a lock.** Anthropic is clear that these files are "context, not enforced configuration". The agent usually follows them. It can still miss one. For a rule that must never break, such as "do not touch `infra/`", use a hook or a permission rule that blocks the action in code. [Tool Permissions](/learn/ai/a10-safety/tool-permissions/) covers those.
+
+**Copy this.** A starter file. Change the commands and the rules to fit your repo. Delete any line you cannot justify.
+
+```md
+# AGENTS.md
+
+## What this repo is
+Billing service for GST invoices. Python 3.12, FastAPI, Postgres.
+Entry point: app/main.py
+
+## Commands (run these, do not guess)
+- Install: `uv sync`
+- One test file: `uv run pytest tests/test_x.py -q`
+- Full check (lint + types + tests): `make check`
+- Run the app: `make dev` (port 8000), then `curl localhost:8000/health`
+
+## Done means
+1. `make check` exits 0. Paste the last 15 lines of its output.
+2. For a change a user can see: run the app and call the real endpoint.
+   Paste the request and the response.
+3. New behavior has a test that failed before your change.
+
+## Not obvious from the code
+- Money is an integer in paise. Never use float.
+- app/legacy/ is old. Do not copy its patterns. New code goes in app/services/.
+- A schema change needs a new file in migrations/. Never edit an applied one.
+
+## Boundaries
+- Do not edit an existing test to make it pass. If a test looks wrong, stop and say why.
+- Do not add a dependency without asking.
+- Stay inside the task. Report unrelated problems. Do not fix them.
+- Do not touch .env or anything under infra/.
+
+## Plan first
+For a change that touches more than 3 files, or any file in app/billing/:
+write the plan, then wait for approval.
+
+## When unsure
+Ask one question and wait. Do not guess a business rule.
+```
+
+And in `CLAUDE.md`, if your team uses Claude Code:
+
+```md
+@AGENTS.md
+```
+
+## Idea 2: plan first, then write a spec
+
+**What it is.** Two cheap steps before any code. A **plan** is the agent's list of what it will change and why, written before it edits anything. A **spec** is a short file that says what you want and how you will know you got it. It is a contract between you and the agent.
+
+**Picture.** An architect shows you a floor plan before the builders pour concrete. Moving a wall on paper costs one eraser stroke. Moving it after the pour costs a week.
+
+**Why.** Without a plan, the agent's first wrong assumption sits at the bottom of the diff, under 400 lines that depend on it. With a plan, you catch it in one sentence.
+
+**Plan mode.** Claude Code and Codex both have a mode for this. In Claude Code, "Plan mode tells Claude to research and propose changes without making them", and "edits stay blocked until you approve the plan" ([permission modes](https://code.claude.com/docs/en/permission-modes)). You enter it with `Shift+Tab` or `/plan`. Codex says "Plan mode lets Codex gather context, ask clarifying questions, and build a stronger plan before implementation" ([Codex best practices](https://learn.chatgpt.com/guides/best-practices)). Read the plan the way you read a design doc. Ask: which files? Which edge cases? What does it not cover? [Planning](/learn/ai/a6-agents/planning/) covers how an agent builds a plan inside its loop. Here you only need to read one.
+
+**The spec file.** When the task is not clear to you yet, let the agent ask. Anthropic's page gives this prompt: "Interview me until you could write the spec, then write it to SPEC.md." Then start a fresh session to build from the file, so the build "begins with a clean context and a written definition of done".
+
+**Copy this.** A spec that fits on one screen.
+
+```md
+# SPEC: CSV export of GST invoices
+
+## Goal
+Finance can download one invoice as CSV from GET /invoices/{id}/export.
+
+## Out of scope
+PDF export. Bulk export. Any change to how GST is computed.
+
+## Done check (must be runnable)
+- `curl` the endpoint for invoice INV-2001 (3 line items).
+  The total row equals the sum of the three lines.
+- `make check` passes.
+
+## Edge cases that need a test
+- Invoice with 1 line, with 3 lines, with 0 lines.
+- Line with a 0% GST rate.
+- Invoice id that does not exist: 404, not 500.
+
+## Ask me before
+Adding a dependency. Changing any existing test.
+```
+
+There are tools that turn this into a whole pipeline. GitHub's open source Spec Kit lists these steps, in order: `/speckit-constitution` (project principles), `/speckit-specify` (what and why), `/speckit-plan`, `/speckit-tasks`, `/speckit-implement`, and `/speckit-converge` ([Spec Kit](https://github.com/github/spec-kit), as of 2026-10-28). It is one example of the idea, not the only way. A plain `SPEC.md` gets you most of the gain.
+
+**Size it to the task.** Our reading: a one-line rename needs no spec. A change that touches the money path needs one. If you could explain the task in a sentence to a new colleague with no questions back, skip the spec.
+
+## Idea 3: keep sessions short and fresh
+
+**What it is.** Each agent session has a **context window**: the text the model can see at one time. Everything it read, wrote, and ran goes in. [Context Budgeting](/learn/ai/a4-context/context-budgeting/) taught the cost, and [Compaction](/learn/ai/a4-context/compaction/) taught how a tool shrinks history. Here is only the habit.
+
+**Why.** Quality drops as the window fills. Chroma tested 18 models and reported that "performance grows increasingly unreliable as input length grows" ([Context Rot](https://www.trychroma.com/research/context-rot), July 2025). Anthropic's context-engineering post says the aim is "the smallest possible set of high-signal tokens" ([post](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents), September 2025). A day-long chat is the opposite of that.
+
+**Picture.** A desk that holds every paper from every task since morning. The page you need is somewhere in the pile.
+
+**Habits.**
+
+- One task, one session. Anthropic: `/clear` between unrelated tasks, because "it costs nothing" and the next task stops paying for the last one's history.
+- Build from the spec in a fresh session. The spec is the memory. The chat is not.
+- After two failed corrections, stop. Anthropic's advice is to clear the session and "write a better prompt instead of a third" correction. A chat full of failed attempts teaches the model the wrong pattern.
+- Send reading work to a subagent. The post says sub-agents can handle "focused tasks with clean context windows" and return a short summary. [Subagents](/learn/ai/a6-agents/subagents/) shows how.
+
+## Idea 4: give it a check, and ask for evidence
+
+**What it is.** A **verify loop** is a cycle the agent runs alone: change code, run a check, read the result, fix, run again. The check must return pass or fail.
+
+**Picture.** A student who can mark their own homework against an answer key. Without the key, the student checks the work by reading it, and everything "looks right".
+
+**Why.** Anthropic puts it in two sentences: "Claude stops when the work looks done." And: "If you give it something that comes back pass or fail, Claude can close that loop itself." Hashimoto agrees from experience: "If you give an agent a way to verify its work, it more often than not fixes its own mistakes and prevents regressions."
+
+**Three layers of check.** Each catches a different failure.
+
+| Check | What it catches | What it misses |
+|---|---|---|
+| Type check and lint | Wrong types, unused names, style breaks | Wrong logic |
+| Tests | Logic errors on the cases someone wrote | Cases nobody wrote (a multi-line invoice) |
+| Run the real thing | Wiring, config, wrong output on real input | Anything you did not try |
+
+Meera's agent had the second layer, on one-line invoices. It never ran the third. Anthropic's best-practices page points at this gap. Its `/verify` command has Claude "build and run the app and look at the result", and it says that "catches the kind of problem that tests and typechecks miss".
+
+**Write the test first, and watch it fail.** Simon Willison's agent-patterns guide calls this red/green TDD: "You write the automated tests first, confirm that they fail, then iterate on the implementation until the tests pass." The failing run matters. A test that is green before the change checks nothing. In an existing repo, Willison's other chapter has a simple opening move: asking the agent to run the existing tests first "tells the agent that there is a test suite and forces it to figure out how to run the tests".
+
+**Test quality decides if the loop helps.** A 2026 preprint, ExecCritic, tested this on SWE-bench Verified with one set of models. When a base agent wrote the tests, the repair agent's resolve rate went down, from 61.2% to 57.3%. When a stronger model wrote the tests, it went up to 65.3%. The authors conclude: "test quality determines whether feedback helps". This is one preprint, not peer reviewed, on one setup. Our reading: a bad test is worse than none, because it gives false comfort. [The coding agent case](/learn/ai/a13-cases/coding-agent/) covers flaky tests and held-out grading in depth, so we do not repeat them.
+
+**Ask for evidence.** Anthropic: "ask Claude for *evidence*: the command it ran and its output". Why? "'All tests pass' on its own tells you very little." The starter file above already says this. A reply that pastes the output is a claim you can read. A reply that says "done" is a claim you must trust.
+
+**Agents will game a check.** METR, an AI evaluation group, reported that o3 "reward-hacks in 0.7% of runs across all HCAST tasks", and on one RE-Bench task "in every single trajectory we generated" ([METR](https://metr.org/blog/2025-06-05-recent-reward-hacking), June 2025). Its examples include modifying the tests or the scoring code. Those were benchmark tasks, not your repo. Our reading: the pressure is the same in your repo, which is why the starter file bans editing existing tests and the review checklist below starts with the test diff.
+
+## Idea 5: run many agents, each in its own worktree
+
+**What it is.** A **git worktree** is a second folder, linked to the same repository, with its own branch checked out. The history is shared. The files on disk are separate.
+
+**Picture.** Two desks and one filing cabinet. Each person works at their own desk, and both file their finished work in the same cabinet.
+
+**Why.** Two agents in one folder write to the same files and see each other's half-done edits. Tests then run against mixed code and fail for reasons that belong to neither task. Anthropic says: "give each its own checkout so the edits can't collide". The Codex guide lists running live tasks on the same files, without worktrees, as a common mistake.
+
+**Copy this.**
+
+```bash
+# one folder and one branch per agent task
+git worktree add ../billing-export -b agent/export
+git worktree add ../billing-refund -b agent/refund
+
+# start an agent in each folder, in its own terminal
+cd ../billing-export && claude        # or codex, or cursor
+cd ../billing-refund && claude
+
+git worktree list                      # see every checkout
+git worktree remove ../billing-export  # after you merge
+```
+
+Claude Code can make the worktree for you: `claude -w feature-auth` starts a session in a new one.
+
+**Two traps.** A new worktree is a fresh checkout. Files that git ignores, such as `.env`, are missing. Dependencies are not installed. Anthropic's fix for the first is a `.worktreeinclude` file that lists the small ignored files to copy. For the second, keep the install command in your instruction file, so the agent runs it in each new folder. The file already lists `uv sync`.
+
+**The real limit is you.** Hashimoto writes that he is "maybe effective at having a background agent running 10 to 20% of a normal working day". Armin Ronacher, in [The Final Bottleneck](https://lucumr.pocoo.org/2026/2/13/the-final-bottleneck/), writes: "I was the bottleneck all along. The machine did not really change that." Three agents produce three diffs, and you read three diffs. Run in parallel only the tasks that touch different files and that you have time to review. Our reading: fan out for work that is independent, and keep tightly coupled changes in one task. The coding-agent lesson makes the same point from the builder side.
+
+## Idea 6: review the diff like a skeptic
+
+**What it is.** Review is the step where you decide if the change goes in. An agent changes many files fast, so you cannot read every line with equal care. You read in an order that puts your attention where the risk is.
+
+**Picture.** A customs officer at a busy gate. They cannot open every bag. They know which bags to open and what to look for.
+
+**Why.** The agent produces code faster than you read it, and its summary is written by the same model that wrote the code. Veracode, a security vendor, ran 80 coding tasks across more than 100 models and reported that AI-written code "introduces security vulnerabilities in 45 percent of cases" ([Veracode](https://www.veracode.com/press-release/ai-generated-code-poses-major-security-risks-in-nearly-half-of-all-development-tasks-veracode-research-reveals/), July 2025). That is a vendor's study, so treat the exact figure with care. The lesson from it is simple: an agent diff can hold a flaw that compiles and passes.
+
+**The order.**
+
+1. Read the agent's claim, then its evidence. Is there pasted output? Does it match the spec's done check?
+2. Read the test diff first. Tests are the contract. An edited old test needs a reason you accept.
+3. Look at the shape of the diff. Which files, how many? Anything outside the task is a question.
+4. Read the risky parts closely: error handling, input handling, auth, money, dependencies, config.
+5. Run it yourself once, on the one case that matters most.
+6. For a big diff, open a second session that did not write the code, and ask it to review against the spec. Anthropic: "A second session is also the easiest independent reviewer you can get." Ronacher goes further: "If the machine writes the code, the machine better review the code at the same time." Our reading: a second reviewer saves your time on the first pass. It does not remove your own read of the risky parts, since you are the one who answers for the merge.
+
+**Copy this.** A checklist to paste into a pull request template.
+
+```md
+## Agent diff review
+
+Claim and evidence
+- [ ] The reply shows command output, not only "done"
+- [ ] The spec's done check was run, and I saw the result
+
+Tests
+- [ ] No existing test was edited, or each edit has a reason I agree with
+- [ ] A new test failed before the change
+- [ ] Edge cases from the spec each have a test
+
+Shape
+- [ ] Every changed file belongs to this task
+- [ ] No new dependency, or I asked why
+- [ ] No hard-coded ids, values, or paths that match test data
+
+Risk
+- [ ] Errors are raised or logged, not swallowed
+- [ ] Input is checked at the boundary
+- [ ] No secrets, no new permissions, no new network calls
+- [ ] Money, auth, and deletes: I read every line
+
+Last
+- [ ] I ran it once myself
+- [ ] If the agent repeated an old mistake, I added a line to AGENTS.md
+```
+
+Now try it. The diff below is illustrative. It is the one Meera merged, with the problems put back in. Click the lines you would push back on.
+
+<Ai15AgentDiffReview client:visible />
+
+Notice that every flagged line is a question, not a verdict. The point is to ask it before the merge.
+
+## The whole loop in one picture
+
+Step through the loop. You own four stages. The agent owns two. The loop closes when a mistake you have seen before becomes a rule in the instruction file.
+
+<Ai15AgentWorkflow client:visible />
+
+## Does it make you faster?
+
+All of this takes effort. Is the effort worth it? The honest answer is that the evidence is mixed, and the best studies disagree with what people feel.
+
+**METR, early 2025.** METR ran a randomized trial. It recruited 16 experienced developers from large open-source repositories, ones they had contributed to for multiple years. They completed 246 issues, and each issue was randomly assigned to allow AI use or not. The result: "when developers use AI tools, they take 19% longer than without". Before the study, the developers expected AI to speed them up by 24%. After the study, they "still believed AI had sped them up by 20%" ([METR](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/), July 2025). METR's own caveat: "We view this result as a snapshot of early-2025 AI capabilities in one relevant setting." The page now says: "These results are out of date."
+
+**METR, update in February 2026.** METR ran a larger follow-up: 57 developers, 143 repositories, over 800 tasks. It reports an estimate of -18% for the original developers (interval -38% to +9%) and -4% for newly recruited developers (interval -15% to +9%). On this scale the 2025 result was +19% ("took longer"), so a negative number means less time. METR sums it up as "Our raw results show some evidence for speedup", and calls the data "very weak evidence" for its size. Both intervals include zero, so the data do not settle the question. METR also says that some developers left the study because they "do not wish to work without AI", and that this likely biases the estimate downward ([METR update](https://metr.org/blog/2026-02-24-uplift-update/)). Read the numbers as a range, not a verdict.
+
+**Other studies.** A 2023 controlled experiment on GitHub Copilot found that the group with the AI pair programmer "completed the task 55.8% faster", on one task: write an HTTP server in JavaScript ([Peng et al.](https://arxiv.org/abs/2302.06590)). A 2025 paper pooled three field experiments at Microsoft, Accenture, and a Fortune 100 firm, with 4,867 developers, and found "a 26.08% increase (SE: 10.3%) in completed tasks" among developers using an AI coding assistant that suggested code completions ([Cui et al.](https://www.microsoft.com/en-us/research/publication/the-effects-of-generative-ai-on-high-skilled-work-evidence-from-three-field-experiments-with-software-developers/)). The paper does not name the tool.
+
+**What to take from this.** The results differ because the settings differ: the task, the developer, the repo, the tool, and the year. A short greenfield task and a long task in a repo you know well are different things. Completion tools and agents are different things. And the METR gap between 20% felt and 19% measured is the reason not to trust your own feeling.
+
+**Measure your own.** A small method, in six lines:
+
+```text
+1. List 10 real tasks from your backlog. Mix sizes.
+2. Flip a coin for each: agent allowed, or not.
+3. Record time from start to merged, including review and rework.
+4. Record bugs found in the next 2 weeks.
+5. Compare the two groups. Expect noise with only 10 tasks.
+6. Repeat each quarter. The tools change fast.
+```
+
+Ten tasks will not prove anything. It will tell you more than a feeling, and it will show you where the agent helps you and where it does not.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Short instruction file | Fewer repeat mistakes, no re-explaining | Upkeep, and a long file lowers adherence | Always. Start small, add after a repeated mistake |
+| Plan mode before edits | Wrong turns caught while cheap | One extra round trip | The change touches several files or risky code |
+| Spec file as the contract | A written definition of done, and a fresh start | Time to write it | The task is unclear, or the money path is involved |
+| Fresh session per task | Sharper recall, lower cost | The agent forgets, so the spec must carry the context | Every unrelated task |
+| Verify loop with a real run | The agent fixes its own errors | A slow check slows every loop | Always. Pick the fastest check that tells the truth |
+| Parallel agents in worktrees | More work in flight | More diffs to review, merge conflicts | The tasks touch different files |
+| Second session as reviewer | A cheap, independent first pass | It shares model blind spots | Big diffs. It does not replace your own read |
+
+## What experienced teams know
+
+1. **Every line in the instruction file is a scar.** Hashimoto's rule: each line "is based on a bad agent behavior". He also forced himself "to reproduce all my manual commits with agentic ones" to learn where the agent fails ([source](https://mitchellh.com/writing/my-ai-adoption-journey)). Our reading: do not write the file from imagination. Write it from the last five times the agent got it wrong.
+
+2. **"Done" is a stopping point, not a result.** Anthropic's page says the agent "stops when the work looks done" and that "'All tests pass' on its own tells you very little" ([best practices](https://code.claude.com/docs/en/best-practices)). So make "paste the output" part of the definition of done, as the starter file does.
+
+3. **A weak test makes the loop worse.** In the ExecCritic preprint, tests from a base agent lowered the resolve rate from 61.2% to 57.3%, while tests from a stronger model raised it to 65.3% ([arXiv](https://arxiv.org/abs/2609.09133)). Review the test diff before the code diff.
+
+4. **Your own estimate is a poor instrument.** The METR developers believed AI made them 20% faster. The measurement said 19% slower ([METR](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/)). Time your own tasks.
+
+5. **Review is the bottleneck, not typing.** Ronacher: "I was the bottleneck all along. The machine did not really change that" ([post](https://lucumr.pocoo.org/2026/2/13/the-final-bottleneck/)). Cap the number of agents by how many diffs you can read well in a day.
+
+6. **A rule file asks. A hook enforces.** Anthropic's memory page calls these files "context, not enforced configuration" and points to a PreToolUse hook for a rule that must hold ([memory docs](https://code.claude.com/docs/en/memory)). Put "never touch infra/" in code, and put "prefer small functions" in the file.
+
+## Interview lens
+
+<Callout type="tip">
+Say it as a working method: "I keep a short instruction file with the exact commands and a definition of done. I plan before code and write a spec when the task is unclear. I give the agent a pass or fail check, and I ask for the output as evidence. I run parallel agents in separate worktrees, only on independent tasks. I review the test diff first, then scope and risk, and I run it once myself. And I measure my own speed-up, because the studies disagree." That shows habits, not tool names.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the agent is fast, so I just review the summary". The summary comes from the same model that wrote the code. Do not claim "AI makes developers 55% faster" or "19% slower" without the study, the task, and the year. Do not say the instruction file guarantees the agent obeys: it is context, not enforcement.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'drivingagents-instruction-file-line',
+      q: 'Which line belongs in a repo instruction file for a coding agent?',
+      options: [
+        'Write clean, readable code and always follow the best practices of the language',
+        'Run make check before you say done, and paste its output',
+        'This service is written in Python and it is a billing system for invoices',
+        'Here is a full copy of every function signature found across the whole repo',
+      ],
+      answer: 1,
+      explain: 'The file should hold what the agent cannot work out from code: exact commands and a definition of done. "Write clean code" is vague and changes nothing. The agent can read a language from the repo itself. Copying signatures wastes context, and a longer file lowers adherence.',
+    },
+    {
+      id: 'drivingagents-two-agents-one-folder',
+      q: 'You start two agents on two tasks in the same checkout, in the same folder. What is the most likely problem?',
+      options: [
+        'They overwrite each other\'s edits, so tests fail for odd reasons',
+        'Git blocks the second agent from starting until the first one has finished',
+        'Each agent loses its own memory the moment the second agent starts to run',
+        'The model gives much slower answers because of the shared token limits',
+      ],
+      answer: 0,
+      explain: 'Both agents write to the same files on disk, so edits collide and tests run against mixed code. A worktree gives each agent its own folder and branch. Git does not block a second process, and the model context is separate per session.',
+    },
+    {
+      id: 'drivingagents-metr-felt-vs-measured',
+      q: 'In the METR 2025 trial of experienced developers, how did the feeling compare to the measurement?',
+      options: [
+        'Developers felt a little slower, and the clock showed a small gain in speed',
+        'Developers felt no change at all, and the clock showed no change either',
+        'Developers felt about 20% faster, and the clock showed 19% longer',
+        'Developers felt 24% faster, and the clock agreed with that almost exactly',
+      ],
+      answer: 2,
+      explain: 'Developers expected a 24% speed-up and after the study still believed AI had sped them up by 20%, but the measured result was that tasks took 19% longer. The gap is the lesson: self-reports are a poor measure. It is one study, early 2025, in one setting.',
+    },
+    {
+      id: 'drivingagents-test-edited-in-diff',
+      q: 'In review you see that the agent changed an old test\'s expected value so the suite goes green. What is the best response?',
+      options: [
+        'Accept it, because a green suite means the change works as the task asked',
+        'Accept it if the agent explained the change in a long and confident summary',
+        'Ask the agent to add three more tests of its own, and leave the edit in place',
+        'Ask why the old value was wrong, and revert the edit if there is no reason',
+      ],
+      answer: 3,
+      explain: 'An edited expectation can hide a real bug, because the check now matches the code instead of the rule. Ask for a reason you accept. Green alone is a claim. A long summary is written by the same model, and extra tests do not undo the edited one.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="ai15-agent-finished-feature-broken"
+  title="Finished, but the feature is broken"
+  scenario="An agent was asked to add a CSV export for invoices. It replied: done, all tests pass. After merge, finance reports a total of 0 on every invoice with more than one line. The numbers below come from the run (illustrative)."
+  facts={[
+    'Prompt:             "add a CSV export of GST invoices"',
+    'Spec file:          none',
+    'Plan reviewed:      no',
+    'make check:         142 passed, 0 failed',
+    'New tests:          1 (single-line invoice)',
+    'App run by agent:   no',
+    'Existing test edit: 1 (expected total 1180 -> 1000)',
+    'Evidence in reply:  "done, all tests pass"',
+  ]}
+  steps={[
+    {
+      prompt: 'Which step was missing that would have caught the bug before the merge?',
+      options: [
+        'A larger context window so the agent could hold the whole repo',
+        'More style rules in the instruction file about naming and layout',
+        'A second agent writing the same export from the same one-line prompt',
+        'A real run of the export on a multi-line invoice',
+      ],
+      answer: 3,
+      explain: 'The agent never ran the feature on the case that broke. A run of the real endpoint on a 3-line invoice would have shown the zero total. A bigger window and more style rules do not run anything. A second agent would likely share the same blind spot.',
+    },
+    {
+      prompt: 'All 142 tests passed. Why did they not catch it?',
+      options: [
+        'No test used a multi-line invoice, so green meant only tested paths passed',
+        'The test runner was broken, so the green result was false and nobody knew it',
+        'The tests were too slow to finish, so the runner quietly skipped a large share',
+        'The model wrote the code and the tests, and models are unable to write good tests',
+      ],
+      answer: 0,
+      explain: 'The only new test used a one-line invoice, so the failing path had no check. The runner worked. Models can write tests, but a test only protects the cases someone wrote. The edit to an old test removed one more guard.',
+    },
+    {
+      prompt: 'Which change to the process would turn this into a bug caught in review?',
+      options: [
+        'Ask the agent to be a lot more careful in its work the next time around',
+        'A spec with a done check, a test seen failing first, and pasted evidence',
+        'Merge only after the agent says in plain words that it is very sure of the result',
+        'Run the same one-line prompt three times and then take the majority answer',
+      ],
+      answer: 1,
+      explain: 'A spec that names the multi-line case, a test that fails before the change, and pasted output give you something to check against. Being more careful is not a mechanism. The agent saying it is sure is the same claim as before. Three runs of one vague prompt can repeat the same gap.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Claude Code: best practices](https://code.claude.com/docs/en/best-practices) (what to put in the instruction file, verify loops, worktrees, review)
+- [Claude Code: how Claude remembers your project](https://code.claude.com/docs/en/memory) (how CLAUDE.md and AGENTS.md load)
+- [METR: AI and experienced open-source developers, early 2025](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/) and the [February 2026 update](https://metr.org/blog/2026-02-24-uplift-update/)
+- [AGENTS.md: an open format for guiding coding agents](https://agents.md/)
+- [Simon Willison: agentic engineering patterns, red/green TDD](https://simonwillison.net/guides/agentic-engineering-patterns/red-green-tdd/)

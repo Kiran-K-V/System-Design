@@ -1,0 +1,246 @@
+---
+summary: 'Data parallelism copies the model to every GPU, splits the batch, and averages the gradients. Every copy then holds all 16 bytes per parameter. ZeRO shards the optimizer states, then the gradients, then the weights across the GPUs, so per-GPU memory falls with the GPU count. Stage 3, which PyTorch calls FSDP, pays about 1.5 times the network traffic.'
+requires: ['ai/e2-training/memory-per-parameter']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE2ZeroWalk from '../../../../components/anim/lessons/AiE2ZeroWalk.tsx';
+import AiE2ZeroCalc from '../../../../components/anim/lessons/AiE2ZeroCalc.tsx';
+
+## The problem
+
+You have 64 GPUs and a 7.5B-parameter model to train. The previous lesson said a model's training state is 16 bytes per parameter. So the model needs about 120 GB of state, and an 80 GB GPU cannot hold it.
+
+The obvious tool is **data parallelism**: use all 64 GPUs, each with a copy of the model, each reading a different slice of the data. It is the most common way to use many GPUs. It also does nothing for this problem. Each of the 64 GPUs still needs the full 120 GB. You bought 64 times the memory and use it to store 64 identical copies.
+
+This lesson answers four questions:
+
+1. How does data parallelism work, and what does it cost?
+2. Why is every copy so wasteful?
+3. How does ZeRO remove the waste, one piece at a time?
+4. What does the saving cost, and when do you stop sharding?
+
+[Lesson E2.2](/learn/ai/e2-training/memory-per-parameter/) built the 16 bytes: weights 2, gradients 2, and optimizer states 12. We use those numbers here.
+
+## Question 1: how does data parallelism work?
+
+**What it is.** In **data parallel** [mid] training, every GPU holds a full copy of the model. A training batch is split into equal pieces, one per GPU. Each GPU runs the forward and backward pass on its piece and gets its own gradients. Then the GPUs average their gradients, so every copy applies the same update and the copies stay identical.
+
+**The picture.** Think of 64 proofreaders, each with the same copy of a manuscript, each reading a different chapter. At the end of the day they pool their notes into one average set of corrections, and every proofreader applies that same set to their own copy. The next morning the copies still match.
+
+**Why it exists.** It is simple, and it scales the batch with the GPU count. The only extra work is the averaging step. For a backend engineer, it resembles replicas that all must agree after every write, as in the [replication lesson](/learn/backend/04-data/replication/), except that here the agreement happens on every single step and the GPUs must wait for it.
+
+**The averaging step.** The operation that does it is an **all-reduce** [mid]. Every GPU contributes its gradients, and every GPU ends up with the sum (or average). It is built from two smaller operations that matter later:
+
+- **Reduce-scatter** [senior]: add the gradients across GPUs, but each GPU keeps only one slice of the result.
+- **All-gather** [senior]: each GPU holds one slice, and the operation gives every GPU all slices.
+
+An all-reduce is a reduce-scatter followed by an all-gather. Keep that fact in mind. It is the reason ZeRO can shard without adding traffic, which Question 4 shows.
+
+**Overlap hides the wait.** If the GPUs wait for the whole backward pass to finish before they average, they sit idle during the network transfer. The Ultra-Scale Playbook calls that naive approach a "BIG NO-NO". The fix is a hook on each parameter. As soon as one gradient is ready, its all-reduce starts, while the backward pass keeps working on earlier layers. Gradients are also grouped into buckets, so fewer, larger transfers run instead of many small ones. The network cost then hides behind compute, as long as the network keeps up.
+
+## Question 2: why is every copy wasteful?
+
+**What it is.** After the averaging step, all 64 GPUs hold the same weights, gradients, and optimizer states. The copies are the same bytes. Only the activations differ, because each GPU saw different data.
+
+**The picture.** A company with 64 offices, each of which keeps the full set of the same company records, when each office only works on its own small file. The filing cabinets are full of duplicates.
+
+**Why it matters.** The saving is large. Of the 16 bytes per parameter, 12 are optimizer state. The optimizer state is only read and written once per step, during the update. A GPU does not need all of it at all times. It needs the part it updates.
+
+The ZeRO paper (Zero Redundancy Optimizer, from Microsoft) is built on this point. Its idea: instead of every GPU keeping everything, each GPU keeps one share, and the GPUs together keep exactly one copy. Data parallelism keeps its simple structure and its easy scaling. Memory stops being copied.
+
+## Question 3: how does ZeRO share the states?
+
+ZeRO does it in three stages. Each stage shards one more item. To **shard** [mid] something means to split it into equal parts and give each GPU one part. The stages build on each other.
+
+1. **Stage 1: shard the optimizer states.** GPU k keeps quarter k of the 32-bit master weights, momentum, and variance. It updates only its quarter. It then sends the updated weights to the others. Weights and gradients stay whole on every GPU. The paper says this gives about 4 times less memory.
+2. **Stage 2: shard the gradients too.** After the backward pass, a reduce-scatter gives each GPU only the gradient slice it needs for its optimizer shard. It frees the rest. The paper says about 8 times less memory.
+3. **Stage 3: shard the weights too.** Now no GPU holds a full copy of anything. The share per GPU is 16 bytes divided by the number of GPUs. The paper says the memory falls linearly with the number of data-parallel GPUs.
+
+Step through the four-GPU case below. The heights come from the 2, 2, and 12 byte split.
+
+<AiE2ZeroWalk client:visible />
+
+### The paper's example
+
+The ZeRO paper works one example, a 7.5B-parameter model on 64 GPUs. These are its figures for the model states per GPU, activations not included:
+
+| Method | Per-GPU memory |
+|---|---|
+| Plain data parallel | 120 GB |
+| Stage 1 | 31.4 GB |
+| Stage 2 | 16.6 GB |
+| Stage 3 | 1.9 GB |
+
+Look at the pattern. Stage 1 gets most of the way in one step, but it stops at about 30 GB, because the weights and gradients are still whole. Each further stage helps less in the first step and more as the GPU count grows. Stage 3 is the only one where adding GPUs keeps reducing the share.
+
+The paper's headline: with all three stages, a trillion-parameter model can train on 1,024 NVIDIA GPUs, because the states come to 16 GB per GPU. That is the paper's claim, for states only.
+
+Now try your own case. Pick a model, a stage, and a GPU count. The calculator applies the paper's formulas, so you can check the table above, and it shows what a 70B model needs.
+
+<AiE2ZeroCalc client:visible />
+
+Read the result as a plan, not a promise. The calculator counts model states. Activations and buffers also need room, and lesson E2.2 covered how to cut activations.
+
+## Question 4: what does sharding cost?
+
+**What it is.** Network traffic. The paper counts it in units of the parameter count, per step.
+
+- Plain data parallel: an all-reduce of the gradients. The paper counts it as 2 units.
+- Stage 1: also 2 units. The all-reduce becomes a reduce-scatter plus an all-gather of the updated weights. The two together are an all-reduce, so the total is the same.
+- Stage 2: also 2 units. The paper says the total is exactly the same as plain data parallel. The Playbook agrees: stage 2 equals vanilla data parallel in traffic.
+- Stage 3: 3 units, which the paper calls 1.5 times the baseline.
+
+**Why stage 3 costs more.** In stages 1 and 2, every GPU still has all the weights, so the forward and backward pass run without waiting for anyone. In stage 3, no GPU holds the weights of the layer it must run. So before each layer, the GPUs all-gather that layer's weights, use them, and free them. The backward pass needs them again, so it gathers a second time. That second gather is the extra traffic.
+
+**The picture.** Instead of every cook keeping every ingredient on their own shelf, the kitchen has one shared pantry, with each cook holding a share. Before each dish, the cooks pass around what is needed, use it, and put it back. It saves shelf space and adds walking.
+
+**Why it is often acceptable.** The Playbook says the extra traffic "is actually not a big deal" because it overlaps with compute. While the GPUs work on layer n, the next layer's weights are already being gathered. This is called prefetching. It works if the network is fast enough to deliver the next layer before the current one finishes. That condition is the catch. A fast link inside one server may keep up. A slower link between servers may not, and the GPUs then wait.
+
+**FSDP.** PyTorch's implementation of stage 3 is called **FSDP** [mid], for Fully Sharded Data Parallel. The Playbook names it as such. The idea is the same as the ZeRO paper. If you use PyTorch, FSDP is how you get this behavior. DeepSpeed, from the ZeRO authors, is the other widely used implementation.
+
+## When to stop sharding
+
+The stages are a ladder. Each rung saves more memory and adds more risk. A simple rule: **use the lowest stage that fits.**
+
+| If | Then |
+|---|---|
+| The states fit on one GPU with room for activations | Plain data parallel. No sharding. |
+| The states almost fit | Stage 1 or 2, which add no network traffic |
+| The states do not fit even at stage 2 | Stage 3 (FSDP), and check that the network can overlap the gathers |
+| A single layer is too large for one GPU, or stage 3 is too slow | Split the model itself: lesson E2.4 |
+
+The last row needs one note. In stage 3, a GPU gathers a whole layer's weights to run that layer, so one layer must fit on one GPU. Our reading: that is a real limit of sharding, and it is one reason very large models use model parallelism as well. Lesson E2.4 covers it.
+
+The Playbook also gives a rule of thumb that data parallel size should not grow past about 512. It is guidance from one guide, not a law.
+
+<Diagnose
+  client:visible
+  id="e2-zero-stage3-slow"
+  title="More memory, less speed"
+  scenario="A team trains a 70B model on 128 GPUs spread over 16 servers of 8 GPUs. With ZeRO stage 2 it runs out of memory. They switch to stage 3 and the job fits, but its throughput is much lower than they expected."
+  facts={[
+    'stage 2:  OOM',
+    'stage 3:  fits, per-GPU state is a fraction of before',
+    'link inside a server:   fast',
+    'link between servers:   much slower',
+    'GPU utilization:        drops in bursts, in step with the weight gathers',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause of the slow-down?',
+      options: [
+        'Stage 3 gathers each layer\'s weights over the network, and the link between servers is slower than the link inside one server',
+        'Stage 3 trains a different model, so it needs more steps',
+        'Stage 3 stores fewer gradients, so the update is less accurate',
+        'The optimizer states were moved to the CPU by default',
+      ],
+      answer: 0,
+      explain: 'Stage 3 adds weight gathers in the forward and backward pass. Inside a server the fast link may keep up. Between servers the gather may not finish before the layer needs it, so GPUs wait. Sharding does not change the math or the model.',
+    },
+    {
+      prompt: 'Which action best attacks that cause?',
+      options: [
+        'Increase the sequence length',
+        'Use the lowest stage that fits, and keep the gathers on the fastest links, for example by combining sharding with other kinds of parallelism',
+        'Turn off prefetching so layers load one at a time',
+        'Add more servers, so the gathers are spread thinner',
+      ],
+      answer: 1,
+      explain: 'The aim is to keep the heavy gathers on fast links, and to shard no more than needed. Turning off prefetching removes the overlap that hides the cost. More servers add more slow-link traffic. Lesson E2.4 covers combining parallelism kinds.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Plain data parallel | Simplest, fastest per step | Every GPU holds all 16 bytes | The model state fits with room for activations |
+| ZeRO stage 1 | About 4 times less state, no added traffic | Weights and gradients stay whole | The optimizer states are what overflows |
+| ZeRO stage 2 | About 8 times less, no added traffic | More code paths | Weights fit but optimizer and gradients do not |
+| ZeRO stage 3 (FSDP) | State falls with GPU count | About 1.5 times the traffic, needs fast links | The weights themselves do not fit |
+| Add model parallelism | Room beyond what sharding gives | Layout complexity, new failure modes | A layer is too big or the link is too slow |
+
+## What experienced teams know
+
+1. **Stages 1 and 2 are nearly free.** The [ZeRO paper](https://arxiv.org/abs/1910.02054) states the same communication volume as data parallel for both. If the states almost fit, try them before stage 3.
+2. **Stage 3 costs 1.5 times the traffic.** The paper puts it at 3 units against 2. Check your link speed before you pick it.
+3. **Prefetching decides whether stage 3 is cheap.** The [Ultra-Scale Playbook](https://nanotron-ultrascale-playbook.static.hf.space/) says the cost is manageable because the next layer's weights are gathered during the current layer's compute. It works only if the network is fast enough.
+4. **Overlap the gradient sync.** The same guide says to start each gradient's all-reduce as soon as it is ready and to use buckets, rather than wait for the backward pass to end.
+5. **Do the sums per GPU, not in total.** The paper's 7.5B example shows 120 GB falling to 1.9 GB per GPU at stage 3 on 64 GPUs. The total memory used is still 16 bytes times the model, so you save memory per device, not in total.
+6. **Sharding leaves activations alone.** The ZeRO paper treats activation memory as a separate problem and discusses checkpointing for it. Plan both.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "Plain data parallel copies the model to every GPU, so each holds all 16 bytes per parameter. ZeRO removes the copies in three stages: optimizer states, then gradients, then weights. Stages 1 and 2 add no traffic. Stage 3, which PyTorch calls FSDP, gathers weights before each layer and costs about 1.5 times the traffic, so it needs fast links and prefetching. I would use the lowest stage that fits, and past that I would add model parallelism." Then name what ZeRO does not shard: the activations.
+</Callout>
+
+<Callout type="mistake">
+Do not say "data parallelism splits the model". It splits the batch and copies the model. Do not say ZeRO reduces total memory: it reduces memory per GPU by removing duplicates. Do not pick stage 3 by default, because it carries the most traffic. And do not forget that the paper's per-GPU figures count states only.
+</Callout>
+
+<Callout type="deep" title="Why an all-reduce equals a reduce-scatter plus an all-gather">
+An all-reduce gives every GPU the full sum. Break it in two. A reduce-scatter makes each GPU own one slice of the sum. An all-gather then hands every GPU all the slices. If each GPU only needs its own slice, as in stages 1 and 2 where each GPU updates only its own shard, it can skip the second half until the updated weights need to be shared. That is why sharding the optimizer states does not add traffic: the same bytes cross the network, in a different order.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In plain data parallel training, what is split across the GPUs, and what is copied?',
+      options: [
+        'The batch is copied and the model is split',
+        'The batch is split and the model is copied to every GPU',
+        'Both are split into equal parts',
+        'Both are copied, and only the gradients differ',
+      ],
+      answer: 1,
+      explain: 'Each GPU holds a full model copy and reads its own slice of the batch. Then the gradients are averaged. Splitting the model is a different technique, covered in the next lesson.',
+    },
+    {
+      q: 'Why do ZeRO stages 1 and 2 add no network traffic compared with plain data parallel?',
+      options: [
+        'They skip the gradient averaging step',
+        'They keep the gradients in memory instead of sending them',
+        'They shard the batch instead of the states',
+        'An all-reduce is a reduce-scatter plus an all-gather, so splitting it that way moves the same data',
+      ],
+      answer: 3,
+      explain: 'The same bytes cross the network, in two steps instead of one. Skipping the averaging step would leave the copies different, and the batch is not what ZeRO shards.',
+    },
+    {
+      q: 'What extra work makes ZeRO stage 3 (FSDP) cost more traffic than stage 2?',
+      options: [
+        'It gathers each layer\'s weights from the other GPUs before using the layer, in both the forward and the backward pass',
+        'It sends the activations to a parameter server',
+        'It repeats the optimizer step on every GPU',
+        'It compresses the gradients to 8 bits',
+      ],
+      answer: 0,
+      explain: 'No GPU holds the full weights at stage 3, so each layer\'s weights must be gathered when needed, and again in the backward pass. That is the 3 units against 2. Activations and the optimizer step are not what changes.',
+    },
+    {
+      q: 'A team has a model whose states almost fit on one GPU. What is the best first move?',
+      options: [
+        'ZeRO stage 3, because it saves the most memory',
+        'Stage 1 or 2, which cut memory with no added traffic, before trying stage 3',
+        'Remove the optimizer to save memory',
+        'Move to a smaller batch and ignore sharding',
+      ],
+      answer: 1,
+      explain: 'Use the lowest stage that fits. Stages 1 and 2 add no network cost. Stage 3 is for when the weights themselves do not fit. Removing the optimizer would stop training from working, and a smaller batch changes only activations.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054): the three stages, the 7.5B example, and the communication counts. Sections on partitioning are the useful part.
+- [The Ultra-Scale Playbook](https://nanotron-ultrascale-playbook.static.hf.space/): data parallelism, ZeRO, and FSDP, with the overlap tricks.
+- [PyTorch FSDP tutorial](https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html): the PyTorch API for stage 3.

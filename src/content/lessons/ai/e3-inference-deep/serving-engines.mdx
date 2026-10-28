@@ -1,0 +1,315 @@
+---
+summary: 'A serving engine is the program that turns GPU memory and kernels into an API with a scheduler. vLLM, SGLang, TensorRT-LLM, and TGI make different bets on hardware, features, and speed. Pick by your constraints, then judge it by goodput at your own load, not by peak throughput.'
+requires: ['ai/e3-inference-deep/paged-attention', 'ai/a2-inference-cost/prompt-caching', 'ai/e3-inference-deep/disaggregation']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE3TraceMarks from '../../../../components/anim/lessons/AiE3TraceMarks.tsx';
+import AiE3LoadKnee from '../../../../components/anim/lessons/AiE3LoadKnee.tsx';
+
+## The problem
+
+A team moves its chat product from an API to its own GPUs. An engineer reads a benchmark page, picks the engine at the top of the chart, and runs a load test. The result is a record: more output tokens per second than any earlier run. The team ships.
+
+Within a week the support queue fills. Users say the answers "crawl", the first words take seconds to appear, and the text freezes in the middle of a sentence. The dashboard still shows the record. Nothing is down. Every number the team chose to watch is healthy.
+
+Two things went wrong. The team picked an engine by one number, and it watched one number. This lesson fixes both. It has four questions:
+
+1. What does a serving engine do, and what parts can differ between engines?
+2. What does each of four well-known engines bet on?
+3. Which numbers tell you the truth about a running engine?
+4. How do you test an engine so the result predicts production?
+
+Earlier lessons built the parts. [Lesson A2.4](/learn/ai/a2-inference-cost/batching-throughput/) showed why batching raises throughput and costs latency. [Lesson A9.7](/learn/ai/a9-llmops/llm-dashboards/) showed why GPU busy-light numbers mislead and why goodput matters. This lesson does not repeat them. It looks at the program that makes those trade-offs and at how to measure it.
+
+## Question 1: what does a serving engine do?
+
+A **serving engine** [mid] (also called an inference server or inference framework) is the program that loads model weights onto GPUs and answers requests. Think of a restaurant kitchen. The model is the recipe book. The GPU is the stove. The engine is the head cook: it takes orders, decides what goes on the stove next, and keeps the pantry (the KV cache) in order. The same recipe and the same stove can give a fast kitchen or a slow one, depending on the cook.
+
+An engine has five jobs. Each one is a place where engines differ.
+
+- **The API.** It accepts requests over the network and streams tokens back. Most engines copy the OpenAI-style chat API so that clients do not change.
+- **The scheduler.** At every decode step it picks which requests run. This is the continuous batching of lesson E3.1: the engine is a queue with a per-step scheduler. It also decides when a new prompt's prefill may interrupt running decodes.
+- **The KV cache manager.** It hands out GPU memory for each request's saved context, in blocks, as in lesson E3.2. It can also keep blocks of shared prefixes for reuse, as in lesson [A2.5](/learn/ai/a2-inference-cost/prompt-caching/).
+- **The kernels.** A **kernel** [mid] is one program that runs on the GPU, such as attention or a matrix multiply. Fast kernels for your GPU model are a large share of an engine's speed.
+- **The parallel runtime.** It splits a model over several GPUs when one cannot hold it, and it can split prefill from decode, as in lesson E3.5.
+
+Why list these? Because a benchmark ranks the whole bundle for one model, one GPU, one traffic shape, and one software version. When any of the four changes, the ranking can change. Lesson [A2.7](/learn/ai/a2-inference-cost/self-host-vs-api/) already showed a case: the vLLM project reported 2.7x more throughput on Llama 3 8B on one H100 between two of its own releases. The engine moves as fast as the field.
+
+## Question 2: what does each engine bet on?
+
+We take four engines. For each, every claim below comes from the project's own README, docs, blog, or paper, which we fetched on 2026-10-28. A claim from a project about its own speed is a **company claim**. Read it as "what they measured, on their setup".
+
+### vLLM
+
+**What it is.** The vLLM README calls it "a fast and easy-to-use library for LLM inference and serving". It started in the Sky Computing Lab at UC Berkeley and says it is built and maintained by "a diverse community of many dozens of academic institutions and companies", with over 2,000 contributors.
+
+**The bet.** Breadth. The README lists PagedAttention, continuous batching, chunked prefill, prefix caching, speculative decoding (several methods), disaggregated prefill and decode, tensor, pipeline, data, expert and context parallelism, quantization formats, and an OpenAI-compatible API server. It names support for NVIDIA, AMD, and Intel GPUs and for CPUs, with plugins for TPUs, Gaudi, Ascend, and Apple Silicon. It lists more than 200 supported model architectures.
+
+**Picture.** A big general store. It stocks almost everything, and a new model usually lands there first or soon after. You pay for that with more settings to understand.
+
+**Why it exists.** It is built around PagedAttention. Lesson [A2.3](/learn/ai/a2-inference-cost/kv-cache/) gave the memory-waste story.
+
+**Example.** Your team wants to serve three different open models on mixed hardware and swap them often. Wide model and hardware support is the main requirement, so vLLM is the default first try.
+
+### SGLang
+
+**What it is.** The SGLang README calls it an "open-source inference framework for large language, vision-language, and diffusion models" that is "optimized for agentic workloads, large-scale serving, and RL rollouts". It lists NVIDIA, AMD, TPU, Intel, Apple Silicon, and Huawei Ascend as supported hardware. Its docs say it is "designed for low-latency, high-throughput inference with RadixAttention, prefix caching, and multi-GPU parallelism".
+
+**The bet.** Reuse of shared prefixes. **RadixAttention** [senior] keeps the KV blocks of past requests in a tree keyed by the token sequence (a radix tree), so a new request that starts with a known prefix reuses the saved work. The SGLang paper reports "up to 6.4x higher throughput compared to state-of-the-art inference systems" across several models and tasks (paper claim, against the systems of late 2023). That gain is large only when requests share prefixes: few-shot prompts, long system prompts, multi-turn chat, agent loops that resend the same history.
+
+Two later claims come from the SGLang v0.4 blog. The first is a scheduler that overlaps CPU work with GPU work. The post says "the scheduler runs one batch ahead and prepares all the metadata required for the next batch", so the GPU does not wait for the CPU. It reports a 1.1x speedup over the previous version and 1.3x over other baselines on Llama-3.2-3B with 500 prompts of 4,096 input and 2,048 output tokens, and says the gain is largest on small models and large tensor-parallel sizes. The second claim is a cache-aware load balancer that sends a request to the replica that already holds its prefix. The post reports up to 1.9x throughput and a cache hit rate that rises from 20% to 75% on 8 x A100 80GB, on a workload with many long prefix groups that were perfectly balanced. The post itself warns that results vary with the workload.
+
+**Picture.** A kitchen that remembers every half-prepared dish and starts a new order from the last good step.
+
+**Why it exists.** Agent and RAG traffic repeats the same long prefix many times. Recomputing that prefix each time is waste.
+
+**Example.** A coding agent resends a 20,000-token history on each step. Hit rate on the prefix decides cost, so the prefix cache and the router are what you compare, not raw kernel speed.
+
+### TensorRT-LLM
+
+**What it is.** NVIDIA's docs call TensorRT-LLM a "comprehensive open-source library for accelerating and optimizing inference performance" on NVIDIA GPUs. The README says it is "architected on PyTorch" and offers "custom kernels for common inference operations (attention, GEMMs, MoE, ...)" and runtime optimizations such as prefill-decode disaggregation, wide expert parallelism, and speculative decoding.
+
+**The bet.** The best possible use of NVIDIA hardware. The docs list tensor, pipeline, and expert parallelism; speculative decoding with EAGLE, MTP, and NGram; guided decoding; LoRA; in-flight batching (their name for continuous batching); and a paged KV cache with block reuse. For precision, they say FP8 is supported on H100 and later GPUs and "can double performance and halve memory consumption" relative to 16-bit floating point (NVIDIA's claim), and FP4 has native support on B200 with optimized kernels.
+
+**Picture.** A race car built by the engine maker. It is hard to beat on that maker's track and useless anywhere else.
+
+**Why it exists.** NVIDIA knows its own chips. New hardware features, such as FP4 on a new GPU, reach its own library first.
+
+**Example.** You run a fixed model on a large NVIDIA fleet for months, a few percent of cost is worth a team, and you accept tying the stack to one vendor.
+
+We could not confirm from the pages we fetched whether a separate model-compile step is still needed in the current release, so we say nothing about it. Check the docs for your version.
+
+### TGI
+
+**What it is.** TGI is Hugging Face's Text Generation Inference. Its README starts with a caution: "text-generation-inference is now in maintenance mode." The maintainers say they will accept pull requests only for minor bug fixes, documentation, and lightweight maintenance. The README points to vLLM and SGLang, and to llama.cpp or MLX for local use, as the engines "which we contribute to and recommend using going forward". On 2026-10-28 the repository page also showed the repo as archived and read-only. Check that status again before you rely on this lesson.
+
+**The bet (earlier).** A production-ready server for Hugging Face models, with continuous batching, tensor parallelism, token streaming, Prometheus metrics and OpenTelemetry tracing, and many quantization formats.
+
+**Why it matters now.** The README says TGI started the move toward optimized engines that rely on `transformers` model architectures. It did its job and the field moved on. If you run it today, new models and new hardware will not arrive there. Plan a migration.
+
+**Example.** An older deployment of TGI serves one model well. It works, so nothing breaks tonight. But the next model release may not load, so budget the move to vLLM or SGLang before you need it in an emergency.
+
+### The four side by side
+
+| Engine | What its own docs lead with | Hardware named | Watch for |
+|---|---|---|---|
+| vLLM | Throughput, PagedAttention, wide feature list and model support | NVIDIA, AMD, Intel GPUs, CPUs, plugins for others | Many options; defaults change between versions |
+| SGLang | RadixAttention and prefix reuse, agent and RL workloads | NVIDIA, AMD, TPU, Intel, Apple, Ascend | Gains depend on prefix sharing in your traffic |
+| TensorRT-LLM | Kernels and runtime tuned for NVIDIA GPUs | NVIDIA | Vendor lock-in; check the docs for your GPU generation |
+| TGI | Production server on Hugging Face models | Many, per README | Maintenance mode; migrate |
+
+How to choose, in the order the questions arrive in real projects. First, does the engine run your model on your hardware at all? That removes options fast. Second, does your traffic share long prefixes? If yes, test the prefix cache and the router on your own traffic. Third, how much is a few percent of throughput worth in engineer time? Only a large steady fleet pays for hand-tuning. Fourth, what is the project's lifecycle? TGI shows that an engine is a dependency, and dependencies can stop moving.
+
+## Question 3: which numbers tell the truth?
+
+An engine exports numbers. Which ones answer "are users happy" and which answer "is the engine near its limit"? [Lesson A9.7](/learn/ai/a9-llmops/llm-dashboards/) covers the user clocks and the busy-light trap. Here is the short version with the mechanism, then the part new to this lesson: where the numbers come from inside the engine.
+
+Every streamed request has two clocks. **TTFT** is time to first token. **TPOT** is time per output token after the first. Both are in lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/). The animation shows one request with both marks, and shows that waiting in the engine's queue counts toward TTFT even before the GPU does any work.
+
+<AiE3TraceMarks client:visible />
+
+Databricks gives the arithmetic link: a TPOT of 100 ms is 10 tokens per second per user, which they note is faster than a typical person reads. So a TPOT target is a reading-speed target. A TTFT target is a "does it feel alive" target.
+
+### Where the numbers live
+
+vLLM serves Prometheus metrics. **Prometheus** [mid] is a monitoring system that scrapes numbers from a web endpoint on a schedule. A **histogram** [mid] metric counts how many requests fell into each time bucket, so you can ask for p95 later. From the vLLM metrics page, the ones that matter for this lesson are:
+
+- Queue: `vllm:num_requests_running` and `vllm:num_requests_waiting` (gauges), and `vllm:request_queue_time_seconds` (the time spent waiting).
+- KV cache: `vllm:kv_cache_usage_perc`, where 1 means 100 percent, and `vllm:prefix_cache_hits` against `vllm:prefix_cache_queries`.
+- Preemptions: `vllm:num_preemptions`, a counter of times the engine had to evict a running request, which is a sign the KV cache is too full.
+- Latency: `vllm:time_to_first_token_seconds`, `vllm:inter_token_latency_seconds`, and `vllm:request_time_per_output_token_seconds`.
+
+The page notes that deprecated metrics are hidden in the next minor version and removed two versions later, and it warns you to check autoscaling rules and dashboards when you upgrade. Other engines expose similar numbers under other names, so write a small mapping layer and name things in your own terms. TGI's README also lists Prometheus metrics.
+
+Why these? They map to the engine's three limits. A growing waiting queue says the engine cannot admit work. A KV cache near 100% with preemptions says memory is the limit, not compute. Slow inter-token latency with a short queue says the batch is too big or the model is too large for the step.
+
+**MBU** (model bandwidth utilization) says how close decode runs to the memory limit. The formula is in lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/). Databricks adds two points worth keeping. MBU "could be unexpectedly low because of software inefficiencies", and it is useful "to compare different inference systems (hardware + software) in a normalized manner". Because MBU falls as the batch grows, a low MBU at high load is not a fault by itself. Compare engines on the same load.
+
+### Goodput, the number a leaderboard hides
+
+Throughput counts every token the engine produced. **Goodput** counts the work that met the targets. The DistServe paper's abstract describes it as the maximum rate that can be served "within both TTFT and TPOT constraints on each GPU". Lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/) introduced the idea. The next section shows what it does as load rises.
+
+## Question 4: how do you test an engine?
+
+A load test sends fake users at the engine and records what happens. Two choices decide whether the result predicts production.
+
+**What do the users do?** In a **closed-loop** test [senior], a fixed number of virtual users each send a request, wait for the answer, and send the next. When the engine slows down, the users slow down too, so the test hides overload. In an **open-loop** test [senior], requests arrive at a chosen rate whether or not earlier ones finished. Real users behave like this. The vLLM benchmark tool documents the open-loop knobs: `--request-rate` sets the target requests per second, with arrivals drawn from a Poisson process (random, independent arrivals) or a Gamma distribution, `--burstiness` sets how uneven the arrivals are, and `--max-concurrency` limits requests in flight, for example to imitate a gateway that holds back traffic. Its default request rate is infinity, which sends everything at once. That default finds the peak throughput. It does not tell you what happens at your real rate.
+
+**What do the requests look like?** Use your own mix of prompt and output lengths, and your own prefix sharing. A test with short random prompts hides the effect of prefix reuse and of long prompts that stall decodes.
+
+Now put the two together. Move the load slider in the simulator. It models one replica with continuous batching. Throughput keeps rising as load rises, because a bigger batch shares each weight read. Goodput, the share that meets both targets, rises with it and then falls. The point where goodput peaks is the **knee** [mid].
+
+<AiE3LoadKnee client:visible />
+
+Read three things off it.
+
+1. **Before the knee, the engine is healthy.** Queue time is near zero and TPOT is steady.
+2. **At the knee, the engine is full.** Adding load adds a little throughput and a lot of wait or slow tokens.
+3. **Past the knee, throughput still looks good.** That is the trap. Tighten the TPOT target and the knee moves left, with the throughput curve unchanged.
+
+The model is made up. The shape is not: it follows what Databricks measured, that a larger batch gives more throughput and slower tokens for every user. The sizing rule that follows is simple. Run each replica below its knee, and pick the knee by the targets you promised users. Lesson E3.8 turns this number into a fleet size.
+
+A few practical rules come with it.
+
+- Test at several rates, including above your expected peak, and record goodput at each, not only throughput.
+- Warm the engine first. The first requests include compile and cache effects that later ones do not.
+- Record the engine version and flags with every result. Defaults move.
+- Repeat on a real day of traffic replayed at its real arrival pattern before you trust it.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| vLLM | Widest model and hardware support, large community | Many options to learn, defaults move | Mixed models or hardware, a safe first try |
+| SGLang | Strong prefix reuse and a cache-aware router | Gains shrink when prefixes differ | Agents, RAG, multi-turn chat with long shared prefixes |
+| TensorRT-LLM | Vendor tuning for NVIDIA GPUs and new precisions | NVIDIA only, tighter coupling | Large fixed NVIDIA fleet, long-lived model |
+| TGI | An existing working deployment | No new features, maintenance mode | Only as a short bridge while you migrate |
+| Judge by peak throughput | One easy number | Hides latency and goodput | Offline batch jobs with no latency target |
+| Judge by goodput at your load | Predicts what users feel | More test work, needs your traffic | Anything interactive |
+
+## Interview lens
+
+<Callout type="tip">
+Say what you would measure before you name an engine: "I would test two engines on a replay of our own traffic at our real arrival rate, and compare goodput against our TTFT and TPOT targets, plus KV cache use and queue time. I would not pick by peak throughput. If our requests share long prefixes, I would test prefix reuse and routing first." Then name the engine as a result of the test, not as a preference.
+</Callout>
+
+<Callout type="mistake">
+Do not quote an engine's speedup without its baseline, model, hardware, and workload. Do not say "TensorRT-LLM is fastest" or "vLLM is fastest" as a fact: each project's own numbers measure its own chosen setup. Do not run a test at infinite request rate and report it as capacity. Do not recommend TGI for a new project: its maintainers say it is in maintenance mode.
+</Callout>
+
+## What experienced teams know
+
+- **GPU busy-light is not the signal.** The ChatGPT infrastructure engineer told The Pragmatic Engineer that a simple utilization metric "turned out to be misleading, as simple utilization only said whether or not the gpu was doing math in a time period". The team focused on KV cache utilization and batch size instead (Pragmatic Engineer, "Scaling ChatGPT").
+- **Your benchmark rate is a choice.** The vLLM benchmark tool defaults to an infinite request rate, which sends all requests at once. Set `--request-rate` to a real arrival rate, or you measure a burst, not a service (vLLM benchmark docs).
+- **Low MBU may be your software.** Databricks says MBU "could be unexpectedly low because of software inefficiencies" and recommends it for comparing systems on the same hardware. Use it to see how far an engine is from the memory limit, not only whether it is fast enough (Databricks).
+- **A router gain is a workload gain.** SGLang's cache-aware load balancer reached 1.9x on a workload with many long, perfectly balanced prefix groups. The post says results "might vary based on the characteristics of the workload". Measure prefix hit rate on your traffic before you plan on it (SGLang v0.4 blog).
+- **Metric names are an interface.** vLLM removes deprecated metrics two minor versions after it hides them. Pin the version and check dashboards and autoscaling rules at every upgrade (vLLM metrics docs).
+- **An engine is a dependency with a lifecycle.** TGI moved to maintenance mode and its README points users to other engines. Keep the engine behind your own API and your own metric names so a switch is a small change (TGI README).
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="e37-record-throughput"
+  title="Record throughput, unhappy users"
+  scenario="A team load-tests a new engine and reports a record. In production, users complain that the text appears in slow bursts. The numbers are illustrative."
+  facts={[
+    'load test: all requests sent at once (request rate = infinity)',
+    'output throughput: 1.4x the old engine, record high',
+    'production at peak: TPOT p95 140 ms, target 60 ms',
+    'production at peak: TTFT p95 1.1 s, target 1.5 s',
+    'KV cache use 96%, preemptions rising',
+  ]}
+  steps={[
+    {
+      prompt: 'Which number did the team fail to watch?',
+      options: [
+        'Total output tokens per second across all users',
+        'Goodput: the rate of requests that meet both the TTFT and TPOT targets',
+        'GPU busy percent as reported by the driver tool',
+        'The count of different models the engine can load',
+      ],
+      answer: 1,
+      explain: 'Throughput can set a record while most users miss the TPOT target. Goodput counts only requests that meet both targets, so it would have fallen. GPU busy percent stays high in both cases and says nothing about user speed.',
+    },
+    {
+      prompt: 'What is the most likely reason TPOT is so high at peak?',
+      options: [
+        'The network between the engine and the client is slow',
+        'The prompt is too short for the engine to batch',
+        'The batch is too big and the KV cache is nearly full, so each step is slow and requests get evicted',
+        'The tokenizer is splitting words into too many tokens',
+      ],
+      answer: 2,
+      explain: 'A KV cache at 96% with rising preemptions means memory is the limit. A large batch lengthens each decode step for every user. A slow network would delay TTFT as much as TPOT, and short prompts do not hurt batching.',
+    },
+    {
+      prompt: 'Which change to the test and the plan fixes the process, not only this incident?',
+      options: [
+        'Run an open-loop test at several real request rates and size replicas to the knee for the TPOT target',
+        'Rerun the same test and hope the number is lower',
+        'Lower the TPOT target until the production numbers pass',
+        'Switch engines every time a new benchmark appears',
+      ],
+      answer: 0,
+      explain: 'An open-loop test at real rates shows where goodput peaks, so you can run replicas below that point. Lowering the target hides the problem from the dashboard, not from users. Chasing benchmarks repeats the mistake.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'e37-q-engine-parts',
+      q: 'A serving engine has a scheduler and a KV cache manager. Which pair of jobs does each do?',
+      options: [
+        'The scheduler picks who runs each step, and the manager hands out GPU memory for saved context',
+        'The scheduler trains the model on new data, and the manager stores the finished weights on disk',
+        'The scheduler cleans the prompt text before use, and the manager counts the monthly bill',
+        'The scheduler balances load across regions, and the manager rotates the API keys of users',
+      ],
+      answer: 0,
+      explain: 'The scheduler decides per step which requests are in the batch. The KV cache manager allocates blocks for each request saved context. Training, billing, and key rotation are not engine jobs.',
+    },
+    {
+      id: 'e37-q-sglang-fit',
+      q: 'For which traffic does SGLang RadixAttention give the largest gain, by its own paper and docs?',
+      options: [
+        'Requests that are all short and have nothing in common with each other',
+        'One huge offline batch job made of unrelated documents of varied sizes',
+        'Requests that share long prefixes, such as multi-turn chat and agent loops',
+        'Requests with no system prompt, a single turn, and a different topic each',
+      ],
+      answer: 2,
+      explain: 'RadixAttention keeps KV blocks of past requests in a tree and reuses a matching prefix. Unrelated or very short requests have nothing to reuse, so the gain is small. The paper reports its best numbers on workloads with shared prefixes.',
+    },
+    {
+      id: 'e37-q-tgi',
+      q: 'A team plans a new product and proposes TGI as its engine. What does the TGI README suggest?',
+      options: [
+        'Use TGI, since it is the most actively developed engine for new open models',
+        'Prefer another engine: TGI is in maintenance mode and the README names vLLM and SGLang',
+        'Use TGI only on AMD hardware, which it alone supports among the engines named here',
+        'Use TGI because it is the only engine that offers continuous batching of requests',
+      ],
+      answer: 1,
+      explain: 'The README says TGI is in maintenance mode and recommends vLLM and SGLang going forward. Continuous batching is common to all four engines, and TGI is not limited to AMD.',
+    },
+    {
+      id: 'e37-q-open-loop',
+      q: 'A load test uses 50 virtual users who each wait for an answer before sending the next request. The engine slows down under load. What does the test show?',
+      options: [
+        'The overload clearly, since slow answers raise the request rate of the users',
+        'Less overload than production would bring, since the users slow down too',
+        'The same overload as production, since both runs use the same engine and model',
+        'Nothing at all, since closed-loop tests cannot measure latency of any kind',
+      ],
+      answer: 1,
+      explain: 'Waiting users send fewer requests when answers are slow, so the test hides overload. Real users keep arriving. An open-loop test at a chosen rate keeps arrivals independent of the engine speed. Closed-loop tests can measure latency, but they under-load a slow engine.',
+    },
+    {
+      id: 'e37-q-knee',
+      q: 'In the load simulator you tighten the TPOT target. What happens to the throughput curve and to the knee?',
+      options: [
+        'Throughput falls and the knee moves right',
+        'Throughput stays the same and the knee moves left',
+        'Both stay the same, since targets do not change the engine',
+        'Throughput rises and the knee moves left',
+      ],
+      answer: 1,
+      explain: 'The engine does the same work at each load, so throughput does not change. A stricter target makes more users count as late, so goodput peaks at a lower load and the knee moves left.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [vLLM README](https://github.com/vllm-project/vllm): the feature and hardware list used above.
+- [SGLang README](https://github.com/sgl-project/sglang) and [SGLang v0.4 release post](https://lmsys.org/blog/2024-12-04-sglang-v0-4/): the scheduler and cache-aware router claims with their setups.
+- [TensorRT-LLM overview](https://nvidia.github.io/TensorRT-LLM/overview.html) and [TGI README](https://github.com/huggingface/text-generation-inference): the NVIDIA feature list and the maintenance-mode notice.
+- [vLLM metrics](https://docs.vllm.ai/en/latest/usage/metrics.html) and [vLLM benchmark CLI](https://docs.vllm.ai/en/latest/benchmarking/cli/): metric names, and the request-rate options for an open-loop test.
+- [Databricks, LLM Inference Performance Engineering](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices) and [the DistServe paper](https://arxiv.org/abs/2401.09670): the metric definitions and the goodput idea. You do not need the paper to follow this lesson.

@@ -6,7 +6,7 @@ Date of research: 2026-10-14. Decisions applied: 2026-10-15 and 2026-10-16 (see 
 
 ## Summary: lessons per module
 
-Core path: **114 lessons** (A0 to A14). Electives: **28 lessons** (E1 to E3, optional). Total: **142**.
+Core path: **119 lessons** (A0 to A15). Electives: **28 lessons** (E1 to E3, optional). Total: **147**.
 
 | Part | Module | Title | Lessons |
 |---|---|---|---|
@@ -25,12 +25,13 @@ Core path: **114 lessons** (A0 to A14). Electives: **28 lessons** (E1 to E3, opt
 | Customization and media | A12 | Multimodal and Voice | 5 |
 | Practice | A13 | Case Studies (9 deep cases with drills) | 9 |
 | Practice | A14 | In the Wild | 6 |
+| Craft | A15 | The AI Engineer's Craft | 5 |
 | Electives (optional) | E1 | Classic ML Systems | 13 |
 | Electives (optional) | E2 | Training at Scale | 7 |
 | Electives (optional) | E3 | Inference Systems Deep Dive | 8 |
-| | | **Core total** | **114** |
+| | | **Core total** | **119** |
 | | | **Electives total** | **28** |
-| | | **All lessons** | **142** |
+| | | **All lessons** | **147** |
 
 **ML share.** Count "ML infrastructure" as classic ML, training at scale, and deep inference serving, plus the cases and teardowns built on them.
 - Before (2026-10-15): 35 of 128 lessons (27%), all on the required path. They were A3 (9), A4 (10), A5 (11), A13.1 to A13.3 (3), A14.1 and A14.6 (2).
@@ -1127,6 +1128,37 @@ _Six teardowns, each with a loaded primary source. Agent teardowns only where th
 - Animate: Tool count vs debuggability. Second: judge kappa by criterion.
 - Prove it: Diagnose. An agent with 70 tools picks wrong ones. Which fixes does the post suggest?
 - Src: [G12]
+
+### Part: Craft (A15)
+
+#### A15. The AI Engineer's Craft
+
+_Daily skills, not architecture. Added 2026-10-28. Sources not loaded yet: each lesson needs fresh research before writing._
+
+**A15.1 driving-coding-agents: Driving Coding Agents**
+- requires: A6.1, A13.6
+- Write: Repo instruction files (AGENTS.md, CLAUDE.md). Plan first, then act. Spec files as the contract. Parallel agents in git worktrees. Verify loops (tests, type check, run the app). How to review an agent diff. Where agents fail: vague specs, no verify step, context rot in long sessions.
+- Prove it: Diagnose. An agent "finished" but the feature is broken: which step was missing?
+
+**A15.2 prompt-optimization: Prompt Optimization as Search**
+- requires: A4.1, A8.3
+- Write: Hand-tuning does not scale. Treat the prompt as a parameter and the eval set as the loss. DSPy (program shape, compiled prompts). GEPA (reflective rewrite from failure traces, keep a Pareto set). Overfitting to a small eval set.
+- Prove it: Diagnose. Score rose on dev set, fell in production: why?
+
+**A15.3 model-migration: Model Migration Playbook**
+- requires: A9.3, A8.8
+- Write: New model ships. Re-run evals, diff behavior per slice, re-tune prompts, shadow traffic, staged cutover, rollback. Deprecation dates. Prompts tuned to old model quirks.
+- Prove it: Order the steps.
+
+**A15.4 debugging-model-behavior: Debugging Model Behavior**
+- requires: A1.1, A1.5
+- Write: Minimal repro of a bad output. Logprobs show where the model was unsure. Tokenization bugs (whitespace, numbers, rare names). Why temperature 0 is still not deterministic (batch invariance). Bisect the prompt. When to blame retrieval, not the model.
+- Prove it: Diagnose from a trace.
+
+**A15.5 reading-benchmarks: Reading Benchmarks Without Being Fooled**
+- requires: A1.7, A8.3
+- Write: Contamination. Leaderboard gaming and Goodhart's law. LMArena style bias. Vendor-chosen settings. Build your own one-hour "new model check" kit from your golden set.
+- Prove it: Diagnose. Which claim in a launch post should you test first?
 
 ### Part: Electives (optional) (E1 to E3)
 

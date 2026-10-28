@@ -1,0 +1,404 @@
+---
+summary: 'A model swap is a release you did not choose, on a date you did not pick. Run a fixed playbook: decide, inventory what depends on the model, read the vendor guide, replay the golden set and diff per slice, read the flipped cases, re-tune the prompt, check tokens and cost, shadow, roll out in stages with a rollback switch, and retire the old path.'
+requires: ['ai/a9-llmops/versioning', 'ai/a8-evals/rollout']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import Ai15MigLadder from '../../../../components/anim/lessons/Ai15MigLadder.tsx';
+import Ai15MigDiff from '../../../../components/anim/lessons/Ai15MigDiff.tsx';
+
+## The problem
+
+This is an illustrative story about a made-up team. We looked for a public company write-up of a model migration with numbers we could check, and we did not find one. So we did not borrow a real story.
+
+A team runs a support bot. It sorts tickets, drafts replies, and calls a refund tool. On a Monday, an email arrives: the model behind the bot will retire in about two months.
+
+A developer changes the model name in one config file. She runs the team's 200 test questions. The bot passed 179 of them on the old model. It passes 179 on the new one. The score did not move, so the team ships the change to all users on Tuesday.
+
+Two weeks later, three things surface. The support lead says that customers who write in Spanish now get replies in English. Finance says the bill is higher, and nobody changed a price. And the refund tool is called less often: the bot now explains how to ask for a refund, and does not start one.
+
+All three were in the test results on Monday. They were hiding inside a total that did not change. Some slices went up, and some went down, and the total stayed flat. Nobody read the cases. Nobody counted tokens. And the old model retires in three weeks, so going back is not an option for long.
+
+[Lesson A9.3](/learn/ai/a9-llmops/versioning/) already taught that a model is a pinned release with a retirement date. It also covered why a new model can break your prompts. This lesson does not repeat those facts. It gives you the steps to follow when the notice arrives. This lesson answers five questions:
+
+1. When does a migration start, and what depends on the model?
+2. What does the vendor say will change?
+3. Did behavior change, and where?
+4. How do you fix it, and what does it cost?
+5. How do you ship it, undo it, and finish?
+
+## Question 1: when does a migration start, and what depends on the model?
+
+Think of a rented flat. The lease ends on a fixed date. You do not wait for the last week to start packing. First, you write down the end date. Then you walk through every room and list what you own.
+
+Microsoft's [model migration guide for Foundry](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/model-migration) names four reasons to migrate. A model is retiring. A better model is available. Cost or latency is a problem. A capability gap blocks the product. Two of these come with a deadline. Two are your choice. The guide also says you do not need a notice to start. And it says that a decision to stay on the current model is a valid result.
+
+**Step 1: the trigger.** Write a short decision record. It needs three lines: who owns the migration, what the hard date is, and whether you will move or stay on purpose. The hard date is not the retirement date. The guide says to treat "the deprecation date minus your validation and rollout time" as the real deadline. Retirement dates are "not extendable" there.
+
+Here is a live example, as of 2026-10-28. Anthropic's [deprecations page](https://platform.claude.com/docs/en/about-claude/model-deprecations) lists `claude-sonnet-4-5-20250929` as deprecated on September 30, 2026, with retirement on November 30, 2026. The page names `claude-sonnet-5-5` as the replacement. Today, 33 days remain. A team that has not started still has time. But it is the time for the whole playbook, not for one deploy.
+
+**Step 2: the inventory.** Think of the walk through the flat. You list every place the model is used. Do this before you read any guide, because the guide only helps if you know what to check against it.
+
+Start with a code search. Then go beyond the code, because the model hides in many places:
+
+| Where it hides | What to write down |
+|---|---|
+| Code and config | Every model name, in every service and environment |
+| Eval jobs and notebooks | Which jobs call the model, including the judge that grades answers (see [judges](/learn/ai/a8-evals/judges/)) |
+| Prompts | Which prompt file each call site reads, and its version |
+| Settings | `max_tokens`, effort or thinking settings, sampling settings |
+| Tools and parsers | Tool descriptions, output schemas, and the code that reads replies |
+| Budgets and alerts | Cost forecasts, length caps, dashboards keyed by model name |
+| Capacity deals | Rate-limit tiers and commitments tied to one model |
+| Fine-tuned models | They have their own retirement clock (the Microsoft guide says to plan to re-tune early) |
+
+Two commands cover the first pass. The patterns are examples. Change them for your vendors.
+
+```bash
+# every place a model name appears in the repo
+rg -n -i "claude-|gpt-|gemini-" --glob '!node_modules' --glob '!*.lock' .
+
+# every call site that sends a prompt or tools
+rg -l -i "system_prompt|tool_choice|tools=" .
+```
+
+A code search finds only what is in the repo. A usage export finds the rest. Anthropic's deprecations page says the Console Usage page can export a CSV of usage by API key and model, so you can spot callers that code search missed. A key that still calls the old model, and that nobody owns, is the one that fails on the retirement date.
+
+OpenAI's [GPT-5.5 upgrade guide](https://developers.openai.com/api/docs/guides/upgrading-to-gpt-5p5) gives a similar order for the person or agent that does the upgrade. Find every model reference. Match each one to its prompt text. Flag any link you cannot confirm. Choose how big the change is. Check that tools, schemas, and parsers still fit. A flagged link is a finding. Do not guess.
+
+## Question 2: what does the vendor say will change?
+
+Think of the guide that comes with a new phone. Most pages say nothing new. A few pages say that a cable you own no longer fits. Read those pages first.
+
+**Step 3: read the vendor migration guide.** Read it for your exact starting model and your exact target. Then sort what you find into two lists.
+
+A **hard break** is a change that returns an error. Your first call fails, so a smoke test finds it in minutes. A **silent shift** is a change that still returns an answer. The answer is just different. Only an eval finds a silent shift.
+
+Here are examples from two Anthropic guides, as of 2026-10-28.
+
+| Kind | Example | How you find it |
+|---|---|---|
+| Hard break | The Haiku 5.5 guide says a `thinking` value of `{"type": "enabled", "budget_tokens": N}` "returns a 400 error". It says the same for an assistant prefill, a final assistant turn that the model continues. | A smoke test on the first call |
+| Silent shift | The Sonnet 5.5 guide says a request with no `thinking` field runs with adaptive thinking. On Sonnet 4.5 the same request ran without thinking. | Replay and cost check |
+| Silent shift | Both guides say the same text becomes about 30 percent more tokens than on the older models, and the exact change depends on content. | Token count on your own prompts |
+| Silent shift | The Haiku 5.5 guide says its safety classifiers can decline a request. For code moving from Haiku 4.5, "these refusals are new". | Count of `refusal` stop reasons in replay |
+| Silent shift | The Haiku 5.5 guide says Claude 4 and later models have a more concise, direct style and "need explicit direction". | Read the flipped cases |
+
+You already know the tokenizer and the rejected settings from [lesson A9.3](/learn/ai/a9-llmops/versioning/). The new point here is the sort. Every line in a guide goes into one of two lists. The hard-break list becomes tickets. The silent-shift list becomes things to watch in the replay. A change that nobody has read is a change that nobody watches.
+
+Both vendors now offer a tool that does the first pass. Anthropic's guides show a Claude Code command: `/claude-api migrate this project to claude-sonnet-5-5`. OpenAI's upgrade guide tells a coding agent to "replace the model string first" and to "prefer prompt-only upgrades when possible". These tools are a good draft. They change code. They cannot tell you whether the new behavior is acceptable. Read the diff they produce, as you would read a pull request from a new teammate.
+
+## Question 3: did behavior change, and where?
+
+Think of a school report. A pupil's average is the same as last year. But the maths mark went up and the reading mark went down. Only the separate marks tell you what to teach.
+
+**Step 4: replay unchanged.** Run your golden set ([lesson A8.3](/learn/ai/a8-evals/golden-sets/)) on the new model. Change nothing else. Same prompt, same settings, as far as the new model allows. The Microsoft guide gives the reason: "Replay unchanged before you tune." This isolates "the behavior that the *model* changed from the changes *you* introduce".
+
+Three rules make the replay trustworthy. The guide states two of them, and the third is plain practice.
+
+- **Freeze the set.** Keep inputs, expected answers, and success criteria fixed for the whole migration. The guide says that if any of them change, you can no longer compare old and new.
+- **Use the same graders.** The guide says to run "the identical set of evaluators" on both models.
+- **Re-run the old model today.** Do not compare to a score from last month. A fresh run on the old model, with the same set and graders, is the baseline.
+
+**Step 5: diff per slice.** A **slice** is a group of test cases that share a trait: a topic, a language, a tool, a length. You tag the cases once. The [error analysis lesson](/learn/ai/a8-evals/error-analysis/) shows where good tags come from. Then you report the pass rate for each slice, old and new, side by side.
+
+Why? A total is an average, and an average can hide a swap. Use the widget below. It shows the same 200 made-up cases twice. All numbers are illustrative.
+
+<Ai15MigDiff client:visible />
+
+Look at the slice view. Two slices lost 10 points or more. Two gained. The total did not move. A team that reads only the total ships this change. A team that reads the slices knows where to look.
+
+A word of care: a small slice is noisy. Twenty cases is a small sample, and a change of a few cases moves the percent a lot. Lesson [A9.3](/learn/ai/a9-llmops/versioning/) made the same point about one score on 200 cases. So the slice diff does not give a verdict. It gives a reading list.
+
+**Step 6: read the flipped cases.** A **flip** is a test case whose result changed between old and new. Open every flip in a flagged slice. Read the old answer, then the new answer. Write the cause in words.
+
+This step is the one that teams skip, and it is the one that pays. A score says that something changed. Only the answers say what. The Microsoft guide lists the changes that most often appear: verbosity, reasoning depth, structured-output adherence, tool-call shape, refusal behavior, and latency variance. Use that list as a starting set of cause labels. Add your own as you go.
+
+Read the flips in both directions. A case that went from fail to pass is also a flip. Check that it passed for a good reason. A judge may favor longer answers, and a new model may write longer answers (see [judges](/learn/ai/a8-evals/judges/)). A pass for the wrong reason is a future failure.
+
+Then record what you found. Copy this template. The two example rows match the widget above.
+
+| Slice | n | Old | New | Change | Flips read | Cause (in words) | Action |
+|---|---|---|---|---|---|---|---|
+| Needs a tool call | 40 | 90% | 80% | -10 | all | Writes steps in text, skips the refund tool | Fix prompt |
+| Not in English | 20 | 85% | 70% | -15 | all | Replies in English | Fix prompt |
+| Refund questions | 80 | 90% | 96% | +6 | 5 of 5 | Shorter, clearer answers | Accept |
+| (your slice) | | | | | | | Fix prompt / Fix code / Accept / Block |
+
+Give every row one action. **Fix prompt** goes to Step 7. **Fix code** is for parsers, schemas, and settings. **Accept** means the new behavior is fine. **Block** means the new model cannot ship yet. A table with a blank action column is not finished.
+
+## Question 4: how do you fix it, and what does it cost?
+
+Think of a driver who moves to a new car. The pedals are the same. But the brake is more sensitive, and the mirrors sit in new places. The driver does not need new lessons. The driver needs a short time to adjust, and a way to check that the adjustments work.
+
+**Step 7: re-tune the prompt.** A prompt is tuned to one model, often without anyone knowing it. A migration is the moment those hidden habits show.
+
+What do vendors say? They disagree, and that is useful. Anthropic's [Haiku 5.5 prompting guide](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-haiku-5-5) says: "Existing Claude Haiku 4.5 prompts should perform well without changes." OpenAI's [GPT-5 guide](https://developers.openai.com/api/docs/guides/gpt-5) says Cursor found that "sections of their prompt that had been effective with earlier models needed tuning". Both are vendor statements about particular models and particular workloads. Neither is a result for your bot. Your replay decides.
+
+How much can a rewrite matter? Not Diamond, a company that sells prompt adaptation, ran one test on a banking intent task (Banking77, a 200-case subset). The company published these accuracies: GPT-4o with the original prompt 82.5%, Claude Sonnet 4 with the same prompt 80%, and Sonnet 4 with a rewritten prompt 89%. This is a vendor claim from one small test. Read it as a direction, not as a promise. The direction matches the lesson of the previous step: the same prompt can lose on a new model, and a rewrite can win it back.
+
+Follow these rules when you re-tune:
+
+1. **Change one thing per run.** If a run has two changes, you cannot say which one helped.
+2. **Log every change.** Write the change, the reason, and the score. The Microsoft guide warns that prompt changes are "easy to do and easy to lose". Copy your original prompt first.
+3. **Tune on one part of the set, and check on another.** If you tune on every case, the score climbs and means little. [Lesson A15.2](/learn/ai/a15-craft/prompt-optimization/) covers this failure in depth.
+4. **Treat an automatic optimizer as a draft.** OpenAI's [prompt optimizer guide](https://developers.openai.com/api/docs/guides/prompt-optimizer) says: "Always evaluate and manually review optimized prompts before using them in production." The Microsoft guide says its optimizer applies general practice in one pass, and does not fit to your data.
+5. **Audit old patches.** This is the step teams forget. Many prompt lines exist to fix a failure of the old model. The new model may not have that failure. The line may now do harm. Anthropic's Haiku 5.5 guide gives an example from its own tests. A blanket instruction to search for any present-day factual question "made the model search on half of the prompts that needed no search". It "didn't produce more correct answers". OpenAI's GPT-5 guide says that contradictory or vague instructions can be "more damaging to GPT-5 than to other models".
+
+For rule 5, make a small audit table. One row per instruction in the prompt:
+
+```text
+Prompt line                          Why it is there                 Old-model patch?   Plan
+"Reply in JSON only, no prose"       Old model added a chatty intro  Yes                Test removal
+"Never call the refund tool twice"   Real incident, March            No                 Keep
+"ALWAYS answer in English"           Old model drifted to Spanish    Yes                Test removal
+```
+
+A line that is a patch gets a removal test: run the set with and without it. Keep the line only if the score drops without it.
+
+**Step 8: check tokens, latency, and cost.** Do this before any user sees the new model. You already have a replay set. Measure these on it, old and new:
+
+| Measure | Why it moves in a migration |
+|---|---|
+| Input tokens | A new tokenizer cuts the same text into more tokens. Anthropic's guides say about 30 percent more for the newer tokenizer, depending on content. That is a vendor claim. Measure your own prompts. |
+| Output tokens | Thinking can be on by default. The Sonnet 5.5 guide says thinking tokens are billed as output tokens. |
+| p95 latency | The **p95** is the time that 95 out of 100 requests beat. More thinking makes the slow tail slower. |
+| Price per token | It can differ between models, so the guides say to re-baseline cost. |
+| Cost per request | The result of all four rows above, on your real prompts. |
+
+Count tokens with the new model. The Haiku 5.5 guide says to count prompts "with `model` set to `claude-haiku-5-5` rather than reusing counts measured on Claude Haiku 4.5". A `max_tokens` limit tuned on the old model may also cut off a reply on the new one. Thinking tokens count toward the limit, so a small limit can end a reply before the answer starts.
+
+Many new models also have an effort setting. The Haiku 5.5 guide says to compare "two or three of these levels on your own evals". That is another dimension to sweep. A higher level may buy quality, and it will cost tokens and time. Pick the level from your numbers.
+
+Microsoft's guide adds a warning for planning: pricing structure shifts between model generations, and reasoning tokens, cached input, and structured-output overhead "can swing unit economics by 2x or more". So project monthly cost from your own token logs, not from a price list. OpenAI's guide is shorter: "Do not claim token savings without task-level validation."
+
+Agree on the limits before you measure. For example: p95 not above a set ratio, cost per request not above a set ratio. Step 8 ends with a pass or a fail for each limit. It does not end with a feeling.
+
+## Question 5: how do you ship it, undo it, and finish?
+
+Think of a bridge reopening. Engineers do not open it to all traffic on the first morning. They let a few vehicles cross, watch the supports, and keep the old ferry running until the bridge has proved itself.
+
+**Step 9: shadow, then roll out in stages.** [Lesson A8.8](/learn/ai/a8-evals/rollout/) teaches the ladder in full: shadow, canary, gates, rollback. [Lesson A8.7](/learn/ai/a8-evals/online-evals-ab/) teaches how many requests a canary needs. Do not read them again here. This lesson adds what is special about a model migration.
+
+**Shadow** means to copy live requests to the new model, grade the answers, and drop them. Users see only the old answer. The Microsoft guide says: "When you can't canary, use shadow or mirror mode." It names regulated flows as the common reason. Tian Pan, an individual engineer and not a vendor, writes that shadow should run "one to two weeks". That is advice from one author, not a measured result.
+
+**A staged rollout** moves a growing share of users to the new model. The same author suggests 5%, 25%, 50%, then 100%, with at least 4 to 6 hours at each step. The author also gives rollback limits, such as a semantic quality drop of more than 5 points or cost per request more than 20% above projections. These are one engineer's suggestions. Set your own limits, and set them from your replay and cost-check numbers. Your Step 4 baseline is what the gates compare against.
+
+The **rollback switch** is one setting that sends all traffic back to the old model, with no deploy. A small routing file can be that switch:
+
+```yaml
+# routing.yaml: one place decides which model answers
+feature: ticket-triage
+stable:    { model: claude-sonnet-4-5-20250929, prompt: triage@v14 }
+candidate: { model: claude-sonnet-5-5,          prompt: triage@v15 }
+candidate_share: 0.05     # 0 sends everyone to stable
+kill_switch: false        # true sends all traffic to stable, at once
+stable_retires_on: 2026-11-30   # a reminder: rollback ends here
+```
+
+Notice the model and the prompt move together. A rollback that switches the model and keeps the new prompt is not a rollback.
+
+How long do you keep the old path? The Microsoft guide says embedded teams "typically want about 30 days" as a rollback corridor. But the corridor has a hard end: the day the old model retires. Today, with 33 days left on Sonnet 4.5, a 30-day corridor needs you at 100% in about three days. A team that starts late gets a short corridor, or none. The guide also says that a rollback decision forced by a deprecation deadline, and not by evidence, "is a sign the migration started too late".
+
+Some migrations are not all-or-nothing. The guide notes that real migrations are often split: a latency-sensitive or high-risk path may stay on the old model for weeks while the rest moves.
+
+**Step 10: retire the old path.** The migration is not done when traffic reaches 100%. Do these four things:
+
+1. Delete the old model branch and the old prompt version from the code.
+2. Confirm that the old deployment is retired or removed, so it does not keep running and costing money.
+3. Archive the replay results, the behavior diff table, and the prompt change log.
+4. Update the places a person reads: runbooks, dashboards, docs, and any page that names the old model.
+
+Then add fresh production traces to your golden set. The Microsoft guide says this makes the next migration start cheaper. The next notice will come.
+
+## The naive way: swap the string and ship
+
+The common first design is what the story told. Change the model name. Run the test set. Look at the total. Deploy to everyone.
+
+It fails in five ways. The total hides slices that moved in opposite directions. Nobody reads the flipped cases, so a cause is never found. Nobody counts tokens, so the bill surprises you. The change goes to all users at once, so the first signal is a complaint. And no rollback switch exists, so the fix is a rushed deploy with a retirement date behind it.
+
+## The real fix: one playbook on one page
+
+The fix is to do the same ten steps every time, in the same order, so that a notice does not become a crisis. Step through the playbook below. Each step has an output and a stop sign. If you cannot produce the output, or the stop sign applies, you do not move on.
+
+<Ai15MigLadder client:visible />
+
+Here is the checklist in a form you can copy into a ticket. Each line has an output you can check.
+
+```text
+MODEL MIGRATION CHECKLIST            owner: ______   hard date: ______
+
+[ ] 1 Trigger     Decision record: owner, real deadline, go or stay
+[ ] 2 Inventory   List of every call site, prompt, setting, judge, budget
+                  Usage export by key and model checked for unknown callers
+[ ] 3 Read guide  Hard-break list (becomes tickets)
+                  Silent-shift list (becomes things to watch)
+[ ] 4 Replay      Old model re-run today on the frozen set, same graders
+                  New model run with prompt and settings unchanged
+[ ] 5 Slice diff  Per-slice table, old vs new, with the case count n
+[ ] 6 Read flips  Every flip in flagged slices read, cause written in words
+                  Fail-to-pass flips checked for the right reason
+[ ] 7 Re-tune     Original prompt copied. One change per run. Change log kept.
+                  Old-model patches audited. Held-out part of the set checked.
+[ ] 8 Cost check  Input tokens, output tokens, p95, cost per request: old vs new
+                  Tokens counted with the NEW model. Effort level compared.
+[ ] 9 Roll out    Shadow with write tools stubbed
+                  Staged share with gates set from steps 4 and 8
+                  Rollback switch tested BEFORE the first real user
+[ ] 10 Retire     Old path deleted. Old deployment confirmed gone.
+                  Results archived. Docs updated. New traces added to the set.
+```
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Start at the notice | Time for every step, a long rollback corridor | Work before it feels urgent | Always for a model you cannot lose |
+| Wait for the deadline | Nothing for the team | A forced swap and no rollback | Never, if you can help it |
+| Replay unchanged before tuning | A clean baseline | One extra run | Always |
+| Change the model string only | A small, easy diff | You may leave quality on the table | The replay shows no flagged slice |
+| Re-tune the prompt | Often recovers lost slices | Time, and a risk of overfitting a small set | A flagged slice has a cause a prompt can fix |
+| Shadow before the canary | Real inputs, zero user risk | Extra inference cost | Any change with a real slice drop or an unknown |
+| Skip shadow, go to a small canary | Faster | Real users see the first mistake | A small, well-tested change |
+| Long rollback corridor | Real undo | Two paths to keep running | Until the old model's retirement date |
+| Use a vendor migration tool | Fast first draft of code changes | You must still review every change | Code changes with a clear guide |
+
+## What experienced teams know
+
+1. **Replay before you tune, and freeze the set.** Microsoft's [migration guide](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/model-migration) says to "replay unchanged before you tune" and to keep the dataset and criteria frozen for the whole migration. If you change the model and the prompt in one step, you cannot say which one moved the score. Tag the baseline run in your results store, so it cannot be lost.
+
+2. **"No changes needed" is a claim to test.** Anthropic says existing Haiku 4.5 prompts [should perform well](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-haiku-5-5) on Haiku 5.5. OpenAI's [GPT-5 guide](https://developers.openai.com/api/docs/guides/gpt-5) says Cursor had to tune sections of its prompt. Both statements can be true for different workloads. Your replay is the only source that speaks for your prompts.
+
+3. **A patch for one model can hurt the next.** In Anthropic's own tests, a blanket instruction to search for any present-day factual question made the model search on half of the prompts that needed no search, with no gain in correct answers ([Haiku 5.5 prompting guide](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-haiku-5-5)). So give every prompt line a reason, and test the removal of each line that was a patch.
+
+4. **A new default can raise your bill with no price change.** The [Sonnet 5.5 migration guide](https://platform.claude.com/docs/en/models/sonnet-5-5/migration-guide) says a request with no `thinking` field now runs with adaptive thinking, and thinking tokens are billed as output tokens. The guide also lists about 30 percent more tokens for the same text. So measure cost per request on your own set, with your real settings. OpenAI's [upgrade guide](https://developers.openai.com/api/docs/guides/upgrading-to-gpt-5p5) says: "Do not claim token savings without task-level validation."
+
+5. **Your rollback window ends when the old model does.** The Microsoft guide says retirement dates are not extendable, and that embedded teams typically want about 30 days of rollback corridor. With Sonnet 4.5 retiring on November 30, 2026 ([Anthropic deprecations](https://platform.claude.com/docs/en/about-claude/model-deprecations)), a team that starts on October 28 has about three days of slack for a full corridor. Put the retirement date in the routing file, next to the kill switch.
+
+6. **Retiring is a step, not a clean-up.** The same Microsoft guide says teams that skip retirement collect zombie deployments, and that people forget to update the docs that name the old model. Make the four retirement actions tickets with owners. And add fresh traces to the golden set while the migration is still in your head.
+
+## Interview lens
+
+<Callout type="tip">
+Say it as a sequence: "A model swap is a release with a deadline. I write a decision record, inventory every call site and the judge, and read the vendor guide, sorting changes into hard breaks and silent shifts. I replay the frozen golden set on old and new models with nothing else changed, diff per slice, and read the flipped cases. Then I re-tune one change at a time and audit old-model patches. I check tokens, p95, and cost per request. I shadow, roll out in stages with a one-switch rollback, and retire the old path when it is done." That shows order, evidence, and an end date.
+</Callout>
+
+<Callout type="mistake">
+Do not say "the score is the same, so it is safe". A total can hide a slice that fell. Do not tune the prompt before you replay it unchanged. And do not say "we can roll back" without naming the day the old model retires. Rollback ends on that day.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'migration-replay-unchanged-first',
+      q: 'Why run the golden set on the new model with the prompt unchanged before you tune the prompt?',
+      options: [
+        'The vendor will not give support to a team that tunes before it replays',
+        'It shows what the model changed alone',
+        'An unchanged prompt always scores higher on a new model than a tuned one',
+        'A vendor rule forbids any prompt tuning on a new model at all',
+      ],
+      answer: 1,
+      explain: 'A replay with nothing else changed gives a baseline. Any later score change can be tied to your edit. If you change the model and the prompt together, you cannot say which one moved the score.',
+    },
+    {
+      id: 'migration-same-total-hidden-slices',
+      q: 'The old and new models both pass 179 of 200 cases. What can you NOT conclude?',
+      options: [
+        'That the total pass rate is the same on both models',
+        'That the set held 200 cases in all',
+        'That the old model passed a good share of the cases',
+        'That each slice behaves the same',
+      ],
+      answer: 3,
+      explain: 'A total is an average. Some slices can rise while others fall, and the total stays flat. Only a per-slice table, and a read of the flipped cases, shows where behavior moved.',
+    },
+    {
+      id: 'migration-recount-tokens-new-model',
+      q: 'You move to a model with a newer tokenizer. How should you get the token count for your prompts?',
+      options: [
+        'Count with the new model itself',
+        'Reuse the old counts, since the text itself has not changed',
+        'Divide the old count by the ratio of the two prices',
+        'Ask the new model to guess the count from the text',
+      ],
+      answer: 0,
+      explain: 'The same text can become more tokens on a new tokenizer, so old counts are wrong for the new model. Count with the new model, then re-check max_tokens and cost. Do not reuse old numbers.',
+    },
+    {
+      id: 'migration-rollback-corridor-limit',
+      q: 'What sets the outer limit of your rollback corridor during a migration forced by retirement?',
+      options: [
+        'The date of your first canary',
+        'The size of your golden set',
+        'The retirement date of the old model',
+        'The number of slices you have defined',
+      ],
+      answer: 2,
+      explain: 'Rollback works only while the old model runs. After its retirement date, requests to it fail. So the corridor can never reach past that date, and a late start makes the corridor short.',
+    },
+  ]}
+/>
+
+## Prove it
+
+<Diagnose
+  client:visible
+  id="ai15-order-the-migration"
+  title="What comes next?"
+  scenario="A team gets a retirement notice for the model behind its support bot. The old model retires in 33 days. The team has a 200-case golden set, a routing file, and no shadow setup yet. Follow the playbook, one decision at a time."
+  steps={[
+    {
+      prompt: 'The notice just arrived. What is the first move?',
+      options: [
+        'Change the model name in production, then watch the error dashboard for a week',
+        'Write a decision record, then list every call site that uses the model',
+        'Start a 1% canary today, so the team learns as fast as it can from live users',
+        'Rewrite the whole prompt for the new model, before it has been tested at all',
+      ],
+      answer: 1,
+      explain: 'You cannot check a migration against a guide until you know what depends on the model. The decision record gives an owner and a real deadline. The inventory finds the call sites, and the judge, that the change will touch. Everything else comes after.',
+    },
+    {
+      context: 'The team replays the frozen set with the prompt unchanged. The new model passes 179 of 200, the same as the old model. But the per-slice table shows tool-call cases fell from 90% to 80%, and Spanish cases from 85% to 70%.',
+      prompt: 'The total is flat. What is the next step?',
+      options: [
+        'Ship to everyone, because the total did not fall',
+        'Raise the temperature on the new model to recover the slices',
+        'Open the flipped cases in the two flagged slices, and write each cause in words',
+        'Drop the two slices from the golden set, because they are small',
+      ],
+      answer: 2,
+      explain: 'The slice table says where to look. The flipped cases say why. The cause decides the action: fix the prompt, fix the code, accept the change, or block the swap. Dropping slices hides the problem. Shipping on the total repeats the Monday mistake.',
+    },
+    {
+      context: 'The flips show that the new model writes refund steps in text and skips the tool, and replies in English to Spanish tickets. The team changes the prompt one line at a time. Both slices now pass at their old rates on a held-out part of the set.',
+      prompt: 'What must happen before any real user sees the new model?',
+      options: [
+        'Move to 100% at once, since the slices have recovered and the work is done',
+        'Delete the old model path now, so that nobody can send traffic back to it',
+        'Check tokens, p95, and cost on the same set, then shadow live traffic',
+        'Skip the cost check, because the price list shows the same price as before',
+      ],
+      answer: 2,
+      explain: 'Quality is one of several limits. A new tokenizer or default thinking can change tokens, p95, and cost with no price change, so measure them on your own set. Then shadow shows real inputs with zero user risk. Deleting the old path removes the rollback.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Microsoft Foundry: model migration](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/model-migration) (a six-phase process: Discover, Assess, Adapt, Validate, Roll out, Retire)
+- [Claude Sonnet 5.5 migration guide](https://platform.claude.com/docs/en/models/sonnet-5-5/migration-guide) (a checklist by starting model; thinking on by default)
+- [Claude Haiku 5.5 migration guide](https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide) (hard breaks, token recount, prefill)
+- [Prompting Claude Haiku 5.5](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-haiku-5-5) (what to re-test in your prompts, and why blanket instructions backfire)
+- [OpenAI: upgrading to GPT-5.5](https://developers.openai.com/api/docs/guides/upgrading-to-gpt-5p5) (a step list for a model-string upgrade, and validation advice)
+- [Anthropic: model deprecations](https://platform.claude.com/docs/en/about-claude/model-deprecations) (dates, replacements, usage export)
+- [Not Diamond: better models, worse results](https://www.notdiamond.ai/blog/better-models-worse-results) (a vendor test of one prompt on two models)
+- [Tian Pan: model migration as database migration](https://tianpan.co/blog/2026/04/20/llm-model-migration-production-playbook) (one engineer's shadow, canary, and rollback advice)
+- [Prompt Migration: Stabilizing GenAI Applications with Evolving Large Language Models](https://arxiv.org/abs/2507.05573) (a case study of successive GPT upgrades in one enterprise search product)

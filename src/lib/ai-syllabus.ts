@@ -1,6 +1,6 @@
 // AI track outline. Titles only. Source: AI_SYSTEM_DESIGN_PLAN.md section 3.
 // Lesson ids are "ai/<module.slug>/<lesson.slug>". Every lesson is "coming soon" until an MDX file exists.
-// Core modules are A0 to A14. Elective modules E1 to E3 carry a `label` so they show as "E1", "E1.3".
+// Core modules are A0 to A15. Elective modules E1 to E3 carry a `label` so they show as "E1", "E1.3".
 import type { ModuleOutline } from './syllabus';
 
 export const aiSyllabus: ModuleOutline[] = [
@@ -206,6 +206,17 @@ export const aiSyllabus: ModuleOutline[] = [
       { slug: 'linkedin-genai', title: 'LinkedIn GenAI Product' },
       { slug: 'claude-agent-sdk', title: 'Claude Agent SDK: The Agent Loop' },
       { slug: 'shopify-sidekick', title: 'Shopify Sidekick' },
+    ],
+  },
+  {
+    slug: 'ai/a15-craft',
+    title: "The AI Engineer's Craft",
+    lessons: [
+      { slug: 'driving-coding-agents', title: 'Driving Coding Agents' },
+      { slug: 'prompt-optimization', title: 'Prompt Optimization as Search' },
+      { slug: 'model-migration', title: 'Model Migration Playbook' },
+      { slug: 'debugging-model-behavior', title: 'Debugging Model Behavior' },
+      { slug: 'reading-benchmarks', title: 'Reading Benchmarks Without Being Fooled' },
     ],
   },
   {

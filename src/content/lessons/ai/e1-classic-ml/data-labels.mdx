@@ -1,0 +1,236 @@
+---
+summary: 'Labels come from users, from people, or from rules, and each source has a bias. Fraud is rare, labels arrive late, and a random split leaks the future. Split by time and judge with precision and recall, not accuracy.'
+requires: ['ai/e1-classic-ml/problem-framing']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE1LabelTimeline from '../../../../components/anim/lessons/AiE1LabelTimeline.tsx';
+import AiE1ImbalanceSim from '../../../../components/anim/lessons/AiE1ImbalanceSim.tsx';
+
+## The problem
+
+A payments team trains a fraud model. The report says 99.9% accuracy. The team is happy. A week after launch, the fraud team says the model has not caught a single fraud.
+
+Both statements are true. The model learned to say "not fraud" every time. Stripe, in its write-up of how it built Radar, says "fraud is rare—on the order of 1 out of every 1,000 payments" ([Stripe](https://stripe.dev/blog/how-we-built-it-stripe-radar)). A model that never flags anything is right about 999 payments in 1,000.
+
+This lesson is about the data side of that trap. In lesson E1.1 you chose a label as one link in the chain from goal to model. Now we look at where labels come from and why they are messy. A **training example** is one row: the input facts about a case, plus a **label**, the right answer you want the model to learn. The set of these rows is the **training set**.
+
+This lesson answers five questions:
+
+1. Where do labels come from?
+2. What goes wrong when positives are rare?
+3. Why do labels arrive late, and what does that do?
+4. How does the way you collect data bias the labels?
+5. How should you split data so the test is honest?
+
+## Where labels come from
+
+There are four common sources. Each trades cost, speed, and quality in a different way.
+
+**Explicit labels.** The user tells you directly. A star rating, a thumbs up, a "report spam" button. They are clean and clear. But few users bother, and those who do are not typical. Think of a restaurant comment card: only the very happy and the very angry fill it in.
+
+**Implicit labels.** You infer the answer from behavior. A click, a long watch, a purchase, a skip. Huyen's book calls labels that come from the system's own behavior "natural labels", and notes that for tasks like delivery time estimation and recommendation they exist but are often delayed: "natural labels are usually delayed" (chapter 4 of the [book's summary](https://github.com/chiphuyen/dmls-book/blob/main/summary.md)). They are cheap and plentiful, since every user produces them. But they are noisy. A click may mean "interested" or "misled". Lesson E1.1 showed how a model can game them.
+
+**Human labels.** Paid raters read each example and give an answer. They are the closest to ground truth when the rule for the label is clear. They are slow and cost money per row. The same summary says "hand labels can be expensive and slow". Raters also disagree, so serious teams write guidelines and measure how often raters agree.
+
+**Programmatic labels.** A rule, or a set of rules, labels the data. For example: "if a payment came from a card that was reported stolen within a day, label it fraud". Or you use an older model as a labeler. This is the family that the book's summary lists as "weak supervision, semi-supervision, transfer learning, and active learning" as alternatives to hand labeling. It is fast and cheap. It is also only as good as the rule, and the new model learns the rule's mistakes.
+
+A useful picture: labels are like the answer key for a school test. A teacher can write the key by hand (human), take it from the textbook (programmatic), or let students vote on the answers (implicit). Each way gives a key that is a little different from the truth.
+
+Here is a table to compare them.
+
+| Source | Example | Speed | Cost per row | Main risk |
+|---|---|---|---|---|
+| Explicit | Star rating | Fast | Low | Few users respond, and not typical ones |
+| Implicit | Click, watch, purchase | Fast | Near zero | Noisy proxy for what you want |
+| Human | Rater marks fraud or not | Slow | High | Raters disagree, small volume |
+| Programmatic | Rule or older model | Fast | Low | Model copies the rule's mistakes |
+
+In practice teams mix them. A cheap implicit label gives volume. A small human-labeled set gives a trusted check. If you read lesson [A8.3](/learn/ai/a8-evals/golden-sets/), that trusted set is the same idea as a golden set.
+
+## The naive way: accuracy on rare events
+
+Why did the fraud model score 99.9%? Because **accuracy** is the share of predictions that are right. When almost every row is "not fraud", a model that always says "not fraud" is almost always right.
+
+This is **class imbalance**: one outcome is much more common than the other. Huyen's book says it flatly: "problems with class imbalance are the norm in the real world" (chapter 4). Fraud is the usual example. Others are click on a banner ad, failing hardware, and a customer who cancels.
+
+The trap is that accuracy rewards the lazy answer. You need numbers that look only at the rare class.
+
+- **Recall** is the share of real frauds that the model flags. A model that never flags has recall 0.
+- **Precision** is the share of flagged payments that are really fraud. If the model flags 100 payments and 20 are fraud, precision is 20%.
+
+These two pull against each other. If you flag more payments, you catch more fraud (recall rises) but you also flag more good payments (precision falls). A good payment that is blocked is a lost sale and an annoyed customer. So you choose a point on this trade-off, and that point is a business decision. It is the **threshold**: the score above which the model flags a payment.
+
+Try the simulator. Start with fraud at 1 per 1,000. Then raise it. Watch what happens to the accuracy of the always-no model, and compare it to your model.
+
+<AiE1ImbalanceSim client:visible />
+
+The first row never changes in one respect. Its recall is always zero. Its accuracy falls as fraud gets more common, which tells you that accuracy is mostly measuring how rare fraud is. The second row is a model that catches many frauds and flags some good payments. Its accuracy can be lower than the always-no model, and it is still far more useful.
+
+What do teams do about imbalance? Huyen's chapter 4 covers three families: pick better metrics (precision, recall, and curves built from them), resample the data (keep all frauds, keep only some good rows), and change the loss so a missed fraud costs more than a false alarm. Start with the metric. If you only fix the metric, you already avoid the 99.9% trap. Resampling changes the share of fraud in training, so the model's raw scores no longer mean "chance of fraud". Lesson E1.11 returns to this when scores must be calibrated.
+
+## Label delay
+
+Now a new problem. You said "label it fraud when the cardholder disputes it". But when does a dispute arrive?
+
+Not at once. A cardholder may notice a charge on a statement days or weeks later. The label does not exist when the payment happens. This is **label delay**: the gap between the event and the moment its label is known. In the book's words, natural labels "are usually delayed".
+
+Two harmful things follow.
+
+**Recent rows are mislabeled as good.** Yesterday's payments have no dispute yet, so they look "not fraud". If you train on them, you teach the model that fresh fraud is normal. The newest and most relevant data is the least reliable.
+
+**The model learns the past.** Training uses only rows whose labels have landed. If labels take 30 days, the model trains on fraud as it was 30 days ago and more. Attackers who changed tactics last week are invisible.
+
+The cure for the first problem is a **maturity window**: only use a row for training once enough time has passed that most labels should have arrived. Rows younger than the window are left out or treated as "unknown". The cure for the second is to retrain often and to use signals that arrive sooner, such as a manual review result, as a faster early label.
+
+Here is a thing to remember. A label delay is different for every problem. For a click it is seconds. For a loan default it is months. When you design a system, ask: "How long after the event do I learn the right answer?" That answer sets how fresh your model can be.
+
+## Selection bias
+
+There is another trap in the labels. You do not see the labels for everything. You see the labels for what your system chose to show or allow.
+
+Take a fraud model that blocks risky payments. A blocked payment never completes, so you never learn if it was really fraud. You only see outcomes for payments the model let through. The next model trains on that filtered data. It never sees what the old model's decisions hid. This is **selection bias**: your training set is a biased sample, picked by earlier decisions.
+
+The same happens in a feed. If you log only what users were shown, you do not know whether they would have liked the items you did not show. The Rules of ML warn about logging only what the user saw, and note that this leaves out the negative cases you need. The fix the Rules of ML points to is to hold out a small share of traffic for cleaner data (Rule 34). For example, let a tiny share of payments through without blocking, so you can see the true outcome, or show a small share of random items in the feed. It costs some money or quality. It buys honest labels. Lesson E1.6 comes back to this when we compare offline and online metrics.
+
+A picture: you cannot learn whether a restaurant is good by only asking people who walked in. You also need to know about the people who looked at the menu and walked on by.
+
+## Split by time, not at random
+
+Now to the test. To know if a model works, you hold back some rows. You train on one part and test on the other. The **train/test split** decides which rows go where.
+
+The common first move is a random split: shuffle, take 80% for training and 20% for testing. For most tasks with time in them, this is wrong.
+
+Why? Fraud patterns move. A trick that appears on day 20 is in the data. A random split puts some day-20 rows in training and some day-12 rows in the test. The model learns the day-20 trick and gets credit for finding it on day 12. In production the model only sees the past. The test score is too good because the model saw the future. This is a kind of **data leakage**: information in training that will not be there at prediction time.
+
+Huyen's chapter 5 gives the rule: "Split data by time into train/valid/test splits instead of doing it randomly". The Rules of ML say the same in a concrete form (Rule 33): "If you produce a model based on the data until January 5th, test the model on the data from January 6th and after." They add that some drop in score is expected, "but it shouldn't be drastic".
+
+There is one more detail from this lesson: label delay. If your labels take 14 days, the rows from the last 14 days before the cut-off are incomplete. Leave a gap, or treat them as unknown.
+
+Step through the timeline below. It shows the delay first, then the leaky random split, then the time split with a gap.
+
+<AiE1LabelTimeline client:visible />
+
+One more leak to avoid. Chapter 5 also advises to "scale and normalize your data after splitting to avoid data leakage". If you compute an average over all rows and then split, the test rows already influenced the training numbers. Compute any statistic from the training part only, and apply it to the rest.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Implicit labels | Huge volume, no cost | Noisy, can be gamed | You need scale and have a second check |
+| Human labels | Trusted, clear rules | Slow, costly, small volume | You need a golden set or a hard label |
+| Programmatic labels | Fast, cheap, consistent | Copies rule errors | You can write a decent rule |
+| Random split | Easy, uses all data evenly | Leaks the future | Data has no time order |
+| Time split with a gap | Honest test | Less data, newest rows unused | Anything that changes over time |
+| Resampling the rare class | Easier training | Scores no longer match true rates | You only need a ranking, not a probability |
+| Holdout for clean data | Unbiased labels | Cost of unfiltered traffic | The old model hides outcomes |
+
+## What experienced teams know
+
+1. **Fraud is rare, so accuracy lies.** [Stripe](https://stripe.dev/blog/how-we-built-it-stripe-radar) describes fraud as roughly 1 in 1,000 payments. Report precision and recall, not accuracy.
+2. **Imbalance is normal.** Huyen's [chapter 4 summary](https://github.com/chiphuyen/dmls-book/blob/main/summary.md) says problems with class imbalance are the norm in the real world. Plan the metric first.
+3. **Natural labels arrive late.** The same summary says they are usually delayed. Write down the delay for each label before you design the training schedule.
+4. **Split by time.** Chapter 5 says to split by time instead of at random. Rule 33 of the [Rules of ML](https://developers.google.com/machine-learning/guides/rules-of-ml) gives the "train until January 5th, test after" form.
+5. **Normalize after the split.** Chapter 5: scale and normalize your data after splitting to avoid leakage. Compute statistics from the training part only.
+6. **Log what you did not show.** The Rules of ML warn against logging only what the user saw, and Rule 34 points to a small held-out share of traffic for cleaner training data. You pay a little to learn what you would have missed.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "Fraud is about 1 in 1,000, so I would not use accuracy. I would use precision and recall, and set the threshold from the cost of a missed fraud against the cost of a blocked good payment. Labels are disputes that arrive weeks later, so I would use a maturity window and split by time with a gap. And since the old model blocks payments, I would hold out a small share to get clean labels." That covers imbalance, delay, bias, and the split.
+</Callout>
+
+<Callout type="mistake">
+Do not quote accuracy for a rare-event model. Do not split at random when the data has time order. Do not train on rows whose labels have not arrived yet, as if they were "good". And do not forget that a model that filters traffic also filters its own future training data.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A model for a rare event reaches 99.9% accuracy but catches none of the real positives. What explains it?',
+      options: [
+        'The test set was too small to measure accuracy at all',
+        'The model overfit, so its test accuracy dropped below its training accuracy',
+        'The model says "no" to everything, and almost every row really is "no"',
+        'The labels were assigned by a rule instead of by people',
+      ],
+      answer: 2,
+      explain: 'When the positive class is rare, a model that always says no is almost always right. Overfitting would show as a gap between training and test scores, and the label source does not cause this effect.',
+    },
+    {
+      q: 'Fraud disputes arrive weeks after a payment. What should a team do with payments from the last few days when it builds a training set?',
+      options: [
+        'Include them as good payments, because no dispute has arrived yet',
+        'Leave them out or mark them unknown for now',
+        'Include them and double their weight, since they are the freshest rows',
+        'Label them all as fraud, to be safe',
+      ],
+      answer: 1,
+      explain: 'Recent rows look good only because their labels have not landed. Calling them good teaches the model that fresh fraud is normal. Labelling them all fraud would swamp the data with false positives.',
+    },
+    {
+      q: 'A team shuffles all rows and splits 80/20 for a model that predicts next week\'s behavior. Why is the test score likely too high?',
+      options: [
+        'Shuffling removes the rare class from the test set entirely',
+        'The test set has too few rows to be reliable',
+        'Training rows come from after some test rows',
+        'The model sees the labels of the test rows during training time',
+      ],
+      answer: 2,
+      explain: 'With time-ordered data a random split puts later rows in training and earlier rows in testing, which leaks the future. The rows themselves are separate, so labels of test rows are not seen directly.',
+    },
+    {
+      q: 'A fraud model blocks risky payments and the next model trains on the outcomes it can see. What is the problem?',
+      options: [
+        'The data is biased by what the old model let through',
+        'Blocked payments are always fraud, so labels are perfect',
+        'The model needs more good payments to balance the classes',
+        'The labels are delayed by one week for every payment',
+      ],
+      answer: 0,
+      explain: 'The old model chose which payments get a known outcome, so the new model learns from a filtered sample. A small unblocked holdout shows what the filter hides. Class balance is a different issue.',
+    },
+  ]}
+/>
+
+<Diagnose
+  id="data-labels-accuracy-trap"
+  title="99.9% accuracy, no fraud caught"
+  scenario="A new fraud model scores 99.9% accuracy on the test set. In its first week, the fraud team finds that it flagged almost nothing."
+  facts={['fraud rate in data:   about 1 in 1,000', 'accuracy:            99.9%', 'flags per day:        near 0', 'recall on frauds:     not reported']}
+  steps={[
+    {
+      prompt: 'Why does the test accuracy look so good?',
+      options: [
+        'Accuracy counts right answers, and a model that always says "not fraud" is right 999 times in 1,000.',
+        'The model learned every fraud pattern and sees none today.',
+        'The test set was built from the training set.',
+        'The model is too complex for the number of rows.',
+      ],
+      answer: 0,
+      explain: 'With 1 fraud in 1,000, saying "no" every time scores about 99.9%. A model that learned all patterns would flag frauds. Leakage from training to test would not give this exact pattern.',
+    },
+    {
+      prompt: 'Which change to the report fixes the blind spot?',
+      options: [
+        'Report accuracy on a larger test set.',
+        'Report precision and recall on the fraud class, and pick the threshold from the cost of a miss and of a false block.',
+        'Report training loss instead of test accuracy.',
+        'Drop the test set and use the training set.',
+      ],
+      answer: 1,
+      explain: 'Precision and recall look only at the rare class. A larger test set has the same blind spot, and training loss says nothing about how the model does on new data.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Stripe, How we built it: Stripe Radar](https://stripe.dev/blog/how-we-built-it-stripe-radar): fraud is rare, about 1 in 1,000 payments.
+- [Google, Rules of Machine Learning](https://developers.google.com/machine-learning/guides/rules-of-ml): Rules 33 and 34 on time splits and clean training data.
+- [Chip Huyen, Designing Machine Learning Systems: chapter summaries](https://github.com/chiphuyen/dmls-book/blob/main/summary.md): chapters 4 and 5 on labels, imbalance, and splits.

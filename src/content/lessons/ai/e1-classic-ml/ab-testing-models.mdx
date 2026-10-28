@@ -1,0 +1,281 @@
+---
+summary: 'An offline gain is a hint, not proof. Randomize by user, pick one primary metric with guardrails, fix the sample size before you start, and do not peek. Use interleaving to compare rankers cheaply, then walk the winner up a gated ramp.'
+requires: ['ai/e1-classic-ml/offline-online-metrics', 'ai/a8-evals/online-evals-ab']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE1AbPeek from '../../../../components/anim/lessons/AiE1AbPeek.tsx';
+import AiE1AbInterleave from '../../../../components/anim/lessons/AiE1AbInterleave.tsx';
+
+## The problem
+
+Your new ranking model beats the old one offline. Lesson E1.6 showed why that is not enough: the log was shaped by the old model, and offline metrics can rise while revenue stays flat. The only fair test is to put both models in front of real users at the same time and compare what they do.
+
+The cost of that test is higher than most engineers expect. Ron Kohavi and two co-authors at Microsoft wrote one of the standard guides to online experiments ([Practical Guide to Controlled Experiments on the Web, KDD 2007](https://www.exp-platform.com/Documents/GuideControlledExperiments.pdf)). Their worked example is a shop where 5% of visitors buy. To detect a 5% change in the buying rate, they say, you need "less than 500,000 users". To detect a 20% change, "the number of users needed drops by a factor of 16 to 30,400". A small effect needs a very large crowd.
+
+The lesson on [online evals and A/B for LLM features](/learn/ai/a8-evals/online-evals-ab/) already taught the basics for LLM features: a randomized split, a primary metric with guardrails, a written decision rule, and a check for a sample ratio mismatch. The lesson on [shadow, canary, and rollback](/learn/ai/a8-evals/rollout/) taught the release ladder. We do not repeat them. This lesson goes deeper on what is specific to classic ML models, and it answers six questions:
+
+1. Who gets which model, and how do we make that stable?
+2. How many users do we need, and what makes the number smaller?
+3. Why must we not stop the test when it first looks good?
+4. Why does a new model look better in week one than in week four?
+5. How do we compare two rankers with far fewer users?
+6. How do we walk a winner up to 100% safely?
+
+## Question 1: who gets which model?
+
+An **experiment unit** is the thing you randomize. For a model test it is almost always the **user**, not the request.
+
+Why? Picture a restaurant that serves your starter from kitchen A and your main course from kitchen B, flipping a coin for each dish. You could not say which kitchen made you happy. A user who sees model A on one request and model B on the next mixes the two. Their habits, such as a long session that builds on earlier clicks, belong to neither. The Kohavi guide assumes the unit is a user and says "it is important that the user receive a consistent experience throughout the experiment".
+
+How do you build a stable assignment? Do not store a table. Hash the user ID together with the experiment name, and use the result to pick a bucket. The same user always lands in the same bucket, so no state is needed. The Kohavi paper lists the properties a good scheme needs:
+
+- Users are spread evenly across variants.
+- Repeat visits give the same variant.
+- Several experiments at once do not correlate: a user's bucket in one experiment must not predict their bucket in another. Mixing the experiment name into the hash does this.
+- Ramp-up is **monotonic**: when you raise the share from 5% to 25%, users already in the treatment stay in it.
+
+The last point matters for models. If a ramp reshuffled users, you would expose people to a model, remove it, and expose them again, which muddies every metric.
+
+What does "who" cost you in ML? Two traps.
+
+**Shared state across users.** A model that learns online (lesson E1.9) trains on both arms' clicks if it is one model. Then arm A benefits from what arm B's users taught it. Each arm needs its own model state, or the test measures a blend.
+
+**Network and marketplace effects.** In a two-sided marketplace, one side's treatment changes the other side's experience. A pricing model that gives treated riders cheaper trips takes drivers from control riders. Randomizing by user then understates or overstates the effect. Teams randomize by city or by time slice in these cases. This is our reading, and we only name the problem here.
+
+## Question 2: how many users, and what shrinks the number?
+
+The size of a test depends on three things. Think of listening for a faint voice in a noisy room. The quieter the voice (a small effect), the louder the room (high variance), the longer you must listen. And you must decide how long to listen before you start.
+
+The standard result, from the guide's section on sample size, has this shape. The needed number of users grows with the **variance** of your metric, and it falls with the **square** of the difference you want to see. The paper writes it as `n = (4 r σ / Δ)²`, for 95% confidence and 90% power, where `r` is the number of variants, `σ` is the standard deviation of the metric, and `Δ` is the smallest difference worth detecting. It also says "the factor of 4 may overestimate by 25% for large n". You do not need to compute it by hand. Learn three consequences.
+
+**A small effect costs a great deal.** Because of the square, halving the effect you want to detect multiplies the users by four. That is the factor of 16 the paper reports when it compares a 5% and a 20% change in conversion.
+
+**Noisy metrics cost more.** The paper compares metrics on one shop: revenue per user has high variance, so detecting a 5% change takes over 1.6 million users. The yes-or-no "did they buy" has lower variance, so the same 5% takes under 500,000. It says "conversion probability ... typically has lower Std-Dev than number of purchase units ..., which in turn has a lower Std-Dev than revenue." The trade is real: the cheap metric is easier to move but further from the business goal. That is the proxy question from lesson E1.1 again.
+
+**Users who never saw a difference add noise.** If the change affects only the checkout page, analyze only users who reached it. The paper's example cuts the total users from about 500,000 to 256,000. This is "almost half the previous result, thus the experiment could run for half the time". Many teams forget to log **exposure**: the moment a user actually met the model's output.
+
+A fourth lever came later. Microsoft's Bing team published **CUPED**, a method that uses each user's behavior before the test to remove predictable noise ([Deng and others, 2013](https://exp-platform.com/Documents/2013-02-CUPED-ImprovingSensitivityOfControlledExperiments.pdf)). They report that on their system they "can reduce variance by about 50%, effectively achieving the same statistical power with only half of the users, or half the duration." That is a Bing result on Bing metrics. Your gain depends on how well a user's past predicts their future.
+
+## Question 3: why must we not stop when it first looks good?
+
+The sample size is part of the plan. Here is why you must keep it.
+
+A test result has a **p-value**: the chance of seeing a difference this big if nothing real changed. The usual rule says a p-value under 0.05 is a win. That 5% is the false-alarm rate, and it holds only if you look **once**, at the planned size. Looking after every batch of users gives chance many tries. Evan Miller's [How Not To Run An A/B Test](https://www.evanmiller.org/how-not-to-run-an-ab-test.html) says that if you stop at the first significant look, "all the reported significance levels become meaningless." In his example, a useless change wrongly "wins" 26.1% of the time, "more than five times what you probably thought the significance level was."
+
+Try it. Choose "No real change". Add batches one at a time. Some runs show a red peek, where a win would have been declared while nothing was different. Press "New random run" and try again.
+
+<AiE1AbPeek client:visible />
+
+In a quick check on this widget's own generator, a no-change test that looks after each of 20 batches declared a winner in about one run in four. The same test, read once at the end, was wrong about one run in twenty. That is the cost of peeking.
+
+You still need to watch a test for harm. The guard is to separate the two jobs. Watch **guardrails** all the time, because stopping for harm is always right. Read the **primary metric** only at the planned size. If you want valid looks along the way, use a design built for it, called a **sequential test**. Miller names sequential and Bayesian designs as the options. We do not teach their maths here.
+
+## Question 4: why does the model look better in week one?
+
+Two opposite effects distort early results. The Kohavi guide calls them **primacy** and **newness**.
+
+**Newness effect.** When something new appears, some users "investigate it, click everywhere, and thus introduce a 'newness' bias." Picture a shop that moves its shelves. For a week, customers wander and pick up more items. Then they settle into their routine. A new recommender that shows unfamiliar items gets extra clicks for the same reason. Those clicks fade.
+
+**Primacy effect.** The reverse. "If you change the navigation on a web site, experienced users may be less efficient until they get used to the new navigation, thus giving an inherent advantage to the Control." A model whose results look different can hurt in week one, even if it is better.
+
+The guide's conclusion: "Both primacy and newness concerns imply that some experiments need to be run for multiple weeks." It offers one check: "compute the OEC only for new users on the different variants, since they are not affected by either factor." (OEC is the paper's name for the main metric you optimize.) A new user has no habit to disturb.
+
+For models there is a third trap, our own reading and not from the guide: a **warm-up**. A treatment model may need caches filled, or a user's history rebuilt under the new feature set. Its first days may differ from its steady state. Compare week three with week one. If the lift shrinks, you saw novelty. If it holds, you can trust it more.
+
+## Question 5: how do we compare two rankers with fewer users?
+
+A ranking model returns an ordered list. An ordinary A/B test gives each user one list and compares group averages, such as clicks per session. People differ a lot from one another, so the noise is large.
+
+**Interleaving** removes much of that noise. It shows each user **one merged list** that mixes results from both rankers, then credits each click to the ranker that supplied the clicked item. This is a **within-subject** design: each person compares both models.
+
+The common recipe is **team draft**, named after how kids pick teams. Think of a playground. Two captains take turns choosing players, and a coin flip decides who picks first in each round. Each captain takes their best player who is still free. The paper by Oosterhuis and de Rijke describes the version for many rankers, which is the same as team draft for two: "the first sampled ranker places their top document at the first position ... Subsequently, the next sampled ranker adds their top pick of the remaining documents." Clicks go "to the ranker that contributed the document".
+
+Step through a tiny example.
+
+<AiE1AbInterleave client:visible />
+
+How much do you save? The same paper states that, because of their within-subject nature, "interleaved comparisons can be up to two orders of magnitude more efficient than A/B tests in effective sample size for studies of comparable dependent variables". That is a claim from the literature, citing earlier work, and "up to" is doing a lot of work. Treat it as a reason to try interleaving, and measure the saving for your own system.
+
+What are the limits? These are our reading, from how the method works:
+
+- It only fits **ranked lists**. It cannot test a pricing model or a fraud score.
+- It measures **preference between two rankers** by clicks. It does not measure revenue, long-term retention, or latency. A ranker that wins on clicks can still lose on the business metric. So interleaving is a fast **screen**. Models that win go on to a real A/B test with guardrails.
+- It needs both rankers to run on each request. That costs serving compute, and it needs the lists to merge cleanly. Two models with different candidate sets need care.
+
+A common use: ten candidate models, a cheap interleaving round to cut to two, and one A/B test for the final.
+
+## Question 6: how do we walk a winner up to 100%?
+
+A new model is a new risk, even after it wins a test, because the test ran on a slice. The ramp keeps the slice small until the evidence grows. The [rollout lesson](/learn/ai/a8-evals/rollout/) taught the ladder mechanics. Here is what the stages mean for a classic model.
+
+| Stage | What users see | What you check | Gate to move on |
+|---|---|---|---|
+| Offline | Nothing | Metrics on a held-out time slice (lesson E1.6) | Beats the current model on the agreed metric |
+| Shadow | Nothing. The new model scores live requests, and its output is logged and dropped | Latency, errors, feature coverage, how far its scores differ from the old model's | No crashes, p95 latency in budget, features present, score shape sane |
+| Canary, a few percent | New model for a small random user share | Guardrails and a few quick health metrics | No guardrail worse than a written limit |
+| Ramp, for example 1%, 5%, 25%, 100% | Growing share | Primary metric and guardrails, with sample ratio check | Each step holds for a set time and traffic |
+| Holdback | A small share stays on the old model after launch | Long-term effect, drift (lesson E1.7) | Reviewed on a schedule |
+
+The ramp in the Kohavi guide is a good model to copy: "start with a 99.9%/0.1% split, then rampup the Treatment from 0.1% to 0.5% to 2.5% to 10% to 50%". Their reasoning: "The square factor in the power formula implies that such errors could be caught quickly on small populations and the experiment can be aborted before many users are exposed to the bad treatment." Big failures show up in small samples, because a large effect needs few users.
+
+Notice the limit. A ramp finds big failures fast. It does not find small losses, and it does not replace the full-size test for the primary metric. The ramp protects users. The sample size makes the decision.
+
+A **holdback** is worth the small cost. Keep about 1% of users on the old model, or on no model at all, for weeks after launch. It answers the question that gets asked six months later: "is the model still helping?"
+
+## The naive way: ship on offline AUC and a quick look
+
+The naive process: the offline score is up, so ship to everyone and watch the dashboard. Or run a test, look every morning, and stop on the first day the lift looks significant.
+
+The first version has no comparison group, so you cannot tell the model's effect from the calendar. The second is peeking, with a large false-alarm rate, plus novelty: the early days of a new model are not its steady state. Both can give a false win, and the false win then trains the next model through the logs.
+
+## The real fix: a plan written before the test
+
+Write the plan before you start, as a short card.
+
+| Item | What to decide |
+|---|---|
+| Unit and assignment | User. Hash of user ID and experiment name. Monotonic ramp |
+| Primary metric | One metric, close to the goal, with the lowest variance that still means something |
+| Guardrails | Latency p95, error rate, a revenue or safety metric, with written limits |
+| Exposure | Log the moment each user meets the model output. Analyze exposed users |
+| Size and duration | From the effect, the variance, and the traffic. Include at least one full weekly cycle, and more if novelty is likely |
+| Reading rule | Look at the primary metric once, at the planned size. Watch guardrails always |
+| Checks | Sample ratio check first. Separate model state per arm |
+| Ramp | Shadow, canary, then steps with gates, then a holdback |
+
+## What experienced teams know
+
+1. **Small effects need big crowds.** In Kohavi's shop example, a 5% change in the buying rate needs under 500,000 users, and a 20% change needs 30,400 ([Kohavi and others, KDD 2007](https://www.exp-platform.com/Documents/GuideControlledExperiments.pdf)). Decide the smallest effect worth shipping before you ask for traffic.
+2. **Lower variance buys time.** Analyzing only exposed users cut the paper's checkout example to about half the traffic ([same guide](https://www.exp-platform.com/Documents/GuideControlledExperiments.pdf)), and CUPED reported about 50% variance reduction on Bing ([Deng and others](https://exp-platform.com/Documents/2013-02-CUPED-ImprovingSensitivityOfControlledExperiments.pdf)).
+3. **Peeking inflates false wins.** One example stopping at the first significant look gave 26.1% false positives ([Miller](https://www.evanmiller.org/how-not-to-run-an-ab-test.html)). Fix the size in advance, or use a sequential design.
+4. **Run it for weeks when novelty is possible.** The guide says primacy and newness "imply that some experiments need to be run for multiple weeks", and suggests a new-user analysis as a check ([Kohavi and others](https://www.exp-platform.com/Documents/GuideControlledExperiments.pdf)).
+5. **Interleaving is a screen, not a verdict.** It can be up to two orders of magnitude more efficient in effective sample size ([Oosterhuis and de Rijke](https://arxiv.org/pdf/1711.09454)), but it measures click preference between rankers only.
+6. **Ramp small first.** The early stages of the ramp expose few users, and large failures show in small samples ([Kohavi and others](https://www.exp-platform.com/Documents/GuideControlledExperiments.pdf)).
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Randomize by user | Clean, independent comparison | Fewer independent units than requests | Almost always |
+| Randomize by city or time slice | Handles marketplace spillover | Far fewer units, so less power | Two-sided markets |
+| Cheap, low-variance metric | Smaller sample, faster test | Further from the business goal | Early stages, as a screen |
+| Business metric as primary | Close to what you want | Noisy, needs many users or CUPED | Final decision |
+| Variance reduction (exposure filter, CUPED) | Same power with fewer users | Extra logging and care | Traffic is the limit |
+| Fixed-size test | Valid false-alarm rate | You wait for the full size | Default |
+| Sequential test | Valid early stops | More complex analysis | You must stop early for cost or harm |
+| Interleaving | Much more sensitive for rankers | Only for lists, clicks only, serves both models | Choosing among many rankers |
+| Long test with a holdback | Sees novelty fade and long-term effect | Slower launch | Models that change habits |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I would randomize by user with a stable hash of user ID and experiment name, so the ramp is monotonic. I would pick one primary metric, guardrails for latency and a business metric, and size the test before I start. I would read the primary metric once at the planned size, and watch only guardrails along the way. I would run at least a full weekly cycle, and longer if novelty is likely. For ranking, I would use interleaving to screen candidates, then one A/B test. Rollout is shadow, canary, a gated ramp, and a holdback." This shows both statistics and rollout sense.
+</Callout>
+
+<Callout type="mistake">
+Do not say "ship when the p-value drops below 0.05" if you looked every day. Do not call an offline gain a launch decision. Do not forget that a lift in week one may be novelty. Do not quote a sample size with no base rate, effect size, or variance.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'e1-ab-unit-user',
+      q: 'Why do teams usually randomize a ranking-model test by user and not by request?',
+      options: [
+        'Hashing a user ID is faster than hashing a request ID',
+        'There are always fewer users than requests, which makes tests cheaper',
+        'A user who sees both models mixes the effects, and session habits belong to neither',
+        'Requests cannot be logged, but users can',
+      ],
+      answer: 2,
+      explain: 'When one person meets both models, their behavior blends the two, so you cannot credit either. The units must be independent and stable. Hash speed is irrelevant, fewer units make a test weaker, and requests can be logged.',
+    },
+    {
+      id: 'e1-ab-peek-cost',
+      q: 'A team checks a no-change A/B test after every batch of users and stops at the first p-value under 0.05. What happens to the false-win rate?',
+      options: [
+        'It is far above 5%, because chance gets many tries',
+        'It stays at 5%, because each look uses the same rule',
+        'It falls below 5%, because more data is seen',
+        'It depends only on the base rate',
+      ],
+      answer: 0,
+      explain: 'The 5% holds for one look at a planned size. Many looks give chance many chances to cross the line, and one published example reached about 26%. Looking more does not lower the rate, and the base rate is not the cause.',
+    },
+    {
+      id: 'e1-ab-variance-lever',
+      q: 'Traffic is the limit. Which change lets the same test reach the same power with fewer users?',
+      options: [
+        'Analyze everyone who visited, exposed or not',
+        'Use a metric with lower variance, or analyze only users who met the change',
+        'Stop the test earlier when it looks good',
+        'Raise the number of variants',
+      ],
+      answer: 1,
+      explain: 'Needed users grow with variance, so a quieter metric or a filter on exposed users cuts the number. Adding unexposed users adds noise. Early stopping breaks the false-alarm rate, and more variants raise the total needed.',
+    },
+    {
+      id: 'e1-ab-interleave-limit',
+      q: 'A team wants to test a new fraud-scoring model against the old one with interleaving. What is the main problem?',
+      options: [
+        'Interleaving needs ten or more models at once',
+        'Interleaving cannot use clicks',
+        'The new model must be trained on interleaved data first',
+        'The method needs a ranked list, and a fraud score is not one',
+      ],
+      answer: 3,
+      explain: 'Team draft merges ranked lists and credits clicks to the ranker that supplied the clicked item. A fraud score has no list to merge. The other options describe things interleaving does not require.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="e1-ab-early-win-fades"
+  title="A win on day three that vanished"
+  scenario="A team tests a new feed-ranking model on a half-and-half user split. The plan was 28 days. On day three, the lead engineer checks the dashboard and sees a clear win. The model ships. A month later, the lift is gone. The numbers below are made up for the exercise."
+  facts={[
+    'day 3: clicks per user, new vs old: +4.1 percent, p = 0.02',
+    'day 3 users with no history (new accounts): +0.3 percent',
+    'day 28 on the planned size, if the team had waited: +0.2 percent, p = 0.61',
+    'the test was looked at every morning from day 1',
+    'the new model shows many items users had not seen before',
+  ]}
+  steps={[
+    {
+      prompt: 'What are the two best explanations for the day-three win?',
+      options: [
+        'A sample ratio mismatch and a broken hash',
+        'Label delay and concept drift',
+        'Too many variants and a low base rate',
+        'Peeking after each day, plus a newness effect from unfamiliar items',
+      ],
+      answer: 3,
+      explain: 'The team looked daily and stopped at the first good look, which inflates false wins. The model shows unfamiliar items, and the lift is large for existing users but tiny for new ones, who have no habit to disturb. That fits newness. The other options do not fit these facts.',
+    },
+    {
+      prompt: 'What should the plan have said?',
+      options: [
+        'Read the primary metric once at the planned size, run full weekly cycles, and check new users',
+        'Stop as soon as p drops below 0.05 to save traffic',
+        'Switch to a metric with more variance for a larger lift',
+        'Use offline AUC as the final decision',
+      ],
+      answer: 0,
+      explain: 'A fixed reading rule fixes the false-alarm rate, a long enough run lets novelty fade, and the new-user cut is the guide\'s check for it. Early stopping is the failure here. A noisier metric needs more users. Offline AUC cannot see user habits.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Kohavi, Henne, and Sommerfield: Practical Guide to Controlled Experiments on the Web (KDD 2007)](https://www.exp-platform.com/Documents/GuideControlledExperiments.pdf). The source of the sample-size rule, the ramp, and the primacy and newness effects. Section 3.2 has the formula. You do not need it by heart.
+- [Deng, Xu, Kohavi, and Walker: Improving the Sensitivity of Online Controlled Experiments by Utilizing Pre-Experiment Data (CUPED)](https://exp-platform.com/Documents/2013-02-CUPED-ImprovingSensitivityOfControlledExperiments.pdf)
+- [Evan Miller: How Not To Run An A/B Test](https://www.evanmiller.org/how-not-to-run-an-ab-test.html)
+- [Oosterhuis and de Rijke: Sensitive and Scalable Online Evaluation with Theoretical Guarantees](https://arxiv.org/pdf/1711.09454). Section 1 states the efficiency claim for interleaving, and Section 4.1 describes team draft.

@@ -1,0 +1,267 @@
+---
+summary: 'A pretraining dataset is built by a pipeline: collect, extract, filter, deduplicate, mix, and sometimes synthesize. Each stage drops or reweights tokens and each can hurt quality or leak test data. Near-duplicates are found with fingerprints, and every filter needs its own small-model evaluation.'
+requires: ['ai/a1-model-function/scaling-laws', '06-async/pubsub-logs']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE2DataFunnel from '../../../../components/anim/lessons/AiE2DataFunnel.tsx';
+import AiE2DedupDemo from '../../../../components/anim/lessons/AiE2DedupDemo.tsx';
+
+## The problem
+
+Your team trains a language model. The architecture is standard and the GPUs are paid for. You train on a fresh web crawl, and the score on a public benchmark jumps nine points. The room cheers. Then a colleague greps the training text and finds the benchmark's test questions, word for word, on a forum mirror.
+
+The model did not get smarter. It saw the exam. Worse, the same crawl also contains one product page copied onto thousands of sites, spam in six languages, and a menu bar that repeats "Home | About | Cart" a billion times.
+
+A model learns whatever its training text contains. So the quality of the dataset sets a ceiling on the quality of the model, and nothing later in training can lift it. Lesson [A1.7](/learn/ai/a1-model-function/scaling-laws/) showed that teams spend huge compute on training. This lesson looks at what that compute is fed. A team that gets the data wrong pays for the whole run and gets a worse model.
+
+This lesson answers four questions:
+
+1. What stages turn a raw crawl into training data?
+2. How do you find near-copies in billions of documents?
+3. How do you know a filter helped and did not hurt?
+4. How does a test set leak in, and how do you keep it out?
+
+The word **pretraining** [mid] means the first and largest training phase. The model reads a huge pile of text and learns to predict the next token. Later phases, such as the ones in [lesson A11.2](/learn/ai/a11-finetuning/sft-lora/), start from that result. A **corpus** [junior] is the pile of text used for training.
+
+## Naive solution: crawl more, train on all of it
+
+The first idea is simple. More text is better, so crawl as much of the web as you can and train on every token.
+
+This fails in three ways. Spam and boilerplate are tokens the model must learn to predict, so they take compute and teach nothing. Repeated text makes the model memorize. And benchmark text on the web ends up in training, so your scores stop meaning anything.
+
+The fix is not to crawl less. It is to treat the corpus as a product with a build process, as you would treat a binary. That process is a pipeline.
+
+## Question 1: what stages turn a crawl into training data?
+
+**What it is.** A **data pipeline** [mid] is a chain of stages. Each stage reads the output of the one before and writes a smaller or reweighted dataset. The Stanford CS336 course teaches the same list in its data lectures: sources, then filtering, deduplication, mixing, and synthetic data.
+
+**The picture.** Think of a water plant. River water comes in. A screen takes out branches, a filter takes out silt, and a final step takes out germs. Nobody drinks the river. Nobody judges the plant by how much water it takes in either. They judge the water that comes out.
+
+**Why it exists.** Each stage removes one kind of waste, and a cheap early stage keeps expensive later stages small. Rules run first because they cost almost nothing per document. A model-based classifier runs later, on fewer documents.
+
+**The stages.**
+
+- **Collect.** A crawler fetches pages. A common starting point is **Common Crawl** [mid], a public archive of web snapshots that is released in monthly batches. A team may also add code, books, papers, and licensed text.
+- **Extract and select language.** Strip the HTML down to the main text. Drop menus and scripts. Keep the languages you target.
+- **Filter for quality.** Drop spam, gibberish, and pages that are mostly boilerplate. This uses hand-written rules (for example, a share of lines that end in punctuation) and small **classifiers** [junior] (models that label each document good or bad).
+- **Deduplicate.** Remove exact and near copies. Question 2 covers how.
+- **Mix.** Decide how often each source is read during training. This does not drop anything. It sets the weights.
+- **Synthesize.** Have a model write extra examples to fill gaps. **Synthetic data** [mid] is data written by a model, not by people.
+
+The animation shows the funnel. All shares in it are made up to show the shape. Real pipelines publish their own numbers, and those differ a lot by source.
+
+<AiE2DataFunnel client:visible />
+
+**An example with real numbers.** The FineWeb team documented one public pipeline in detail. Its starting point was 96 Common Crawl snapshots. Its output was a dataset of 15 trillion tokens. A filter named after the C4 dataset, which drops lines that do not end in a terminal punctuation mark, removed around 30% of all tokens in their test. Their own custom rules for a high punctuation ratio, duplicated lines, and short lines together removed about 22%. One cheap rule at the start can remove a third of the data.
+
+**The backend link.** If you read the [pub/sub and logs lesson](/learn/backend/06-async/pubsub-logs/), you know the pattern: an append-only log that several consumers read at their own pace. A pipeline is the same idea in batch form. Each stage writes a versioned dataset, and the next stage reads it. You can rerun one stage and everything after it without recrawling. That matters because you will change the filters many times.
+
+## Question 2: how do you find near-copies at web scale?
+
+**What it is.** **Deduplication** [mid] removes repeated documents. An exact copy is easy: hash the text and keep one document per hash. A **near-duplicate** [mid] is harder. It is the same page with a new footer, a changed date, or a few reworded sentences. A hash of the whole text changes if one character changes, so it misses these.
+
+**Why it matters.** The study behind this lesson's numbers is "Deduplicating Training Data Makes Language Models Better" by Lee and colleagues. They report that existing text datasets hold many near-duplicates and long repeated substrings. As a result, over 1% of the unprompted output of the models they studied was copied word for word from the training data. In C4, they found one 61-word English sentence repeated over 60,000 times. After deduplication, models emitted memorized text ten times less often and needed fewer training steps for the same accuracy. They also report that train-test overlap affected over 4% of the validation sets of standard datasets.
+
+**The picture.** Think of a library that receives the same textbook from thousands of donors. Some copies have a new cover. Some have a sticker on page 1. You cannot compare every book with every other book, because there are too many. You give each book a short label from its content, so that books with similar content get similar labels. Then you only compare books whose labels are close.
+
+**The mechanism: a fingerprint.** A **simhash** [senior] is such a label. It is a short bit string, here 32 bits, built so that similar texts give similar strings. The steps:
+
+1. Split the text into words.
+2. Hash each word to 32 bits. A hash is a fixed scramble of the word. The same word always gives the same bits.
+3. For each of the 32 positions, count votes. Each word votes plus one if its bit is 1, minus one if it is 0.
+4. Set each fingerprint bit to 1 if its total is positive, otherwise 0.
+
+Why does it work? A new footer changes a few words out of a hundred, so only a few votes change, and most bits stay the same. A text about another topic has mostly different words, so about half its bits differ. The number of differing bits is the **Hamming distance** [mid]. Small distance means near copy.
+
+Try it. The four pairs are made up. The widget runs the real algorithm in your browser.
+
+<AiE2DedupDemo client:visible />
+
+Two things to notice. First, the "light rewrite" pair has few words in common but a small distance. The fingerprint is more forgiving than a word-overlap test. Second, the threshold is a choice, not a fact. Set it too low and rewrites slip through. Set it too high and you delete pages that only look alike. That is why the choice needs labelled examples.
+
+**At scale.** Comparing every pair of billions of documents is impossible. The standard trick is to bucket documents by pieces of the fingerprint, then compare only inside a bucket. The same idea drives **MinHash** [senior], a related fingerprint that estimates the share of words two documents share. The FineWeb team used MinHash. The Lee paper used two tools: a suffix array to find long repeated substrings, and MinHash for near-duplicate documents.
+
+### Dedup scope is a design choice
+
+You can deduplicate inside one snapshot or across all snapshots. The FineWeb team tried both. Global MinHash across all 96 snapshots gave little improvement over no deduplication. For the oldest crawl they studied, the data it kept was worse than the 90% it removed. Deduplicating each snapshot on its own did better, and they chose that. Our reading, not the paper's claim: global dedup may remove good pages that are repeated for a reason and keep junk that appears only once. The lesson is that more deduplication is not always better. The result is the team's own finding on their data, so test it on yours.
+
+## Question 3: how do you know a filter helped?
+
+A filter is a judgment about text. It makes mistakes in both directions. It keeps some junk and drops some good text. Nobody can read billions of documents to check, so how do you evaluate it?
+
+**What it is.** An **ablation** [senior] is a controlled experiment that changes one thing and holds the rest fixed. For a filter: build two datasets, one with the filter and one without, train the same small model on each, and compare scores.
+
+**The picture.** A restaurant tests a new recipe on a few tables before it changes the menu everywhere. The small model is the few tables.
+
+**Why it exists.** You cannot tell if a filter helped from the filter's own output. A classifier that says "good" 90% of the time may be wrong in the same way each time. Only the downstream score, measured on text the model never trained on, tells you.
+
+**An example.** The FineWeb team ran its filter tests on models of 1.71 billion parameters, trained on about 28 billion tokens. They trained two models per dataset version with different random seeds. They picked benchmarks for "early signal" at that small scale, with low score variance between runs on random samples of the same data. The second seed matters. Without it, you cannot tell a real gain from noise.
+
+**The catch.** A filter can also cause harm you do not see in a benchmark. The study of C4 by Dodge and colleagues found that its blocklist filter disproportionately removes text from and about minority individuals. Their abstract also reports machine-generated text and text from unexpected sources, such as patents and military websites, inside the corpus. A benchmark average hides this. So a filter needs two checks: does the score improve, and what exactly did it remove? Read a random sample of the removed documents. This ties to [error analysis](/learn/ai/a8-evals/error-analysis/): you look at examples, not only at an average.
+
+### Mixing and synthetic data
+
+**Mixing** sets how often each source appears. Web text may be most of the tokens, and code and books a smaller share that is read more often per token than their size suggests. The weights are tuned the same way as filters, with small-model runs. There is no universal recipe, and public recipes are partial, so treat any published ratio as one team's result.
+
+**Synthetic data** has the usual risk of a model teaching a model. Its errors repeat at scale. Keep it only after a check, such as running the code it wrote or verifying a math answer, as in [lesson A11.5](/learn/ai/a11-finetuning/distillation-data/). It fills gaps. It does not replace the web.
+
+## Question 4: how does a test set leak in?
+
+The problem story shows the failure. **Contamination** [mid] means test items appear in training data. [Lesson A8.3](/learn/ai/a8-evals/golden-sets/) covers how to measure it, and it points out that Dodge and colleagues found benchmark examples inside C4. Here we ask how the pipeline lets it happen and how a pipeline stops it.
+
+It happens because benchmarks are published on the web: on paper sites, on code hosts, in forum posts, and in blog posts that quote them. A crawler takes all of them. A newer crawl has more of them, so a model trained on it looks better for the wrong reason.
+
+The pipeline fix is called **decontamination** [senior]. Before training, scan the corpus for text from your eval sets and remove the matches. The usual test is a long shared word sequence, called an n-gram, such as 13 words in a row. The golden-sets lesson shows the limit: a scan finds copies but misses paraphrases and translations.
+
+Three habits make the fix work:
+
+- **Hold out first.** Build private eval sets before you build the corpus, and scan against them.
+- **Scan on every rebuild.** A new crawl can bring new leaks. The nine-point jump in the opening story came from exactly this.
+- **Report both scores.** Show the score on the full test set and on the clean part. If they differ, the leak helped.
+
+Deduplication helps here too. A benchmark that appears 40 times on the web appears 40 times in training. Dedup cuts that to one, but it does not cut it to zero. Only decontamination does.
+
+<Diagnose
+  client:visible
+  id="e2-data-new-crawl-jump"
+  title="The suspicious jump"
+  scenario="A team rebuilds its pretraining corpus from a newer web crawl and trains the same model again. The public benchmark score rises by 9 points. Their private evals barely move."
+  facts={[
+    'public benchmark X:     61.0 -> 70.0',
+    'private support evals:  78.2 -> 78.6',
+    'crawl date:             3 months after benchmark X was published',
+    'pipeline change:        none (same filters, same dedup)',
+    'dedup scope:            per snapshot',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'The new crawl contains benchmark X text, so the model saw the test items',
+        'The newer crawl is simply cleaner, so every score rises',
+        'Per-snapshot dedup removed too little, so the model memorized more',
+        'The benchmark got easier because its wording changed',
+      ],
+      answer: 0,
+      explain: 'A jump on the one public benchmark, with flat private evals and a crawl made after the benchmark appeared, points to a leak. A cleaner crawl would lift the private evals too. Dedup scope does not explain a jump on one test set.',
+    },
+    {
+      prompt: 'Which check confirms it fastest?',
+      options: [
+        'Retrain the model with a different random seed',
+        'Scan the new corpus for long word sequences shared with benchmark X, and score the model on the clean items only',
+        'Ask the model to recite the benchmark questions from memory',
+        'Compare the model sizes before and after',
+      ],
+      answer: 1,
+      explain: 'The n-gram scan finds the copies, and the clean-subset score shows how much the leak helped. A new seed measures noise, not a leak. Asking the model to recite is a weak test, because a model can fail to recite and still benefit.',
+    },
+    {
+      prompt: 'What should the pipeline do from now on?',
+      options: [
+        'Stop publishing benchmark scores and use only private evals',
+        'Remove matching documents on every rebuild, keep private held-out sets, and report scores on the full and the clean sets',
+        'Crawl only older snapshots, which cannot contain new benchmarks',
+        'Raise the dedup threshold until the jump disappears',
+      ],
+      answer: 1,
+      explain: 'Decontamination must be a stage that runs on every rebuild, with private sets for the real decision. Using only old snapshots gives stale data. Tuning dedup until a number looks right hides the leak instead of removing it.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Strict quality filter | Cleaner text, less compute on junk | Drops rare but good text, can bias what stays | You have an ablation that shows the score gain and a reviewed sample of what was dropped |
+| Aggressive dedup | Less memorization, fewer test leaks | May remove pages that were repeated for a reason | You tested the scope (per snapshot or global) on small models |
+| Higher similarity threshold | Catches more rewrites | Deletes pages that only look alike | Labelled pairs show the threshold works |
+| Heavier source mix (code, books) | Better on code and reasoning tasks | Less web diversity, tuning cost | Your target tasks need those skills |
+| Synthetic data | Fills gaps the web lacks | Repeats the writer model's errors | Outputs can be checked by running or verifying them |
+| Rebuild the corpus often | Fresh knowledge | New leaks, new evals to compare | A scan and a held-out set run on every rebuild |
+
+## What experienced teams know
+
+1. **Memorization has a measurable cause.** The [deduplication paper](https://arxiv.org/abs/2107.06499) found a 61-word sentence repeated over 60,000 times in C4, and models trained on deduplicated data emitted memorized text ten times less often. Count your most repeated documents before you train.
+2. **Global dedup is not automatically better.** The [FineWeb paper](https://arxiv.org/abs/2406.17557) reports that MinHash over all 96 snapshots gave little gain, and that deduplicating each snapshot alone did better. Test the scope on your own data.
+3. **Evaluate a filter with small models and two seeds.** FineWeb's filter tests used 1.71B-parameter models on about 28B tokens, two seeds per dataset, with benchmarks chosen for low variance between samples. A one-run difference is noise until proven otherwise.
+4. **One cheap rule can remove a third of the data.** In the same paper the terminal-punctuation rule removes around 30% of tokens. Log the share removed by every rule, so a rule change cannot silently reshape the corpus.
+5. **Filters have side effects.** The [C4 documentation study](https://arxiv.org/abs/2104.08758) reports that the blocklist filter disproportionately removes text from and about minority individuals. Read a sample of what each filter drops.
+6. **Test sets sit in the crawl.** The same study found evaluation examples from other benchmark datasets inside C4. Scan for your own eval text on every rebuild and keep a private set that was never published.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "A pretraining corpus is built by a pipeline: extract, filter, deduplicate, mix. I would deduplicate with a fingerprint such as MinHash and test whether to dedup per snapshot or globally. I would test every filter by training small models on the data with and without it, using two seeds. And I would decontaminate against private eval sets on every rebuild, then report the full and the clean score." Then name one risk: a filter that drops text about some groups.
+</Callout>
+
+<Callout type="mistake">
+Do not say "more data is always better" or "we filter for quality" with no way to measure it. Do not say dedup removes test leaks: it reduces repeats but a single leaked copy stays. And do not trust a score jump on a public benchmark after a data change until you have checked for leaks.
+</Callout>
+
+<Callout type="deep" title="Why not read the data?">
+You can and should read samples. But a pipeline decides on billions of documents, so the check that scales is behavioral: train a small model and measure. That is also why pipelines are versioned like code. A filter change is a change to the model, and you need a record of which dataset version made which model.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why is a hash of the whole document a weak tool for finding near-duplicate web pages?',
+      options: [
+        'Hashes are too slow to run on billions of documents',
+        'A hash always gives the same value for different pages',
+        'A hash can only be computed for pages in English',
+        'One changed character, such as a new footer, gives a completely different hash',
+      ],
+      answer: 3,
+      explain: 'A whole-text hash catches only exact copies, because a tiny edit changes the whole value. A simhash is built so that similar text gives similar bits. Hashes are fast, and they work on any language.',
+    },
+    {
+      q: 'In the simhash demo, two unrelated texts differ in about half of the 32 bits. What does a very small distance tell you?',
+      options: [
+        'The texts are almost certainly near copies of each other',
+        'The texts are about different topics',
+        'The texts have the same length',
+        'The texts came from the same website',
+      ],
+      answer: 0,
+      explain: 'Each bit is set by votes from all the words. If only a few words differ, only a few votes change, so most bits match. Same length and same site are not what the fingerprint measures.',
+    },
+    {
+      q: 'A team tests a new quality filter. What is the right way to know it helped?',
+      options: [
+        'Check that the classifier labels 90% of the kept pages as good',
+        'Read ten of the kept pages and see that they look fine',
+        'Train the same small model on the data with and without the filter, using two seeds, and compare scores',
+        'Count how many tokens the filter removed, since more removed means better',
+      ],
+      answer: 2,
+      explain: 'Only the downstream score on held-out tests shows the effect, and two seeds separate a real gain from noise. The classifier judging its own output can be wrong the same way every time. Removing more tokens is not a goal.',
+    },
+    {
+      q: 'Why does deduplication reduce, but not remove, the risk of test-set leaks in training data?',
+      options: [
+        'Dedup only works on code, not on prose',
+        'It cuts many copies of a benchmark to one, but one copy still trains the model',
+        'Dedup removes the test items but also removes the training items',
+        'Benchmarks are always stored in a form dedup cannot read',
+      ],
+      answer: 1,
+      explain: 'Dedup keeps one copy of each repeated text. If that text is a test item, it stays in the corpus. Only a scan against your eval sets, called decontamination, removes it.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Deduplicating Training Data Makes Language Models Better](https://arxiv.org/abs/2107.06499): the 61-word sentence, the memorization result, and the train-test overlap figure.
+- [The FineWeb Datasets](https://arxiv.org/abs/2406.17557): one documented pipeline, with its dedup and filter experiments.
+- [Documenting Large Webtext Corpora: C4](https://arxiv.org/abs/2104.08758): what a famous corpus holds, including benchmark text and filter side effects.
+- [Stanford CS336, Language Modeling from Scratch](https://cs336.stanford.edu/): the data lectures on filtering, deduplication, mixing, and synthetic data. You do not need it to follow this lesson.

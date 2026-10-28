@@ -1,0 +1,275 @@
+---
+summary: 'Decode makes one token per pass, and each pass is limited by reading weights, not by math. Speculative decoding lets a cheap guesser propose several tokens, then the large model checks them all in one pass and keeps the matching ones. The output is unchanged. The gain depends on how often guesses are kept, and it fades when the GPU is already busy.'
+requires: ['ai/a2-inference-cost/prefill-decode', 'ai/a2-inference-cost/batching-throughput', 'ai/e3-inference-deep/continuous-batching']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE3SpecWalk from '../../../../components/anim/lessons/AiE3SpecWalk.tsx';
+import AiE3SpecSpeedup from '../../../../components/anim/lessons/AiE3SpecSpeedup.tsx';
+
+## The problem
+
+You run a coding assistant on your own GPUs. At night the cluster is quiet, and one user waits for a long answer. The GPU is busy, but it is not working hard. Each new token needs a full read of the model weights, and the math units sit nearly idle. The user watches the text crawl.
+
+Lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) explained why. Decode makes one token per pass, and each pass is limited by memory bandwidth. Lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/) gave one cure: serve many users in one batch, so they share each read. That cure raises total throughput. It does not make one user's answer arrive faster.
+
+This lesson is about the second cure. It speeds up one stream by using the compute that the memory-bound step leaves free. The questions on the way are:
+
+1. Why can a large model check several tokens for the price of one?
+2. How does a cheap guesser fit into that check?
+3. Why is the output not changed?
+4. What decides the speedup?
+5. When does it stop helping?
+
+## Naive solution: make the single step faster
+
+The obvious levers are a faster GPU, fewer bytes per weight ([quantization, lesson A2.6](/learn/ai/a2-inference-cost/quantization-small-models/)), or more GPUs sharing the read (lesson E3.6). All three lower the cost of one pass. None of them changes the rule that a pass makes **one** token, because each token depends on the one before it.
+
+That dependency looks like a wall. To pick token 5 you need token 4, and to pick token 4 you need token 3. Does the large model really have to wait?
+
+## Question 1: why can the model check several tokens at the price of one?
+
+**What it is.** Look at what a pass does when it reads a prompt. In prefill the model takes all the prompt tokens together and, at every position, computes what the next token would be. Position 7 gets a prediction that uses tokens 1 to 7 only. All positions are done in one pass.
+
+**The picture.** Think of a teacher marking a whole page of an exam at once. Marking a page of ten answers takes only a little longer than marking one. The student wrote the answers one by one, but the teacher can check them together, because every answer is already on the page.
+
+**Why it matters.** Suppose someone hands the large model a guess for the next five tokens. The guess is a "page already written". The model can run one pass over the prompt plus the guess. At each of the five positions, the pass says which token the model would have chosen after the tokens before it. If the guess matches, the guess was right. This is a check, not a creation.
+
+**Example, and the cost.** Lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) showed that decode is memory-bound. A pass is limited by reading all the weights once. A pass over six positions reads the same weights and does a little more math. The math units were idle anyway. So a check of five guessed tokens costs about the same time as making one token. Checking is cheap. Making is expensive. That gap is the opportunity.
+
+## Question 2: where does the guess come from?
+
+**What it is.** A **draft model** [mid] is a small, fast model that guesses the next few tokens. The large model that has the final say is the **target model** [mid]. The draft model is usually from the same family, with far fewer parameters, so it must use the same vocabulary of tokens as the target.
+
+**The picture.** An editor and a junior writer. The junior writes a quick five-word guess for each sentence. The editor reads the guess at a glance and says "right, right, right, wrong from here". The editor keeps the right words and writes the first wrong one personally. The editor never accepts a word that the editor would not have written.
+
+**Why it works.** Much of a text is easy. After "The capital of France is", most models agree on the next word. A small model gets these easy tokens right most of the time. The hard tokens go wrong, and the check catches them. This idea is called **speculative decoding** [senior]. The name comes from speculative execution in a processor: do work you might not need, and throw it away if the guess was wrong.
+
+**Example.** Step through one round below. The words are illustrative. The shape is real.
+
+<AiE3SpecWalk client:visible />
+
+Notice three things.
+
+- The draft model runs five small steps, one after another. They are cheap, but not free.
+- The large model runs **once** and scores all five positions.
+- You keep the guesses up to the first mismatch. At the mismatch you use the large model's own token. So a round always gives at least one token, and at most six (five guesses and one extra).
+
+The rule has one more detail. If all five guesses match, the large model has also computed the token for the position **after** the fifth guess. That is a free sixth token. This is why the best case is the guess length plus one.
+
+### The bookkeeping you do not see
+
+The pass writes KV cache entries (lesson [A2.3](/learn/ai/a2-inference-cost/kv-cache/)) for all the positions it checked. When a guess is rejected, the entries for the rejected positions are thrown away, and the next round overwrites them. The draft model has its own weights and its own KV cache, so it takes memory too. A draft model of a few billion parameters is small next to a 70B target. It is not zero.
+
+## Question 3: why is the output not changed?
+
+This is the part to be careful about. Speculation is **lossless**: it gives the same text distribution as the large model alone, not a faster but worse model. The authors of the original paper show this for their method, and report outputs that are identical to the baseline in their test.
+
+**The easy case: greedy decoding.** In **greedy decoding** [junior] (temperature zero) the model always takes its single most likely token. The check is a plain comparison. A guessed token is kept if and only if it is the token the large model would have picked at that position. Every kept token is one the large model would have written. The first mismatch gets the large model's pick. So the final text is exactly the text of ordinary decoding.
+
+**The sampling case.** With sampling (temperature above zero) the model draws a token at random from its probabilities, so a plain comparison is not enough. The paper uses an acceptance rule that keeps the final distribution exactly equal to the large model's. The picture: keep the guess with a chance that depends on how much the large model likes it compared with how much the draft model liked it. A guess the large model likes at least as much is always kept. A guess it likes less is kept only some of the time. When a guess is rejected, the replacement is drawn from what the large model wanted and the draft model under-produced. The result is that the mix of kept and replacement tokens matches the large model's own distribution.
+
+<Callout type="deep" title="The sampling rule, in symbols">
+Let p be the large model's probability for the guessed token, and q the draft model's. Keep the guess with probability min(1, p / q). On rejection, draw a new token from the distribution proportional to max(0, p(x) minus q(x)) over all tokens x. The paper proves that the tokens produced this way are distributed exactly as p. You do not need the proof to use the idea. You need to know that the draft model changes the speed, not the distribution.
+</Callout>
+
+One consequence for your quality checks. If you add speculation to a deployed model, you do not need to rerun a quality benchmark for the speed idea itself. You do need to test your server, because a bug in the implementation (a wrong rollback, a wrong tokenizer mapping) can break the guarantee even though the method is sound.
+
+## Question 4: what decides the speedup?
+
+Two numbers decide the gain, and one more decides the cost.
+
+**The acceptance rate** [mid] is the chance that a guessed token is kept. Call it alpha. A high alpha means the guesser and the large model agree often. Alpha depends on the draft model, the task, and the sampling setting. The original paper saw higher acceptance at temperature zero than at temperature one: speedups of about 3.4 times against about 2.6 times on a translation task with the T5-XXL model. Text that is easy to predict, such as boilerplate code, templated replies, or a summary that quotes the source, gives a higher alpha than free creative writing.
+
+**The guess length.** Guessing more tokens per round gives more chances to keep tokens. But a guess is only useful up to its first miss. The chance that the whole guess survives falls with every extra token. So the gain per extra guess shrinks. Under the paper's simple assumption that every guess has the same chance alpha of being kept, the expected tokens per large-model pass is a short geometric sum. You do not need the formula. You need its shape: it climbs, then flattens. At alpha of 0.7 and a guess of five tokens, a round yields about three tokens on average (derived from the paper's formula). That is three tokens for the price of one large pass plus five small ones.
+
+**The draft cost.** The draft model is not free. Call its step time, as a fraction of one large step, c. If c is large, the small steps eat the gain. In the paper's tests the draft was about two orders of magnitude smaller than the target, and that size usually worked best, because it balances acceptance and cost. Their draft step cost stayed under 5 percent of a large step. A draft that is too small guesses badly. A draft that is too big is too slow.
+
+Now play with the numbers. The tool does the arithmetic with the formulas from the paper. The last card uses a simple batch model that we describe below.
+
+<AiE3SpecSpeedup client:visible />
+
+Try these three moves.
+
+1. Hold the guess length at five. Lower the acceptance rate. The speedup falls fast. A guesser that is right half the time barely pays for itself.
+2. Raise the draft cost. The best guess length drops, because every guessed token now costs something.
+3. Raise the guess length with a high acceptance rate. Tokens per pass climb, and the extra arithmetic grows with them. The extra arithmetic is the work spent on guesses that were thrown away.
+
+### Where the guess can come from
+
+A small model is not the only guesser. The idea needs a cheap way to propose tokens. Several exist, and the vLLM documentation lists them.
+
+| Guesser | How it guesses | Cost | When it fits |
+|---|---|---|---|
+| Separate draft model | A small model of the same family | Extra weights, extra KV cache, a model to host | General text, low load |
+| Extra prediction heads or a trained draft head (the EAGLE and multi-token prediction kinds) | Small parts attached to the target model | A training step, small memory | A model family that ships with them |
+| N-gram or suffix lookup | Copy text that already appeared in the prompt or the answer | Almost none, no extra model | Output that repeats the input: edits, quotes, structured data |
+
+vLLM's guide says that the model-based methods give the best latency reduction, while the lookup methods give modest speedups without adding work at peak traffic. It tells you to treat the table as a starting point, because real gains depend on your model, traffic, hardware, and sampling settings.
+
+The lookup row is the cheap end. For an edit of a file, the best guess is the file itself. Lesson [Cursor Codebase Indexing and Instant Apply](/learn/ai/a14-wild/cursor/) shows that case in full: Cursor guesses from the old file instead of using a draft model. This lesson does not repeat it. The point to keep: a good guesser is whatever is cheap and often right for your traffic.
+
+## Question 5: when does it stop helping?
+
+**What it is.** Speculation spends compute to save time. It only works if there is spare compute. The large pass now checks the guess length plus one positions for every user in the batch, not one. If the GPU still has room, that is free. If the GPU is already busy, the extra positions are not free.
+
+**The picture.** A restaurant kitchen with a free cook. A waiter can send the free cook to prepare dishes that the customer might order. If they are right, the dish is ready at once. In a rush hour every cook is busy, so the free cook does not exist. Preparing guessed dishes now delays real orders.
+
+**Why it matters.** Lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) gave the ridge point, near 295 tokens per weight read on an H100: the number of tokens one read can serve before the math becomes the limit. A big batch from continuous batching (lesson E3.1) already moves the step toward that limit. Add speculation, and each user now checks several tokens, so the step crosses the ridge sooner. Once the step is compute-bound, wasted guesses cost real time.
+
+**Example.** Move the batch slider in the tool above, with alpha 0.7, guess length 5, and draft cost 5 percent. At small batches the speedup is more than two times. As the batch grows, the speedup falls, and past a few hundred users it drops below one. Speculation is then slower than plain decoding. This is our toy model, not a measurement. It shows the direction, and the direction matches what the paper says about its limit: the method is not helpful when compute is already saturated. The vLLM guide frames the use case the same way, as a tool for medium to low traffic and memory-bound work.
+
+This leads to the design rule for a fleet. Speculation is a **latency** tool, not a throughput tool. It helps the single user at quiet times. At peak load a batch of users already shares each weight read, so there is little to win. Good servers can turn it on and off by load, or vary the guess length. vLLM lists dynamic speculation methods for this reason. In a shared fleet, you do not pick one setting for all hours.
+
+<Callout type="deep" title="Why the extra arithmetic matters for cost">
+The paper calls the extra work a rise in "arithmetic operations". Each rejected guess is arithmetic that produced nothing. On a lightly loaded GPU this work is free, because the units were idle. On a loaded GPU it is paid with time. When you compare cost per token between a speculative and a plain deployment, compare at the load you actually run at, not at one user.
+</Callout>
+
+## What to watch in production
+
+Three signals tell you if speculation helps your traffic.
+
+- **Acceptance rate**, per task and per sampling setting. vLLM exposes per-request acceptance metrics. A falling rate after a model upgrade means the draft model no longer matches the target.
+- **Time per output token** at your real load, not at one user. The target is lower TPOT without raising time to first token.
+- **GPU use by the draft model.** A draft that takes memory from the KV cache lowers the number of users you can batch (lesson [A2.3](/learn/ai/a2-inference-cost/kv-cache/)).
+
+A rollout plan that works: turn it on for one traffic class that is easy to predict, such as code edits or structured output. Compare TPOT and acceptance. Then widen.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Speculation with a draft model | Lower TPOT for one user, same output | Extra memory, extra arithmetic, a second model to keep in step | Quiet or medium load, long answers |
+| Lookup guessing (copy from input) | Large gain when the answer repeats the input, no extra model | Little gain on new text | Edits, quotes, extraction |
+| Larger guess length | More tokens per pass when guesses are good | More waste when guesses are bad | Acceptance is high |
+| Plain decoding with a big batch | Highest throughput per GPU | Per-user speed stays low | Peak load, batch jobs |
+| Faster hardware or lower precision | Helps every request | Cost, quality risk (lesson [A2.6](/learn/ai/a2-inference-cost/quantization-small-models/)) | You need a floor-level speed up first |
+
+## What experienced teams know
+
+1. **It is a low-load tool.** vLLM's [speculative decoding guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/) says it reduces inter-token latency under medium-to-low QPS, memory-bound workloads. Test at your peak, not at one user.
+2. **Acceptance is the number to measure, and it is per task.** The [original paper](https://arxiv.org/abs/2211.17192) saw speedups from about 2.3 to 3.4 times depending on task and temperature on one model. Do not carry a number from another workload.
+3. **The draft should be much smaller than the target.** The paper found a draft about two orders of magnitude smaller usually worked best. A draft that is slow erases the gain.
+4. **A cheap guesser can beat a clever one.** The vLLM guide says lookup methods give modest gains with no extra load at peak. For edits, Cursor's [apply post](https://cursor.com/blog/instant-apply) guesses from the old file. Lesson [A14: Cursor](/learn/ai/a14-wild/cursor/) reads that post with its limits.
+5. **Watch the guarantee when you build it yourself.** The sampling rule is exact only if the rollback, the shared vocabulary, and the probabilities are right. Compare the output of a speculative and a plain server on a fixed set of prompts at temperature zero before you ship.
+6. **Fleet settings change by the hour.** vLLM lists methods that adapt the guess to traffic. A fixed setting tuned for the night can slow the day.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "Decode is memory-bound, so checking a few extra tokens in one pass costs about the same as making one. A small draft model proposes tokens, the large model verifies them in one pass, and I keep the guesses up to the first mismatch. The output distribution is unchanged. The gain follows the acceptance rate and falls when the batch is large, because the spare compute is gone. So I use it for latency at low or medium load and measure acceptance per task." Then name the cost: extra memory for the draft and extra arithmetic.
+</Callout>
+
+<Callout type="mistake">
+Do not say speculation makes the model "approximate" or "faster but lower quality". It does not change the distribution. Do not promise a fixed speedup, because it depends on acceptance and load. Do not turn it on for a fleet at peak and assume it helps: at high batch it can be slower than plain decoding. Do not forget the draft model's own memory.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="e3-spec-night-day"
+  title="Fast at night, slower at peak"
+  scenario="A team turns on speculative decoding with a small draft model for their 70B chat service. In the quiet hours the median time per output token falls a lot. At the evening peak the median time per output token is worse than before they turned it on. The numbers are illustrative."
+  facts={[
+    'night: batch about 4 users, acceptance rate 0.72, TPOT down about 2x',
+    'peak: batch about 300 users, acceptance rate 0.70, TPOT up',
+    'draft model: 7% of a target step per guessed token',
+    'GPU memory use: KV cache pool is smaller than before',
+  ]}
+  steps={[
+    {
+      prompt: 'The acceptance rate is about the same at night and at peak. What explains the change in speed?',
+      options: [
+        'The draft model got worse at peak, so guesses are rejected',
+        'At peak the step is already compute-bound, so extra checked positions cost real time',
+        'The large model changes its answers at peak, so the check fails',
+        'Speculation only works for one user at a time by design',
+      ],
+      answer: 1,
+      explain: 'Acceptance is unchanged, so the guesses are fine. With hundreds of users, each checking several positions, the pass crosses the ridge point and becomes compute-bound. Then rejected guesses cost real time. The output is not changed by load, and speculation works for batches too until compute runs out.',
+    },
+    {
+      prompt: 'Which change fits this fleet best?',
+      options: [
+        'Raise the guess length so more tokens are kept per pass',
+        'Use a larger draft model to raise the acceptance rate',
+        'Turn speculation off, or shorten the guess, when the batch is large',
+        'Lower the temperature to zero for all users',
+      ],
+      answer: 2,
+      explain: 'The problem is spare compute, not guess quality. Making guesses longer or the draft bigger adds more work to a busy GPU. Switching it off or shortening the guess at high load keeps the night gain without the peak loss. Temperature changes acceptance a little, not the compute limit.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why can the large model check five guessed tokens in about the time it takes to make one token?',
+      options: [
+        'The pass is limited by reading weights, so extra positions use idle math units',
+        'The guessed tokens skip the attention step in the large model',
+        'The large model reads fewer weights when it is given a guess',
+        'The draft model does the checking, so the large model is not involved',
+      ],
+      answer: 0,
+      explain: 'A decode pass is memory-bound: its time is the weight read. Checking more positions adds a little math, which was idle. The guesses are not skipped, the weights are read in full, and the large model does the final check.',
+    },
+    {
+      q: 'In one round the draft model guessed five tokens and the large model disagrees at the third. How many tokens does the round produce?',
+      options: [
+        'Two, since only the matching guesses count',
+        'Three: the two matches and the large model\'s own third token',
+        'Five, since the large model keeps the guess and fixes it later',
+        'One, since a mismatch cancels the whole round',
+      ],
+      answer: 1,
+      explain: 'The first two guesses match and are kept. At the mismatch, the large model\'s own token is used, and it was already computed in the same pass. The later guesses are dropped. A round always yields at least one token.',
+    },
+    {
+      q: 'A team asks whether speculative decoding will lower the quality of their model\'s answers. What is the correct reply?',
+      options: [
+        'Yes, a little, because the draft model is weaker than the target',
+        'Only for long answers, since errors in guesses add up',
+        'Only when the guess is longer than five tokens',
+        'No, the acceptance rule keeps the target model\'s distribution, so only speed changes',
+      ],
+      answer: 3,
+      explain: 'Every kept token is one the target model would have produced, and a rejected guess is replaced by the target\'s own choice. The draft model sets the speed, not the output distribution. A bug in the implementation could still break this, which is why you test your server.',
+    },
+    {
+      q: 'Which workload is the best fit for lookup guessing, where the guesser copies text that already appeared in the prompt?',
+      options: [
+        'Writing a new short story from a one-line idea',
+        'Rewriting a file with a small change, so most of the output repeats the input',
+        'Answering a trivia question with one word',
+        'Translating a sentence into a language with a new alphabet',
+      ],
+      answer: 1,
+      explain: 'When the output mostly copies the input, copied text is often right, so acceptance is high and no extra model is needed. New creative text has little to copy. A one-word answer leaves nothing to speculate on. A translation does not repeat the input text.',
+    },
+    {
+      q: 'A fleet runs near full batches all day. Why is speculative decoding a poor fit there?',
+      options: [
+        'The draft model cannot run beside a large batch',
+        'Large batches always lower the acceptance rate to zero',
+        'Speculation needs spare compute, and a full batch has none left',
+        'Speculation only works at temperature zero',
+      ],
+      answer: 2,
+      explain: 'Speculation trades extra arithmetic for lower latency. A full batch has already used the idle math units, so the extra checked positions slow the step. Acceptance does not fall to zero with batch size, and speculation works with sampling too.',
+    },
+  ]}
+/>
+
+## Further reading
+
+You do not need the papers to use the idea. They are the sources for the claims above.
+
+- [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192): the algorithm, the acceptance rule, the speedup formula, and the 2X-3X result on T5-XXL.
+- [vLLM: Speculative Decoding](https://docs.vllm.ai/en/latest/features/speculative_decoding/): the list of methods, the low-to-medium QPS guidance, and acceptance metrics.
+- [Cursor: Editing Files at 1000 Tokens per Second](https://cursor.com/blog/instant-apply): speculation from the existing file, a company claim covered in lesson A14.

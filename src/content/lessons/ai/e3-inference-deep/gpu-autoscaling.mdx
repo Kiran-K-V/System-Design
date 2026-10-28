@@ -1,0 +1,285 @@
+---
+summary: 'A GPU replica must find a node, pull an image, and load tens to hundreds of GB of weights before it serves a token, so a spike outruns an autoscaler that reacts late. Scale on queue and KV cache signals, buy buffers on purpose (headroom, spares, a warm pool), and size the fleet from goodput measured on your own load test.'
+requires: ['ai/e3-inference-deep/serving-engines', '02-networking/load-balancing', 'ai/a2-inference-cost/self-host-vs-api']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import AiE3ColdStartTimeline from '../../../../components/anim/lessons/AiE3ColdStartTimeline.tsx';
+import AiE3ScaleSim from '../../../../components/anim/lessons/AiE3ScaleSim.tsx';
+import AiE3Planner from '../../../../components/anim/lessons/AiE3Planner.tsx';
+
+## The problem
+
+A team serves a chat feature from a fleet of GPU replicas. They copy the autoscaling rule from their web tier: add replicas when CPU is high. A launch post goes out at noon. Traffic doubles in two minutes. The autoscaler waits for its metric to rise, then asks for more replicas, and the replicas take minutes to come up. For those minutes, every request is slow or fails. By the time the new replicas are ready, the first wave of angry users has already left. (This story is illustrative, not a real incident.)
+
+A web server starts in a second. A GPU replica does not. That one fact changes how you scale, how you size, and what you pay for. This lesson has five questions.
+
+1. Why does a GPU replica take so long to start?
+2. Which signal should the autoscaler watch?
+3. What buffers cover the gap, and what do they cost?
+4. How do you buy the GPUs?
+5. How do you turn all of this into a plan?
+
+[Lesson A2.7](/learn/ai/a2-inference-cost/self-host-vs-api/) priced a fleet sized for the peak and showed that average load sets the real cost. [Lesson E3.7](/learn/ai/e3-inference-deep/serving-engines/) showed how to measure goodput and find the knee of one replica. This lesson uses both. It also adds time: how long a new replica takes, and what you lose while you wait.
+
+## Question 1: why does a GPU replica take so long to start?
+
+A **cold start** [mid] is the time from "we need one more replica" to "that replica serves its first user". The word "cold" means the new replica has nothing ready: no model in memory, no cache.
+
+Think of opening a new restaurant branch. You cannot serve one customer until the building is found, the kitchen is built, and the cooks have read the recipe books. A web server is a food cart: it is ready when you wheel it out.
+
+A GPU replica goes through four stages, in order.
+
+1. **Find a GPU node.** The cluster scheduler must place the replica on a machine with free GPUs. If none is free, a new machine must be bought or started. When GPUs are scarce, this stage can have no end. The ChatGPT infrastructure engineer told The Pragmatic Engineer: "There are simply no more GPUs to buy or rent, and therefore no GPUs to autoscale into."
+2. **Pull the container image.** The server software and its libraries come as one large file set. A node that has never run it must download it.
+3. **Load the weights.** The model files are copied from disk, network storage, or object storage into GPU memory. This is the stage that grows with the model. A 70B-parameter model in 16-bit needs about 140 GB (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). The time is bytes divided by the speed of the slowest link on the path. We derived that rule. We do not have a published figure for one cluster, so measure yours.
+4. **Warm up and join.** The server runs startup work, and a readiness check must pass before the load balancer sends traffic. A replica that joins too early serves errors, which is the same readiness rule as in the [backend load-balancing lesson](/learn/backend/02-networking/load-balancing/).
+
+<CrossTrackLink id="02-networking/load-balancing">
+A load balancer sends traffic only to backends that pass a health check. A new backend that is not ready must stay out of the pool, or it turns a scale-up into a burst of errors.
+</CrossTrackLink>
+
+Why is stage 3 the one you work on? Because you control it. You can keep weights on fast local disk on each node, so a start reads a local file instead of fetching it over the network. vLLM also ships a loader called the Run:ai Model Streamer. Its docs describe it as "a library to read tensors in concurrency, while streaming it to GPU memory". You turn it on with `--load-format runai_streamer`, and it reads from local paths and from S3, Google Cloud Storage, Azure Blob Storage, and S3-compatible stores. The docs say distributed streaming "can significantly improve loading times from object storage or high-throughput network fileshares". They give no speedup figure, so we give none. Test it on your storage.
+
+A concrete example. A team serves a 70B model. Weights live in object storage. Each new replica fetches 140 GB over the network on each start. They copy the weights once to a local disk on every GPU node image or node pool. The same start now reads from the local disk. They changed no model and no code, and the longest stage of the start got shorter.
+
+### The spike meets the cold start
+
+The animation uses made-up numbers. Watch how long capacity stays below demand.
+
+<AiE3ColdStartTimeline client:visible />
+
+Two lessons come out of it. First, the gap is the sum of two delays: the time to see the spike, and the time to start a replica. Reacting faster to the signal shrinks the first. Only buffers or a faster start shrink the second. Second, a web-style autoscaler that waits for a high metric will always arrive late, because a metric that is high means users already wait.
+
+## Question 2: which signal should the autoscaler watch?
+
+An **autoscaler** [junior] is a control loop that compares a measured number with a target and changes the replica count. The Kubernetes Horizontal Pod Autoscaler (HPA) states the rule in one line: the desired count is the current count times the ratio of the current metric value to the desired metric value, rounded up. It can scale on custom and external metrics, not only on CPU or memory. If the queue is twice the target, the loop asks for about twice the replicas.
+
+So the question is which metric. CPU is wrong for a model server: the CPU mostly waits for the GPU. GPU busy percent is also wrong. The ChatGPT engineer says the simple utilization metric "turned out to be misleading, as simple utilization only said whether or not the gpu was doing math in a time period", and that it did not tell them if they were under-using compute or "being starved of memory". The metrics the team used instead were KV cache utilization and batch size: "The combination of batch size and KV cache utilization was the primary metric we focused on." They also say that "GPU RAM, not compute resource, is the most frequent bottleneck for LLM operations" (Pragmatic Engineer, "Scaling ChatGPT").
+
+This matches what the engine exports. From lesson E3.7: vLLM exposes `vllm:num_requests_waiting`, `vllm:request_queue_time_seconds`, and `vllm:kv_cache_usage_perc`. Why these?
+
+- **Queue depth** (requests waiting) is the earliest honest sign. A queue only grows when the engine cannot admit work. It rises before TTFT breaks.
+- **KV cache use** says memory is near its limit. At that point more load means evictions and slow tokens, not more throughput.
+- **Goodput against target** is the best signal, but it is a result and it lags. Use it to check the other two.
+
+An everyday picture: a bank. The number of people waiting in the line is a better guide for opening another window than how busy the tellers look.
+
+Two more rules from experience with control loops. A signal that is a rolling average already lags, so keep its window short for scale-up. And scale-down should be slower than scale-up. The Kubernetes docs call a replica count that keeps moving up and down "thrashing" or "flapping", and they offer a stabilization window to smooth it. For scale-down the default window is 300 seconds, and for scale-up there is no window, so the HPA scales up at once. That default fits GPUs well, because a replica you remove must be paid for again, in minutes of cold start, if traffic returns.
+
+### The limit of signals
+
+A better signal moves the start of the scale-up earlier. It does not make a start faster. If new replicas need several minutes, a signal that fires two minutes early still leaves a gap. That is why the next question exists.
+
+## Question 3: which buffers cover the gap, and what do they cost?
+
+You can place three kinds of buffer between a spike and a cold start. They differ in how fast they help and how much they cost when nothing happens.
+
+- **Headroom.** Run the fleet below its knee, for example at 70% of goodput, so a rise in traffic fits into the replicas you already have. Cost: you pay for capacity you do not use. It works at once and needs no scale-up.
+- **Spares.** Extra replicas for failures. A GPU node can fail while the fleet is at its peak, and a replica holds many GPUs, so one failure removes a large step of capacity. Cost: idle replicas. The spare is also headroom when nothing fails.
+- **Warm pool.** A few replicas that are already started and hold the weights in GPU or host memory. When the autoscaler asks for more, it takes from the pool and only a short server start remains. Cost: those GPUs bill by the hour while idle, and the pool must be refilled in the background after each use.
+
+Why three? Because they fix different problems. Headroom covers a slow rise. A warm pool covers a sudden jump, bigger than your headroom, for the time one start takes. Spares cover loss. A fleet with the right headroom for its traffic growth and its cold start needs a smaller pool.
+
+The simulator below runs a spike over 30 minutes. Change the cold start time and the pool size and watch two numbers move: traffic not served, and cost per hour.
+
+<AiE3ScaleSim client:visible />
+
+Read it in this order.
+
+1. **Set the pool to 0 and raise the cold start time.** The share not served grows with the cold start. The cost does not change. This is the price of being cheap and slow.
+2. **Hold the cold start at 5 minutes and add a pool.** Traffic not served drops. Cost rises by the cost of the idle GPUs. The pool pays off most when the spike is bigger than the headroom.
+3. **Make the spike smaller.** A smaller spike needs a smaller pool. The right pool size depends on the largest spike you want to survive, not on average load.
+4. **Shorten the cold start** to 60 seconds. The pool matters much less. Work on the start time can replace GPUs you would otherwise pay to keep idle.
+
+The model is a toy. It uses a made-up price and made-up constants, and it assumes demand is in whole replicas. Its direction is what you take away: you buy speed with idle GPUs, or you buy it with engineering work on the start.
+
+When no GPUs exist to scale into, buffers inside one cluster are not enough. The ChatGPT infrastructure engineer says the team "was forced to go multi-region, multi-cluster, and globally distributed" from day one. If your provider cannot give you more GPUs in a region, a second region or provider is the only buffer left. Lesson [A13.1](/learn/ai/a13-cases/chatgpt-assistant/) walks a ladder of what to shed first when no capacity can appear.
+
+## Question 4: how do you buy the GPUs?
+
+You can pay for the same GPU in different ways. Each way trades price against freedom.
+
+- **On demand.** You start and stop when you like and pay the list price. It costs the most per hour. It suits the part of the fleet that changes, if the provider has capacity at all.
+- **Reserved or committed.** You promise to pay for a fixed term and get a lower hourly price. Terms differ by provider, so read yours. It suits the steady part of the fleet that runs all day. If your traffic shrinks, you still pay.
+- **Spot.** Spare capacity at a steep discount in exchange for giving it back on short notice. AWS states that "it is always possible that your Spot Instance might be interrupted", and that the notice comes two minutes before EC2 stops or terminates the instance (and not two minutes for hibernation). It recommends designing the application to be fault-tolerant.
+
+Now compare the two minutes with the cold start. If a replica takes longer than two minutes to load, you cannot replace a reclaimed spot replica in the warning time. Another replica must already be serving. So spot is a good fit where you can afford the lost capacity, such as offline batch jobs, a retry-tolerant queue, or a small extra slice above a reserved base. It is a poor fit for the only copy of an interactive replica. Never use spot for the whole fleet of a latency-bound product.
+
+A simple split follows from the daily traffic curve. Reserve what runs all day (the floor of the curve). Use on demand for the part that rises and falls with the day. Use spot only for work that can pause. The planner below lets you move the split and see the monthly cost. Its discounts are made up and say nothing about any provider.
+
+## Question 5: how do you build the plan?
+
+A capacity plan is a chain of small answers, each from a measurement. Here is the chain in words. The widget does the arithmetic.
+
+1. **Traffic.** Peak requests per second, and the number of output tokens each request makes. Multiply them to get peak output tokens per second. Use your own logs. If you have none, state the assumption.
+2. **Goodput per replica.** From the load test of lesson E3.7, at your real prompt and output lengths. This is the rate one replica serves while meeting both TTFT and TPOT targets. Do not use peak throughput. A replica is one engine instance, so for a big model it is several GPUs. That makes capacity move in steps. One more user can mean one more whole replica.
+3. **Headroom.** Divide by a share below 100% so each replica runs below its knee. How much? Enough that traffic growing during one cold start fits. The widget shows the headroom that traffic growth requires, from the growth speed and the cold start. If the headroom you set is smaller, a fast ramp will outrun the fleet.
+4. **Spares.** Add whole replicas for failures. One is the minimum for a fleet that cannot drop.
+5. **Cold start.** Weights size divided by read speed, plus node, image, and warm-up time. This number decides your pool and your scale-up lead time.
+6. **Purchase mix.** Reserved for the floor, on demand for the daily swing, spot only for work that can pause.
+7. **Check against average.** Compute average use and cost per million tokens. A fleet sized for the peak runs at the average (lesson [A2.7](/learn/ai/a2-inference-cost/self-host-vs-api/)). Compare with a plan sized for the average with a warm pool to see how much the buffer costs.
+
+<AiE3Planner client:visible />
+
+What the defaults show. The widget starts with 60 requests per second at 500 output tokens and a 140 GB model on 2 GPUs per replica. It asks for 16 replicas and 32 GPUs. The cold start comes to over two minutes, and the traffic growth you set needs more headroom than the 20% in the plan, so the plan flags it. Try three changes in turn. Raise the read speed and watch the cold start and the needed headroom fall. Raise the warm pool and watch the autoscaled cost rise. Move the reserved share up and watch the monthly bill fall while the commitment grows.
+
+All inputs in the widget are illustrative. The planner leaves out several costs: the engineers who run the fleet, the extra capacity of a second region, the share of tokens spent on prompts, and a change of model, which resets the load test. It also assumes one engine setup and one GPU type. Treat its output as the shape of an answer, and replace each input with a number you measured.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Fixed fleet sized for peak | No cold start, simple | Pays for peak all day, low average use | Flat, high traffic, or no GPUs to scale into |
+| Autoscale on queue and KV signals | Follows the daily curve, lower idle cost | Cold start gap, tuning work | Strong daily pattern, tolerance for short slow periods |
+| Warm pool | Fast scale-up | Idle GPUs billed by the hour | Sharp spikes, long cold start |
+| Faster weight loading | Shorter gap, smaller pool | Engineering time, local disk | Large model, frequent scale events |
+| More headroom | Instant absorption | Idle capacity all day | Fast ramps, strict latency targets |
+| Reserved capacity | Lower price per hour | Commitment, no refund when traffic falls | Steady floor of traffic |
+| Spot capacity | Steep discount | Taken back with short warning | Batch and retry-tolerant work only |
+
+## Interview lens
+
+<Callout type="tip">
+Lead with time, not with replicas: "A new replica takes minutes, so I plan around the gap. I scale on queue depth and KV cache use, not GPU busy percent. I keep headroom for ordinary growth and a small warm pool for jumps. I size replicas from goodput measured on our own load test, add spares for failures, and reserve the steady floor. Spot is for work that can pause." Then give the plan as a chain: traffic, goodput, headroom, spares, cold start, purchase mix.
+</Callout>
+
+<Callout type="mistake">
+Do not say "autoscale on CPU" or "on GPU utilization". Do not assume you can always get more GPUs: say what happens when none are free. Do not size from a peak-throughput benchmark. Do not put the only copy of an interactive replica on spot. Do not forget that scale-down has a price too: a replica removed on a quiet minute costs a full cold start when traffic returns.
+</Callout>
+
+## What experienced teams know
+
+- **Sometimes there is nothing to scale into.** The ChatGPT infrastructure engineer says there were "no GPUs to autoscale into", so the team went multi-region and multi-cluster from day one and ran a balanced global fleet (Pragmatic Engineer, "Scaling ChatGPT").
+- **Watch memory, not the busy light.** The same team found a simple utilization metric misleading and moved to KV cache utilization and batch size as the main signals (Pragmatic Engineer, "Scaling ChatGPT").
+- **Autoscalers can scale on any metric you export.** The Kubernetes HPA compares a current value with a target and scales the count by the ratio. It supports custom and external metrics, so queue depth from the engine is a legal input (Kubernetes HPA docs).
+- **Scale up fast, scale down slow.** The HPA has no stabilization window for scale-up by default and a 300-second window for scale-down, to stop flapping. A GPU replica is costly to rebuild, so many teams lengthen the scale-down window (Kubernetes HPA docs; the lengthening is our reading).
+- **Spot warning is shorter than a model load.** EC2 gives a two-minute interruption notice at best. A 140 GB load can take longer, so a replacement must already be running (AWS EC2 Spot docs; the comparison is our reading).
+- **Loading is an engine feature too.** vLLM ships a streaming loader that reads tensors concurrently into GPU memory from local and object storage. Its docs give no speedup number, so measure it on your own storage (vLLM docs).
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="e38-autoscaler-lags-spike"
+  title="The autoscaler arrives after the users leave"
+  scenario="A team serves a 70B model on a fleet that scales on GPU busy percent. A launch brings a sudden spike. The numbers are illustrative."
+  facts={[
+    'GPU busy percent: 92% before the spike, 100% during it',
+    'queue wait p95: 0.2 s before, 40 s at minute 2',
+    'KV cache use: 97%, preemptions rising',
+    'new replicas requested at minute 4, serving at minute 9',
+    'cold start measured: weights 140 GB from network storage',
+  ]}
+  steps={[
+    {
+      prompt: 'Why did the autoscaler react so late?',
+      options: [
+        'GPU busy percent was already near its ceiling, so it could not show how much extra demand there was',
+        'The model is too small for the traffic it receives',
+        'Kubernetes cannot scale GPU workloads at all',
+        'The load balancer ignored the new replicas for the whole spike',
+      ],
+      answer: 0,
+      explain: 'A busy percent of 92% before the spike and 100% during it hides the spike: it only says something was running. Queue wait and KV cache use rose sharply and would have fired earlier. The other options do not match the facts.',
+    },
+    {
+      prompt: 'Which pair of signals should drive the scale-up instead?',
+      options: [
+        'CPU use and disk free space on the node',
+        'Queue depth or queue wait, and KV cache use',
+        'Network bytes in and the number of connected clients',
+        'GPU temperature and fan speed',
+      ],
+      answer: 1,
+      explain: 'A growing queue and a nearly full KV cache are the engine saying it cannot admit more work. CPU and temperature do not track the engine limits, and connections do not show how much work each one brings.',
+    },
+    {
+      prompt: 'Even with the better signal, five minutes of cold start remain. Which change cuts the gap the most for this team?',
+      options: [
+        'Ask users to retry less often',
+        'Keep weights on local disk and keep a small warm pool of started replicas',
+        'Lower the replica count to save money during quiet hours',
+        'Move to a larger model for better answers',
+      ],
+      answer: 1,
+      explain: 'The weight load from network storage is the long stage. Local weights shorten it, and a warm pool skips most of it for a sudden jump. Fewer replicas or a larger model would make the gap worse.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'e38-q-cold-stage',
+      q: 'Which stage of a GPU replica start grows with the size of the model?',
+      options: [
+        'Finding a node with free GPUs in the cluster',
+        'Running the readiness check before joining',
+        'Loading the weights into GPU memory',
+        'Pulling the base container layers of the image',
+      ],
+      answer: 2,
+      explain: 'Weight loading copies the model files into GPU memory, and its time is bytes divided by the speed of the slowest link. Node search and the readiness check do not depend on model size, and container layers depend on the image, not the weights.',
+    },
+    {
+      id: 'e38-q-signal',
+      q: 'Why is queue depth a better scale-up signal than GPU busy percent for a model server?',
+      options: [
+        'It is cheaper to collect than any other metric a server can export',
+        'It always reads lower than GPU busy percent, so alerts stay quiet',
+        'A queue grows only when the engine cannot admit work, so it warns early',
+        'It is the only metric that the load balancer is able to read',
+      ],
+      answer: 2,
+      explain: 'The busy percent only says something was running in the sample period, and it reads full at moderate and extreme load alike. A queue appears when requests cannot be admitted, so it warns early. Cost of collection and load balancer access are not the reason.',
+    },
+    {
+      id: 'e38-q-pool',
+      q: 'A team adds a warm pool of started replicas. What do they pay for, and what do they get?',
+      options: [
+        'Idle GPUs billed by the hour, and faster scale-up for a jump',
+        'Nothing extra, since idle GPUs are free while they hold weights',
+        'A lower price per token, since warm replicas use less memory',
+        'A longer cold start, since pool replicas must load the weights twice',
+      ],
+      answer: 0,
+      explain: 'Pool replicas already hold the weights, so a scale-up takes only a short server start, but the GPUs are billed while idle. They are not free, they do not change the price per token directly, and they shorten the start rather than lengthen it.',
+    },
+    {
+      id: 'e38-q-spot',
+      q: 'Why is spot capacity a poor choice for the only copy of an interactive replica?',
+      options: [
+        'Spot GPUs run the model more slowly than reserved GPUs of the same type',
+        'The provider can take it back on short notice, before a model load could finish',
+        'Spot prices change every second, so the cost can never be known',
+        'Spot instances are not able to hold the weights of large models',
+      ],
+      answer: 1,
+      explain: 'AWS gives a two-minute notice at best, and a large model can take longer to load, so a replacement cannot be ready in time. Spot hardware is the same, can hold the same weights, and the price question is a minor concern next to losing the replica.',
+    },
+    {
+      id: 'e38-q-steps',
+      q: 'Each replica uses 8 GPUs, and traffic grows by a small amount past the fleet capacity. What happens to capacity planning?',
+      options: [
+        'It grows smoothly, one GPU at a time, as the traffic rises',
+        'It does not change, since replicas cannot be added while running',
+        'It falls, since larger replicas are slower than small ones',
+        'It grows in steps of a whole replica, so a small rise can force a large buy',
+      ],
+      answer: 3,
+      explain: 'A replica is one engine instance, so you add or remove it whole. For a model split over 8 GPUs, a small excess demand means a full new replica. The steps are larger for bigger models.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [The Pragmatic Engineer, Scaling ChatGPT](https://newsletter.pragmaticengineer.com/p/scaling-chatgpt): the capacity, multi-region, and KV cache points quoted above.
+- [Kubernetes, Horizontal Pod Autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/): the scaling rule, custom metrics, and the stabilization window.
+- [vLLM, Run:ai Model Streamer](https://docs.vllm.ai/en/latest/models/extensions/runai_model_streamer.html) and [vLLM metrics](https://docs.vllm.ai/en/latest/usage/metrics.html): the weight loader and the queue and KV metrics.
+- [AWS, Spot Instance interruption notices](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-instance-termination-notices.html): the two-minute warning and the interruption behaviors.

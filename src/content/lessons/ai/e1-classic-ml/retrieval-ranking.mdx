@@ -1,0 +1,240 @@
+---
+summary: 'You cannot run a heavy model on every item for every request. A recommender uses a cascade: two towers and a vector index pick about a thousand candidates fast, a heavy ranker scores them with rich features, and a last stage applies policy. The stages share one latency budget, and a good item missed by stage one is lost for good.'
+requires: ['ai/e1-classic-ml/features-store', 'ai/a1-model-function/embeddings', '10-advanced/vector-databases']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE1CascadeFunnel from '../../../../components/anim/lessons/AiE1CascadeFunnel.tsx';
+import AiE1TwoTower from '../../../../components/anim/lessons/AiE1TwoTower.tsx';
+import AiE1CascadeBudget from '../../../../components/anim/lessons/AiE1CascadeBudget.tsx';
+
+## The problem
+
+You build the home feed of a short-video app. The catalogue holds millions of videos. Tens of millions of people open the app every day. When someone opens it, the feed must show about ten videos that fit that person, and it must do so before the screen feels slow. Say the whole request has about 100 milliseconds. (All numbers in this lesson are illustrative, unless a source is named.)
+
+You train a very good model. It reads the user's history, the video's text, its recent view counts, the time of day, the phone model, and how the user and the video relate to each other. Offline, it ranks videos better than anything you tried before. You deploy it, and the feed takes eleven seconds to load.
+
+The model is not slow for one video. It is slow because you asked it to look at millions of videos for each request. Questions for this lesson:
+
+1. Why can you not just score every item, and what do you do instead?
+2. What are the two towers, and why does the first stage use them?
+3. Why does a second stage exist, and what does it do that the first cannot?
+4. How do the stages share one latency budget?
+5. What must be recomputed when something changes?
+
+This lesson builds on three earlier ones. Lesson [A1.2](/learn/ai/a1-model-function/embeddings/) taught embeddings: lists of numbers where similar things sit near each other. The backend lesson on [vector databases](/learn/backend/10-advanced/vector-databases/) taught how to find the nearest vectors fast. Lesson E1.3 taught the feature store, which holds the features the later stages read.
+
+## Question 1: why not score everything?
+
+The simple design is to take the user, score every video with the best model, sort, and keep the top ten. It is correct and it is easy to explain. It fails on cost.
+
+Cost per request is the number of items times the cost of scoring one. A heavy model costs real compute per item. Multiply by millions of items and by thousands of requests per second, and the machines needed would cost more than the app earns. The YouTube paper states the shape of the problem: it needs to score millions of items under a serving latency of tens of milliseconds, and so it needs an approximate scheme that grows more slowly than the number of items.
+
+A second idea is to compute all scores ahead of time. For each user and each video, store a score. Now serving is a lookup. This breaks on size and on age. Millions of users times millions of videos is a table far too large to store or refresh. And scores go stale the moment the user watches something.
+
+The idea that works is a **cascade**. Think of hiring for a job with ten thousand applicants. Nobody interviews all ten thousand. A fast screen on the CV keeps fifty. A longer interview picks five. A last check handles things that have nothing to do with skill, such as the team's balance. Each step is more expensive per person and sees fewer people. A recommender has the same three steps.
+
+| Stage | Items in | Items out | Cost per item | What it optimises |
+|---|---|---|---|---|
+| Candidate generation | Millions | About a thousand | Very low | Not missing good items |
+| Ranker | About a thousand | About a hundred | High | Order by predicted value |
+| Re-rank | About a hundred | About ten | Low | Policy, diversity, freshness |
+
+The counts are illustrative. The YouTube paper describes the same shape in words: candidate generation winnows the corpus to hundreds of videos, and ranking then orders a few hundred. The animation below shows how the funnel narrows.
+
+<AiE1CascadeFunnel client:visible />
+
+## Question 2: what are the two towers?
+
+Stage 1 must be cheap per item. The trick is to do most of the work before the request, so that at request time all that is left is a comparison.
+
+An **embedding**, from lesson [A1.2](/learn/ai/a1-model-function/embeddings/), is a list of numbers that places a thing in space. A **tower** is a small neural network that turns raw inputs into one embedding. A two-tower model has two of them.
+
+- The **user tower** reads what is known about the user and the context: recent watches, language, device, time of day. It outputs a user vector.
+- The **item tower** reads what is known about a video: its title, category, creator, age. It outputs an item vector.
+
+The score for a pair is the **dot product** of the two vectors. A dot product multiplies the numbers position by position and adds them up. It is large when the two vectors point the same way, and small when they do not. It is the simplest way to measure "these two agree".
+
+Picture a library with a card for every book and a card for every reader. Each card is a short list of scores on a few dimensions, such as "likes action", "likes comedy", "wants short". A good match is a reader and a book whose cards point the same way. The librarian does not read the books. The librarian compares cards.
+
+Why this helps the cost: the item tower does not depend on the user. So you run it once per video, offline, and store the result. The stored item vectors go into an **approximate nearest neighbour** index, or ANN index, which finds the vectors closest to a query vector without checking all of them. Lesson [A5.2](/learn/ai/a5-rag/ann-indexes/) and the backend [vector databases](/learn/backend/10-advanced/vector-databases/) lesson explain how HNSW (a layered graph of links between vectors) and IVF (cluster lists) do it. At request time you run only the user tower, once, and ask the index for the nearest items. The cost per request is one small network call and one index lookup, however many millions of items sit in the index.
+
+The YouTube paper uses this idea. It frames candidate generation as predicting which video the user watches next out of millions. At serving time, it says, the scoring problem reduces to a nearest-neighbour search in the dot-product space, because the calibrated likelihoods from the output layer are not needed. The authors also report that live A/B results were not particularly sensitive to which nearest-neighbour algorithm they chose. This is a paper claim about their system. Practitioners now usually call this shape a two-tower model.
+
+How does training work? You have pairs of a user and a video that the user watched. You push the two vectors of each pair closer. You also take other videos at random and push those away. The YouTube paper says it samples several thousand negatives per example instead of scoring all millions. The model must learn that the watched video is closer than the random ones.
+
+What do you give up? The two towers never see each other until the final dot product. The user tower cannot say "this user, for this specific video, in this exact context". It can only say "here is the user, in a general way". That makes stage 1 rough. It is acceptable because stage 1 has a modest job: bring back a thousand items that include the good ones. Precision belongs to stage 2.
+
+What recomputes when something changes? Pick a change and see.
+
+<AiE1TwoTower client:visible />
+
+Three things stand out. A new video costs one item-tower run and one index insert. A watch by a user costs a user-tower run and nothing else. And retraining a tower is expensive: all item vectors must be recomputed and the index rebuilt, and the user tower must change at the same time, since both must agree on the vector space. Teams therefore plan tower releases like a database migration, not like a config change.
+
+New items also have a timing problem. A video uploaded a minute ago is not in the index until its vector is computed and inserted. The YouTube paper notes that users prefer fresh content, and it adds an "example age" feature to counter the model's bias towards the past. The refresh lag between upload and index is a number to track, because it decides how soon a new video can be shown at all.
+
+## Question 3: why a second stage?
+
+If stage 1 already scores items, why not stop there? Because the dot product is a blunt tool, and the thousand candidates are few enough to afford more.
+
+The **ranker** is a heavier model. It scores each (user, item) pair with all the features you have. These include crossed features, such as "this user's watch share of this creator in the last week", which the towers cannot see since they never see the pair together. The YouTube paper says the ranking stage has access to many more features about the video and the user's relationship to it, because only a few hundred videos are scored instead of millions. It also notes that ranking is needed to merge candidates from different sources, since their scores are not directly comparable.
+
+The ranker reads many of its features from the feature store of lesson E1.3, at request time. This is why skew (lesson E1.4) hurts rankers most. They have the most features and the most paths.
+
+The same idea appears in search for text. Pinecone's guide on rerankers puts it this way. A bi-encoder, which is the two-tower idea applied to text, must compress all the meanings of a document into one vector, so information is lost. A reranker, also called a cross-encoder, feeds the query and one document into the model together, which loses less but costs a full model run per pair. The guide says rerankers are slow and retrievers are fast. It gives one claim of its own: at 40 million records, a small BERT-style reranker on a single V100 GPU would take more than 50 hours to answer one query. Its fix is the cascade: retrieve a few with a fast encoder, then rerank only those. Lesson [A5.6](/learn/ai/a5-rag/reranking-rewriting/) shows this same cascade in RAG. A language-model app and a video app are solving the same problem.
+
+What does the ranker optimise? This choice matters more than the model. The YouTube paper says its final ranking objective is generally a simple function of expected watch time per impression. It says that ranking by click-through rate often promotes deceptive videos that the user does not complete, while watch time better captures engagement. This is the gap between a proxy and a goal, from lesson E1.1, showing up inside a model.
+
+## Question 4: what does the last stage do?
+
+After the ranker you have a sorted list. You do not show it as it is.
+
+**Re-ranking** applies rules that are about the product and not about taste:
+
+- **Diversity.** Do not show ten videos from one creator, or ten near-duplicates.
+- **Policy and safety.** Remove videos the user hid, videos under review, and content that must not be shown in some regions.
+- **Freshness and exploration.** Mix in a few new or unproven videos to learn about them.
+- **Business rules.** A promoted video in slot four.
+
+The reason to keep these separate from the ranker is that they change on a different clock. A policy rule must take effect in minutes, with no retraining. Google's Rules of Machine Learning make the same point for spam: quality ranking and spam filtering are different jobs, since spammers react to your signals, so put filtering in a policy layer that you can change fast. The re-rank stage is also cheap, since it works on about a hundred items.
+
+## Question 5: how do the stages share the budget?
+
+Each stage has a cost and a way to fail. Together they must fit the request budget.
+
+Look at the money. The ranker's time grows with the number of candidates and with the cost per candidate. Suppose the ranker gets heavier. To stay inside the budget you must send it fewer candidates. But fewer candidates means stage 1 has fewer chances to include the good items. Try it below. Raise the ranker's cost and watch what the budget does to the candidate count and to recall. **Recall** here means the share of the items that would have been good that stage 1 managed to include.
+
+<AiE1CascadeBudget client:visible />
+
+The important rule follows. **The ranker cannot recover an item that stage 1 never returned.** A perfect ranker on a candidate set that missed the right items gives a perfect order of the wrong things. This is why the stages need separate metrics: stage 1 is judged on recall, the ranker on ordering quality (lesson E1.6), and the whole system on online results.
+
+Other levers exist when the budget is tight:
+
+- **Run the ranker on a GPU in parallel lanes.** The widget has this slider. It costs money.
+- **Make the ranker cheaper.** Fewer features, a smaller model, or a smaller model trained to copy the big one.
+- **Cache.** Item vectors and slow-changing item features are cached. Lesson [cache strategies](/learn/backend/05-caching/cache-strategies/) covers the pattern.
+- **Add a cheaper stage in the middle.** A light ranker that cuts a thousand to three hundred before the heavy one.
+
+Many systems use several candidate sources in parallel. The YouTube paper notes that its two-stage design lets it blend candidates from other sources. A source for "videos from creators you follow", one for "popular in your city", and one for the towers can all feed the ranker. This helps new users and new items, which the towers know little about (the cold-start problem).
+
+## Numbers you set before you build
+
+- **Quality bar.** Stage 1: recall of the items the user later engaged with, at the candidate count you can afford. Ranker: ordering quality on its candidates. System: the online metric from lesson E1.6.
+- **Latency budget.** One number for the request, split into stages (the widget uses 100 ms, illustrative). The split is a design choice. Measure each stage at the 95th percentile, since the slowest stage sets the tail.
+- **Cost.** Index memory (item count times vector size), ranker compute per request, and the offline job that recomputes item vectors.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Two towers for stage 1 | Item vectors precomputed, tiny cost per request | No user-item interaction before the dot product; tower releases are heavy | The catalogue is too big to score |
+| More candidates | Higher recall | More ranker time | The ranker is cheap or parallel |
+| Heavier ranker | Better ordering | Fewer candidates in the budget | Stage 1 recall is already high |
+| Several candidate sources | Cold start and diversity | More pipelines to run, scores not comparable | New users or new items matter |
+| Policy in a re-rank layer | Fast rule changes, no retraining | One more stage to test | Rules change often |
+| A middle ranking stage | A smoother cost curve | More moving parts | Two stages leave a big cost jump |
+
+## What experienced teams know
+
+1. **Two stages is the standard shape.** The [YouTube paper](https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/) describes a deep candidate generation model followed by a deep ranking model, and says the design lets it recommend from millions of videos and blend other candidate sources. That is a paper claim about 2016.
+2. **Tower and index choices matter less than you expect.** The same paper reports that A/B results were not particularly sensitive to the choice of nearest-neighbour algorithm. Spend effort on the objective and the features.
+3. **The objective beats the architecture.** The paper says ranking by click-through rate promotes deceptive videos and that its final objective is generally a simple function of expected watch time per impression.
+4. **A fast stage and a precise stage is a general pattern.** Pinecone's [reranker guide](https://www.pinecone.io/learn/series/rag/rerankers/) says retrieving a small set from a large dataset is much faster than reranking a large set. The same cascade serves search and RAG.
+5. **Changing the ranker changes your future data.** Google's [Rules of Machine Learning](https://developers.google.com/machine-learning/guides/rules-of-ml) warn that switching a ranking algorithm radically enough to show different results changes the data the model will see later. Design the model to favour data it has already seen, and expect a gap.
+6. **Keep policy out of the model.** The same rules suggest a policy layer for spam. Use a re-rank stage for rules you must change in minutes.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I cannot score every item per request, so I use a cascade. Stage 1 is a two-tower model. The item tower runs offline and the vectors sit in an ANN index. At request time I run the user tower and look up about a thousand candidates. Stage 2 is a heavy ranker with crossed features on those candidates. Stage 3 re-ranks for policy and diversity. I give each stage a share of the latency budget, and I measure stage 1 on recall, because the ranker cannot fix what it never sees." Then add one detail: what recomputes when a tower is retrained.
+</Callout>
+
+<Callout type="mistake">
+Do not say "use a bigger model" without saying where it runs. A bigger ranker shrinks the candidate budget and can lower recall. Do not draw one big box called "recommender". Do not forget that stage 1 and stage 2 use different features, and that the towers must be retrained and released together. And do not judge stage 1 by the ranker's metric. They fail in different ways.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why can an item tower run offline while the user tower must run at request time?',
+      options: ['An item vector does not depend on who is asking', 'Items are fewer than users, so they fit in memory', 'The user tower is the only one that is trained', 'Item features never change after upload'],
+      answer: 0,
+      explain: 'The item vector depends only on the item, so it can be stored and looked up. The user vector depends on fresh history and context. Item counts and item changes do not explain it, and both towers are trained.',
+    },
+    {
+      q: 'A team retrains the item tower and keeps the old user tower. What happens?',
+      options: ['Nothing, since the index only holds item data', 'The new item vectors live in a different space than the user vectors', 'Only the newest items are affected by the change', 'Recall rises, since the item vectors are more up to date'],
+      answer: 1,
+      explain: 'Both towers must agree on one vector space. New weights make a new space, so the old user vectors would compare against the wrong item vectors. Replace both and rebuild the index.',
+    },
+    {
+      q: 'Stage 1 returns candidates that do not include the video a user would love. What does the ranker do with that video?',
+      options: ['It finds it by scoring the whole catalogue again', 'It ranks it low, since it has no data on it', 'Nothing, since it never sees it', 'It asks the index for the next ten items'],
+      answer: 2,
+      explain: 'The ranker only scores what stage 1 passes on. A missed item cannot be recovered later. That is why stage 1 is judged on recall.',
+    },
+    {
+      q: 'The ranker becomes twice as expensive per item and the budget does not change. What is the direct consequence?',
+      options: ['Send it fewer candidates, which risks lower recall', 'Skip the re-rank stage, which then costs nothing', 'Rebuild the index, which makes the ranker faster', 'Raise the budget, since latency is not a real limit'],
+      answer: 0,
+      explain: 'Ranker time grows with candidates times cost per item. With a fixed budget, fewer candidates fit. The re-rank stage is a small cost, an index rebuild does not speed the ranker, and the budget is a product limit.',
+    },
+    {
+      q: 'Why is a policy rule, such as "hide videos under review", placed in a re-rank layer and not learned by the ranker?',
+      options: ['Rankers cannot learn rules of any kind', 'Rules must take effect in minutes with no retraining', 'Re-rank is always the most accurate stage', 'Rules are cheaper to store than model weights'],
+      answer: 1,
+      explain: 'A rule in a later layer changes at once and is easy to audit. A learned rule needs data and a release. Rankers can learn some rules, but they cannot promise to follow one.',
+    },
+  ]}
+/>
+
+## Prove it
+
+<Diagnose
+  client:visible
+  id="e1-cascade-recall-loss"
+  title="A better ranker, a worse feed"
+  scenario="A team replaces its ranker with a model that is more accurate offline. It is also slower, so the team cuts the candidate list from 1,000 to 100 to stay inside the latency budget. After launch, watch time per user falls. Numbers are illustrative."
+  facts={[
+    'ranker ordering quality on its own candidates: old 0.61, new 0.68',
+    'p95 latency: old 70 ms, new 74 ms (budget 100 ms)',
+    'stage 1 recall of items the user later watched:',
+    '   with 1,000 candidates: 91%',
+    '   with 100 candidates:   38%',
+  ]}
+  steps={[
+    {
+      prompt: 'Where is the loss coming from?',
+      options: [
+        'Stage 1 now returns too few candidates, so good items never reach the ranker',
+        'The new ranker is worse at ordering, so the offline score is wrong',
+        'The latency budget is too loose, so users wait longer',
+        'The re-rank stage is removing too many items',
+      ],
+      answer: 0,
+      explain: 'The ranker scores higher on its own candidates, and latency is fine. Recall of watched items fell from 91% to 38%, so most good items are gone before the ranker sees them.',
+    },
+    {
+      prompt: 'What is the best next step?',
+      options: [
+        'Roll back to the old ranker, since the new one failed',
+        'Restore more candidates and make the new ranker cheaper or parallel',
+        'Cut the candidates to 50 so latency drops further',
+        'Remove the candidate stage and score everything',
+      ],
+      answer: 1,
+      explain: 'The ranker is better. The mistake was paying for its cost with recall. Make it cheaper, add lanes, or add a light middle stage, so that stage 1 can send enough candidates. Rolling back throws away the gain, and scoring everything breaks the budget.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Deep Neural Networks for YouTube Recommendations](https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/): the two-stage design, the watch-time objective, and the serving notes quoted above. The paper is from 2016.
+- [Rerankers and Two-Stage Retrieval (Pinecone)](https://www.pinecone.io/learn/series/rag/rerankers/): the same cascade for text search, with the bi-encoder and cross-encoder trade-off.
+- [Rules of Machine Learning (Google)](https://developers.google.com/machine-learning/guides/rules-of-ml): the sections on policy layers and on skew in ranking problems.

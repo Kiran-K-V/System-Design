@@ -1,0 +1,268 @@
+---
+summary: 'Continuous batching hands control back to a scheduler after every decode step. See the loop that runs between steps, how requests at different positions share one batch, and why booked KV memory, not the batch limit, becomes the gate.'
+requires: ['ai/a2-inference-cost/batching-throughput', '06-async/queues']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE3SchedLoop from '../../../../components/anim/lessons/AiE3SchedLoop.tsx';
+import AiE3SelectiveBatch from '../../../../components/anim/lessons/AiE3SelectiveBatch.tsx';
+import AiE3BatchSim from '../../../../components/anim/lessons/AiE3BatchSim.tsx';
+
+## The problem
+
+[Lesson A2.4](/learn/ai/a2-inference-cost/batching-throughput/) told you what continuous batching does: a finished request leaves, and a waiting request takes its slot. That picture treats a batch like a pool of workers. A GPU does not work like that.
+
+A GPU runs one big block of numbers through the model. Every row in the block must have the same shape. Now think about what sits in a real batch. One user is on token 3 of an answer. Another is on token 900. A third has just arrived with a 2,000-token prompt. How can these three share one block? And who decides, about 40 times a second, who is in the batch for the next step?
+
+This lesson opens that loop. You will learn what the scheduler does between two steps, the trick that lets requests at different positions share a batch, and the limit that stops the batch from growing. The simple picture from A2.4 stays true. Here you learn the mechanism under it.
+
+## Naive solution: schedule whole requests
+
+The first design is **request-level scheduling** [mid]. The server collects some requests, hands them to the engine as one batch, and waits. The engine runs the model again and again, one token per request per run, until every request in the batch is done. Only then does it return anything.
+
+First, a word for one run. An **iteration** [mid] is one pass through all the layers of the model. In that pass, every request in the batch gets one new token. The Orca paper uses this word, and so do we. A request that writes 500 tokens needs 500 iterations.
+
+The Orca paper names two faults of request-level scheduling.
+
+1. **Early finishers cannot leave.** A request that ends at iteration 40 sits in the batch until iteration 500. The engine still computes for it at every iteration. The paper draws this extra work as "inactive" requests, and the client gets no answer until the whole batch ends.
+2. **Late arrivals must wait.** A request that arrives at iteration 41 waits for the whole batch to finish before it starts.
+
+The unit of scheduling is the wrong size. A request is hundreds of iterations long. The scheduler only gets a say once per request, so it cannot react to anything that happens inside.
+
+A backend engineer has seen this problem before. Picture a job queue where each job needs 500 time slices. The naive scheduler gives a worker one job and does not look again until the job ends. The fix is the same as in an operating system: run one slice, then let the scheduler look again. The queue lesson ([06-async/queues](/learn/backend/06-async/queues/)) gives the shape: jobs wait in a queue and workers take them. Here the worker is the engine, and each job comes back to the queue 500 times.
+
+## The mechanism: a scheduler that runs between iterations
+
+The Orca paper calls the fix **iteration-level scheduling** [senior]. The scheduler runs a short loop, over and over:
+
+1. **Select.** Pick the requests that will run in the next iteration.
+2. **Run.** Ask the engine to run exactly one iteration for them.
+3. **Collect.** Take the new token of each request. Send finished requests back to their clients at once. Remove them from the batch.
+
+The place where requests wait is the **request pool** [mid]. The endpoint puts each new request there. The scheduler reads the pool before every iteration. A new request has to wait for at most one iteration before it gets its chance.
+
+A picture helps. Think of a city bus that stops at every block. A passenger who reaches the stop can board. A passenger who reaches their street gets off. The bus never waits at the depot for a full load. Each block is one iteration.
+
+Step through the animation. It follows four requests through the real Orca loop. The sizes are made up so that you can see every step.
+
+<AiE3SchedLoop client:visible />
+
+The animation shows three decisions that the scheduler makes before every iteration. Each is a knob that you will tune on a real server.
+
+**Which requests go first?** Orca uses first-come-first-served at the iteration level. The paper states the rule: if request X arrived before request Y, then X has run at least as many iterations as Y. A late request can still return earlier if it is short. The rule keeps the loop fair and simple.
+
+**How many may run?** The scheduler has a **maximum batch size** [mid]: the most requests in one iteration. The paper says this knob trades throughput for latency. A larger batch gives more throughput with diminishing returns, and it makes each iteration longer. The operator sets the limit by the latency budget. Lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/) showed the curve for this trade.
+
+**Is there memory?** This is the gate that stopped request C in the animation. Each request needs room for its **KV cache** [mid], the keys and values of every token it has seen (lesson [A2.3](/learn/ai/a2-inference-cost/kv-cache/)). That memory grows by one token at every iteration. Orca measures it in **slots**: one slot holds the keys and values of one token.
+
+Why can the scheduler not just start a request and hope for room? Because it can deadlock. Imagine a batch full of requests that each need one more slot for their next token, and the free pool is empty. No request can run, and none can finish and give its slots back. Nothing moves.
+
+Orca avoids this by booking memory at admission. When a request joins, the scheduler books slots for the largest size the request may reach. That size is the `max_tokens` value that the client sends. The paper's algorithm admits a request only if its booking fits in the free slots. A request that is admitted can always finish. The scheduler gives the slots back when the request ends.
+
+Look at the cost of that safety. The booking is for the worst case, and most requests stop sooner. In the animation, B booked 4 slots and the slots stayed booked until B was done. A real batch has the same effect at a much larger scale. The booked memory, not the batch limit, decides how many requests can run. This waste is the subject of lesson E3.2, and it is why the next lesson exists.
+
+<Callout type="deep" title="Why a batch limit and a memory gate both exist">
+The two limits protect different things. The batch limit protects latency: more requests per iteration means a longer iteration for everyone. The memory gate protects correctness: a request that cannot store its next token cannot run at all. A server with short outputs hits the batch limit first. A server with long contexts hits the memory gate first. When you tune, find out which gate is closing.
+</Callout>
+
+## One batch, many positions: selective batching
+
+Iteration-level scheduling creates a new problem. The requests in one iteration are now at different points. The engine must still run them as one batch, or the GPU goes back to idle. A GPU needs matrices of the same shape.
+
+The Orca paper lists three cases where two requests cannot share a normal batch:
+
+- Both are in their first iteration, but their prompts have different lengths.
+- Both are decoding, but they are at different token positions.
+- One is in its first iteration and reads a whole prompt. The other is decoding and reads one token.
+
+A normal batch is a block of shape [requests, tokens, hidden width]. All requests must have the same number of tokens. With the cases above, that rule would almost never be true. The paper says the chance that two requests fit together gets small very fast as the batch grows.
+
+Orca's answer is **selective batching** [senior]: batch only the steps that can be batched. Look at what a Transformer layer does. Most steps multiply each token's row by the same weight matrices. Those steps do not care which request a row belongs to. You can stack all rows from all requests into one flat block of shape [total tokens, hidden width] and run one big multiply.
+
+One step does care. **Attention** [mid] compares a token with the earlier tokens of its own request. It needs a request's own keys and values. It cannot mix rows from two requests. So Orca does this: before attention, it splits the flat block by request. It runs attention once per request. Then it merges the rows back into one block.
+
+Picture a highway with one exit per rider. All cars share the highway, which is the shared weights. At the end, each car turns into its own driveway, which is its own keys and values. After that the cars rejoin the highway.
+
+<AiE3SelectiveBatch />
+
+Is it a loss to run attention one request at a time? The paper says it costs little, and the reason links back to A2.4. Batching helps because the engine reads the weights from memory once and uses them for many rows. Attention has no model weights. So there is nothing to share, and batching it would gain nothing. The big gain stays in the green steps.
+
+The same idea lives on in newer engines. The vLLM paper says that vLLM joins the prompt tokens and the latest tokens of decoding requests into one sequence and feeds it to the model. Its attention kernel reads each request's cache separately. Our reading: both systems flatten the shared-weight steps and give attention its own per-request path.
+
+## The catch: a new prompt is a big iteration
+
+Selective batching makes a joiner possible. It does not make a joiner free. When request C joined in the animation, its whole prompt ran in that one iteration. In a real server a prompt can be thousands of tokens.
+
+Recall from [lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/) that prefill is compute-bound and takes time in proportion to the prompt. So the iteration that holds a long new prompt is much longer than a normal decode iteration. Every other request in that batch waits for it. The users of those requests see their token stream freeze for a moment. The throughput stays high, but the smoothness of the stream breaks.
+
+The fix is **chunked prefill** [senior]: cut the prompt into chunks and run one chunk per iteration, next to the decode tokens. The vLLM docs describe the policy. The scheduler first adds every decode request to the iteration. Then it fills the rest of a per-iteration token budget with prefill chunks. A prompt that does not fit is cut. The budget has a name, `max_num_batched_tokens`. Per the docs, smaller values give a better gap between tokens, because fewer prefill tokens slow the decodes. Larger values give a better time to first token. In version 1 of vLLM, the docs say chunked prefill is on by default whenever it is possible.
+
+Lesson E3.5 goes further: it covers chunked prefill and putting prefill and decode on separate machines.
+
+## What the load simulator shows
+
+Here is a small model of the whole idea. It is not a benchmark. We chose the numbers to show the mechanism: a decode step has a fixed floor plus a small cost per request, and most requests are short while a few are long. The same random traffic goes to a request-level scheduler and to an iteration-level scheduler. Move the load slider.
+
+<AiE3BatchSim client:visible />
+
+Read three things off it.
+
+1. **At low load the two look alike.** With little traffic there is almost nothing to batch. A request-level scheduler with one or two requests wastes little. This matches the Databricks note that dynamic batching can win at low QPS.
+2. **The request-level scheduler saturates early.** A long request holds the batch while its short neighbours wait. The time per output token climbs into seconds. The throughput curve goes flat at a low load.
+3. **The iteration-level scheduler follows the load.** It finishes about as many requests as arrive, until the batch is full all the time. Then the queue grows, and latency turns sharply upward. That turn is the knee.
+
+The size of the gap in the widget comes from our assumed spread of output lengths. A wider spread gives a bigger gap. If all outputs had the same length, the gap would be small.
+
+## What the published numbers measure
+
+Three sources give large numbers for continuous batching. They do not measure the same thing, so do not add them up.
+
+| Claim | What it measures | Label |
+|---|---|---|
+| Orca: 36.9x throughput over FasterTransformer | GPT-3 175B on a synthetic trace. Prompt lengths from 32 to 512 and output limits from 1 to 128, both uniform. Compared at one median latency per generated token (190 ms). FasterTransformer had 0.185 requests per second, Orca had 6.81. FasterTransformer got a custom batching scheduler written by the authors. | Paper claim, 2022 baseline |
+| Databricks: 10x to 20x over dynamic batching | A summary statement in a blog about the Orca method. It says dynamic batching can win at low QPS. | Vendor blog claim |
+| Anyscale: 8x over naive batching, up to 23x with vLLM | OPT-13B on one A100 40 GB. The 8x is continuous batching alone. The extra gain to 23x comes from vLLM's memory management. | Vendor blog claim |
+
+Two lessons follow. The size of the gain depends on the baseline and the spread of lengths. And the gap between 8x and 23x says that once slots stay full, the next limit is memory. That is lesson E3.2.
+
+## What experienced teams know
+
+**Prefill chunks fill what decode leaves.** The vLLM docs describe a scheduler that adds all decode requests first and then spends the remaining token budget on prefill. A team that cares about smooth streaming lowers the budget. A team that cares about time to first token raises it. The docs give a start point: for throughput, set it above 8,192, especially for smaller models on large GPUs.
+
+**The batch limit is a latency knob.** The Orca paper warns that there is no guarantee that a larger batch limit keeps latency flat for every model, GPU, and workload. Set it from your latency target, not from the largest value that runs.
+
+**Memory is the next gate.** The Anyscale post separates the gain of continuous batching from the extra gain of better memory use. When your slots are full of idle bookings, add memory efficiency before more GPUs. Lesson E3.2 shows how.
+
+**Watch the preemption count.** The vLLM docs explain that when KV cache space runs out, vLLM preempts requests and recomputes them later. The docs say frequent preemption hurts end-to-end latency. They list the fixes: raise `gpu_memory_utilization`, add tensor parallelism, or lower `max_num_seqs` or `max_num_batched_tokens`.
+
+**Offline work may prefer a simpler scheduler.** Databricks says offline batch inference can get good throughput with simpler batching, because there is no latency target to protect and no overhead from continuous scheduling. Use the complex scheduler for shared online services.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Iteration-level scheduling | Short requests leave early, late requests join fast, slots stay full | A scheduler that runs 20 to 50 times a second, flat and split batching | Shared online service with mixed lengths |
+| Request-level scheduling | Simple, easy to reason about | Idle slots, long waits behind long requests | Offline jobs, very low traffic |
+| Higher batch limit | More throughput, with diminishing returns | Longer iterations for every user | Latency budget has room |
+| Book max_tokens at admission | No deadlock, every admitted request finishes | Memory held for tokens that may never exist | You cannot grow or move a request later |
+| Big prefill budget per iteration | Lower time to first token | Stalls in other users' streams | Prompts are long and streaming smoothness matters less |
+| Small prefill budget per iteration | Smooth streams | Slower first token for long prompts | Interactive chat |
+
+## Interview lens
+
+<Callout type="tip">
+Name the unit of scheduling: "A request is hundreds of iterations. A request-level scheduler only decides once per request, so short requests wait behind long ones and slots go idle. Continuous batching decides before every iteration. It admits new requests, returns finished ones, and the shared-weight steps run as one flat batch. Attention runs per request because it reads that request's own keys and values." Then name the gate: "Memory, not the batch limit, usually stops it."
+</Callout>
+
+<Callout type="mistake">
+Do not say that continuous batching makes each request faster. It raises the throughput of the whole server and cuts waiting. A request in a bigger batch still has a slower step than one alone. Do not claim one headline number such as 23x without its baseline. Do not forget that a long new prompt can stall the whole batch for one iteration.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="e3-cb-long-prompt-stall"
+  title="Streams freeze when a long prompt joins"
+  scenario="A team serves a chat model with iteration-level scheduling, so short answers already leave the batch as soon as they end. Users complain that the token stream sometimes stops for a moment. The numbers below are illustrative."
+  facts={[
+    'typical gap between streamed tokens: 35 ms',
+    'gap when a 4,000-token document arrives: 900 ms, for every user in the batch',
+    'queue wait for new requests: low',
+    'throughput: at its best level',
+  ]}
+  steps={[
+    {
+      prompt: 'Why does every user in the batch see a long gap when one long document joins?',
+      options: [
+        'The whole prompt runs inside one iteration, so that iteration is long',
+        'The scheduler waits for the document to finish writing its answer',
+        'The batch limit was reached, so every request is paused',
+        'The KV cache of every other request is cleared',
+      ],
+      answer: 0,
+      explain: 'A new request joins between iterations, and its prompt is processed in the iteration it joins. A long prompt makes that iteration long, and every request in it waits. The scheduler does not wait for the answer, and no cache is cleared.',
+    },
+    {
+      prompt: 'Which change fixes the stall and keeps the scheduler?',
+      options: [
+        'Switch back to request-level scheduling to avoid mixed batches',
+        'Cut the prompt into chunks and run one chunk per iteration beside the decodes',
+        'Raise the maximum batch size so more requests share the long step',
+        'Book more KV slots for each request at admission',
+      ],
+      answer: 1,
+      explain: 'Chunked prefill limits how many prompt tokens enter one iteration, so decode steps stay short. Request-level scheduling would bring back idle slots. A larger batch makes the long step longer, and booking more slots does not change the step time.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'What does iteration-level scheduling change about when the scheduler gets control?',
+      options: [
+        'It runs after every iteration, so finished requests return and new ones join',
+        'It runs once per request, when that request arrives',
+        'It runs only when the whole batch has finished',
+        'It runs once per second, on a timer',
+      ],
+      answer: 0,
+      explain: 'The scheduler selects, runs one iteration, and collects, over and over. That is why a finished request can leave and a new one can join within one iteration. Once per request or per batch is the old design.',
+    },
+    {
+      q: 'Selective batching runs attention one request at a time. Why does this cost little?',
+      options: [
+        'Attention is too small to matter for the total time',
+        'GPUs run the attention of different requests in parallel anyway',
+        'Attention has no model weights, so batching it shares no weight reads',
+        'The keys and values of all requests are the same',
+      ],
+      answer: 2,
+      explain: 'Batching pays because one read of the weights serves many rows. Attention reads no weights, only the request\'s own keys and values, so batching it gains little. It is not small, and the keys and values differ for each request.',
+    },
+    {
+      q: 'Why does the Orca scheduler book max_tokens worth of KV slots when it admits a request?',
+      options: [
+        'To make the request run faster',
+        'To avoid a deadlock where running requests cannot store their next token',
+        'To let the client change max_tokens during the answer',
+        'To keep the prompt of the request in a separate pool',
+      ],
+      answer: 1,
+      explain: 'If admitted requests could run out of slots while none can finish, nothing would move. Booking the worst case guarantees every admitted request can finish. The booking does not speed anything up.',
+    },
+    {
+      q: 'A batch has a free batch slot, but a waiting request is not admitted. Which reason fits the Orca loop?',
+      options: [
+        'The waiting request is too short to be worth batching',
+        'The engine only accepts new requests at the start of a minute',
+        'The free slots of KV memory are fewer than the request needs to book',
+        'The earlier requests must finish first for fairness',
+      ],
+      answer: 2,
+      explain: 'The scheduler admits in arrival order and stops when the next request does not fit in the free KV slots. That is the memory gate. Fairness allows a late request to finish earlier, and there is no timer.',
+    },
+    {
+      q: 'At very low traffic, how do request-level and iteration-level scheduling compare?',
+      options: [
+        'Iteration-level always wins by the same large factor',
+        'They are close, because there is little to batch',
+        'Request-level is always twice as fast',
+        'Request-level fails because it cannot handle small batches',
+      ],
+      answer: 1,
+      explain: 'With few requests there is nothing to refill, so the two behave alike. Databricks notes dynamic batching can even win in low-QPS settings. The big gap appears when load and length spread are high.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Orca: A Distributed Serving System for Transformer-Based Generative Models](https://www.usenix.org/conference/osdi22/presentation/yu): iteration-level scheduling, selective batching, and Algorithm 1. The PDF is on that page. You do not need the distributed-engine half to follow this lesson.
+- [Databricks, LLM Inference Performance Engineering: Best Practices](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices): the three batching styles and when dynamic batching wins.
+- [Anyscale, How continuous batching enables 23x throughput](https://www.anyscale.com/blog/continuous-batching-llm-inference): the 8x and 23x measurements and what each one includes.
+- [vLLM docs, Optimization and Tuning](https://docs.vllm.ai/en/latest/configuration/optimization/): preemption, chunked prefill, and `max_num_batched_tokens`.

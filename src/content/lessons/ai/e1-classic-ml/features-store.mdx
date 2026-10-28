@@ -1,0 +1,240 @@
+---
+summary: 'A feature is an input computed from raw data. Training reads history from an offline store. Serving reads the newest value from a fast online store. One shared definition feeds both, and a point-in-time join keeps the future out of training rows.'
+requires: ['ai/e1-classic-ml/data-labels', '05-caching/cache-strategies']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import AiE1FeaturePipeline from '../../../../components/anim/lessons/AiE1FeaturePipeline.tsx';
+import AiE1PointInTime from '../../../../components/anim/lessons/AiE1PointInTime.tsx';
+
+## The problem
+
+A data scientist builds a fraud model. One of her best inputs is "how many payments this card made in the last 7 days". She writes a query on the data warehouse, trains the model, and gets a good score.
+
+Then the engineer who must serve the model asks: "Where do I get that number at checkout, in 20 milliseconds?" The warehouse query takes minutes. He writes a second version of the calculation in the payments service. It is slightly different: it counts refunds, and the window ends at a different hour.
+
+Now there are two definitions of one input. The model was trained on one and runs on the other. Its live score is worse than the test score, and nobody knows why. Lesson E1.4 is about that failure. This lesson is about the system that prevents it.
+
+Some terms first. A **feature** is one input value the model reads, computed from raw data. Raw data is "a list of payments". A feature is "payments in the last 7 days for card X". The **feature vector** is the list of all features for one example. The model sees only features. It never sees the raw data.
+
+This lesson answers five questions:
+
+1. Why do features need their own system?
+2. What are the offline and online stores?
+3. How does one definition feed both?
+4. What is a point-in-time join, and what does it stop?
+5. When is a feature store worth it?
+
+## Why features need their own system
+
+Without a plan, every team writes its own feature code. Four problems show up.
+
+**Duplicate work.** Ten teams each compute "payments in 7 days" in their own way. Each pays for the compute and storage.
+
+**Two code paths.** One path builds features for training (a big batch job). Another builds them for serving (a service). They drift apart, as the story shows.
+
+**Slow serving.** A model call at checkout cannot run a heavy query. The numbers must already be computed and ready to read.
+
+**Leaky history.** When you rebuild features for old training rows, it is easy to use data that did not exist at that time. We cover this below.
+
+A **feature store** is a system that fixes these: it keeps feature definitions in one place, computes the values, stores them for both training and serving, and hands them to whoever asks by name.
+
+Uber's Michelangelo platform is a well-known example. Its engineering post describes "a centralized Feature Store in which teams around Uber can create and manage canonical features", with "approximately 10,000 features in Feature Store" ([Uber](https://www.uber.com/en-US/blog/michelangelo-machine-learning-platform/)). Teams share them: one team writes a feature, and the others pick it by name.
+
+## Two stores for two jobs
+
+Training and serving want opposite things.
+
+**Training** reads a lot of data, once, and does not mind waiting. It needs the full history, with a timestamp on each value, so it can rebuild what was known at any past moment. Cheap, large storage is right. This is the **offline store**.
+
+**Serving** reads one small record, many times a second, and must answer in milliseconds. It needs only the newest value for one key, such as one card or one user. A fast key-value store is right. This is the **online store**. The key is the **entity**: the thing the features describe, such as a user, a card, or a video.
+
+The Uber post draws the line this way: "Models that are deployed online cannot access data stored in HDFS", so the "features needed for online models" are "precomputed and stored in Cassandra". HDFS is the big, cheap file system used in Hadoop for batch work. Cassandra is a database built for fast reads and writes by key (see [Cassandra](/learn/backend/08-technologies/cassandra/)). So the offline side is big and slow to read, and the online side is small and quick.
+
+<CrossTrackLink id="05-caching/cache-strategies">
+The online store behaves like a cache in front of a slow source. A value is computed ahead of time, written under a key, and read at request time. The same questions apply: how stale can a value be, who writes it, and what happens on a miss. That lesson covers the patterns. Here the "source" is the feature computation, and the "cache" holds the newest value per key.
+</CrossTrackLink>
+
+The cache link helps with a common question. What happens when the online store has no value for a key, for example a new user? The model server must have a plan: use a default, mark the feature as missing, or fall back to a simpler model. Decide this on purpose. A silent wrong default is a common source of quiet quality loss.
+
+## How values get into the stores
+
+There are two ways to compute a feature, and most systems use both.
+
+**Batch.** A job runs on a schedule, such as hourly or nightly. It reads the full history and computes features for everyone. It is simple, cheap, and good for slow-changing facts such as "average basket over 90 days". The Uber post says they "conduct bulk precomputing and loading historical features from HDFS into Cassandra on a regular basis". The price is staleness: a value is as old as the last run.
+
+**Stream.** A **stream processor** (a program that reads a never-ending flow of events and updates results as each event arrives) keeps a feature fresh. For "payments in the last 7 days", each new payment updates the count at once. Uber says it uses "Samza-based streaming compute jobs to generate aggregate features at low latency". The price is more moving parts and more to monitor.
+
+The rule of thumb is to match freshness to the feature. A feature about a user's taste for the last year can be batch. A feature about the last five minutes must be stream. The more fresh you need it, the more you pay.
+
+Step through the diagram. Watch where each store sits, and what feeds it.
+
+<AiE1FeaturePipeline client:visible />
+
+## One definition for both paths
+
+The second problem was two code paths. The fix is one definition that both paths run.
+
+Michelangelo's answer was a small language. The post says it uses "a DSL (domain specific language) that modelers use to select, transform, and combine the features". A **DSL** is a tiny language built for one job, here "pick these features and combine them". It adds that "the same expressions are applied at training time and at prediction time", and that "this system guarantees that the same data and batch pipeline is used for both training and serving".
+
+Do not read this as "everyone must use a DSL". The lesson to take is the principle: write the feature logic once, in a form that both paths can run, and test that the two outputs match. Some teams use a shared code library. Others use a feature store product that defines features in code and runs them for both stores. The tool matters less than the rule.
+
+Think of a recipe card in a shared kitchen. If every cook writes their own version, the dish tastes different each night. A single card on the wall, followed by every cook, gives the same dish.
+
+The idea has an official place in the Rules of ML. Rule 32 says to "re-use code between your training pipeline and your serving pipeline whenever possible". Lesson E1.4 goes through that rule and the related ones in detail.
+
+## The point-in-time join
+
+Now the hardest idea in this lesson, and the one that hides the most bugs.
+
+To train, you need a table: one row per past event, with the features as they were at that moment, and the label. Say a payment happened on day 8. You need "disputes against this user" as known on day 8, not as known today.
+
+The simple way is to join the events with the feature table on the user key and take the newest value. That value was computed later than day 8. It may contain facts from after the payment. The model sees something it would not have seen in production. This is **leakage**, and it makes offline scores look great and live scores poor.
+
+A **point-in-time join** fixes this. For each training row with a timestamp, it picks the latest feature value known on or before that timestamp. Feast, an open-source feature store, describes it as the ability "to reproduce the state of features at a specific point in the past". For each row it scans backward from that row's timestamp. Feast adds a detail: by default, a join only limits the event time of the value, so a value backfilled or corrected afterward can still appear. Its option to filter by when a value was created exists, in its words, "to keep backfilled values from leaking into training data" ([Feast docs](https://docs.feast.dev/getting-started/concepts/point-in-time-joins)). That is why a feature store keeps timestamps: without them you cannot rebuild the past.
+
+Use the toggle below. The table is tiny and made up. User A's fraud is on day 8, and the dispute is opened on day 9.
+
+<AiE1PointInTime client:visible />
+
+With the plain join, a rule that says "any dispute means fraud" looks perfect. That is the leak: the dispute is a result of the fraud. With the point-in-time join, the feature is 0 at the time of the payment, and the rule misses the fraud. The second result is the honest one. It tells you the feature alone cannot find this fraud at payment time.
+
+A leaked feature is the most dangerous kind, because it makes the model look better. Nobody investigates a good score. If a feature looks too good to be true, check if it uses information from after the event.
+
+## When a feature store is worth it
+
+Do you need one? Not always. The cost is real: a store to run, definitions to govern, jobs to keep healthy.
+
+A feature store pays off when:
+
+- **Many models share features.** Michelangelo had about 10,000 shared features. Sharing is where the saving is.
+- **You serve online with tight latency.** You must have precomputed values ready to read.
+- **Skew has bitten you.** You have seen the training-serving mismatch and need one source of truth.
+- **History matters.** You need correct point-in-time training data for features that change.
+
+It is probably too much when you have one model, a nightly batch score, and no online serving. A table in a warehouse is enough. Huyen's book lists the feature store as one of three essential ML platform tool categories next to deployment and model store, but a small team can start with a shared library and a key-value table ([chapter 10 summary](https://github.com/chiphuyen/dmls-book/blob/main/summary.md)).
+
+A last point on size. The online store holds one value per feature per entity, so its size is a plan for memory, not a surprise. Estimate the number of entities times the number of features times the bytes per value, and then add room for keys and replicas. You do this once at design time. It tells you if the online store fits on a few nodes or needs a cluster.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Batch features | Simple, cheap, easy to backfill | Stale until the next run | Features change slowly |
+| Stream features | Fresh within seconds | More moving parts to run and monitor | Features about recent events |
+| Separate code per path | Each path is easy to write | Two definitions drift apart | Prototypes only |
+| One shared definition | Same value in training and serving | Upfront tooling and governance | Online serving of important models |
+| Point-in-time join | Honest training data | Needs timestamps and more storage | Features that change over time |
+| Feature store | Reuse, shared definitions, serving | Another system to run | Many models or online serving |
+| Warehouse table only | No new system | No low-latency serving | One model, batch scoring |
+
+## What experienced teams know
+
+1. **Share features, not code copies.** Uber's [Michelangelo post](https://www.uber.com/en-US/blog/michelangelo-machine-learning-platform/) reports about 10,000 shared features in one store. Teams create canonical features once and reuse them.
+2. **The online store is not the offline store.** The same post says online models cannot read HDFS, so features are precomputed into Cassandra. Plan two stores on purpose.
+3. **Apply the same expressions twice.** Michelangelo's DSL applies the same expressions at training and prediction time. Rule 32 of the [Rules of ML](https://developers.google.com/machine-learning/guides/rules-of-ml) says to reuse code between training and serving whenever possible.
+4. **Keep timestamps.** [Feast](https://docs.feast.dev/getting-started/concepts/point-in-time-joins) rebuilds past feature state by scanning back from each row's timestamp. Without a timestamp you cannot do it.
+5. **Check for backfills.** The same page warns that backfilled or corrected values can leak into training data unless you filter by creation time.
+6. **Watch coverage.** Rule 22 of the Rules of ML asks how many examples a feature covers. A feature that is missing for many online requests will behave differently from training.
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I would define each feature once and run that definition for both paths. A batch job fills the offline store with full history and timestamps, for training. A stream job keeps the online store at the newest value per key, for serving by key lookup in milliseconds. Training rows use a point-in-time join, so a row only sees values known at its timestamp." That names two stores, one definition, and the leak.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we put features in a database" and stop. Do not join on the key alone when building training data. And do not let the training job and the serving service each compute the feature in their own way. If a feature makes the offline score jump, check first if it uses data from after the event.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why do feature stores usually keep an offline store and an online store instead of one?',
+      options: [
+        'Training needs history, serving needs fast lookups',
+        'Rules of privacy law forbid training and serving from sharing one database',
+        'The offline store is faster, so it always holds the freshest values',
+        'Each store holds a different model, so the data never overlaps',
+      ],
+      answer: 0,
+      explain: 'The two jobs want opposite things: big cheap history for training, tiny and fast reads for serving. Speed claims run the other way, since the online store is the fast one. The stores hold the same features, not different models.',
+    },
+    {
+      q: 'A training table is built by joining events to the newest feature value for each user. What is the likely effect?',
+      options: [
+        'Training is much slower, but the scores stay the same as before',
+        'Rows may see later values, so offline scores are too good',
+        'Rows lose their labels, so the training job fails',
+        'The online store runs out of memory',
+      ],
+      answer: 1,
+      explain: 'The newest value was computed after some events, so it can contain their outcome. This is leakage and it inflates offline scores. It does not remove labels or touch the online store.',
+    },
+    {
+      q: 'A new user has no entry in the online store at request time. What should the design do?',
+      options: [
+        'Fail the whole request and show an error to the user',
+        'Use a made-up value and do not record that it was missing',
+        'Use a planned default or a missing marker, and log it',
+        'Wait for the stream job to finish its work before answering',
+      ],
+      answer: 2,
+      explain: 'A miss is normal for new entities, so decide the behavior up front and log it. An unrecorded made-up value hides a quiet quality problem, and waiting breaks the latency budget.',
+    },
+    {
+      q: 'Which sign most strongly says a team should adopt a feature store?',
+      options: [
+        'One model runs nightly and writes its scores to a plain table',
+        'The team has a small dataset and has no online serving at all',
+        'Features are computed once a year from a single spreadsheet',
+        'Several online models disagree on how a feature is computed',
+      ],
+      answer: 3,
+      explain: 'Shared features and mismatched definitions are what a store fixes. A nightly batch with no online serving can read a warehouse table, so the cost of a store is not justified there.',
+    },
+  ]}
+/>
+
+<Diagnose
+  id="features-store-too-good"
+  title="A feature that is too good"
+  scenario="A new feature, 'disputes opened against this card', lifts offline AUC from 0.82 to 0.99. After launch, live results are no better than before."
+  facts={['offline AUC before:   0.82', 'offline AUC after:    0.99', 'live lift:            none', 'training join:        by card id, newest value']}
+  steps={[
+    {
+      prompt: 'What most likely happened?',
+      options: [
+        'The training join attached the newest value, so rows saw disputes that were opened after the payment.',
+        'The online store is too slow to serve the feature.',
+        'The model has too few layers to use the feature.',
+        'AUC cannot be used for fraud models at all.',
+      ],
+      answer: 0,
+      explain: 'A dispute is a result of fraud, and a join on the key alone brings it into earlier rows. Store speed would show as latency, not as a gap in lift, and model depth does not explain a near-perfect score.',
+    },
+    {
+      prompt: 'What is the fix?',
+      options: [
+        'Remove all features that use disputes and never use them again.',
+        'Increase the training set size.',
+        'Rebuild the training table with a point-in-time join, so each row sees only values known at its payment time.',
+        'Lower the decision threshold.',
+      ],
+      answer: 2,
+      explain: 'A point-in-time join keeps each row honest. A dispute history feature can still be useful when it only uses disputes known at payment time. More data or a new threshold does not remove the leak.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Uber, Meet Michelangelo](https://www.uber.com/en-US/blog/michelangelo-machine-learning-platform/): the shared feature store, DSL, and online and offline paths.
+- [Feast, Point-in-time joins](https://docs.feast.dev/getting-started/concepts/point-in-time-joins): how a feature store rebuilds past feature state.
+- [Google, Rules of Machine Learning](https://developers.google.com/machine-learning/guides/rules-of-ml): Rules 22 and 32 on feature coverage and shared code.

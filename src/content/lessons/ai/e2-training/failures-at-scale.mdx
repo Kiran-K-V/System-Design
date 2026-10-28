@@ -1,0 +1,268 @@
+---
+summary: 'A training job on thousands of GPUs stops many times a day, so failure is routine. This lesson shows why failures grow with cluster size, the four ways a job breaks, and the recovery loop of detect, replace, reload and resume.'
+requires: ['ai/e2-training/model-parallelism', '07-reliability/failure-modes']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import AiE2FailureCycle from '../../../../components/anim/lessons/AiE2FailureCycle.tsx';
+import AiE2FailureSim from '../../../../components/anim/lessons/AiE2FailureSim.tsx';
+
+## The problem
+
+You start a training run on 16,384 GPUs. It will run for weeks. On the first night, at 3 a.m., one GPU out of the 16,384 returns a hardware error. The job stops. Nobody is awake. By 8 a.m. someone notices, finds the bad machine, restarts the job from the last saved copy, and loses the work done since that copy. The whole cluster, which costs many thousands of dollars an hour to run, sat idle for five hours because one chip had a bad moment.
+
+That story is not rare. It is the normal case at this size. Meta, in the paper that describes its Llama 3 model, wrote that "the complexity and potential failure scenarios of 16K GPU training surpass those of much larger CPU clusters that we have operated." Over a 54-day stretch of one training run it logged 419 unexpected interruptions, and still kept the cluster doing useful work more than 90% of the time. Lesson E2.7 reads that report in full. This lesson teaches the general ideas behind it, so that you can reason about any big job.
+
+The questions on the way are:
+
+1. Why does a bigger cluster fail more often?
+2. How does a training job break, and why are some breaks hard to see?
+3. What is the loop that turns a failure into a short pause?
+4. Which parts of that loop can you shorten, and what does each cost?
+
+## Why a big job is fragile
+
+### One slow or dead GPU stops everyone
+
+Training is **synchronous**. This means that all GPUs work on the same step at the same time, and at the end of the step they all swap what they learned (lesson E2.3 called this averaging the gradients). No GPU can begin step 101 until every GPU has finished step 100.
+
+Think of a rowing crew of 16,384 people. Every stroke has to land together. If one rower drops the oar, the boat does not go on at 16,383 oars. It stops, and everyone waits.
+
+The Llama 3 paper says it directly: "the synchronous nature of training makes it less fault-tolerant—a single GPU failure may require a restart of the entire job." Compare this with a web service of 100 servers behind a load balancer, which the backend track covers in lesson [Failure Modes](/learn/backend/07-reliability/failure-modes/). When one server dies, the load balancer stops sending it requests and the other 99 serve on. A training job has no such slack. The parts are not interchangeable copies, because each GPU holds its own slice of the model or the data (lesson E2.4).
+
+<CrossTrackLink id="07-reliability/failure-modes">
+Machines fail in more ways than up or down. The lesson names five failure modes, shows which ones a health check misses, and shows how one failure spreads. Training adds a twist: the parts are not interchangeable, so a single failure stops the whole job.
+</CrossTrackLink>
+
+### Rates add up
+
+A second fact makes it worse. A job is built from many parts, and any one of them can break the job. A GPU chip. The memory stacked on it. The server around it. The network card, the cable, the switch. The driver. The training code. Failure of any one counts.
+
+Picture an old string of holiday lights wired in series. Each bulb is reliable, but if any one burns out, the whole string goes dark. A string of 100 bulbs goes dark far more often than a string of 10, even though every bulb is the same.
+
+Put numbers on it in words. Suppose each GPU, with its share of the server, cables and software, has a small chance of causing an interruption in any given hour, and these chances are independent. Then the chance that something breaks in the cluster grows in proportion to the number of GPUs. Double the GPUs and you halve the average time between interruptions. This is the **mean time between failures**, often written MTBF: the average gap between two failures.
+
+Two kinds of numbers appear in this lesson. One is sourced: Meta's paper says 419 unexpected interruptions in 54 days on up to 16,384 GPUs. The other is ours: we spread that count over all GPUs to get a rate for one GPU's share of the cluster, then ask what happens at other sizes. The result is an assumption, not a measurement of any other cluster. Use the simulator below. It does the arithmetic. At the default setting the rate is Meta's, and you can move it up or down.
+
+<AiE2FailureSim client:visible />
+
+Try these three moves.
+
+- **Slide the cluster size.** At a few hundred GPUs, most days pass without a stop. At 16,384, almost no 24-hour stretch is free of one. At 131,072, even an hour without a stop is rare. The red marks of the sample day show how many stops that means.
+- **Slide the rate.** A cheaper, less reliable part set shifts the whole picture. At 4 times the rate, a 16,384-GPU job loses a quarter of its time with the default recovery settings, and more as the restart gets slower.
+- **Slide recovery.** Cutting the restart from 60 minutes to 5 does far more than any change to a failure rate you do not control. This is the main idea of the lesson: you cannot stop failures, so you make each one cheap.
+
+The word for how failures arrive is **Poisson**. A Poisson process is a stream of events that arrive at random, each independent of the others, at a steady average rate. It has no memory: a job that has run 10 hours without a stop is no less likely to stop in the next hour. That is why you cannot schedule your way around failures. They do not come in a rhythm you can predict.
+
+Meta published a second source that shows the same shape from real data. In a study of two of its research clusters, built from A100 GPUs, the authors report a mean time to failure of 7.9 hours for 1,024-GPU jobs. They then project 1.8 hours for 16,384-GPU jobs and 0.23 hours for 131,072-GPU jobs, and write that "hardware reliability shrinks inversely proportional to the number of GPUs." This is a **paper claim** and a projection from a fitted model. It counts every kind of failure of a job in those clusters, so it will not match Llama 3's figure (about one unexpected interruption every 3 hours at 16K, our derived reading). The shape is what matters. The gap between failures falls as the job grows.
+
+## How a job breaks
+
+If a failure were always a clean crash with an error message, a restart script would be enough. It is not. Four kinds of break differ in how quickly you can see them.
+
+| Kind | What it is | How you notice | Cost of delay |
+|---|---|---|---|
+| Crash | A process dies or a GPU reports an error | At once, from the error code | Small |
+| Hang | Nothing errors, nothing moves: every GPU waits for one that will never answer | Only when a timer expires | Large: the full time-out |
+| Straggler | A GPU or link still works but slowly | Only by comparing against its peers | Grows every step, forever |
+| Silent corruption | A part returns wrong numbers and raises no error | By odd results, such as a loss spike | The most dangerous: bad data enters the model |
+
+Take each in turn.
+
+**Crash.** A process exits, or the GPU driver reports an error. The job manager sees it quickly. Detection is easy, so a crash is the cheap case.
+
+**Hang.** A hang is the hard case. Say one GPU's link to the others stalls. The other GPUs ask it for data and wait. No one reports an error, because nothing technically failed yet: everyone is just waiting. The Llama 3 paper says link failures often show up this way: "failures in either the remote GPU or NVLink connectivity often manifest as stalled load/store operations within CUDA kernels without returning a clear error code." NVLink is the very fast cable that joins GPUs inside one server. A hang is found only by a **watchdog**: a timer that says, if no progress for N minutes, call it dead. A long timer wastes time on every hang. A short timer kills healthy jobs that are slowed by a busy network. Set it too low and you get false alarms. This is the same trade-off you meet with timeouts in the backend track.
+
+**Straggler.** A **straggler** is a part that works but runs slowly, for example a GPU that is too hot and lowers its speed. Because training is synchronous, one slow GPU sets the speed of everyone. The paper puts it this way: "Even a single straggler can slow down thousands of other GPUs, often appearing as functioning but slow communications." Nothing is broken, and no alarm sounds. The only symptom is a lower tokens-per-second figure than yesterday. You find the culprit by comparing each GPU's step time with its peers.
+
+**Silent corruption.** The nastiest is **silent data corruption**: a chip computes the wrong answer and reports success. A wrong number that is averaged into the update enters the model, and nothing flags it. The Llama 3 paper lists it as a cause (6 of the 419 unexpected interruptions) and counts it among the "suspected hardware-related issues". **Our reading**: the sign is usually indirect, such as a loss that jumps without a data reason. We do not teach a detection method here, because the paper names none.
+
+Why does this matter for design? Because **time-to-detect is a cost of its own**. A crash costs seconds to detect, a hang costs the full watchdog time-out, and a straggler costs a little every step until someone looks. You will build the monitoring around the slow cases.
+
+## The recovery loop
+
+Now the part you control. The loop has five stages: detect, replace, reload, redo, resume. Step through one failure.
+
+<AiE2FailureCycle client:visible />
+
+The picture is not to scale. It shows the order of the costs. Each stage has a fix and a price.
+
+### Detect
+
+Make a failure visible quickly. Three tools do this.
+
+- **Heartbeats.** Each worker sends a small "I am alive" message at a set interval. If the messages stop, the manager reacts. Same idea as a health check in the backend track.
+- **Watchdog time-outs.** The timer from above, on the communication library, so that a stalled collective turns into an error instead of an endless wait.
+- **Flight recorder.** A **flight recorder** is a record that each worker keeps of its recent actions in a small ring of memory, written over as it goes, like the black box of an aircraft. When a hang happens, you dump the ring and see which GPU was waiting on which. Without it, you know the job is stuck and nothing else.
+
+### Replace
+
+Once you know which machine is bad, take it out and put a healthy one in. A **spare node** is a healthy machine kept idle, or on lower-priority work, so that it can replace a failed one at once. Picture a bench player in a sports team: they cost a salary while sitting down, and they let the game go on when someone is hurt. With no spare, the job waits in a queue for a repair or a new machine. The price of spares is idle GPUs, which is a real bill, so you buy just enough. Also, remove the bad machine from the pool, or the scheduler will give it to the next job and fail again. In practice a **health check** (a short test run on a machine before it joins a job) keeps a bad machine from coming back.
+
+### Reload
+
+Every GPU reads the last **checkpoint**, a saved copy of everything needed to continue: the weights, the optimizer state and the position in the data (lesson E2.5 covers what goes in and how to write it without stopping the job). Reload time depends on the size of the state and the speed of storage. At thousands of GPUs, all reading at once, the storage system itself can be the bottleneck. Starting the job also takes time: loading code, connecting thousands of workers, rebuilding the groups of lesson E2.4. Meta's paper says it worked on exactly this: "To increase the effective training time, we reduced job startup and checkpointing time, and developed tools for fast diagnosis and problem resolution."
+
+### Redo
+
+The work since the checkpoint is lost and has to be computed again. On average, half the gap between two checkpoints is lost per failure. So the **checkpoint interval** trades two costs. Save often, and you lose little per failure but pay for each save (the job pauses, or storage gets busy). Save rarely, and saves are cheap but each failure is costly. The best interval depends on how often failures come, which is why this lesson and lesson E2.5 belong together. The simulator has a slider for it.
+
+### Resume, and the number that matters
+
+When training moves forward again, the clock for the next failure starts. The score for the whole loop is **effective training time**: the share of wall-clock time spent on useful training. Meta defines it as "the time spent on useful training over the elapsed time". Everything amber or red in the picture subtracts from it.
+
+That number sets the cost of the run. A run at 90% effective training time takes about 11% longer than a perfect one, and you pay for every GPU through that extra time. A run at 60% takes two thirds longer.
+
+## Restart the whole job, or keep going with fewer GPUs
+
+A question every reader asks: why restart the entire job? Could the survivors keep going without the dead GPU?
+
+In principle some parts can. In data parallelism (lesson E2.3) every group holds a full copy of the model, so a copy that lost a GPU could be dropped while the rest continue, with a smaller batch. This is called elastic training.
+
+But in the layouts of lesson E2.4, tensor and pipeline groups are tightly coupled. A weight matrix split across 8 GPUs cannot run on 7, and a pipeline missing a stage cannot pass activations forward. **Our reading**: for the largest jobs, the simple and common path is to stop, swap the bad machine for a good one, and restart from a checkpoint. The Llama 3 paper says "a single GPU failure may require a restart of the entire job", which fits that reading but does not state that Meta rules out elastic training. The tools that matter then are the ones that make a full restart short.
+
+## What experienced teams know
+
+These are field notes, each tied to a source we read.
+
+- **Automate recovery, or humans become the bottleneck.** Meta reports that "significant manual intervention was required only three times" during its 54-day snapshot, "with the rest of issues handled by automation." With an interruption every few hours, a human who must wake up for each one is the largest delay in the loop. Source: Llama 3 paper.
+- **Make tracing switchable without a restart.** The same paper says it enables heavier tracing "selectively as needed live in production through online configuration changes … without needing a code release or job restart." A debug tool that needs a restart to turn on is no use in the middle of an incident. Source: Llama 3 paper.
+- **Test for stragglers on purpose.** Slow-but-working parts do not alarm. Meta wrote tools to "prioritize potentially problematic communications," and found that "by investigating just a few top suspects, we were usually able to effectively identify the stragglers." Compare ranks, not averages. Source: Llama 3 paper.
+- **Plan for the failure of the large job, not the small one.** In Meta's study of its research clusters, the authors find that large jobs fail most often, but small jobs make up most of the workload. Reliability work for the rare giant job and for the common small job are different projects. Source: "Revisiting Reliability in Large-Scale Machine Learning Research Clusters" (abstract).
+- **Stability is a first-class goal.** ByteDance's MegaScale paper, about training on more than 10,000 GPUs, says that training stability matters as much as efficiency over long runs, and describes building tools to find root causes deep in the stack. The same bit of the abstract reports 55.2% model FLOPs utilization for a 175-billion-parameter model on 12,288 GPUs. Source: MegaScale abstract.
+- **The data centre itself fails.** Not every pause is a bad part. Meta saw a 1 to 2% daily throughput swing linked to the time of day, and warns that tens of thousands of GPUs starting or stopping together can move power use by "tens of megawatts". Lesson E2.7 covers this.
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| Keep spare nodes | Replacement in seconds, not a queue wait | Idle GPUs on the bill | Large jobs, where each hour of idle cluster costs far more than a spare |
+| Checkpoint more often | Less work lost per failure | Pauses and storage load on each save | Failures are frequent, or each lost hour is costly |
+| Short watchdog time-out | Hangs are found fast | False alarms kill healthy jobs on a busy network | Stable network, good tracing to tell a hang from slowness |
+| Test machines before they join | Fewer repeat failures | Time to run tests, with spare capacity needed | Always, once the cluster is large |
+| Auto-eject suspect machines | No human in the loop | Some good machines are removed in error | When spares are plentiful and the diagnosis is accurate |
+| Full restart of the whole job | Simple, works with any layout | Every GPU pauses | Tensor and pipeline groups that cannot run short |
+| Elastic training (drop a replica) | The job keeps running | Needs a layout with spare data copies, and changes the batch | Mostly data-parallel jobs |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "At this scale failures are routine, so I design for recovery. Rates add up across parts, so the time between failures falls as the cluster grows. I cut the cost of each one: detect fast with heartbeats and watchdogs, keep spare nodes, test machines before they join, restart from a frequent checkpoint. I measure effective training time, the share of wall-clock spent on useful steps. I would also look for stragglers, because a slow GPU never raises an alarm."
+</Callout>
+
+<Callout type="mistake">
+Do not say "we will retry the job" as if training were a web request. A retry restarts from the last checkpoint and repeats the work since. Do not forget the slow failures: a hang waits out a timer and a straggler hides in a good average. Do not quote a failure rate for "a GPU" without saying what it counts: chips, servers, cables and software are not the same thing.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A team doubles the GPUs in one training job and uses the same type of machine. What happens to the average time between interruptions?',
+      options: [
+        'It stays the same, because each GPU is just as reliable as before',
+        'It falls to about half, because any one part can stop the whole job',
+        'It doubles, because the work is shared among more machines',
+        'It falls to a quarter, because the number of links grows with the square',
+      ],
+      answer: 1,
+      explain: 'In synchronous training a failure in any part stops the job, and each GPU adds its own small chance. The chances add, so twice the parts means about twice the stops and half the gap. The link count is not the model here, and more machines do not share the risk: they add to it.',
+    },
+    {
+      q: 'Why is a hang usually more expensive than a crash of a GPU?',
+      options: [
+        'A hang damages the weights, while a crash leaves them untouched',
+        'A hang needs a bigger checkpoint than a crash does to recover',
+        'A hang raises no error, so the job waits until a timer expires',
+        'A hang always takes the whole cluster down for a full day',
+      ],
+      answer: 2,
+      explain: 'A crash gives an error code and is noticed at once. A hang makes every GPU wait for one that never answers, with nothing logged, so the cost includes the whole watchdog time-out. The weights are not harmed by a hang, and the recovery steps afterwards are the same.',
+    },
+    {
+      q: 'What is the main benefit of keeping a few spare nodes next to a large training job?',
+      options: [
+        'They raise the speed of every training step while the job runs',
+        'They let the job run with fewer checkpoints, since spares hold the data',
+        'They remove the need to detect failures, because spares check each step',
+        'A failed machine is replaced at once instead of waiting for a repair',
+      ],
+      answer: 3,
+      explain: 'A spare shortens the replace stage of the loop: the job swaps in a healthy machine and restarts. Spares do not speed up steps, do not hold checkpoints and do not detect anything. They cost idle GPUs, which is why you keep only a few.',
+    },
+    {
+      q: 'A team doubles the time between checkpoints. Failure rate and restart time stay the same. What changes?',
+      options: [
+        'More work is lost per failure on average, and saves cost less overall',
+        'Less work is lost per failure, and saves cost more overall',
+        'Nothing changes, since the checkpoint size is the same in both cases',
+        'Failures become rarer, because there are fewer writes to storage',
+      ],
+      answer: 0,
+      explain: 'On average, half the gap between checkpoints is lost at each failure, so a longer gap loses more per failure. Fewer saves means less pause time for saving. The size of each save does not decide this trade-off, and saving less often does not change how often hardware fails.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="e2-failures-throughput-sag"
+  title="Throughput sags every few hours"
+  scenario="A 2,048-GPU run shows no errors and no restarts. But every few hours tokens per second falls by about a third for 30 to 40 minutes and then recovers on its own. (Illustrative numbers.) Read the dashboard, then decide what to check."
+  facts={[
+    'step time: 4.0 s normal, 6.0 s during a sag',
+    'all 2,048 ranks report the same step time during a sag',
+    'time in compute per rank: 3.1 s on 2,047 ranks, 5.9 s on rank 1337',
+    'time waiting in all-reduce per rank: 0.9 s on 2,047 ranks, 0.1 s on rank 1337',
+    'rank 1337 GPU clock: 1,410 MHz during a sag (others 1,980 MHz)',
+    'rank 1337 GPU temperature: 87 C (others 70 C)',
+    'checkpoint writes: every 30 min, 2 min each, no overlap with the sags',
+    'storage and network counters: flat',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'A straggler: one slow GPU holds every other rank back',
+        'A silent hang in the network that clears itself every few hours',
+        'The checkpoint writes saturate storage and pause the job',
+        'A new data shard that is slower to load than the others',
+      ],
+      answer: 0,
+      explain: 'Every rank reports the same step time because the job is synchronous. Rank 1337 spends 5.9 s in compute while the others spend 3.1 s and wait for it, and its GPU is hot and clocked down. That is a straggler. Storage and network counters are flat and the sags do not line up with checkpoint writes, so those are out. A hang would stop steps, not slow them.',
+    },
+    {
+      prompt: 'Which signal would have found this fastest, before anyone looked at a dashboard by hand?',
+      options: [
+        'The average step time of the whole job, compared with yesterday',
+        'Per-rank compute time, clock and temperature against peers',
+        'The total number of restarts per week for the whole job',
+        'The size of the checkpoint on storage after each save',
+      ],
+      answer: 1,
+      explain: 'The average is the same for all ranks, so it shows the sag but not who causes it. Comparing each rank with its peers points at one outlier at once, and the clock and temperature tell you why. The restart count is zero here, and checkpoint size is unrelated.',
+    },
+    {
+      prompt: 'What do you do about it?',
+      options: [
+        'Raise the watchdog time-out so slow steps are not treated as faults',
+        'Lower the checkpoint interval to 10 minutes, so less work is lost',
+        'Cordon the node, add a spare, and restart from a checkpoint',
+        'Cut the global batch size so every step finishes sooner',
+      ],
+      answer: 2,
+      explain: 'The fault is one overheating machine, so remove it and replace it with a spare, then resume from a checkpoint. Cooling and a health check can follow. A longer time-out hides the problem. A shorter checkpoint interval does not touch the cause, and a smaller batch changes the training recipe without fixing the slow GPU.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [The Llama 3 Herd of Models](https://arxiv.org/html/2407.21783v3): the "Reliability and Operational Challenges" section is the primary source. Lesson E2.7 reads it closely.
+- [Revisiting Reliability in Large-Scale Machine Learning Research Clusters](https://arxiv.org/abs/2410.21680): Meta's study of two research clusters, with failure data, a failure model and a way to estimate effective training time. The full text has more than we used.
+- [MegaScale: Scaling Large Language Model Training to More Than 10,000 GPUs](https://arxiv.org/abs/2402.15627): ByteDance on stability and diagnosis tools in a production training system. You do not need the details of its kernels.

@@ -1,0 +1,264 @@
+---
+summary: 'A model ages while its code stays the same, because the world moves. Learn the three kinds of drift, the monitors that fire before labels arrive, and how to set a retraining schedule from a measured decay curve instead of a guess.'
+requires: ['ai/e1-classic-ml/training-serving-skew', 'ai/e1-classic-ml/offline-online-metrics', '07-reliability/observability']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE1DriftDecay from '../../../../components/anim/lessons/AiE1DriftDecay.tsx';
+import AiE1DriftHist from '../../../../components/anim/lessons/AiE1DriftHist.tsx';
+
+## The problem
+
+Google's Rules of Machine Learning contains a small story about the Google Play team. Play "once had a table that was stale for 6 months, and refreshing the table alone gave a boost of 2% in install rate" (Rule 10, [Rules of ML](https://developers.google.com/machine-learning/guides/rules-of-ml)). Nobody changed the model code in those six months. Nothing crashed. No alert fired. The model was simply a little worse each week, and nobody could see it.
+
+The same document explains why. A normal service fails loudly: a server is down, a request returns an error. A machine-learning system fails quietly. In the document's words, "The machine learning system will adjust, and behavior will continue to be reasonably good, decaying gradually."
+
+This is **model aging**: the quality of a deployed model falls over time, although the model file does not change. This lesson answers five questions:
+
+1. Why does a model get worse when no code changed?
+2. What kinds of change are there, and how do they differ?
+3. How do we notice, when the true answers arrive days or weeks late?
+4. How fast does our model age, and how often should we retrain?
+5. What should we do when an alert fires?
+
+Earlier lessons gave you the parts. Lesson E1.4 explained training-serving skew, a mismatch between how features are made in training and in serving. Lesson E1.6 explained offline and online metrics. Lesson [observability](/learn/07-reliability/observability/) explained metrics and alerts for services. This lesson adds one idea on top of them: the data itself moves.
+
+## Question 1: why does a model get worse when no code changed?
+
+A model is a frozen summary of a past. Training reads a pile of old examples and stores the patterns it found. At serving time, the model assumes that tomorrow looks like that pile.
+
+Think of a city map printed in 2015. The paper does not change. The city does. New roads open, old ones close, and the map slowly lies more. The map is not broken. It is old.
+
+Why does this happen to models? Because the things a model reads are made by people and systems that keep changing. New products appear. Users change their habits. Attackers change their tricks. A partner team renames a field. The model sees inputs it never met in training and does its best.
+
+A made-up example makes the point. A payment-risk model learned from last year's traffic. This year, a festival sale sends ten times the usual volume of small payments from first-time buyers. The model never saw that mix. It scores many honest buyers as risky. The code is the same. The world is not.
+
+How fast does this happen? It depends on the product. Rule 8 in the same document says to "know the freshness requirements of your system". It gives a sharp example: "if the ML model for Google Play Search is not updated, it can have a negative impact in under a month." Ad systems "have new advertisements to handle every day, and must update daily." Other models can sit for a year. There is no general answer. You have to measure yours. Question 4 shows how.
+
+## Question 2: what kinds of change are there?
+
+People use the word **drift** for all of these, but they are different problems with different fixes. Chip Huyen's [essay on data distribution shifts](https://huyenchip.com/2022/02/07/data-distribution-shifts-and-monitoring.html) gives the standard three. We write each with an input called X (what the model reads) and an output called Y (what it predicts or what turns out true).
+
+**Input drift** (the essay calls it covariate shift). The inputs change, but the rule that links input to output does not. In her words, "covariate shift is when P(X) changes, but P(Y|X) remains the same." Picture a bakery that learned to guess a customer's order from their age. A new university opens next door, and the customers are now much younger. The rule "age tells you the order" still holds. The model just meets many ages it rarely saw. Our festival example is mostly this.
+
+**Label drift** (label shift). The share of each outcome changes, but each outcome still looks the same. "Label shift is when P(Y) changes but P(X|Y) remains the same." Picture a fraud model in a week when a fraud ring is active. The rate of fraud rises. A fraudulent payment still looks like fraud. A model tuned for a low rate now picks the wrong threshold.
+
+**Concept drift.** This is the hard one. In the essay's short form: "same input, different output." The meaning of the input changed. Picture a spam filter. The words in a message are the same as last month, but spammers found that these words now get through, and the rule that mapped these words to "spam" no longer holds. A model cannot find this by looking at inputs alone, because the inputs did not move.
+
+| Kind | What moved | What stays | Where you see it first | Typical fix |
+|---|---|---|---|---|
+| Input drift | The spread of the inputs | The input-to-output rule | Feature statistics | Retrain on newer data; fix the pipeline if it is a bug |
+| Label drift | The share of each outcome | What each outcome looks like | Prediction and label rates | Recalibrate or move the threshold; retrain |
+| Concept drift | The input-to-output rule | Nothing you can see in the inputs | Only in outcomes, late | Fresh labels, a retrain, and often new features |
+
+Real systems mix all three. The table tells you where to look, not which one you have.
+
+One more case is not drift at all: a **pipeline bug**. A feature goes empty because a team renamed a column. The Rules of ML example is exact: "a feature column could be populated in 90% of the examples" and "suddenly drop to 60% of the examples." Nothing in the world changed. Something in your plumbing did. This case is common, it is cheap to detect, and it looks like drift on a dashboard. Treat it as the first suspect.
+
+## Question 3: how do we notice, when labels arrive late?
+
+The most direct sign of a sick model is a drop in accuracy. Huyen says it plainly: "Accuracy-related metrics are the most direct metrics to help you decide whether a model's performance has degraded." But there is a catch: "Changes in accuracy-related metrics might not become obvious for days or weeks."
+
+This is **label delay**. The true answer is not known when the model decides. A loan model finds out in months whether the loan was repaid. A fraud model finds out when a customer disputes a payment, often weeks later (lesson E1.2 covered this). If you wait for accuracy, you find out after the harm.
+
+So you build a **monitoring ladder**. Each rung needs fewer or no labels, and each fires earlier. Pick the rungs from fastest to slowest.
+
+1. **Data health.** Is the feature present, and is it in range? The key number is **coverage**: the share of rows where a feature has a real value. A drop from 90% to 60% overnight is a bug, not a trend. It needs no labels and fires in minutes.
+2. **Feature shape.** Do the live values look like the training values? Compare the histogram of each important feature with its histogram at training time. Needs no labels.
+3. **Prediction shape.** Does the model output the same spread of scores as before? Huyen notes that "Prediction distribution shifts are also a proxy for input distribution shifts." The model's own output is one number you always have.
+4. **Outcome.** Accuracy, precision, or a business metric, once labels arrive. Slow but the truth.
+
+So alert on feature statistics, and do not wait for the model output to look wrong. Huyen is careful here. She calls summary statistics such as the mean and the variance "a good start, but these metrics are far from sufficient". Two histograms can have the same average and look nothing alike.
+
+Try both kinds of failure in the widget. Move the shift slider: the shape distance rises and the shape alert fires. Then set missing rows to 40% and put the shift back at 0: the shape distance stays at 0, because the rows that remain look normal. Only the coverage check sees this failure.
+
+<AiE1DriftHist client:visible />
+
+Two practical questions come up at once. The first is which test to use for "do these two histograms differ". A classic choice is the Kolmogorov-Smirnov test, which compares two samples. Huyen's warning is that it "can also be expensive and produce too many false positive alerts". With millions of rows, a tiny and harmless change becomes "statistically significant". So many teams use a plain distance, as the widget does, and set the alert line from history. The second is the window. Huyen writes: "The shorter your time scale window, the faster you'll be able to detect changes in your data distribution," but "too short a time scale window can lead to false alarms of shifts." You tune it, as you tune any alert. Lesson [observability](/learn/07-reliability/observability/) covers the alert hygiene that applies here too.
+
+## Question 4: how fast does our model age?
+
+You might think the answer is a fixed schedule: "retrain monthly". Huyen reports how most teams pick one: many companies "still determine based on gut feelings instead of experimental data". A gut number is wrong in two ways. Too slow, and quality sags below what the product can stand. Too fast, and you spend compute and take release risk for nothing.
+
+The better way is to **measure the decay curve**. Here is the method, in plain steps.
+
+1. Train a model on data up to a cut-off date, as you would for a release.
+2. Score it on the next week of data, then the week after, then the week after that. Labels exist for old weeks, so you can compute the metric for each.
+3. Plot the metric against the weeks since training. The slope is your aging rate.
+4. Choose the quality floor: the lowest value the product can live with.
+5. The gap between the starting value and the floor, divided by the slope, is the longest safe time between retrains. Keep a margin below it.
+
+The Rules of ML describe the live version: look at "the difference between the performance on the 'next-day' data and the live data", and note that a gap "may indicate that some features are time-sensitive and possibly degrading model performance." That is the same idea in a production check.
+
+Step through the picture. The numbers are illustrative. A straight line is a simplification. Real curves bend, and some drop off a cliff when an event happens, such as a sale or a new app version. So measure over a long enough period to include those events.
+
+<AiE1DriftDecay client:visible />
+
+Two details matter. First, the decay differs by model. A ranking model for a news feed ages in days. A model for a stable product may age in months. Huyen says "Different models in your pipeline might require different retraining schedules." Second, freshness changes, as the Rules of ML note: "freshness can change over time, especially when feature columns are added or removed from your model." Add a new, fast-moving feature and your safe interval can shrink. Measure again after every big feature change.
+
+Retraining has a cost, and the measured curve lets you price it. If the model loses little per week, a long gap is fine. If it loses a lot, a short gap pays for itself. Lesson E1.9 goes the other way: for models that age in hours, a retrain is not fast enough, and the training itself has to become continuous.
+
+## Question 5: what should we do when an alert fires?
+
+An alert is a question, not an answer. Huyen puts it well: "The problem is not how to detect these changes, but how to know which change actually requires your attention." Follow a fixed order so that the cheap explanations go first.
+
+1. **Is it a pipeline bug?** Check coverage, units, and renamed fields. A bug is fixed by repairing the pipeline. A retrain on broken data bakes the bug into the model.
+2. **Is it a real change in the world?** Compare with the calendar: a festival, a sale, a launch, a marketing push. If the change is temporary, retraining on it may hurt.
+3. **Does it hurt the outcome?** Check the label-based metric, with the delay in mind. Many shifts in inputs do no harm. Do not retrain on every alert.
+4. **If it hurts and it is lasting:** retrain on fresh data, test the new model online (lesson E1.8 covers how), and release it by the usual ladder.
+5. **If it hurts and no retrain helps:** the problem may be concept drift. The inputs no longer carry the signal. New features or fresh labels are the fix, not more of the same data.
+
+Keep a log of every alert and what it turned out to be. Over a few months this tells you which monitors are noisy and which ones caught real harm. It is also the data you need to set thresholds.
+
+## The naive way: a calendar and one number
+
+The naive design has two parts. Retrain on a fixed day each month, because that is what the team does. Watch one dashboard: the average model score, or the online metric. Both parts fail.
+
+A calendar ignores the real aging rate. The model may be fine in week 3 and broken in week 2. The average score hides a feature that went to zero, because a model with a missing feature can still produce plausible scores. The online metric lags, and it blends many causes together. When it finally moves, the team cannot tell if the cause is the model, the data, or the season.
+
+## The real fix: layers, a measured curve, and a trigger
+
+Put the pieces together. The design has three layers of check and two ways to start a retrain.
+
+| Layer | What it watches | Needs labels? | Speed | Catches |
+|---|---|---|---|---|
+| Data health | Coverage, ranges, freshness of each feature | No | Minutes | Pipeline bugs and silent failures |
+| Shape | Feature and prediction histograms against the training window | No | Hours | Input and label drift |
+| Outcome | Accuracy or business metric on labeled data | Yes | Days to weeks | Concept drift and real harm |
+
+The two ways to start a retrain are a **schedule** from the measured curve, and a **trigger** from an alert on the outcome layer. The schedule is the default. The trigger is the safety net. Neither fires without the checks of Question 5.
+
+A note on cost. Monitoring each feature and the output costs little: a histogram per feature per window is small data. Store the training-time histogram with the model version, so any live window can be compared to the exact data that model saw. That is the same discipline as storing the feature definitions in lesson E1.3.
+
+## What experienced teams know
+
+1. **Silent failure is the default.** The Rules of ML warn that decay is gradual and stale tables can sit for months, with a refresh alone giving "a boost of 2% in install rate" on Play ([Rules of ML, Rule 10](https://developers.google.com/machine-learning/guides/rules-of-ml)). Assume your model is aging until a monitor says otherwise.
+2. **Know the freshness need per model.** Search at Google Play can suffer within a month without an update, and ad systems update daily ([Rule 8](https://developers.google.com/machine-learning/guides/rules-of-ml)). Write the freshness need down next to each model.
+3. **Coverage is the cheapest alert.** The Rules of ML example of a feature falling from 90% to 60% populated is the typical silent failure ([Rule 10](https://developers.google.com/machine-learning/guides/rules-of-ml)). A coverage alert needs no labels and no statistics.
+4. **Summary statistics are not enough.** Mean and variance are "a good start, but ... far from sufficient", and KS tests can give "too many false positive alerts" ([Huyen](https://huyenchip.com/2022/02/07/data-distribution-shifts-and-monitoring.html)). Compare shapes, and set alert lines from your own history.
+5. **Most retrain schedules are gut feel.** Huyen reports that many companies set the frequency "based on gut feelings instead of experimental data". Measure the decay curve and write down the slope ([Huyen](https://huyenchip.com/2022/02/07/data-distribution-shifts-and-monitoring.html)).
+6. **Non-stationary data is the reason to go faster.** The Monolith paper says "the underlying distribution of user data is non-stationary", and it reports metrics that fluctuate "across different days due to concept-drift" ([Liu and others, Monolith](https://arxiv.org/html/2209.07663v2)). Lesson E1.9 builds on this.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Fixed calendar retrain | Simple, predictable release work | Wrong rate for the real decay | Only as a first step, until you measure |
+| Schedule from a measured curve | Retrain only as often as needed | You must build a backtest and re-measure | Most models with delayed labels |
+| Alert-triggered retrain | Fast response to a sudden change | Noisy alerts cause needless retrains | As a safety net beside a schedule |
+| Tight shape alerts | Early warning without labels | False alarms from harmless shifts | High-stakes models with long label delay |
+| Loose shape alerts | Few false alarms | Late warning | Models that age slowly and are cheap to be wrong |
+| Retrain on the newest data only | Matches today's world | Forgets rare past events | Fast-changing products |
+| Retrain on a long window | Keeps rare cases | Dilutes recent change | Stable products with seasonal cycles |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "A model ages because its training data was a snapshot. I monitor in layers. Data health first, meaning coverage and ranges per feature. Then shape, meaning feature and score histograms against the training window. Then outcome, when labels arrive. I set the retrain schedule from a measured decay curve: gap to the quality floor divided by the weekly slope, with a margin. An alert goes through a fixed triage: pipeline bug, then calendar event, then real harm." This shows monitoring design and cost sense.
+</Callout>
+
+<Callout type="mistake">
+Do not say "I will retrain monthly" with no reason, and do not say "I will monitor accuracy" when the labels arrive in six weeks. Do not retrain on every drift alert: many shifts do no harm, and retraining on a bug bakes the bug into the next model.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'e1-drift-coverage-silent',
+      q: 'A feature that was filled in for 90% of requests is now filled in for 60%. The model score average looks normal. Which check would have caught this fastest?',
+      options: [
+        'A coverage check on each feature, with an alert line',
+        'A weekly review of the online revenue metric',
+        'A monthly retrain on the newest data',
+        'A latency alert on the model server',
+      ],
+      answer: 0,
+      explain: 'Coverage is the share of rows with a real value. It needs no labels and fires in minutes. The revenue metric moves late and mixes causes. A retrain would learn from the broken data. Latency does not change when a feature goes empty.',
+    },
+    {
+      id: 'e1-drift-concept-invisible',
+      q: 'Spammers find new wording that gets past a filter. The inputs look the same as last month, but the old rule from words to "spam" no longer holds. Which kind of change is this, and where does it show?',
+      options: [
+        'Input drift, shown in feature histograms',
+        'Label drift, shown in the share of spam in the logs',
+        'A pipeline bug, shown in coverage',
+        'Concept drift, shown late in outcomes',
+      ],
+      answer: 3,
+      explain: 'The inputs did not move, so histograms stay quiet. The rule from input to output changed, which is concept drift. You see it in outcomes once labels arrive. Input drift would show in the histograms, and a bug would show in coverage.',
+    },
+    {
+      id: 'e1-drift-schedule-curve',
+      q: 'A team wants a retraining schedule that is not a guess. What is the best way to get one?',
+      options: [
+        'Copy the schedule of a famous company',
+        'Score a frozen model on each later week and read the slope of its metric',
+        'Retrain every time any alert fires',
+        'Retrain as often as the compute budget allows',
+      ],
+      answer: 1,
+      explain: 'The backtest of a frozen model against later weeks gives the aging slope. Gap to the quality floor divided by slope is the longest safe interval. Another company has a different product. Retraining on every alert wastes work, and the full budget wastes compute.',
+    },
+    {
+      id: 'e1-drift-ks-large',
+      q: 'A team compares each feature with a statistical test on millions of rows and gets alerts every day for tiny changes. What is the likely cause, and the usual response?',
+      options: [
+        'The model is broken, so retrain it daily',
+        'The features are mislabeled, so drop the alerts',
+        'With huge samples, harmless changes look significant, so use a distance and set the line from history',
+        'The training window was too short, so extend it',
+      ],
+      answer: 2,
+      explain: 'Large samples make tiny differences significant, which is why such tests give many false alarms. A plain distance with an alert line tuned on past data is common. Retraining daily or dropping alerts treats a noisy monitor as a real fault.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="e1-drift-coverage-drop"
+  title="Coverage fell overnight"
+  scenario="A product-ranking model has run for six weeks. This morning, the dashboard shows one feature, 'days since last purchase', filled in for far fewer rows. Labels for orders arrive about two weeks late. The numbers below are made up for the exercise."
+  facts={[
+    'feature coverage, days_since_last_purchase: 98% last week, 60% today',
+    'distribution of the other 60%: same shape as training',
+    'average model score: 0.41 last week, 0.40 today',
+    'accuracy on labeled data: last label batch (two weeks old) is normal',
+    'last deploy of the data pipeline: yesterday evening',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'Concept drift: users changed their habits overnight',
+        'A pipeline bug from yesterday evening deploy',
+        'Label delay: the accuracy number is too old to trust',
+        'Normal input drift: the shape of the data is unchanged',
+      ],
+      answer: 1,
+      explain: 'A sudden drop in coverage right after a pipeline deploy points at the plumbing. Habits do not change in a night. The old accuracy number is true but cannot see this event, and the remaining 60% matching training is why the score average hides the failure.',
+    },
+    {
+      prompt: 'What is the right first action?',
+      options: [
+        'Retrain now on the new data',
+        'Wait two weeks for fresh labels',
+        'Check and roll back or fix the pipeline change, then watch coverage',
+        'Raise the alert line so it does not fire',
+      ],
+      answer: 2,
+      explain: 'Fix the cause first. A retrain on rows with the missing feature would teach the model that the value is often absent. Waiting for labels lets users see bad ranking for two weeks. Raising the line hides the fault.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Google: Rules of Machine Learning](https://developers.google.com/machine-learning/guides/rules-of-ml). Rules 8, 10, and 37 are the source of the freshness, silent-failure, and next-day checks used here.
+- [Chip Huyen: Data distribution shifts and monitoring](https://huyenchip.com/2022/02/07/data-distribution-shifts-and-monitoring.html)
+- [Liu and others: Monolith, real-time recommendation with collisionless embedding tables](https://arxiv.org/html/2209.07663v2). Read the introduction on non-stationary data.

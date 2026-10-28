@@ -1,0 +1,325 @@
+---
+summary: 'When a model and its training state do not fit on one GPU, you split the work four ways: tensor parallelism splits each matrix, pipeline parallelism splits the layers, context parallelism splits the sequence, and expert parallelism splits the experts. Each split has its own traffic and its own waste, and the speed gap between links inside a node and between nodes decides where each one can run.'
+requires: ['ai/e2-training/data-parallel-zero', 'ai/a2-inference-cost/gpu-memory-math']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Math from '../../../../components/lesson/Math.astro';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE2ParGrid from '../../../../components/anim/lessons/AiE2ParGrid.tsx';
+import AiE2PipeBubble from '../../../../components/anim/lessons/AiE2PipeBubble.tsx';
+import AiE2LayoutPlanner from '../../../../components/anim/lessons/AiE2LayoutPlanner.tsx';
+
+## The problem
+
+You joined a team that trains a large model. A job runs on 64 GPUs and works. Your lead asks you to make it run on 512 GPUs for a bigger model. You add GPUs, and the cost per step does not fall. It rises. The new GPUs are busy, but a large share of their time goes to waiting.
+
+Lesson E2.3 showed how to share the training state across copies of the model: data parallelism, with ZeRO and FSDP to remove the waste. That has a limit. Sharding the state helps memory, but every GPU still runs every layer of the whole model on its own slice of the data. When the model is huge, or the sequences are very long, that is not enough. The work itself must be cut up. This lesson covers the four ways to cut it, and the one fact that decides where each cut can go: **how fast the link is between the two GPUs that must talk**.
+
+The questions on the way are:
+
+1. Why are there different links, and why does that matter?
+2. How do you split one matrix across GPUs (tensor parallelism)?
+3. How do you split the layers (pipeline parallelism), and what is the bubble?
+4. How do you split long inputs and experts (context and expert parallelism)?
+5. How do the four combine on a real cluster?
+
+## Question 1: why does the link between GPUs matter?
+
+Training a big model is not only arithmetic. GPUs must also send numbers to each other. The send takes time, and the GPU can sit idle while it waits.
+
+Not all links are equal. Think of an office building. People on the same floor talk across a desk. People on different floors use the lift. Different buildings use a courier. Each step up costs more time.
+
+A GPU cluster has the same tiers:
+
+| Tier | What it is | Figure, with source |
+|---|---|---|
+| Inside a node | A **node** [junior] is one server, usually with 8 GPUs. The GPUs talk over **NVLink** [mid], NVIDIA's direct GPU-to-GPU link | NVIDIA lists 900 GB/s for H100 (fourth generation) and says 1.8 TB/s per GPU for Blackwell (fifth generation, "bidirectional"), company claims |
+| Between nodes | A network card per GPU, over a fabric such as **InfiniBand** [mid] (a network built for clusters) or RoCE (a similar standard over Ethernet) | Llama 3 used 400 Gbps links between GPUs. 400 Gbps is 50 GB/s (derived: divide by 8) |
+
+Read the two columns together. NVLink on an H100 is about ~18 times faster than a 400 Gbps network link (derived: 900 divided by 50). The units differ (bytes versus bits), so check them. The two numbers also measure slightly different things, so treat the ratio as an order of magnitude, not an exact figure. The practical rule is the same either way: **a transfer inside a node is much cheaper than one between nodes.**
+
+You met NVLink in lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/), where tensor parallelism split a 140 GB model over several GPUs for serving. Here the same idea appears at much larger scale, and with a training twist: training sends traffic backward as well as forward.
+
+Keep one rule in mind for the rest of the lesson. Each split sends a different amount of data, a different number of times. The split that talks most must sit on the fastest link.
+
+## Question 2: how do you split one matrix?
+
+### What tensor parallelism is
+
+A transformer layer is mostly big matrix multiplications. A **matrix multiply** [junior] turns an input vector into an output vector using a grid of learned numbers (the weight matrix). If the matrix is too big or too slow for one GPU, cut it.
+
+**Tensor parallelism** [senior] splits each weight matrix across several GPUs. Each GPU holds one slice and does its share of the multiply. Then the GPUs combine their partial results.
+
+Picture four cooks making one huge soup. Each adds the same ingredients but to a quarter of the pot. At certain points they must pour their pots together, mix, and pour back. The pouring is the communication.
+
+### Why it exists
+
+It makes a model fit and it makes each layer faster. Each GPU holds a fraction of the weights, and each does a fraction of the arithmetic. It also cuts the activations (the temporary values a layer produces, which lesson E2.2 counts as part of the memory bill) that each GPU must hold.
+
+### How the combine works
+
+The combine step is an **all-reduce** [mid]: every GPU contributes a partial result, and every GPU ends up holding the sum. It is a **collective** [mid], an operation in which a group of GPUs communicate together rather than one pair.
+
+The Megatron-LM paper designs a transformer layer so that the forward pass needs two all-reduces and the backward pass needs two more. That is four combines per layer, in every step, for every layer. The Ultra-Scale Playbook (a Hugging Face guide) adds a second point: this all-reduce sits in the middle of the computation, so the GPU "cannot overlap" it with other work. The next layer cannot start until the combine ends.
+
+### Why it stays inside a node
+
+Put those two facts together. Tensor parallelism sends data many times per layer, on the critical path, with nothing to hide it behind. It needs the fastest link available. So it goes inside one node.
+
+The Megatron-LM paper states the rule as its first takeaway: tensor parallelism "should generally be used up to degree g when using g-GPU servers", where g is the number of GPUs in one server. With 8 GPUs per server, that is a degree of 8. The Playbook measured the cost of going past it: it reports "significant drops when moving from TP=8 to TP=16, and an even steeper decline from TP=16 to TP=32". Llama 3 405B uses a tensor degree of 8 (paper, Table 4). The same degree as the node size is not an accident.
+
+Now see how this fits with the other methods before we meet them. The animation uses a toy cluster of 16 GPUs in 4 nodes of 4 GPUs. The sizes are illustrative.
+
+<AiE2ParGrid client:visible />
+
+Step 2 shows a tensor group as one node. Steps 3 and 4 add the two other kinds of group. We build them in the next sections.
+
+## Question 3: how do you split the layers?
+
+### Pipeline parallelism
+
+**Pipeline parallelism** [senior] cuts the model by depth. A transformer is a stack of layers. Give the first block of layers to stage 1, the next block to stage 2, and so on. Each **stage** [mid] runs on its own GPU (or its own group of GPUs). A batch enters stage 1, and its output goes to stage 2.
+
+Picture an assembly line. One station fits the engine. The next fits the doors. A car passes through every station in turn.
+
+Why use it? It needs very little communication. Only the activations at the cut between two stages cross the link, once forward and once backward. That is far less than the four all-reduces per layer in tensor parallelism. So pipeline stages can sit on different nodes, over the slower link.
+
+### The problem: the bubble
+
+Send one batch through the line. While stage 1 works, stages 2 to 4 wait. While stage 4 works, stages 1 to 3 wait. At any moment only one station is busy. That is a waste of 3 out of 4 GPUs.
+
+The fix is the same as on a real assembly line: keep it full. Cut the batch into small **micro-batches** [mid]. Send micro-batch 1 into stage 1. When it moves to stage 2, send micro-batch 2 into stage 1. Now several stations work at once.
+
+But the line must still fill at the start and drain at the end. During those times, some stages sit idle. That idle time is the **pipeline bubble** [senior]. The Megatron-LM paper gives it as a fraction of the ideal time:
+
+<Math block tex="\text{bubble} = \frac{p - 1}{m}" />
+
+Here p is the number of stages and m the number of micro-batches in a batch. In words: the bubble grows with the number of stages and shrinks with the number of micro-batches. The paper adds the consequence: for the bubble to be small, m must be much larger than p.
+
+Move the slider. The chart shows a toy pipeline with a simple schedule: all forward passes, then all backward passes. Watch the empty areas at the corners.
+
+<AiE2PipeBubble client:visible />
+
+Two things to notice. First, more micro-batches make the bubble smaller, but with diminishing returns. Second, more stages make it larger. A deeper pipeline lets you fit a bigger model, and it also needs more micro-batches to stay efficient.
+
+### What teams do about it
+
+Real systems reduce the bubble with a few tricks.
+
+- **Interleaving.** Give each GPU several small, separate chunks of layers instead of one big block. A micro-batch then loops through the GPUs more than once. The Megatron-LM paper reports its interleaved schedule improves throughput by 10% or more, at the price of more communication.
+- **Balancing stages.** Llama 3 removes one transformer layer from the first and from the last stage, because those two stages also hold the input embedding and the output layer. That keeps the stages' compute and memory close to equal.
+- **Flexible micro-batch scheduling.** Llama 3 changed its pipeline schedule so the number of contiguous micro-batches can be set freely, instead of being tied to the stage count.
+
+The Playbook also gives one measured number: in its benchmark, moving a pipeline from 8 stages in one node to 16 stages over two nodes cost only 14% of throughput. That is a cost, but a smaller one than the drop for tensor parallelism across nodes. Treat 14% as that benchmark's result, not a rule.
+
+### Where it sits
+
+Pipeline stages go on the slower link. Llama 3 405B uses 16 stages (Table 4 of the paper). A stage may itself be one whole node of 8 GPUs working as a tensor group. So the picture is: inside a node, tensor parallelism. Across nodes, pipeline stages in a chain.
+
+## Question 4: how do you split long inputs and experts?
+
+### Context parallelism
+
+Tensor and pipeline parallelism split the model. They do not help when the **input** is the problem. A sequence of 131,072 tokens has huge activations, and attention (lesson [A1.4](/learn/ai/a1-model-function/attention-cost/)) compares every token with every earlier token.
+
+**Context parallelism** [senior] splits the sequence across GPUs. Each GPU holds a chunk of the tokens. The catch is attention. A token in chunk 3 must still attend to tokens in chunks 1 and 2. So GPUs must send their Keys and Values (the saved vectors from lesson [A1.4](/learn/ai/a1-model-function/attention-cost/)) to each other. The Playbook describes a ring version in which each GPU starts sending its key and value pairs to the others while it computes, so the transfer overlaps with the arithmetic. It also notes that a naive version is unbalanced, because tokens late in a sequence attend to more tokens than early ones. A zig-zag assignment gives each GPU a mix of early and late chunks.
+
+Llama 3 uses it only for the long-context stage. Its table shows two layouts at 16,384 GPUs: with a context degree of 1 at 8,192 tokens and 41% MFU, and with a context degree of 16 at 131,072 tokens and 38% MFU. **MFU** [mid] means model FLOPs utilization: the share of the GPU's peak arithmetic rate that goes into useful model math. A drop from 41% to 38% buys a sequence 16 times longer.
+
+A note on names. **Sequence parallelism** [senior], as the Playbook uses the word, is a companion to tensor parallelism. It splits along the sequence the parts of a layer that tensor parallelism leaves whole, so that activations take less memory. Context parallelism splits attention itself. The names are close. When you read a paper, check which one it means.
+
+### Expert parallelism
+
+Lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/) introduced the mixture of experts (MoE) model: each layer holds many feed-forward blocks (experts), and a router sends each token to a few of them. Mixtral 8x7B has 8 experts per layer and uses 2 per token. It has 47B parameters in total and uses 13B per token (Mixtral paper).
+
+**Expert parallelism** [senior] puts different experts on different GPUs. As the Playbook says, it does not split any matrix multiply. It routes each token's hidden state to the GPU that holds the chosen expert. This needs an **all-to-all** [mid]: every GPU sends a different bundle to every other GPU, then gathers the results. The Playbook lists the all-to-all as the key communication of expert parallelism, and says it works with data parallelism, since it splits the experts and not the input tokens.
+
+The all-to-all is heavy, and it depends on the router. Our reading: if the router favours one expert, that expert's GPU gets more tokens than the others, and everyone waits for it. Teams watch expert load for this reason. Lesson E3.6 covers the serving side. For training, the Playbook suggests that with MoE it can help to place experts across nodes.
+
+## Question 5: how do the four combine?
+
+A large run uses several at once. A GPU's position is given by its index in each: which tensor slice, which context chunk, which pipeline stage, which data replica. Llama 3 calls this **4D parallelism** and places the dimensions in the order tensor, context, pipeline, data. The paper's reason: "the innermost parallelism requires the highest network bandwidth and lowest latency". Data parallelism is outermost, because it "can tolerate longer network latency".
+
+Here are the published layouts. These are measured figures from the Llama 3 paper (company claims about their own run), and the third one has the long context.
+
+| GPUs | Tensor | Context | Pipeline | Data | Sequence length | BF16 MFU |
+|---|---|---|---|---|---|---|
+| 8,192 | 8 | 1 | 16 | 64 | 8,192 | 43% |
+| 16,384 | 8 | 1 | 16 | 128 | 8,192 | 41% |
+| 16,384 | 8 | 16 | 16 | 8 | 131,072 | 38% |
+
+The product of the four degrees is the GPU count. Try it. Click a preset, then change a degree and watch the checks.
+
+<AiE2LayoutPlanner client:visible />
+
+Read the first two rows. The cluster doubled and MFU fell from 43% to 41%. The paper's explanation: the number of tokens per batch is held fixed, so more data-parallel groups means a smaller batch in each, and that leaves less work per group to hide communication behind.
+
+Megatron-LM, the older and well-known reference, shows the result of the same recipe on A100 GPUs. The paper trains a model of 1 trillion parameters on 3,072 GPUs and reports 502 petaFLOP/s in total, which it says is 52% of theoretical peak per GPU (paper claim).
+
+Which dimension do you reach for first? Our reading of the sources, in order:
+
+1. Does the model plus its state fit with data parallelism and ZeRO or FSDP (lesson E2.3)? Then stop. Fewer dimensions mean less traffic.
+2. If not, add tensor parallelism up to the node size.
+3. If it still does not fit, add pipeline stages across nodes.
+4. Add context parallelism only if the sequence is the problem.
+5. Add expert parallelism only for MoE models.
+6. Fill the rest of the cluster with data parallelism.
+
+## Numbers
+
+| Fact | Value | Source |
+|---|---|---|
+| H100 NVLink | 900 GB/s | NVIDIA H100 page |
+| Blackwell NVLink | 1.8 TB/s per GPU, bidirectional | NVIDIA press release, company claim |
+| Network link in Llama 3 cluster | 400 Gbps | Llama 3 paper |
+| Same link in GB/s | 50 GB/s | Derived: 400 / 8 |
+| Llama 3 405B layout, 16K GPUs | TP 8, CP 1, PP 16, DP 128 | Llama 3 paper, Table 4 |
+| Llama 3 MFU, 16K GPUs, 8K tokens | 41% | Llama 3 paper |
+| Llama 3 MFU, 131K tokens, CP 16 | 38% | Llama 3 paper |
+| Megatron-LM, 1T model | 3,072 GPUs, 52% of peak | Megatron-LM paper claim |
+| Pipeline bubble | (p - 1) / m | Megatron-LM paper |
+| Megatron interleaved schedule gain | 10% or more | Megatron-LM paper claim |
+
+## Trade-offs
+
+| Method | You gain | You pay | Choose when |
+|---|---|---|---|
+| Tensor | Each GPU holds a slice of every matrix, and each layer runs faster | Four all-reduces per layer, on the critical path | The model does not fit on one GPU, and the group fits in a node |
+| Pipeline | Little traffic between stages, so it works across nodes | The bubble, plus uneven stages | You must span nodes and want cheap links |
+| Context | Very long sequences fit | Key and value traffic in attention, and load balance | The sequence length is the memory problem |
+| Expert | Many experts without holding all on one GPU | An all-to-all every layer, and hot experts | The model is MoE |
+| Data (plus ZeRO or FSDP) | Simple, scales throughput | Replicated or gathered state | The model fits, or fits after sharding |
+
+## Interview lens
+
+<Callout type="tip">
+Answer in order of link speed: "Tensor parallelism talks the most, so I keep it inside one node on NVLink, with a degree equal to the node size. Pipeline stages talk little, so they go across nodes. Data parallelism goes outermost. Context parallelism is for long sequences, expert parallelism for MoE. I would raise the micro-batch count to shrink the bubble, and I would measure MFU to see where I lose." Then give the anchor: Llama 3 405B ran tensor 8, pipeline 16, data 128 on 16,384 GPUs at 41% MFU.
+</Callout>
+
+<Callout type="mistake">
+Do not say "add more GPUs" without saying which dimension grows. Do not put tensor parallelism across nodes. Do not quote the bubble without saying how it depends on micro-batches. And do not use sequence parallelism and context parallelism as one word: they split different things.
+</Callout>
+
+<Callout type="deep" title="Why not make the pipeline very deep?">
+Every extra stage adds to the bubble (the p in the formula) and needs more micro-batches to cover it. More micro-batches mean a larger global batch, and training quality sets a limit on batch size. So the depth of a pipeline is capped by how large a batch you may use, not only by memory. That is why teams mix methods instead of using one.
+</Callout>
+
+## What experienced teams know
+
+1. **Match the tensor degree to the node.** The [Megatron-LM paper](https://arxiv.org/abs/2104.04473) states it as its first takeaway: tensor parallelism up to g for g-GPU servers.
+2. **Put the chattiest dimension innermost.** The [Llama 3 paper](https://arxiv.org/abs/2407.21783) orders its four dimensions tensor, context, pipeline, data, and says the innermost needs the most bandwidth.
+3. **Balance the stages.** Llama 3 gives the first and the last pipeline stage one layer fewer, since they carry the embedding and the output head.
+4. **MFU falls as you scale at a fixed batch.** The Llama 3 table shows 43% at 8K GPUs and 41% at 16K with the same tokens per batch.
+5. **Activation memory shaped the design.** The Llama 3 paper says its pipeline changes let it pre-train on 8K-token sequences without activation checkpointing. The next step in this module's memory story is lesson E2.2.
+6. **No single method wins.** The [Ultra-Scale Playbook](https://nanotron-ultrascale-playbook.static.hf.space/) says none of these techniques is a silver bullet, which is why they are combined.
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="e2-model-par-tp16"
+  title="Throughput collapses at tensor degree 16"
+  scenario="A team trains on nodes of 8 GPUs. To fit a bigger model, they raise the tensor degree from 8 to 16 and keep everything else. The job still runs, but tokens per second drops sharply and the GPUs look idle. The numbers are illustrative."
+  facts={[
+    'tensor degree: 16 (was 8), nodes of 8 GPUs',
+    'GPU compute use: falls from busy to waiting',
+    'network counters: heavy traffic on node-to-node links',
+    'NVLink counters: lower than before',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'Tensor groups now span two nodes, so all-reduces use the slow link',
+        'The model has too few layers for 16 GPUs to share, so some idle',
+        'The data-parallel degree fell, so the batch per group is too small',
+        'The GPUs overheat when 16 of them work together on one matrix',
+      ],
+      answer: 0,
+      explain: 'A tensor group of 16 cannot fit in a node of 8. Four all-reduces per layer now cross the network, on the critical path. The counters show it: node-to-node traffic is high, NVLink traffic is low. A change in data-parallel degree affects batch size, not this pattern.',
+    },
+    {
+      prompt: 'Which fix keeps the bigger model and restores speed?',
+      options: [
+        'Return tensor degree to 8 and add pipeline stages across nodes',
+        'Raise the tensor degree to 32 so even more GPUs share the work',
+        'Cut the micro-batch count to 1 so that stages never have to wait',
+        'Replace data parallelism with a larger tensor group per replica',
+      ],
+      answer: 0,
+      explain: 'Pipeline stages send little data between nodes, so they suit the slow link. Degree 32 makes the problem worse. One micro-batch makes the bubble as large as it can be. Trading data parallelism for tensor parallelism pushes more traffic off the node, not less.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why does tensor parallelism usually stay inside one node?',
+      options: [
+        'It holds the whole model on every GPU, so all must share one memory pool',
+        'It sends only activations once per step, so it needs no network',
+        'It joins results every layer, so it needs the fastest link',
+        'It splits the training data, so every GPU must see exactly the same batch',
+      ],
+      answer: 2,
+      explain: 'Each layer needs all-reduces, forward and backward, and the next layer waits for them. That traffic needs NVLink. Pipeline parallelism, not tensor, sends little data between stages.',
+    },
+    {
+      q: 'A pipeline has 8 stages. You raise the micro-batch count from 8 to 64. What happens to the bubble?',
+      options: [
+        'It grows, since more micro-batches mean more waiting',
+        'It shrinks, since the line stays fuller for most of the step',
+        'It stays equal, since only the number of stages sets it',
+        'It disappears, since micro-batches remove idle time entirely',
+      ],
+      answer: 1,
+      explain: 'The bubble is about (p - 1) divided by m, so a larger m makes it smaller. It never reaches zero, because the line still has to fill and drain. The stage count matters, but so does m.',
+    },
+    {
+      q: 'Which problem does context parallelism solve?',
+      options: [
+        'Activations too big as the input is long',
+        'A model with too many layers to fit on one node',
+        'Experts that are not used evenly by the router',
+        'A network link that is far too slow for gradient averaging',
+      ],
+      answer: 0,
+      explain: 'Context parallelism splits the sequence across GPUs. It does not split layers (that is pipeline) or experts (that is expert parallelism), and it does not change the gradient averaging link.',
+    },
+    {
+      q: 'Which communication pattern defines expert parallelism?',
+      options: [
+        'One all-reduce per matrix multiply',
+        'A ring that passes activations from stage to stage',
+        'A broadcast of the full model to each GPU',
+        'An all-to-all that sends tokens to their experts',
+      ],
+      answer: 3,
+      explain: 'Each token is routed to its chosen expert, which may sit on another GPU, then the results come back. The all-reduce belongs to tensor parallelism, and the stage-to-stage chain belongs to pipeline parallelism.',
+    },
+    {
+      q: 'Llama 3 doubled its cluster from 8,192 to 16,384 GPUs with the same tokens per batch, and MFU fell a little. What is the paper\'s reason?',
+      options: [
+        'The tensor degree had to rise, so every single layer ran slower',
+        'Smaller batches per data group left less work to hide traffic',
+        'The network switched from RoCE to InfiniBand, which is slower here',
+        'The pipeline had fewer stages, so the bubble grew a lot',
+      ],
+      answer: 1,
+      explain: 'The tokens per batch were fixed, so more data-parallel groups meant a smaller batch per group. The tensor and pipeline degrees stayed at 8 and 16 in both rows.',
+    },
+  ]}
+/>
+
+## Further reading
+
+You do not need the papers to use the ideas. They are the sources for the numbers above.
+
+- [Llama 3 paper: "The Llama 3 Herd of Models"](https://arxiv.org/abs/2407.21783): Table 4 and the parallelism section.
+- [Megatron-LM: Efficient Large-Scale Language Model Training on GPU Clusters](https://arxiv.org/abs/2104.04473): tensor, pipeline, and data parallelism together.
+- [The Ultra-Scale Playbook (Hugging Face)](https://nanotron-ultrascale-playbook.static.hf.space/): all five methods with benchmarks.
+- [NVIDIA H100](https://www.nvidia.com/en-us/data-center/h100/) and the [Blackwell announcement](https://nvidianews.nvidia.com/news/nvidia-blackwell-platform-arrives-to-power-a-new-era-of-computing): the link figures.
