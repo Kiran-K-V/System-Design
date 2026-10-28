@@ -12,9 +12,10 @@ syl = open(os.path.join(repo, 'src/lib/ai-syllabus.ts')).read()
 
 # Build number -> id from module order (core modules A0..A14 only; electives use labels).
 num_to_id = {}
-mods = re.findall(r"slug: '(ai/[^']+)',\s*(?:label: '([^']+)',\s*)?title: '[^']*',\s*lessons: \[(.*?)\]", syl, re.S)
+mods = re.findall(r"slug: '(ai/[^']+)',\s*(?:label: '([^']+)',\s*)?title: '[^']*',\s*(?:label: '([^']+)',\s*)?lessons: \[(.*?)\]", syl, re.S)
 core = 0
-for slug, label, body in mods:
+for slug, label_before, label_after, body in mods:
+    label = label_before or label_after
     prefix = label or f'A{core}'
     if not label:
         core += 1

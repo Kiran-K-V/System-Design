@@ -1,0 +1,297 @@
+---
+summary: 'Training uses short number formats (BF16, FP8) for speed and keeps a 32-bit master copy for accuracy. It saves checkpoints so a crash loses minutes, not days. This lesson shows why the master copy exists, what a checkpoint holds, and how to pick an interval and write it without stalling the job.'
+requires: ['ai/e2-training/memory-per-parameter', 'ai/a2-inference-cost/quantization-small-models']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE2PrecisionWalk from '../../../../components/anim/lessons/AiE2PrecisionWalk.tsx';
+import AiE2CkptTimeline from '../../../../components/anim/lessons/AiE2CkptTimeline.tsx';
+import AiE2CkptCalc from '../../../../components/anim/lessons/AiE2CkptCalc.tsx';
+
+## The problem
+
+A team starts a three-week training run. In week one they switch the math from 32-bit to 16-bit numbers to go faster. The speed-up is real. Then the loss curve goes flat. Nothing crashed and no error appeared. The model just stopped learning.
+
+In week two a GPU fails at 3 a.m. The job restarts from the last saved copy, which is 6 hours old. Six hours of a large cluster are gone.
+
+Both stories have one cause: a trade between speed and safety. Short numbers are fast but lose small changes. Saving often is safe but costs time. This lesson covers both trades.
+
+The questions on the way are:
+
+1. Why do smaller number formats train faster, and what do they break?
+2. Why does the optimizer keep a 32-bit master copy of the weights?
+3. What does a checkpoint hold, and what does it cost to write?
+4. How often should you save, and how do you save without stopping the job?
+
+Lesson [E2.2](/learn/ai/e2-training/memory-per-parameter/) built the 16 bytes per parameter and said the 32-bit master copy exists. It did not show why. We show it here. The word "checkpoint" there meant a trick to save activation memory. In this lesson it means a saved copy of the training state. The two ideas are unrelated.
+
+## Part 1: mixed precision
+
+### Question 1: why do smaller numbers train faster?
+
+**What it is.** A computer stores a real number in a fixed number of **bits** [junior] (each bit is one 0 or 1). A **floating-point format** [mid] splits those bits into two jobs: an **exponent** that sets how big the number is, and a **mantissa** (also called the fraction) that sets how many digits of detail it keeps. More exponent bits give a wider range. More mantissa bits give finer detail.
+
+**The picture.** Think of a ruler. The exponent chooses the ruler: a ruler in metres, or in millimetres. The mantissa is how many tick marks the ruler has. A 16-bit format has fewer tick marks than a 32-bit one.
+
+**Why it matters.** Fewer bits help in two ways. The numbers take less memory, so a tensor moves across memory and links faster. And the GPU's matrix hardware runs more operations per second on shorter numbers.
+
+**Example.** Lesson [E2.2](/learn/ai/e2-training/memory-per-parameter/) counted 2 bytes for the weights and gradients used in the forward and backward passes. Those are 16-bit. Lesson [A2.2](/learn/ai/a2-inference-cost/quantization-small-models/) showed the same trade on the serving side.
+
+Three formats matter here.
+
+| Format | Bits | Exponent | Mantissa | In one line |
+|---|---|---|---|---|
+| FP32 | 32 | 8 | 23 | Wide range, fine detail. The safe default. |
+| BF16 | 16 | 8 | 7 | Same range as FP32, much coarser detail |
+| FP16 | 16 | 5 | 10 | Finer than BF16, but a narrow range |
+| FP8 | 8 | 4 or 5 | 3 or 2 | Two encodings. Coarse, very fast. |
+
+**BF16** [mid] ("brain float 16") was designed for machine learning. Google's description: one sign bit, eight exponent bits and seven mantissa bits, with "dynamic range ... identical to that of FP32". It keeps the range of FP32 and gives up detail. FP16 has the opposite trade. Its narrow range makes small gradients fall to zero, so FP16 training needs **loss scaling** [senior]: multiply the loss by a large constant before the backward pass, so small gradients stay inside the range, then divide it out. Mixed precision training first described this technique. Google says BF16 "comes close to being a drop-in replacement for FP32" and needs no loss scaling. That is why BF16 became the common choice for large language models. Meta's Llama 3 report quotes its throughput as a BF16 figure.
+
+**FP8** [senior] is the newest step. The format paper from NVIDIA, Arm and Intel defines two encodings: E4M3 (4 exponent bits, 3 mantissa bits) and E5M2 (5 exponent bits, 2 mantissa bits). **Paper claim**: models trained with FP8 matched 16-bit result quality on convolutional, recurrent and Transformer models, including language models up to 175 billion parameters, without changing hyperparameters. Note what this does not say: it does not say FP8 is a free swap, and we did not read details about scaling in that paper.
+
+### How much faster is FP8 than BF16?
+
+We checked the NVIDIA H100 page on 2026-10-28. Its spec table lists the Tensor Core rate for the H100 SXM as 3,958 teraFLOPS for FP8 and 1,979 teraFLOPS for BF16 (FP16 is the same as BF16). That is about 2 times. Three cautions:
+
+- **Company claim.** These are peak figures from the vendor's table, marked "with sparsity". They are the most the chip can do, not what a training job gets.
+- **Matrix math only.** FP8 speeds up the big matrix multiplies. Everything else in a step (communication, memory-bound operations, the optimizer) does not get 2 times.
+- **The 4x headline is different.** The same page says its Transformer Engine with FP8 gives "up to 4X faster training" on GPT-3 175B than the prior generation. That compares two chip generations and includes more than the format change. Do not read it as FP8 against BF16 on the same chip.
+
+**Our reading**: expect a gain well under 2 times from FP8 over BF16 in a whole training step, and measure it on your job.
+
+## Part 2: why the master copy stays in FP32
+
+### Question 2: why not train entirely in BF16?
+
+**What it is.** In a training step, the optimizer adds a small change to each weight. A **master copy** [mid] of the weights is a second copy kept in FP32. The optimizer updates this copy. The 16-bit copy that the forward and backward passes use is made from it each step. Mixed precision training describes this as "maintaining a single-precision copy of the weights that accumulates the gradients after each optimizer step".
+
+**The picture.** Think of a bank balance kept in whole pounds. You earn 10 pence a day. Each day, the bank rounds your balance to the nearest pound. The 10 pence vanishes every time, and after a year you have earned nothing. If the bank tracks pence in a hidden ledger and only shows you whole pounds, the pence add up.
+
+**Why it exists.** An update to a weight is usually tiny compared with the weight. A short format has big gaps between the numbers it can store. If the update is smaller than half a gap, the result rounds back to the old weight and the update is lost. That is the flat loss curve from the opening story. It is silent: nothing errors.
+
+**Example.** Step through it. The values are illustrative (a weight of 1.0 and an update of 0.001), but the mechanism is real.
+
+<AiE2PrecisionWalk client:visible />
+
+This is also why the memory cost in E2.2 looked odd. Of the 16 bytes per parameter, only 2 are used for the fast math. The other 4 + 4 + 4 bytes (master copy, and the optimizer's two running averages) exist so that small updates survive. The speed comes from the short copy. The accuracy comes from the long one.
+
+The same thinking applies to a few other places. Meta's Llama 3 paper reports it used FP32 for gradient accumulation and for the step that adds up gradients across GPUs, "for numerical stability" (our paraphrase of a longer passage). The rule of thumb: run the heavy matrix math in short formats and keep anything that adds up many small numbers in a long format.
+
+### Where FP8 changes this
+
+FP8 has 3 or 2 mantissa bits, so it is even coarser than BF16. It is aimed at the matrix multiplies only. The master weights and optimizer states stay in higher precision. **Our reading**: FP8 mostly changes speed and the memory of activations and communication, not the 12 bytes of optimizer state. Check any claim that FP8 "cuts memory by half" against which of the 16 bytes it touches.
+
+## Part 3: checkpoints
+
+### Question 3: what is a checkpoint, and what goes in it?
+
+**What it is.** A **checkpoint** [junior] is a saved copy of everything needed to restart a training run from that point. Lesson [E2.6](/learn/ai/e2-training/failures-at-scale/) showed that failure is routine at scale and that the redo stage costs the work since the last checkpoint.
+
+**The picture.** A video game save. You can die and reload, but you lose what you did since the last save. A save point that takes ten minutes of loading each time would make you avoid saving.
+
+**What goes in.** To continue a run exactly, a checkpoint needs:
+
+- The weights. The FP32 master copy, not just the 16-bit copy. If you save only the 16-bit copy, you throw away the small updates that the master was built to keep.
+- The optimizer state: the running averages that Adam keeps for each weight. Without them, the optimizer restarts "cold" and the first steps behave differently.
+- The step count and the learning-rate schedule position.
+- The position in the data, so the job does not repeat or skip examples.
+- The random-number generator states, if you want the restart to behave like an uninterrupted run.
+
+Gradients are not saved. They are recomputed in the next step. **Our reading**: so a checkpoint is about 12 bytes per parameter (master copy plus two averages), not the full 16, if you leave out the 16-bit copy and rebuild it on load. Some teams also save the 16-bit copy for convenience or export. A model file you serve is a different thing, and much smaller.
+
+**Size and storage.** In the Llama 3 report, **paper claim**, checkpoint sizes ranged "from 1 MB to 4 GB per GPU". Meta wrote the checkpoints to its Tectonic distributed file system, which it says supports "a sustainable throughput of 2 TB/s and a peak throughput of 7 TB/s". It also says that checkpoint writes are "highly bursty" and "saturate the storage fabric for short durations". The point for a designer: thousands of GPUs all write at the same instant, so storage must handle a burst far above its average load, much like the thundering herd in the backend track.
+
+### How a save works: sharded and asynchronous
+
+Two ideas keep a save cheap.
+
+**Sharded checkpoint** [senior]. Each GPU writes only the slice of state it owns, in parallel, as lesson [E2.3](/learn/ai/e2-training/data-parallel-zero/) sharded it. No single machine gathers the whole model. PyTorch's distributed checkpoint library works this way: it "produces multiple files per checkpoint, with at least one per rank". It also supports **resharding** [senior]: "saving in one cluster topology and loading into another". That matters because the cluster after a failure may not have the same shape as before.
+
+**Asynchronous save** [senior]. A plain save pauses training until the bytes reach storage. An asynchronous save copies the state into CPU memory first, which is quick, then lets training go on while a background thread writes to storage. PyTorch's version says it first "de-stages the state_dict on to the staging storage (defaults to CPU memory)" and then calls the save in a separate thread. The docs mark this feature as experimental. The stall shrinks from "write time" to "copy time". Two limits remain: the copy still takes a moment, and a second save cannot start until the first has finished writing. The state must also not change while it is copied.
+
+<AiE2CkptTimeline client:visible />
+
+Notice the last step of the animation. Cheaper saves do not just save time on each save. They let you save more often, and that cuts the work lost in each failure.
+
+## Part 4: how often to save
+
+### Question 4: what is the best interval?
+
+**What it is.** The **checkpoint interval** [junior] is the time between two saves. Two costs pull in opposite directions.
+
+- **Save cost.** Each save stalls training for a while. Short intervals mean many stalls.
+- **Lost work.** After a failure you redo everything since the last save. On average a failure lands halfway through an interval, so half an interval is lost. Long intervals mean more lost work per failure. A restart delay (find a node, load the state) is added on top.
+
+**The picture.** Backing up a document. Save every second and the editor never lets you type. Save once a day and one crash costs a day.
+
+**The model.** We use a standard first-order model. Let C be the stall for one save, T the interval, M the **mean time between failures** [mid] (**MTBF**, the average gap between two failures of the whole job, as in lesson [E2.6](/learn/ai/e2-training/failures-at-scale/)) and R the restart time. Per unit of time, the share lost is the save stall, C over T, plus the lost work and restart per failure, (T over 2 plus R) over M. The curve has one lowest point. Setting its slope to zero gives T equal to the square root of two times C times M.
+
+**Source.** This is the Young formula, from J. W. Young's 1974 paper on a first-order approximation of the best checkpoint interval. J. T. Daly extended it in 2006 in "A higher order estimate of the optimum checkpoint interval for restart dumps", which assumes failures that arrive at random ("Poisson") and adds the restart time and higher-order terms. A 2024 survey, "A survey on checkpointing strategies: Should we always checkpoint a la Young/Daly?", reviews where the formula works and where it does not. We read Daly's abstract and the survey's abstract. We could not load Young's paper, so we cite it through those two. In this lesson the widget uses only the first-order form, and **we label its numbers illustrative**: none of the slider values come from a real cluster.
+
+<AiE2CkptCalc client:visible />
+
+Try three moves.
+
+- **Make saves cheaper.** Drag the stall down, as an asynchronous save would. The best interval gets shorter, and waste falls. Cheap saves and frequent saves go together.
+- **Make failures more frequent.** Drag the time between failures down, as a bigger cluster would (lesson [E2.6](/learn/ai/e2-training/failures-at-scale/)). The best interval gets shorter, but only with the square root: four times more failures means about half the interval, not a quarter.
+- **Miss the optimum.** Move your interval to half or double the best value. The waste barely changes. The curve is flat near its bottom. **Our reading**: do not spend effort on tuning to the minute. Be in the right range, and spend the effort on making the save stall and the restart time smaller, which lower the whole curve.
+
+### Where the formula stops
+
+The model is a first-order result and has limits.
+
+- It assumes failures arrive at random with a constant rate, and that the interval is much smaller than the time between failures. If the interval is a large share of the MTBF, the formula degrades. Daly's higher-order version covers a wider range.
+- It treats the save stall as the same each time. In practice a burst of writes from many GPUs can slow storage for everyone (see the Llama 3 note above).
+- It sees only the whole job's failure rate. Slow failures and silent corruption (lesson [E2.6](/learn/ai/e2-training/failures-at-scale/)) mean a checkpoint may already contain bad state. Teams keep several old checkpoints, not only the latest.
+- The survey above reports cases where the best period scales differently from the formula. Use the formula to get a starting point, then check it against logs of real failures.
+
+## What experienced teams know
+
+- **Keep the master copy and sums in FP32.** The mixed precision paper keeps a single-precision master copy and scales the loss for FP16. Llama 3 used FP32 for gradient accumulation and gradient reduction. Source: Mixed Precision Training; Llama 3 paper.
+- **BF16 is the default, FP8 is a project.** Google presents BF16 as close to a drop-in replacement for FP32. The FP8 format paper shows parity with 16-bit up to 175B parameters, but as a result in a paper, not as a switch you flip. Source: Google Cloud blog; FP8 Formats for Deep Learning.
+- **Peak is not delivered.** The H100 table lists FP8 as 2 times BF16 at peak. Meta reports BF16 model FLOPs utilization of 38 to 43% across Llama 3 configurations, which is the share of peak that the real job achieved. Plan with the second kind of number. Source: NVIDIA H100 page; Llama 3 paper.
+- **Minimize the pause, not just the interval.** Meta set out to "minimize GPU pause time during checkpointing" and also lists reducing "job startup and checkpointing time" as part of raising effective training time. Source: Llama 3 paper.
+- **Save a format you can reload on a different layout.** PyTorch's distributed checkpoint supports loading into a different cluster topology. After a failure you may get a different number of machines. Source: PyTorch distributed checkpoint docs.
+- **Treat the formula as a start.** The 2024 survey gives cases where the best period differs from Young/Daly. Source: Bautista-Gomez and others, FGCS 2024 (abstract).
+
+## Trade-offs
+
+| Choice | Gain | Pay | When to choose |
+|---|---|---|---|
+| BF16 instead of FP32 for compute | Less memory and faster math, wide range | Coarse detail, so a master copy is needed | Default for large language model training |
+| FP8 instead of BF16 for matrix math | Higher peak math rate, less data moved | Even coarser, more care, gain is under the peak ratio | You have the hardware and can validate quality |
+| FP16 with loss scaling | Finer detail than BF16 | Narrow range, extra moving part | Hardware without BF16 |
+| Save the master copy and optimizer state | Exact resume | Large file, bursty write | Always, for a run you must continue |
+| Shorter interval | Less lost work per failure | More stalls, more storage load | Failures frequent or saves cheap |
+| Asynchronous save | Training continues during the write | Extra CPU memory, complexity, a second save must wait | Large jobs where the stall is significant |
+| Sharded save with resharding | Parallel writes, reload on another layout | Many files, more tooling | Any multi-GPU run |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I run the heavy math in BF16, or FP8 where the hardware and quality allow, and keep a 32-bit master copy of the weights plus the optimizer state, because small updates would round away in a short format. A checkpoint holds the master weights, optimizer state, step, data position and random seeds, written sharded by each GPU. I make the save cheap with an asynchronous copy to CPU memory, then pick the interval from the save stall and the mean time between failures with the Young approximation, and check it against real logs." Then say what you would measure: stall time per save, restart time, and the share of wall-clock spent on useful steps.
+</Callout>
+
+<Callout type="mistake">
+Do not say "FP8 is 2 times faster" without saying that this is a peak, matrix-only, vendor number. Do not say BF16 has more detail than FP16: it has less detail and more range. Do not save only the 16-bit weights and expect an exact resume. Do not use one interval for all jobs: it depends on the stall, the failure rate and the restart time. And do not call Young's formula exact. It is a first-order approximation with stated assumptions.
+</Callout>
+
+<Callout type="deep" title="Why not checkpoint after every step?">
+Because the stall is not the only price. Storage must absorb a burst from every GPU at once, and the write may compete with the training traffic on the same network. Asynchronous saves push the limit down, but not to zero. Past a point, the extra saves cost more than the lost work they prevent. The calculator shows this on the left side of the curve.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A team trains with all weights stored only in BF16 and updates of a size far below the gap between BF16 numbers. What do they most likely see?',
+      options: [
+        'The job crashes at once with a floating-point overflow error in the first step',
+        'The loss rises sharply because BF16 range is too narrow',
+        'Training runs, but the weights stop moving and the loss goes flat',
+        'The job runs at half speed because BF16 doubles memory traffic',
+      ],
+      answer: 2,
+      explain: 'BF16 keeps the range of FP32 but few digits of detail. An update smaller than half a gap rounds back to the old weight and is lost, with no error. Range is not the issue here, since BF16 has the same range as FP32. BF16 also halves memory traffic rather than doubling it.',
+    },
+    {
+      q: 'Why does an NVIDIA table saying FP8 is about 2 times BF16 not mean a 2 times faster training step?',
+      options: [
+        'It is a peak for matrix math only; steps spend time elsewhere',
+        'The table counts FP8 on a different chip, so it is not comparable',
+        'FP8 needs twice as many steps to reach the same loss on every model',
+        'The 2 times only applies to inference and never to training',
+      ],
+      answer: 0,
+      explain: 'The table gives the most the Tensor Cores can do for FP8 and BF16 matrix operations. A real step also includes communication, memory-bound work and the optimizer, which FP8 does not speed up. The comparison is on the same chip, and the FP8 format paper reports parity with 16-bit results for training.',
+    },
+    {
+      q: 'A team lowers the time one checkpoint stalls the job by moving to an asynchronous save. What should they do with the interval, and why?',
+      options: [
+        'Make it longer, because a faster save means failures are rarer',
+        'Make it longer, because the best interval grows as the stall falls in size',
+        'Leave it, because the best interval does not depend on the stall',
+        'Make it shorter: saves are cheaper, so less work is lost',
+      ],
+      answer: 3,
+      explain: 'The best interval grows with the square root of the stall, so a cheaper save moves the best interval down. Shorter intervals then lose less work per failure at little extra cost. The failure rate does not change because of how you save, and the stall is one of the two inputs to the formula.',
+    },
+    {
+      q: 'Which statement about the checkpoint interval formula from Young and Daly is correct?',
+      options: [
+        'It gives the exact best interval for any failure pattern at all',
+        'A first-order estimate for random failures',
+        'It says to checkpoint as rarely as possible, to save the most time',
+        'It depends only on the model size, never on failure rates',
+      ],
+      answer: 1,
+      explain: 'The formula comes from a simple cost model with random failures at a constant rate and an interval much shorter than the time between failures. It is not exact, it balances save cost against lost work rather than minimizing saves, and it uses the failure rate and the save stall, not the model size.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="e2-mixedprec-ckpt-sync-stall"
+  title="The safe setting that made the run slow"
+  scenario="After a bad failure, a team cuts its checkpoint interval from 60 minutes to 5 minutes so that little work is lost. A week later the run is behind schedule, although no failure has happened since. (Illustrative numbers.) Read the dashboard, then decide what to do."
+  facts={[
+    'checkpoint save is synchronous: all GPUs wait until the bytes reach storage',
+    'each save stalls training for about 4 minutes',
+    'saves happen every 5 minutes of training',
+    'storage write bandwidth is at its limit for the whole 4 minutes of each save',
+    'mean time between failures for the job: about 6 hours',
+    'restart time after a failure: about 15 minutes',
+  ]}
+  steps={[
+    {
+      prompt: 'What explains the slow progress?',
+      options: [
+        'The checkpoint stalls now take up most of the wall-clock time',
+        'The model is converging more slowly with shorter intervals',
+        'Storage bandwidth drops each time a failure happens',
+        'The optimizer state is lost on every save and rebuilt',
+      ],
+      answer: 0,
+      explain: 'Each 5 minutes of training is followed by a 4 minute stall, so the job spends nearly half its time saving. Saving more often does not change how fast the model learns per step, and no failure has happened. The state is written, not lost.',
+    },
+    {
+      prompt: 'Which change helps most without bringing back the old problem of a lot of lost work?',
+      options: [
+        'Move to a 24 hour interval to remove nearly all stalls',
+        'Save only the 16-bit weights so the files are smaller',
+        'Use an asynchronous sharded save, then set the interval from the new stall',
+        'Add more GPUs so that each save is spread over more machines',
+      ],
+      answer: 2,
+      explain: 'An asynchronous sharded save shrinks the stall to the time of a copy into CPU memory and spreads the write over many ranks. Then the interval from the Young formula is a sensible number. A 24 hour interval loses up to a day per failure and ignores a 6 hour MTBF. Saving only 16-bit weights loses the master copy and breaks exact resume. More GPUs do not lower the stall.',
+    },
+    {
+      prompt: 'What check should come before you trust the new interval?',
+      options: [
+        'Confirm the new interval is shorter than the old one',
+        'Compare the formula to logged failures and the measured stall and restart time',
+        'Check that the chip supports FP8 for the matrix math',
+        'Check that the checkpoint size is the same as the served model file',
+      ],
+      answer: 1,
+      explain: 'The formula is a first-order estimate from a stall, a failure rate and a restart time. The team should measure all three on the real job and see whether failures are close to random. Shorter is not the goal, FP8 has no link to this, and the training checkpoint is larger than a served model file.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [NVIDIA H100 Tensor Core GPU](https://www.nvidia.com/en-us/data-center/h100/): the spec table with FP8, FP16 and BF16 Tensor Core rates, and the "up to 4X" claim. Read the footnote about sparsity.
+- [Mixed Precision Training](https://arxiv.org/abs/1710.03740): the master copy of weights and loss scaling, from the source.
+- [FP8 Formats for Deep Learning](https://arxiv.org/abs/2209.05433): the two FP8 encodings and the quality results.
+- [BFloat16: the secret to high performance on Cloud TPUs](https://cloud.google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-performance-on-cloud-tpus): the BF16 bit layout and why it needs no loss scaling.
+- [A higher order estimate of the optimum checkpoint interval for restart dumps](https://laro.lanl.gov/esploro/outputs/journalArticle/A-higher-order-estimate-of-the/9916364420003761): Daly 2006, which builds on Young's first-order formula. You do not need the full derivation.
+- [A survey on checkpointing strategies: Should we always checkpoint à la Young/Daly?](https://icl.utk.edu/node/1837): 2024 survey of where the formula holds. Skip the sections on workflows.
+- [torch.distributed.checkpoint](https://docs.pytorch.org/docs/2.14/distributed.checkpoint.html): sharded saves, async saves and load-time resharding.
+- [The Llama 3 Herd of Models](https://arxiv.org/html/2407.21783v3): checkpoint sizes, storage throughput and BF16 utilization are in the infrastructure section.

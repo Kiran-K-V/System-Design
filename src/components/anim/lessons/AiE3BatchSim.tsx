@@ -21,13 +21,13 @@ function Chart({ title, unit, pick, log, yMax, yMin, ticks, sel }: { title: stri
         {ticks.map((t) => (
           <g key={t}>
             <line x1={PAD.l} x2={W - PAD.r} y1={fy(t)} y2={fy(t)} stroke="var(--border)" strokeWidth={1} />
-            <text x={PAD.l - 6} y={fy(t) + 4} textAnchor="end" fontSize={12} fill="var(--muted)">{t >= 1000 ? `${t / 1000}k` : t}</text>
+            <text x={PAD.l - 6} y={fy(t) + 4} textAnchor="end" fontSize={13} fill="var(--muted)">{t >= 1000 ? `${t / 1000}k` : t}</text>
           </g>
         ))}
         {[0.5, 1, 1.5, 2, 2.5, 3].map((x) => (
-          <text key={x} x={fx(x)} y={H - 14} textAnchor="middle" fontSize={12} fill="var(--muted)">{x}</text>
+          <text key={x} x={fx(x)} y={H - 14} textAnchor="middle" fontSize={13} fill="var(--muted)">{x}</text>
         ))}
-        <text x={(PAD.l + W - PAD.r) / 2} y={H - 1} textAnchor="middle" fontSize={12} fill="var(--muted)">arrivals per second</text>
+        <text x={(PAD.l + W - PAD.r) / 2} y={H - 1} textAnchor="middle" fontSize={13} fill="var(--muted)">arrivals per second</text>
         <path d={line('stat')} fill="none" stroke="var(--warn)" strokeWidth={2.2} />
         <path d={line('cont')} fill="none" stroke="var(--ok)" strokeWidth={2.2} />
         <line x1={fx(LOADS[sel])} x2={fx(LOADS[sel])} y1={PAD.t} y2={H - PAD.b} stroke="var(--accent)" strokeWidth={1.4} strokeDasharray="4 4" />

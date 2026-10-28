@@ -56,7 +56,7 @@ function Bars({ rows, scale, note, label }: { rows: Row[]; scale: number; note: 
 const steps = [
   { caption: 'Paper claim: "During a 54-day snapshot period of pre-training, we experienced a total of 466 job interruptions." An interruption is any time the training job stopped and had to restart.' },
   { caption: 'Paper claim: 47 were planned, from automated maintenance such as firmware upgrades, or from operator actions such as a config or dataset change. The other 419 were unexpected. Only the unexpected ones are failures.' },
-  { caption: 'Paper claim: root causes of the 419 (Table 5). A faulty GPU is the biggest row, then GPU memory (HBM3), then a software bug, then switches and cables, then host maintenance. The last bar is our sum of the other 13 rows of the table.' },
+  { caption: 'Paper claim: root causes of the 419 (root-cause table). A faulty GPU is the biggest row, then GPU memory (HBM3), then a software bug, then switches and cables, then host maintenance (the printed share for the first row, 30.1%, does not match its count of 148; see the lesson). The last bar is our sum of the other 13 rows of the table.' },
   { caption: 'Paper claim: about 78% of unexpected interruptions are confirmed or suspected hardware, and manual intervention was needed only three times. Red bars are the hardware rows, amber is software. Our reading: the machine is the main source of trouble, and automation handled almost all of it.' },
 ];
 

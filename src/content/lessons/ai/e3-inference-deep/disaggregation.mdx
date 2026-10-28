@@ -1,0 +1,276 @@
+---
+summary: 'A long prompt on a shared GPU freezes every stream that is already running. Chunked prefill softens the freeze. Disaggregation removes it by giving prefill and decode their own GPUs, and the price is moving the KV cache between them. See when that trade pays and when it does not.'
+requires: ['ai/e3-inference-deep/continuous-batching', 'ai/a2-inference-cost/prefill-decode', 'ai/a2-inference-cost/kv-cache']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE3DisaggFlow from '../../../../components/anim/lessons/AiE3DisaggFlow.tsx';
+import AiE3DisaggTradeoff from '../../../../components/anim/lessons/AiE3DisaggTradeoff.tsx';
+
+## The problem
+
+Your chat service runs well all day. Median time per token is steady. Then a user pastes a 30-page contract and asks for a summary. For about a second, every other user on that GPU sees their answer stop in mid-sentence. The dashboard shows high throughput. Users still complain.
+
+[Lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/) gave you the two phases. **Prefill** [junior] reads the whole prompt in one pass. **Decode** [junior] then makes one token per pass. The first is limited by arithmetic. The second is limited by memory reads. [Lesson E3.1](/learn/ai/e3-inference-deep/continuous-batching/) showed that the scheduler mixes both kinds of work in one batch, and it ended with a warning: a long new prompt makes one iteration very long.
+
+This lesson follows that warning to the end. You will see two cures. The first keeps both phases on one GPU and cuts the prompt into pieces. The second puts the phases on different GPUs. The questions on the way are:
+
+1. Why do the two phases hurt each other on one GPU?
+2. What does chunked prefill fix, and what does it cost?
+3. What is disaggregation, and what does it cost?
+4. When does the split pay off, and when does it lose?
+
+Two terms first. **TTFT** [junior] is the time to first token: how long the user waits before the answer starts. **TPOT** [junior] is the time per output token: the gap between tokens while the answer streams. Teams set a target for each. A target for a latency number is an **SLO** [mid], a service level objective. The two targets pull in different directions, and that is the whole story of this lesson.
+
+## Why the phases hurt each other
+
+Picture one kitchen with one stove. A cook is frying twenty small orders, and each order needs a flip every few seconds. Then a huge order arrives that needs the stove for a full minute. The small orders burn. The kitchen is busy and the output is high, but the customers wait.
+
+On a GPU the same thing happens, for the reason A2.2 gave. A decode step is short because it reads the weights once and does little arithmetic. A prefill step does arithmetic for every prompt token, so it is long. When one batch holds both, the batch runs as long as its longest part. The decode users wait for the prefill to end. That wait is added to their TPOT.
+
+The effect also runs the other way. The DistServe paper, which we use below, reports that adding decode work to a prefill slows the prefill as well, especially when the GPU is already full. So one GPU that serves both phases hurts both targets. The paper calls this **prefill-decode interference** [senior], and it lists a second problem, **resource coupling** [senior]: both phases must use the same GPU count and the same split of the model, even though they have different needs. Lesson [E3.6](/learn/ai/e3-inference-deep/parallelism-moe/) covers the splits.
+
+The animation below shows three layouts. Step through it once. Do not look at the last two steps yet. First read the first two steps and find the gap.
+
+<AiE3DisaggFlow client:visible />
+
+Steps 1 and 2 show the problem. Each small green box is a decode step. The big orange box is a prefill. While it runs, no decode step runs.
+
+## Fix 1: chunked prefill
+
+Chunked prefill cuts the prompt into pieces of equal size. Each iteration carries one piece plus all the running decodes. This is the idea in the SARATHI paper. Its authors call the resulting batch a decode-maximal batch: one prefill chunk, and every free slot filled with decode work.
+
+Why does this help? A prefill chunk is big enough to use all the arithmetic of the GPU. The decode work that rides along is cheap, because it only adds a few rows to a batch that already reads the weights. The paper says the piggybacked decodes cost up to an order of magnitude less than the same decodes in a decode-only batch. The gap between tokens stays about as long as one chunk, not one whole prompt.
+
+[Lesson E3.1](/learn/ai/e3-inference-deep/continuous-batching/) showed the vLLM policy for this: decodes go in first, and a token budget per iteration limits the prefill chunk. That budget is the knob.
+
+### What it costs
+
+Chunking is not free. The sources name two costs.
+
+1. **A longer TTFT for the long prompt.** The prompt now needs many iterations, and each one also carries decodes. The DistServe paper says chunked prefill takes longer than a full prefill, so it trades TTFT for TPOT. It also says that a chunk size so large that it fills the GPU leaves no room for decodes to ride along.
+2. **Repeated reads of the KV cache.** Each chunk must read the keys and values of all earlier chunks. If a prompt is cut into N chunks, the total reading grows with the square of N, where an uncut prompt would read once. The SARATHI paper agrees that attention reads the earlier tokens again. It calls this a slight overhead. It adds that a small chunk lowers the arithmetic intensity of the chunk, so the GPU is used less well. Its fix is to profile once and pick a chunk size for your model, GPU, and workload.
+
+Our reading: chunked prefill is a good first move. It needs no new hardware and no new network. It bends the trade between TTFT and TPOT. It does not remove it.
+
+What does the paper report? For LLaMA-13B on an A6000 GPU, decode throughput rose up to 10 times, and end-to-end throughput rose up to 1.33 times. For LLaMA-33B on an A100 GPU, the gains were 4.25 times and 1.25 times. Read these numbers with care. The "10 times" is about decode throughput, one part of the work, and it is a best case. The end-to-end gain is the number to plan with.
+
+## Fix 2: disaggregation
+
+**Disaggregation** [senior] means to run prefill and decode on different GPUs. A request lands on a **prefill pool**. That pool reads the prompt and makes the KV cache and the first token. The KV cache then moves to a **decode pool**, which makes the rest of the tokens.
+
+The picture is a restaurant with a prep kitchen and a grill. Prep chefs do the long, heavy work. Grill cooks do the quick, repeated work. A big order slows the prep line but never touches the grill.
+
+Why does it help? Three reasons.
+
+1. **No interference.** The decode pool never runs a prefill. Its steps are steady, so TPOT is steady.
+2. **Each pool is tuned for its own target.** The prefill pool serves TTFT. Its batch can be small, so a prompt starts fast. The decode pool serves TPOT. Its batch can be large, because decode gains from batching (lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/)). With one GPU for both, you must choose one batch size for both.
+3. **Each pool picks its own split of the model.** The DistServe paper gave the prefill and decode instances different parallel degrees. For OPT-175B, its search chose a tensor degree of 3 for the prefill instance and 4 for the decode instance. We do not need those numbers. The point is that the two phases got different shapes.
+
+### What it costs: the KV cache must travel
+
+The decode GPU cannot start without the prompt's KV cache. The prefill GPU built it. So it must cross a link. [Lesson A2.3](/learn/ai/a2-inference-cost/kv-cache/) showed that the KV cache of a long prompt is big. The DistServe paper gives an example: the cache of one 512-token request on OPT-66B is about 1.13 GB.
+
+How long the move takes depends on the link. Inside one server, GPUs talk over **NVLink** [mid], a direct GPU-to-GPU link. Between servers, they use a network such as **InfiniBand** [mid], a fast network made for clusters. The first is much faster than a normal network card. Step 5 and step 6 of the animation show a fast and a slow link. The user waits for the move before the second token, because the decode GPU needs the cache to make it.
+
+Two ways to cut this wait appear in the papers.
+
+- **Use the fast link.** DistServe places the prefill and decode instances of the same model stage on one machine, so the transfer runs over NVLink. On its test cluster, the link between machines was only 25 Gbps. With that placement, the paper reports that the transfer was less than 0.1% of total latency for OPT-175B, and over 95% of requests had a transfer delay under 30 ms.
+- **Overlap the move with the prefill.** Splitwise starts sending the KV cache of layer 1 while layer 2 is still computing. Each layer's cache leaves as soon as it exists. In the Splitwise test with two machines, the paper reports that a one-shot transfer added a 64% delay to the second token, and the overlapped transfer added 16.5%. Overall, the overlapped transfer cost 0.8% of end-to-end latency, against up to 3% for the one-shot transfer. Layer-by-layer sending also frees the cache memory on the prompt machine sooner.
+
+Now use the simulator. It is our own model, not a benchmark. It uses the same 70B-class numbers as lessons [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) and A2.3. Do these three tests.
+
+1. Set the link to the 25 Gbps network and raise the prompt length. Watch the "First token" bar of the split pools.
+2. Switch the link to the fast fabric, then to NVLink.
+3. Turn on overlap with the slow link.
+
+<AiE3DisaggTradeoff client:visible />
+
+What you should see:
+
+- With a short prompt, all three layouts look similar. There is little to move and little to stall.
+- With a long prompt, one GPU with the whole prefill makes a huge gap for readers. Chunking makes the gap small but pushes the new user's first token later. The split pools keep the gap small, and the first token stays close to the prefill time, **if** the link is fast.
+- On the slow link, the split loses its first-token advantage for long prompts. Overlap wins part of it back. A split is only as good as its link.
+
+Look also at the SLO sliders. A red bar means that layout misses your target. There is no layout that is best for every target. That is the reason teams measure goodput.
+
+## What goodput adds
+
+**Goodput** [mid] is the request rate a GPU can serve while it still meets both the TTFT target and the TPOT target. Plain throughput counts every token. A server can have a record throughput while many users miss one target. [Lesson E3.7](/learn/ai/e3-inference-deep/serving-engines/) builds the metric in full. Here you need only one point.
+
+The DistServe paper chose goodput per GPU as its goal. Its abstract says the system raises "the maximum rate that can be served within both TTFT and TPOT constraints on each GPU". That is why a split can win even when it uses the same number of GPUs. The same GPUs serve more requests that are on time.
+
+## Splitwise: the hardware angle
+
+Splitwise reached the same design from a different side. Its authors measured that the prompt phase is compute-heavy and the token phase is memory-heavy. So they asked whether each phase should run on different hardware, or on a different power setting. They built clusters from a prompt pool, a token pool, and a third **mixed pool** [senior] of machines that can move between roles when the load shifts. The mixed pool runs both phases in one batch, as an ordinary server would.
+
+The paper tests clusters built from the same GPU in both pools and clusters that mix GPU types. Its abstract reports up to 1.4 times the throughput at 20% lower cost than current designs. Or, at the same cost and power budget, 2.35 times the throughput. Both are claims from the paper, and the abstract does not name the baseline in one line. Read the next section before you quote them.
+
+## What the published numbers measure
+
+Three papers give big numbers. They do not measure the same thing. Do not add them up.
+
+| Claim | What it measures | Label |
+|---|---|---|
+| SARATHI: decode throughput up to 10x, end-to-end up to 1.33x | LLaMA-13B on one A6000 GPU. The 10x is decode work only. Another test, LLaMA-33B on an A100, gave 4.25x decode and 1.25x end-to-end. | Paper claim, 2023 |
+| DistServe: up to 7.4x more requests, or up to 12.6x tighter SLO | OPT models from 13B to 175B on a cluster of 32 A100 80 GB GPUs. Three applications: chatbot, code completion, summarization. Goal is at least 90% of requests inside the SLO. Compared with two baselines, vLLM and DeepSpeed-MII. On the chatbot workload, the paper reports 2.0x to 4.6x over vLLM. | Paper claim, 2024 |
+| Splitwise: 1.4x throughput at 20% lower cost, or 2.35x at the same cost and power | Production request traces and Llama2-70B and BLOOM-176B on A100 and H100 machines. The gains come from designing the whole cluster, including hardware choice, not from the split alone. | Paper claim, 2024 |
+
+Three points follow.
+
+1. **"Up to" means the best case across the tests.** Your own prompt and output lengths decide where you land.
+2. **The baselines are 2023 systems.** DistServe compared against vLLM and DeepSpeed-MII of its time. The vLLM docs now say chunked prefill is on by default when possible, so the gap may be smaller against a current engine. We do not have a source that measures it.
+3. **The DistServe paper itself names where the split may not win.** It says that in offline work with no latency target, the goal is plain throughput, and chunked prefill with piggybacking may be the better choice, because it fills each batch to the compute limit.
+
+## What experienced teams know
+
+**Measure the interference before you split.** The first sign is a TPOT that is bad only when long prompts arrive. If the gap is steady, there is nothing to fix. Chunked prefill with a tuned budget is the cheaper first move. The SARATHI paper's advice is to profile once and pick the chunk size for your model, GPU, and workload.
+
+**The link decides the design.** The DistServe paper states the rule: the split needs a fast path between pools. When the cross-node link is weak, it keeps both pools of one model stage on the same machine and uses NVLink. Check what your cluster offers before you draw the diagram.
+
+**Send the cache while the prompt runs.** Splitwise's layer-by-layer transfer cut the extra delay on the second token from 64% to 16.5% in its two-machine test. The price is a finer sync between the two GPUs, which the paper calls fine-grained synchronization.
+
+**The pool sizes follow the mix of prompts and outputs.** Splitwise found that a good ratio of prompt to token machines depends on the workload, and it keeps a mixed pool so that machines can move between roles when the load shifts. A fixed ratio set at design time will be wrong when the traffic changes. Use your own traces.
+
+**Keep your SLOs honest.** A split helps most when both targets are tight. If the only target is total throughput on an offline job, the DistServe paper says chunked prefill may be the better fit.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Mixed batches, whole prefill | Simplest. One GPU pool. | Long prompts freeze every running stream | Prompts are short, or there is no TPOT target |
+| Chunked prefill | Steady gaps without new hardware | A slower first token for long prompts, repeated KV reads, a chunk size to tune | Interactive chat with mixed prompt lengths; the first move to try |
+| Disaggregated pools | No interference. Each pool tuned for its own target. | KV transfer, two pools to size and run, a placement that needs a fast link | Tight TTFT and TPOT targets together, at a scale where two pools stay busy |
+| Layer-by-layer KV send | Hides most of the transfer | Fine-grained sync between GPUs, and engine support | Long prompts, links that are fast but not free |
+| A mixed pool of flexible machines | Absorbs a change in the workload mix | More scheduling logic | Traffic whose prompt and output mix drifts |
+
+## Interview lens
+
+<Callout type="tip">
+Name the cause first: "Prefill is compute-bound and long. Decode is memory-bound and short. In one batch the decodes wait for the prefill, so TPOT jumps when a long prompt arrives." Then give the two cures in order. "Chunked prefill is the cheap one. It trades first-token time for steady gaps. If both targets are tight, split the phases into pools. Then the cost is KV transfer, so I check the link first, and I overlap the transfer with the prefill." End with the metric: "I judge it by goodput, the rate that meets both targets, not by raw throughput."
+</Callout>
+
+<Callout type="mistake">
+Do not say disaggregation makes the model faster. It makes the targets easier to meet together, and it adds a network cost. Do not quote "7.4x" without its conditions: up to, OPT models, 90% of requests inside the SLO, a 2024 baseline. Do not propose a split on a slow link without checking the transfer time. And do not forget that for an offline job with no latency target, chunked prefill on one pool may win.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="e3-disagg-ttft-regression"
+  title="The split cut the stalls but the first token got slower"
+  scenario="A team splits a 70B chat service into a prefill pool and a decode pool on two groups of servers joined by a normal 25 Gbps network. Streams are now smooth. But users who paste long documents report that the answer starts much later than before. Numbers are illustrative."
+  facts={[
+    'typical gap between tokens: steady, no more stalls',
+    'prompts under 1,000 tokens: first token about the same as before',
+    'prompts above 8,000 tokens: first token much later than before',
+    'prefill GPU utilization: moderate',
+    'KV cache is sent only after the whole prefill ends',
+  ]}
+  steps={[
+    {
+      prompt: 'Why do only the long prompts get slower?',
+      options: [
+        'The KV cache grows with the prompt, so the move over a slow link takes long',
+        'The decode pool refuses long prompts until it is empty',
+        'Prefill itself got slower because it lost its decode work',
+        'The network drops packets only for long prompts',
+      ],
+      answer: 0,
+      explain: 'The cache is proportional to the prompt length. A long prompt means a big cache and a long move over a slow link, and the user waits for it before the second token. Prefill did not get slower. It no longer shares a GPU with decode work.',
+    },
+    {
+      prompt: 'Which change helps most without giving up the split?',
+      options: [
+        'Move back to one pool and use whole prefill',
+        'Raise the decode batch size on the decode pool',
+        'Send the cache layer by layer while the prefill runs, and use a faster link or same-machine placement',
+        'Cut the output length limit for every user',
+      ],
+      answer: 2,
+      explain: 'The wait comes from the transfer, so hide it behind the prefill and shorten it with a faster path. Going back brings the stalls back. A bigger decode batch changes the decode side only, and an output limit does not touch the transfer.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why does one long prompt raise the time per output token of users who are already streaming on the same GPU?',
+      options: [
+        'The decode steps share one iteration with the long prefill, so they wait for it',
+        'The long prompt takes the KV cache of the other users',
+        'The scheduler stops all decoding until the prompt is finished writing its answer',
+        'The GPU slows down its clock to save power',
+      ],
+      answer: 0,
+      explain: 'A mixed iteration lasts as long as its longest part. The decodes ride in the same iteration as the long prefill, so each of them waits. Nothing is taken from the other users, and the scheduler does not wait for any answer.',
+    },
+    {
+      q: 'What is the main price of chunked prefill for the user who sent the long prompt?',
+      options: [
+        'Their answer is wrong more often, because chunks lose context between steps',
+        'Their first token comes later, because the prompt spans many iterations',
+        'They must switch to a smaller model, because chunking needs more memory',
+        'Their KV cache is deleted after each chunk and then built again from zero',
+      ],
+      answer: 1,
+      explain: 'The prompt is spread over many iterations, so the time to first token grows. The output does not change, and the cache is kept between chunks. That is why chunking trades first-token time for steady gaps.',
+    },
+    {
+      q: 'What must a disaggregated design move from the prefill pool to the decode pool?',
+      options: [
+        'The model weights of the whole model, copied again for each request',
+        'The KV cache of the prompt, and the first token',
+        'The user\'s API key, session data, and billing record for the request',
+        'The decode batch that holds the tokens of all the other users',
+      ],
+      answer: 1,
+      explain: 'The decode pool already holds the weights. It needs the prompt\'s keys and values to continue, so the cache must cross the link. That transfer is the cost of the design.',
+    },
+    {
+      q: 'A team has a very slow link between its prefill and decode servers, and most prompts are long. What is the most likely result of a split?',
+      options: [
+        'The first token gets later, because the cache move adds to the wait',
+        'The gap between tokens gets worse, because decode is now shared by more users',
+        'Throughput doubles because the pools never wait for each other at all',
+        'Nothing changes, because the link is not on the critical path of any request',
+      ],
+      answer: 0,
+      explain: 'The user waits for the cache move before the second token, so a slow link adds to the first-token wait. The decode pool still has steady steps. The link is on the critical path, which is why placement and overlap matter.',
+    },
+    {
+      q: 'Which measure does the disaggregation work use to judge a serving system?',
+      options: [
+        'Total tokens per second, whether or not any user is happy with the answer',
+        'Peak memory used on the prefill pool during the busiest hour of the day',
+        'The request rate per GPU that meets both latency targets',
+        'The number of GPUs that the decode pool needs to hold its KV caches',
+      ],
+      answer: 2,
+      explain: 'Goodput counts only work that met both targets. Total tokens per second can hit a record while many users miss a target, which is why raw throughput is not enough here.',
+    },
+    {
+      q: 'For an offline job that summarizes a large archive with no latency target, which design does the DistServe paper say may fit better than a split?',
+      options: [
+        'Disaggregation with a larger decode pool and a very fast link between pools',
+        'Chunked prefill on shared GPUs, because it fills each batch',
+        'One request at a time on each GPU, so that no batch ever waits for another',
+        'A smaller model that runs on the same two pools in the same layout',
+      ],
+      answer: 1,
+      explain: 'With no latency target, plain throughput is the goal, and filling every batch to the compute limit achieves it. The paper says the split helps most when latency targets are tight. One request at a time would waste the GPU.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving](https://arxiv.org/abs/2401.09670): the interference argument, goodput, and the transfer measurements. Skip the placement algorithm on a first read.
+- [Splitwise: Efficient Generative LLM Inference Using Phase Splitting](https://arxiv.org/abs/2311.18677): prompt, token, and mixed pools, layer-by-layer cache transfer, and the cost and power results.
+- [SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills](https://arxiv.org/abs/2308.16369): chunked prefill and decode-maximal batches, with the overheads in its design section.
+- [vLLM docs, Optimization and Tuning](https://docs.vllm.ai/en/latest/configuration/optimization/): the token budget per iteration and how to tune it.

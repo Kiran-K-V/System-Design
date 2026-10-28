@@ -79,7 +79,7 @@ export default function AiE2FailureCycle() {
             </HandText>
             {failed && (
               <g>
-                <SketchArrow points={[[360, 50], [360, Y - 30]]} stroke="var(--bad)" strokeWidth={2.2} />
+                <SketchArrow points={[[360, 50], [360, Y - 30]]} seed={seedOf("e2fc-fail")} stroke="var(--bad)" strokeWidth={2.2} />
                 <HandText x={360} y={40} size={TEXT_SIZES.label} color="var(--bad)">
                   GPU fails
                 </HandText>
@@ -87,7 +87,7 @@ export default function AiE2FailureCycle() {
             )}
             {i >= 4 && (
               <g>
-                <SketchArrow points={[[560, Y + 110], [330, Y + 110], [322, Y + 58]]} stroke="var(--accent)" />
+                <SketchArrow points={[[560, Y + 110], [330, Y + 110], [322, Y + 58]]} seed={seedOf("e2fc-back")} stroke="var(--accent)" />
                 <HandText x={560} y={Y + 128} size={TEXT_SIZES.note} color="var(--accent)">
                   restart from here
                 </HandText>

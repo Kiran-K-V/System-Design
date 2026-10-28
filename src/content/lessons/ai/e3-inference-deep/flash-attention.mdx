@@ -1,0 +1,279 @@
+---
+summary: 'Standard attention writes an N by N score matrix to slow GPU memory and reads it back. FlashAttention cuts the work into tiles that stay in fast on-chip memory and keeps a running softmax, so the matrix is never stored. See why it is exact, why it is an IO fix and not a FLOPs fix, and where it helps inference.'
+requires: ['ai/a2-inference-cost/kv-cache', 'ai/a2-inference-cost/gpu-memory-math']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE3FlashTiles from '../../../../components/anim/lessons/AiE3FlashTiles.tsx';
+import AiE3FlashTraffic from '../../../../components/anim/lessons/AiE3FlashTraffic.tsx';
+
+## The problem
+
+[Lesson A1.4](/learn/ai/a1-model-function/attention-cost/) said that FlashAttention fixes the memory problem of attention without changing the answer, and that the arithmetic stays quadratic. It gave the label. This lesson gives the mechanism, and a test for it: a team writes an attention kernel, counts the arithmetic, finds that it is small, and the kernel is still slow. Where does the time go?
+
+The answer is in the memory system of the GPU. A GPU is very fast at arithmetic. Moving numbers in and out of its big memory is slower. When a step does little arithmetic per number moved, the step waits for memory, not for math. Attention in its plain form is full of such steps.
+
+The questions are:
+
+1. Which two memories matter, and how different are they?
+2. What does plain attention write to the big memory, and why is that costly?
+3. How can a GPU compute attention without ever storing the score matrix? (The softmax step looks like it needs the whole row.)
+4. What does this buy, and what does it not buy?
+5. Does it matter for inference, where the model writes one token at a time?
+
+## Two memories on one GPU
+
+A GPU has a large, slow-ish memory and a small, very fast one. **HBM** [junior] (high bandwidth memory) is the large one on the card, where weights and the KV cache live ([lesson A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). **SRAM** [junior] (static RAM) is the small, fast memory inside the chip, next to the math units. Think of HBM as a warehouse across town and SRAM as the workbench in front of you. You do the work on the bench. A trip to the warehouse costs far more than a step of work.
+
+The FlashAttention paper gives figures for an A100: HBM is 40 GB at 1.5 TB/s, and SRAM is 20 MB at about 19 TB/s. So SRAM is roughly 10 times faster, and about 2,000 times smaller. The paper also states that on modern GPUs "compute speed has out-paced memory speed", so many operations wait on memory.
+
+How does a GPU program use these memories? A **kernel** [mid] is one function that runs on the GPU. The paper describes the execution model: each kernel loads its inputs from HBM, computes, and writes its outputs back to HBM. If a task has three steps and each step is its own kernel, the data makes three round trips to the warehouse.
+
+[Lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/) taught the test for what limits a step: **arithmetic intensity** [mid], the number of operations per byte moved. A step with high intensity waits for the math units (compute-bound). A step with low intensity waits for memory (memory-bound). The paper lists the kinds: a matrix multiply with a large inner size is compute-bound. Element-wise steps (activation, dropout) and reductions (sum, softmax) are memory-bound, because each number is used once or twice and then written back.
+
+## Naive solution: write the score matrix to HBM
+
+Recall attention from [lesson A1.4](/learn/ai/a1-model-function/attention-cost/). For a sequence of N tokens, each head has three matrices of N rows and d columns: queries Q, keys K, and values V. Here d is the **head width** [mid], 64 or 128 in common models. Attention is three steps:
+
+1. Multiply Q by the transpose of K. The result is the score matrix S, with N rows and N columns. Every token scores every other token.
+2. Apply softmax to each row of S. The result is the probability matrix P, also N by N.
+3. Multiply P by V. The result is the output O, N by d.
+
+The paper's Algorithm 0 is the plain way to run this, and it matches how most frameworks do it. Each step is a separate kernel. Step 1 reads Q and K and writes S to HBM. Step 2 reads S and writes P to HBM. Step 3 reads P and V and writes O. The two big matrices make a round trip to HBM each: written, then read.
+
+How big are they? The paper's example is GPT-2 with N = 1,024 and d = 64. Each of S and P has N² numbers, while Q, K, V and O have only N·d. Often N is much larger than d, so the N² matrices dominate. The cost of memory traffic grows with the square of the length, and so does the memory the matrices occupy.
+
+It gets worse with practical options. Masking (hiding future tokens) is applied to S. Dropout (training only) is applied to P. Each is another element-wise pass over an N by N matrix, which the paper calls out as making the problem worse.
+
+Why did the many "approximate attention" methods not fix this? The paper's answer is that they cut the arithmetic, but wall-clock time follows memory traffic. In its words, many approximate methods "do not display wall-clock speedup against standard attention". They aimed at the wrong resource. That is the IO-aware point in the title: count the reads and writes between levels of memory, not only the operations.
+
+## Idea one: fuse the steps
+
+If three steps ran inside one kernel, S and P could stay on chip, and only Q, K, V in and O out would touch HBM. This is **kernel fusion** [mid]. Compilers already fuse simple element-wise operations. Why not attention?
+
+Two obstacles. First, S is N by N, and SRAM is small. For long sequences it cannot hold a whole matrix. Second, the softmax step needs a full row of S before it can finish. If a row is spread over many chunks of keys, you cannot finish the row until you have seen them all. The next section solves the second problem, and tiling solves the first.
+
+## Idea two: tiles and a running softmax
+
+**Softmax** [mid] turns a row of scores into weights that sum to 1. Each score becomes its exponential, then every value is divided by the row's total. A safe version first subtracts the row's largest value, so the exponentials do not overflow. So a softmax needs two row-wide numbers: the maximum, and the sum of exponentials.
+
+Now think of one row of S cut into blocks of columns. We see block 1 first, then block 2. After block 1 we can compute a maximum m and a sum l for what we have seen. Then block 2 arrives, with its own maximum. If the new maximum is larger, the old sum was measured against the wrong reference. The fix is a rescale: multiply the old sum by a factor that moves it to the new reference, then add the new block's sum. The paper states this decomposition exactly. If you keep two numbers per row, m and l, you can compute the softmax one block at a time.
+
+An everyday picture: you keep a running tally of votes, but the unit changes when a bigger ballot box arrives. You convert the old tally to the new unit, then add. The result is the same as counting all at once.
+
+The same rescale applies to the output. FlashAttention keeps a partial output for each row. When a new block changes the reference, it scales the partial output by the same factor and adds the new block's contribution. After the last block, the output is final.
+
+The paper calls this **tiling** [mid]: split the inputs Q, K, V into blocks, bring a block into SRAM, work on it, move on. In the paper's algorithm the outer loop goes over blocks of K and V, and the inner loop goes over blocks of Q. The block width is set by how much fits in SRAM: SRAM must hold a tile of K, V, Q and O at once, so the paper sets the key block width to the SRAM size divided by four times the head width.
+
+Step through a toy run. The sizes are made up: 8 tokens and a tile of 2 by 4. The counter shows the HBM traffic against standard attention.
+
+<AiE3FlashTiles client:visible />
+
+Check what the animation shows. The score tiles exist only inside SRAM. They are used to update m, l and the output, then they are gone. The only things that go to HBM are the output, and the two running numbers per row. And the result is **exact**: not close to, but equal to the plain softmax(QKᵀ)V, up to normal rounding. The approximate methods from the last section give up exactness. FlashAttention does not.
+
+Look also at the price. In the second pass, every row's partial output is read from HBM again, because the outer loop moved to the next block of keys. Tiling trades the big matrix for repeated reads of small things. That trade wins when the matrix is much bigger than what is re-read. The next section shows the numbers.
+
+## Recomputation: a note for training
+
+The backward pass of training needs S and P to compute gradients. The plain way saves them to HBM from the forward pass, which brings the N² storage back. FlashAttention saves only the output and the two running numbers per row (m and l). In the backward pass it recomputes S and P on chip, tile by tile, from Q, K and V in SRAM.
+
+The paper points out that this does more arithmetic: "Even with the increased FLOPs due to recomputation" it runs faster, because recomputing in SRAM is cheaper than reading a big matrix from HBM. This is the clearest sign that time follows memory traffic.
+
+Inference has no backward pass, so this trick does not apply there. It explains why FlashAttention's FLOP count in the next table is higher than the baseline's.
+
+## What it buys: measured, then modelled
+
+The paper's Figure 2 compares the two on a GPT-2 medium attention layer (sequence length 1,024, head width 64, 16 heads, batch 64) on an A100, forward and backward together:
+
+| | Arithmetic | HBM reads and writes | Runtime |
+|---|---|---|---|
+| Standard attention | 66.6 GFLOPs | 40.3 GB | 41.7 ms |
+| FlashAttention | 75.2 GFLOPs | 4.4 GB | 7.3 ms |
+
+Read it as a lesson in what to watch. FlashAttention does about 13% more arithmetic. It moves about 9 times less memory. It runs about 6 times faster (our ratio from the paper's two runtimes). The runtime follows the memory column, not the arithmetic column.
+
+This is a measurement of one training setup. The widget below is a model, and it answers a different question: how does the traffic change with the length and with SRAM size? It counts the reads and writes of the paper's two algorithms for one head, forward only, in 16-bit numbers. Try a length of 131,072 first, then change the SRAM slider.
+
+<AiE3FlashTraffic client:visible />
+
+Three points from the widget.
+
+1. **Memory footprint: quadratic to linear.** The score matrices in standard attention grow with the square of the length. For 128K tokens, that is tens of gigabytes per head (at our 16-bit assumption). FlashAttention keeps two numbers per row. The paper's Theorem 1 says it needs only O(N) extra memory beyond inputs and output. This is why long contexts fit at all.
+2. **Traffic is still quadratic in both.** The total reads and writes grow with N² for both algorithms, but FlashAttention's constant is smaller. The paper states it as an order: standard attention needs on the order of N·d + N² accesses, and FlashAttention on the order of N²d²/M, where M is the SRAM size. The ratio between them is not a function of N. It depends on M compared with d².
+3. **The win depends on the tile.** With a head width of 64 and about 100 KB of SRAM, the model shows several times less traffic. At a head width of 128 and the same SRAM, the model shows almost no saving, because a tile of that size is too narrow. A bigger SRAM share per tile gives a big drop. The paper says the saving is "many times" when d² is much smaller than M, and proves that no exact attention algorithm can do better in order terms for all SRAM sizes. In practice, kernels are tuned to the GPU, and our model is simpler than real kernels. It counts only the paper's first, simple algorithm, and it gives standard attention the fewest passes it could make. Real standard attention makes extra passes for the mask and the softmax, and later FlashAttention kernels change the loop order to cut the repeated reads. **Our reading:** that is why FlashAttention is still the normal choice for models with a head width of 128. Do not read the widget's ratio as a speedup, and do not read "almost no saving" as "not worth using".
+
+## What the published numbers measure
+
+| Claim | What it measures | Label |
+|---|---|---|
+| 7.6x on the attention computation | GPT-2 attention against the PyTorch version, Figure 1 of the paper | Paper claim |
+| 3x end to end on GPT-2 (sequence 1K) | Training time on 8 A100s against Hugging Face. Against Megatron-LM the gain is up to 1.7x | Paper claim |
+| 15% on BERT-large (sequence 512) | Against the MLPerf 1.1 training speed record | Paper claim |
+| 2.4x on Long Range Arena (sequences 1K to 4K) | Training speed against standard attention | Paper claim |
+| Up to 9x fewer HBM accesses | Figure 2 setting, forward and backward | Paper claim |
+
+All of these are training numbers from 2022 on A100 GPUs. Gains are larger on the attention operation alone (7.6x) than on the full model (3x, 15%), since the rest of the model is not changed. We have not checked inference benchmarks in this lesson, and the next section is our reading, not a measured claim.
+
+## What about inference?
+
+Inference has two phases ([lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/)).
+
+**Prefill** reads the whole prompt at once. Every prompt token is a query, so the score matrix is N by N, as in training. Our reading: the same problem appears, and the same fix applies. Long prompts are where an N by N matrix would hurt most. The forward pass is all that runs, so the recomputation trick is not needed.
+
+**Decode** makes one token per pass. There is one new query. Its scores are one row of length n (the context so far), not a matrix. That row is small, and there is no N² matrix to avoid. The cost of attention in decode is different: the engine must read the whole KV cache of the request from HBM at every step. That is memory-bound by nature ([lesson A2.3](/learn/ai/a2-inference-cost/kv-cache/)), and tiling does not remove the reads of keys and values.
+
+So the FlashAttention idea (fuse the steps, keep intermediates on chip, never store scores) is the most valuable in prefill and in training. Inference engines still use the same principle in decode kernels: read each key and value block once, from HBM, and do the work next to it. The PagedAttention kernel of [lesson E3.2](/learn/ai/e3-inference-deep/paged-attention/) is an example from the vLLM paper: it fuses the block read with the attention step, and reads several tokens of a block together. We did not verify how a given engine mixes the two kernels, so check your engine's docs for its attention backend.
+
+## Limits
+
+**It fixes IO, not FLOPs.** The arithmetic is still O(N²d). A 128K prefill still does quadratic work, as the A1.4 lesson said. FlashAttention saves memory and time spent moving data. It does not make attention linear.
+
+**It needs a custom kernel.** The paper's own limitation: the approach needs a new CUDA kernel for each new attention variant, written in a low-level language, and may not carry across GPU architectures. The paper suggests a compiler as future work. This is why a new mask or bias often needs kernel support before it is fast.
+
+**Tile size is a hardware fit.** The block sizes come from the SRAM size. The model above shows why: the saving depends on SRAM compared with head width.
+
+**It is exact, but not free of rounding.** The paper reports that the training curves match those of the other implementations and that the method is numerically as stable as the baselines. Equal in exact arithmetic is not the same as bit for bit equal.
+
+## What experienced teams know
+
+**Count bytes before FLOPs.** The paper's argument against approximate attention is that FLOP reduction "may not correlate with wall-clock speed". When a custom operator is slow, look at memory traffic first. This is the same habit as in [lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/): name the ceiling before you fix anything.
+
+**Anything you add between the matrix multiplies must live inside the kernel.** Masking, dropout and similar element-wise steps each cost another pass over an N by N matrix if they run outside. The paper fuses them into the one kernel. A custom variant that adds a step outside the fused kernel gives the traffic back.
+
+**Memory, not only speed, is the reason it matters.** The paper ties linear memory to longer contexts: GPT-2 with a 4K context trained 30% faster than the Megatron-LM baseline at 1K context, and reached 0.7 better perplexity. The longer context is the product, not the speedup.
+
+**Ask which phase you are tuning.** The paper's numbers are for training. A decode-heavy service gains less from the tiling idea itself, since there is no big score matrix to avoid, and more from reading the cache efficiently.
+
+**A tiled kernel is tuned to one chip.** The paper warns its kernels may not transfer across GPU architectures. After a hardware change, re-measure before you trust an old number.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Standard attention (separate kernels) | Simple, easy to modify | N by N matrices in HBM, slow, memory grows with N squared | Short sequences, quick experiments |
+| FlashAttention (fused tiles) | Linear extra memory, far less HBM traffic, exact result | A custom kernel per variant, tuned to the chip | Long prompts, training, any production prefill |
+| Approximate attention (sparse, low-rank) | Fewer FLOPs | Lost exactness, often no wall-clock gain | Rarely, unless a measured speedup exists |
+| Block-sparse FlashAttention | 2x to 4x faster than FlashAttention in the paper, up to sequence 64K | An approximate result | Tasks that tolerate a sparse pattern |
+| Recompute scores in backward | Saves N² storage | Extra FLOPs | Training |
+
+## Interview lens
+
+<Callout type="tip">
+Say it as an IO argument: "Attention is memory-bound, not compute-bound, in its plain form. The N by N score matrix is written to HBM and read back for the softmax and again for the multiply. FlashAttention tiles Q, K and V into SRAM and keeps a running maximum and sum per row, so it computes the exact softmax one block at a time and never stores the matrix. It does a little more arithmetic and much less memory traffic, so it is faster. Memory drops from quadratic to linear in sequence length. The FLOPs are still quadratic."
+</Callout>
+
+<Callout type="mistake">
+Do not say FlashAttention is an approximation or that it makes attention linear. It is exact, and only the memory is linear. Do not say it speeds up decode by the same factor as training: decode has one query row and is limited by reading the KV cache. Do not call it a math trick. The softmax trick is what makes the tiling possible, but the gain is in memory traffic.
+</Callout>
+
+<Callout type="deep" title="Why not store the matrix in SRAM instead?">
+SRAM is about 20 MB on the paper's A100, and one 4,096-by-4,096 score matrix in 16-bit numbers is about 33 MB for a single head. Long sequences make it far worse. Tiling is the only way to use SRAM when the matrix does not fit, and the running softmax is what makes the tiles combine into the right answer.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="e3-flash-slow-kernel-low-flops"
+  title="A slow attention kernel with little arithmetic"
+  scenario="An engineer writes an attention variant with a new position bias in plain framework operations. Each step is its own kernel. The profile is below. The numbers are illustrative."
+  facts={[
+    'arithmetic throughput: 6% of the GPU peak',
+    'HBM bandwidth in use: 90% of the peak',
+    'size of the score matrix per head: N by N, N = 8,192',
+    'steps: scores, add bias, mask, softmax, multiply by V, each a separate kernel',
+  ]}
+  steps={[
+    {
+      prompt: 'Which resource limits this kernel?',
+      options: [
+        'The math units, because attention has many operations',
+        'HBM bandwidth, because N by N matrices are written and read at every step',
+        'The CPU, because it launches the kernels',
+        'SRAM size, because the tile is too large',
+      ],
+      answer: 1,
+      explain: 'Low arithmetic use with high bandwidth use means the kernel waits on memory. Every separate step writes and re-reads an N by N matrix through HBM. The math units are mostly idle, and the profile says nothing about the CPU or SRAM.',
+    },
+    {
+      prompt: 'Which change helps the most?',
+      options: [
+        'Use an approximate attention that does fewer operations',
+        'Fuse the steps into one tiled kernel that keeps score tiles in SRAM and uses a running softmax',
+        'Buy a GPU with more arithmetic throughput',
+        'Run the softmax in a second stream to overlap it',
+      ],
+      answer: 1,
+      explain: 'The bytes moved are the problem, so keep the intermediates on chip. A tiled fused kernel removes the N by N round trips. Fewer operations or a faster math unit would not change the wait for memory, and overlap does not reduce the bytes.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'FlashAttention gives the same output as standard attention. What does that tell you about its method?',
+      options: [
+        'It is exact: the work is reordered, not the result',
+        'It drops the lowest scores, since those rarely matter much',
+        'It uses fewer heads than the model has in the plain version',
+        'It only works for sequences that are shorter than the SRAM',
+      ],
+      answer: 0,
+      explain: 'The running maximum and sum make a block-by-block softmax equal to the full one. It does not drop scores, change the heads, or require short sequences. Approximate methods give up exactness, FlashAttention does not.',
+    },
+    {
+      q: 'Why does the softmax step make tiling hard, and what removes the problem?',
+      options: [
+        'Softmax has no GPU kernel, so each tile is sent to the CPU to run it',
+        'Softmax is too slow, so a faster function takes its place in tiles',
+        'Softmax runs after all the tokens are generated, so every tile must wait',
+        'It needs a whole row, so a running max and sum are kept',
+      ],
+      answer: 3,
+      explain: 'A row is spread over many key blocks. With the running maximum m and sum l, each new block rescales the old result to the new reference. Nothing moves to the CPU, the function is not replaced, and generation order does not matter.',
+    },
+    {
+      q: 'FlashAttention does more arithmetic than standard attention in the paper\'s training test and runs faster. Why?',
+      options: [
+        'The extra arithmetic runs on a separate unit that costs no time',
+        'Memory traffic set the time, and it moved about nine times less',
+        'It skips the softmax step, so that part of the work disappears',
+        'It uses lower precision for every operation in the layer',
+      ],
+      answer: 1,
+      explain: 'The runtime followed the HBM column, not the FLOPs column. The saved reads and writes were worth more than the extra recompute. It does not skip the softmax or change precision.',
+    },
+    {
+      q: 'A team says FlashAttention makes a 128K prompt cost linear time. What is right about that claim?',
+      options: [
+        'It is right, because the memory use grows in a straight line with length',
+        'It is wrong: the memory is linear but the arithmetic is quadratic',
+        'It is right, but only for the decode phase of a request',
+        'It is wrong: the memory is quadratic and the arithmetic is linear',
+      ],
+      answer: 1,
+      explain: 'The extra memory is linear, but the FLOPs stay on the order of N squared times d. Prefill of a very long prompt is still costly. Decode is a separate case with a single query row.',
+    },
+    {
+      q: 'Why does FlashAttention help prefill more than a single decode step?',
+      options: [
+        'Decode has no attention step, so there is nothing to speed up',
+        'Prefill uses lower precision numbers than decode does',
+        'Prefill builds a full score matrix, decode only one row',
+        'Decode always runs on the CPU rather than on the GPU',
+      ],
+      answer: 2,
+      explain: 'In prefill every prompt token is a query, so the scores form a full matrix. In decode there is one query, so the scores are one short row, and the cost is reading the KV cache. Decode has attention and runs on the GPU. This is our reading, not a measurement.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/abs/2205.14135): Algorithm 0 and 1, the IO analysis, and every figure used here. You can skip the block-sparse and appendix proofs.
+- [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180): the section on the kernel that fuses block reads with attention.
+- [FlashAttention source code](https://github.com/Dao-AILab/flash-attention): the open-source kernels, if you want to see how the tile loop is written.

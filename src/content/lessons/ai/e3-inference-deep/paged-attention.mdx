@@ -1,0 +1,296 @@
+---
+summary: 'PagedAttention gives each sequence a block table that maps logical KV blocks to physical blocks taken on demand, the way an operating system pages memory. See how that removes fragmentation, shares prompt blocks with copy on write, costs a slower kernel, and what happens when blocks run out.'
+requires: ['ai/a2-inference-cost/kv-cache', '01-one-machine/request-journey']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE3PagedWalk from '../../../../components/anim/lessons/AiE3PagedWalk.tsx';
+import AiE3PagedWaste from '../../../../components/anim/lessons/AiE3PagedWaste.tsx';
+
+## The problem
+
+[Lesson A2.3](/learn/ai/a2-inference-cost/kv-cache/) told you the result: paging cuts KV cache waste from most of the pool to a few percent. It gave you the picture. This lesson gives you the mechanism. What does the engine keep in memory? What does it do when a token arrives? What breaks when two requests share a prompt? And what does paging cost?
+
+The last lesson in this module, [E3.1](/learn/ai/e3-inference-deep/continuous-batching/), ended on a gate. A scheduler can only admit a request if its KV memory fits. If memory is booked badly, the batch stays small, and the GPU idles even though its math units are free. So the way you hand out KV memory sets how many users one GPU can serve. That is why one memory idea, PagedAttention, changed how every serving engine works.
+
+Here is the plan. First, the naive way and where the waste comes from. Then the idea borrowed from operating systems. Then a step-through of the data structure. Then sharing, the kernel, and the case where blocks run out.
+
+## Naive solution: one contiguous slab per request
+
+Start with how large the cache is. The vLLM paper uses OPT-13B as its example. One token needs 800 KB of keys and values (2 for key and value, times 5,120 hidden width, times 40 layers, times 2 bytes). The model can write 2,048 tokens, so one request can need as much as 1.6 GB. On an A100 with 40 GB, the paper shows about 65% of memory holding weights and just over 30% holding KV cache. A few tens of requests fill it, even with perfect use.
+
+Now the naive allocator. A GPU kernel is easiest to write when a request's keys and values sit in one unbroken run of memory, like one array. So the engine books one run per request, sized for the longest answer the request may produce. The engine does not know the answer length, so it books for the worst case.
+
+Think of a hotel that books whole floors. A guest says "I may stay up to 30 days", and gets a floor held for 30 days. Most guests leave after 3. The rest of the floor stays empty, and the next guest hears "full".
+
+The paper names three kinds of waste in this design:
+
+- **Reserved space** [mid]: booked for tokens that do not exist yet. It will be used later, but it blocks other requests the whole time.
+- **Internal fragmentation** [mid]: booked space that the request never uses, because it stopped early.
+- **External fragmentation** [mid]: free space broken into holes. No hole is large enough for a new run, even if the holes add up to plenty.
+
+The paper's Figure 3 shows two requests in one pool. Request A has a prompt of 7 tokens and a booking that leaves 2,038 slots never used. Request B has a prompt of 3 tokens and 507 slots never used. Two requests, thousands of empty slots, and a third request cannot fit.
+
+The paper profiled real systems and found that only 20.4% to 38.2% of the KV memory held real token data. The vLLM launch post puts it as "60% to 80%" wasted. Both say the same thing from two sides.
+
+Why not book on demand and grow the run later? Because a run that grows needs the space after it to be free. If it is not, the engine must move the whole run, and that costs time and more free space. So engines booked big and wasted.
+
+A backend engineer has seen this before. It is the problem of giving every user a fixed-size file when files grow at different speeds. The [request journey lesson](/learn/backend/01-one-machine/request-journey/) showed a process with its own memory. Operating systems solved the same problem for processes decades ago.
+
+## The idea from operating systems
+
+An operating system gives each process a **virtual address space** [mid]: a clean, unbroken list of addresses. The process thinks its memory is one long array. In truth the system cuts memory into small fixed-size **pages** [mid]. It keeps a **page table** [mid] for each process. The page table says which physical page holds each virtual page. Pages of one process can sit anywhere. A process that grows takes one more page when the last page is full.
+
+PagedAttention copies this design. The paper's own mapping is:
+
+| Operating system | PagedAttention |
+|---|---|
+| A byte | A token |
+| A page | A block of tokens |
+| A process | A request |
+| A page table | A block table |
+
+A **block** [mid] holds the keys and values of a fixed number of tokens. In the paper, vLLM uses 16 tokens. A **block table** [mid] belongs to one sequence. Its entries are logical blocks, numbered from 0 in the order the sequence reads them. Each entry points to a physical block in the GPU pool. The sequence sees one clean list. The pool is a heap of equal blocks.
+
+Why does this fix the three kinds of waste?
+
+- **No reserved space.** A new block is taken only when the last one is full. Nothing is booked ahead.
+- **Little internal fragmentation.** The only unused slots are in the last block of each sequence. A block holds 16 tokens, so at most 15 slots are empty per sequence.
+- **No external fragmentation.** Every block has the same size. Any free block fits any request. There are no holes that are too small.
+
+## The mechanism, step by step
+
+The animation uses small numbers so you can see every entry: blocks of 4 tokens, a pool of 8 blocks. A request wants two samples from one prompt of 7 tokens. We call the samples A1 and A2. Then an unrelated request B arrives. Step through it and read the block tables on top and the pool below.
+
+<AiE3PagedWalk client:visible />
+
+Four things to notice in the animation.
+
+**Blocks do not need to be neighbours.** A1 got physical blocks 1 and 4. The kernel does not need them to touch, because it reads the block table. The engine hands out blocks from a free list, in any order.
+
+**Blocks are taken one at a time.** A sequence takes a new block only when the write position moves past the end of its last block. This is the "on demand" rule. It means a sequence never holds more than one partly filled block.
+
+**Free is free.** When A2 finished, its blocks went back to the free list. The next request can take them at once. There is no need to wait until a large enough run opens.
+
+**The pool is shared by everyone.** No region belongs to a request. This is why B could fit anywhere.
+
+The paper has one more detail. When a prompt arrives, the engine joins the prompt tokens of new requests and the latest token of each request that is already decoding into one sequence, and feeds it to the model. This is the same flat batch that [E3.1](/learn/ai/e3-inference-deep/continuous-batching/) described. The block tables are how attention finds each request's past.
+
+## Sharing blocks: reference counts and copy on write
+
+Now look again at steps 3 to 5 of the animation. A request asked for two samples of the same prompt. The paper calls this **parallel sampling** [mid]: one prompt, several answers, each with its own random choices. Every sample needs the same keys and values for the prompt. Why store them twice?
+
+With a block table, you do not. A2's table points to the same physical blocks as A1's table. To make this safe, each physical block keeps a **reference count** [mid]: how many block tables point to it. In the animation, blocks 1 and 4 both show a count of 2.
+
+A new problem comes up. The samples now write different tokens. A1 wants to write into block 4, but A2 also reads block 4. A write in place would change A2's view. The fix is **copy on write** [senior]. The rule has three lines:
+
+1. Before a write, look at the reference count of the target block.
+2. If it is above 1, take a new block, copy the data across, lower the old count by 1, and write into the copy.
+3. If it is 1, the sequence owns the block alone. Write in place.
+
+Look at step 4 and 5 of the animation. A1 triggers the copy. After it, block 4's count is 1, so A2 writes in place. Only one copy was made. Block 1 holds the full first 4 prompt tokens. Nobody writes there, so it stays shared to the end.
+
+An everyday picture: two people edit a shared document. The first person to type makes a private copy of the page they edit. The other pages stay shared. The second person, now alone on the original page, edits it directly.
+
+The operating system does the same when a process forks. The paper says so by name. The savings depend on the decoding method. In the paper's test on the Alpaca data, sharing saved 6.1% to 9.8% of memory for parallel sampling and 37.6% to 55.2% for **beam search** [senior]. Beam search keeps the k best partial answers at every step, and these answers share long common beginnings. On the ShareGPT data, with longer prompts, the savings were 16.2% to 30.5% for parallel sampling and 44.3% to 66.3% for beam search.
+
+This is where one plan figure needs care. The vLLM launch post says sharing cuts memory "by up to 55%" for parallel sampling and beam search together. That number is the peak for beam search on the Alpaca data. For plain parallel sampling it is lower, and it grows with prompt length.
+
+The same mechanism gives **prefix sharing**. Many requests start with the same system prompt. They can map their first logical blocks to the same physical blocks, and compute only the new part. [Lesson A2.5](/learn/ai/a2-inference-cost/prompt-caching/) covers the cost side of that idea. The paper describes it as shared-library pages across processes.
+
+## Seeing the waste
+
+Now put the two allocators side by side. The widget below is a model, not a benchmark. It uses one fixed pool and 96 waiting requests, most of them short. The left bar books a fixed run per request. The right bar gives whole blocks. Move both sliders.
+
+<AiE3PagedWaste client:visible />
+
+Read three things from it.
+
+1. **Booking the maximum wastes most of the pool.** At the 2,048-token booking, the bar shows about two thirds of the held space empty, and 16 requests run. With real mixed lengths, that looks like the 20% to 38% of useful memory that the paper measured. (Our lengths are made up. The match is by design, not proof.)
+2. **A short booking looks better but cuts off long requests.** The 1,024 setting runs more requests, but any request that wants more than 1,024 tokens would be stopped. You cannot book a small run without limiting your users.
+3. **Small blocks waste almost nothing, and big blocks bring waste back.** At 16 the waste is about one percent. At 256 it is large again. A block that is too big wastes slots in each sequence's last block, and it cuts sharing, because a block can be shared only as a whole.
+
+The model has one blind spot. It admits requests by their current size. A real request keeps growing, and the pool may run out later. The section on preemption below covers that case.
+
+## The kernel: attention that reads through a table
+
+Paging has one cost that the animation hides. The attention step must now read keys and values that are not in one run. For each token, the kernel looks up the block table, then reads the block from its physical place.
+
+The paper says the kernel does two things. It fuses the block read and the attention step into one kernel, so the data is not copied into a contiguous scratch space first. It also reads many tokens of one block at once. A block that holds more than one token lets the kernel process more positions in parallel and use the hardware better.
+
+The price is a slower attention step. The paper measured 20% to 26% higher attention kernel latency than the highly optimised FasterTransformer kernel. It states why this is acceptable: the overhead is only in the attention operator, not the other operators. And the waste saved lets the engine run many more requests per step.
+
+The block size sits between two forces. A very small block gives the kernel less to read in parallel, and it makes swapping slow (more on that below). A very large block wastes space and shares less. The paper tested the range. On the ShareGPT data, block sizes from 16 to 128 gave the best results. On the Alpaca data, whose sequences are shorter, sizes 16 and 32 worked well, and bigger sizes did much worse, since the sequences were shorter than the block. The paper settled on 16 as the default for vLLM: large enough to use the GPU well, small enough to avoid much internal fragmentation.
+
+## When the pool runs out
+
+Because requests grow, the pool can run out. The engine has to make room. The paper uses the same two answers as an operating system:
+
+- **Swapping.** Copy a victim's blocks to CPU memory, and bring them back later.
+- **Recomputation.** Drop the victim's blocks. When the request resumes, run its prompt plus the tokens it has made as one new prompt, which rebuilds the cache in one pass.
+
+**Preemption** [mid] means pausing one request so that others can go on. The paper uses a simple policy. Requests are served in arrival order. When blocks run out, the latest arrivals are paused first. The engine evicts all blocks of one sequence together, or none, because a sequence needs all its blocks to run. It also stops taking new requests until the paused ones are done.
+
+Which is better? The paper measured both. Swapping is slow with small blocks, because it makes many small copies over the link between CPU and GPU. Recomputation costs the same for any block size. For block sizes 16 to 64, the two had comparable end-to-end speed. The vLLM docs say the default in version 1 is recomputation. The docs also warn that preemption and recomputation can hurt end-to-end latency.
+
+So paging does not remove the limit. It moves it. Memory is wasted much less, but it is still finite. When the pool is full, someone waits or restarts.
+
+## What the published numbers measure
+
+| Claim | What it measures | Label |
+|---|---|---|
+| 20.4% to 38.2% of KV memory holds real data | Profile of existing systems in the paper's experiments | Paper claim |
+| 60% to 80% wasted; under 4% with paging | Launch post summary | Vendor blog claim |
+| 2x to 4x throughput over FasterTransformer and Orca at similar latency | OPT models and LLaMA-13B on A100 GPUs, ShareGPT and Alpaca traces. The authors wrote their own version of Orca, because Orca was not public | Paper claim |
+| 1.7x to 2.7x higher request rate than Orca (Oracle), 2.7x to 8x than Orca (Max) | OPT-13B, ShareGPT. Oracle knows the output length in advance, which no real system can. Max books 2,048 tokens for every request | Paper claim |
+| Up to 22x over FasterTransformer | Same setting. FasterTransformer has no fine-grained scheduling and books like Orca (Max) | Paper claim |
+| 2.2x more requests in the batch than Orca (Oracle), 4.3x than Orca (Max) | OPT-13B, ShareGPT | Paper claim |
+| Up to 24x over Hugging Face, up to 3.5x over TGI | LLaMA-7B on an A10G and LLaMA-13B on an A100 40 GB, ShareGPT lengths | Vendor blog claim |
+
+Two lessons come from the table. First, the baseline sets the headline. Gains over a system with no smart scheduling and big bookings are large, and gains over a smarter baseline are smaller. Second, the paper itself says the gap shrinks when memory is not the limit. For OPT-175B with the short Alpaca data, the Orca variants could also batch many requests, so the system became compute-bound, not memory-bound. Paging helps most when memory is the gate.
+
+## What experienced teams know
+
+**Preemptions are a memory alarm.** The vLLM docs describe the warning and the fixes. Raise the share of GPU memory given to the engine, add tensor parallelism, or lower the cap on concurrent sequences or batched tokens. The docs warn that more tensor parallelism can bring synchronisation cost. If you see preemptions often, the pool is too small for your traffic.
+
+**Treat block size as a default, not a dial.** The paper found 16 works across its workloads, and sizes that are very small or very large did worse. Change it only with a measurement on your own length mix.
+
+**Sharing only works on whole blocks.** The vLLM prefix caching design says only full blocks are cached. Each block's hash covers its parent's hash and its own tokens. So an identical start gives shared blocks, and one changed token near the top changes everything after it. Keep the system prompt first and stable. The lesson on [cache-friendly prompt layout](/learn/ai/a4-context/cache-friendly-layout/) says the same from the cost side.
+
+**Expect the biggest win where sequences are long.** The paper reports gains grow with longer sequences, bigger models, and more complex decoding. A service with short chats and large memory per request may see less.
+
+**Check what your own baseline books.** The gap between "Oracle" and "Max" in the paper is the gap between a system that knows lengths and one that books the maximum. If your current engine already books tightly, your gain from paging is smaller than the headline.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Contiguous slab per request | Simple kernel | Most of the pool wasted, small batches | Almost never on a shared server |
+| Paged blocks | Waste only in the last block, more concurrent requests, sharing | Block-table lookups, a slower attention kernel (20% to 26% in the paper), a more complex scheduler | Memory is the gate, lengths vary |
+| Larger blocks | Better kernel parallelism, less table work | More waste per sequence, less sharing | Sequences are long |
+| Smaller blocks | Less waste, finer sharing | Weaker kernel parallelism, slow swapping | Short sequences, heavy sharing |
+| Recompute on preemption | Cost does not depend on block size, no CPU swap space | Repeated prompt work | Default for most settings |
+| Swap on preemption | No repeated compute | Many small copies if blocks are small | Large blocks, fast link |
+
+## Interview lens
+
+<Callout type="tip">
+Say it as an allocator problem: "KV memory is the gate on batch size. A contiguous slab per request wastes most of it, because lengths are unknown, so you book the maximum. PagedAttention cuts the cache into fixed blocks with a block table per sequence, like OS paging. Blocks are taken on demand, so waste is only the last block. Equal blocks mean no external fragmentation. Reference counts give copy on write, so samples and shared prompts share blocks. The price is a slower attention kernel and the need to preempt when blocks run out."
+</Callout>
+
+<Callout type="mistake">
+Do not say paging makes attention faster. It makes memory use better, which allows bigger batches, and the kernel is a little slower. Do not quote 2x to 4x without its baseline: it compares with systems that book large slabs. Do not say paging removes out-of-memory events. The pool is still finite, and the engine will preempt when it fills.
+</Callout>
+
+<Callout type="deep" title="Why not just move runs to remove holes?">
+Compaction (sliding allocated runs together to close the holes) is the classic fix for external fragmentation. The paper notes that it has been proposed, and calls it impractical in a performance-sensitive serving system, because the KV cache is so large. It adds that even with compaction, a booked run per request still blocks sharing. Paging avoids the problem rather than cleaning it up later.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="e3-paged-pool-looks-empty"
+  title="The pool looks half empty but requests queue"
+  scenario="A team runs an in-house engine that books one contiguous KV run per request, sized by the client's max_tokens. Most clients send max_tokens of 2,048. Real answers are short. The numbers below are illustrative."
+  facts={[
+    'KV pool: 32,768 token slots',
+    'running requests: 16, then new requests queue',
+    'tokens of real keys and values in the pool: about 10,000',
+    'GPU math utilisation during decode: low',
+  ]}
+  steps={[
+    {
+      prompt: 'Why do requests queue while two thirds of the pool holds no data?',
+      options: [
+        'Each running request holds a booked run sized for its maximum, so the free space is booked, not free',
+        'The KV cache is compressed and needs time to unpack',
+        'The GPU runs out of math units for a bigger batch',
+        'Long requests are copied to the CPU and block the pool',
+      ],
+      answer: 0,
+      explain: 'The engine books the maximum run at admission, so slots that hold no token are still taken. Sixteen runs of 2,048 fill the pool. The low math use shows the batch is too small, not too large. Nothing is compressed or copied here.',
+    },
+    {
+      prompt: 'Which change raises the number of running requests the most without cutting what users may ask for?',
+      options: [
+        'Ask every client to lower max_tokens to 256',
+        'Give blocks of a few tokens from a shared pool, and take them as each sequence grows',
+        'Buy a second pool and split requests by length',
+        'Raise the batch limit from 16 to 64',
+      ],
+      answer: 1,
+      explain: 'Paged blocks taken on demand make the held space follow real use, so the same pool holds several times more requests. Lowering max_tokens would cut users off. A higher batch limit does nothing while memory is the gate.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In PagedAttention, what does a sequence\'s block table hold?',
+      options: [
+        'All the keys and values of the sequence, copied in order',
+        'A map from logical blocks to physical blocks',
+        'A list of the other requests that share the same GPU',
+        'The attention scores computed for the last block',
+      ],
+      answer: 1,
+      explain: 'The table is a map from logical blocks (the order the sequence reads them) to physical blocks (where they live). The data stays in the pool. The table does not store scores or list other requests.',
+    },
+    {
+      q: 'With fixed-size KV blocks, why can no holes form between sequences?',
+      options: [
+        'It slides the live data together after every request finishes',
+        'It only accepts requests that have the same length',
+        'All blocks are equal, so any free block fits any request',
+        'It keeps the cache in CPU memory, where space is large',
+      ],
+      answer: 2,
+      explain: 'External fragmentation means free space in holes that are too small. With equal blocks there is no too small. Compaction is a different fix, and the cache stays on the GPU.',
+    },
+    {
+      q: 'Two samples share a prompt block with reference count 2. One sample wants to write into that block. What does the engine do?',
+      options: [
+        'Writes in place, because both samples are working from the same prompt',
+        'Pauses the second sample until the first sample has finished its answer',
+        'Copies the block, lowers the old count to 1, and writes into the copy',
+        'Frees the block and recomputes the whole prompt for both of the samples',
+      ],
+      answer: 2,
+      explain: 'This is copy on write. A write in place would change what the other sample reads. After the copy, the other sample owns the old block alone, so it writes in place with no second copy.',
+    },
+    {
+      q: 'Which setting makes paging help the least?',
+      options: [
+        'Long prompts with many parallel samples per request',
+        'Short sequences and a very large KV pool',
+        'Beam search with a wide beam on a long prompt',
+        'A pool that is nearly full for most of the day',
+      ],
+      answer: 1,
+      explain: 'Paging pays by letting memory hold more requests. If memory is not the gate, as in the paper\'s short-sequence test on a very large model, the system is compute-bound and the gain shrinks. The other three settings are where waste and sharing matter most.',
+    },
+    {
+      q: 'What is the main cost of PagedAttention that the plain contiguous design does not have?',
+      options: [
+        'It wastes more memory in the last block of every sequence',
+        'It needs more GPUs to hold the same model weights',
+        'It cannot serve more than one request at a time',
+        'A slower attention step, from table lookups',
+      ],
+      answer: 3,
+      explain: 'The kernel reads blocks through a table and handles variable lengths, so its attention step was 20% to 26% slower in the paper. Waste is lower, not higher. It serves more requests, and it does not need more GPUs.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180): the block table, copy on write, preemption, and every paper figure used here. You can skip the distributed-execution part.
+- [vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention](https://vllm.ai/blog/2023-06-20-vllm): the launch post with the 60% to 80% waste and the HF and TGI comparisons.
+- [vLLM docs, Optimization and Tuning](https://docs.vllm.ai/en/latest/configuration/optimization/): preemption, recomputation, and the settings that reduce it.
+- [vLLM docs, Automatic Prefix Caching design](https://docs.vllm.ai/en/latest/design/prefix_caching/): block hashes, reference counts and eviction.

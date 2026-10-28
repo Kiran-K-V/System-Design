@@ -30,7 +30,7 @@ const steps: Step[] = [
 export default function AiE3TraceMarks() {
   return (
     <AnimFrame title="One request, two clocks: TTFT and TPOT" steps={steps} interval={5500}>
-      {(i, s) => {
+      {(_i, s) => {
         const t = s.upTo;
         const showQ = t >= QUEUE_END;
         const showP = t >= QUEUE_END + 1;

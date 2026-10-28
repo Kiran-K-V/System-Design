@@ -6,14 +6,14 @@ import { HandText, SketchArrow, SketchBox, SketchSvg, TEXT_SIZES, seedOf } from 
 const W = 720;
 const COLS = [
   { x: 120, name: 'Michelangelo', year: 'Uber, 2017', before: ['One-off serving', 'per team'], after: ['Six-step shared', 'platform'] },
-  { x: 360, name: 'Monolith', year: 'ByteDance, 2022', before: ['Batch train,', 'serve apart'], after: ['Sparse update', 'each minute'] },
+  { x: 360, name: 'Monolith', year: 'ByteDance, 2022', before: ['Fixed-size tables,', 'hashed IDs'], after: ['No-collision table,', 'minute sync'] },
   { x: 600, name: 'Radar', year: 'Stripe, 2023', before: ['XGBoost plus', 'a neural net'], after: ['Neural net', 'only'] },
 ];
 
 const steps = [
   { caption: 'Three systems from three companies, each read from its own post or paper. Each column starts with the "before": the design the team says it left behind.' },
   { caption: 'Michelangelo (Uber post, 2017). Company claim: before it, "no established path to deploying a model into production", so teams built a custom serving container per project. After: one platform with a six-step workflow and a shared feature store.' },
-  { caption: 'Monolith (ByteDance paper, 2022). Paper claim: general frameworks separate batch training from serving, and use fixed-size tables for IDs that collide. After: a collisionless table, and the touched sparse keys pushed to serving every minute.' },
+  { caption: 'Monolith (ByteDance paper, 2022). Paper claim: general frameworks use fixed-size dense variables that cannot grow with new IDs, and hashing IDs into them makes collisions. After: a collisionless table, and the touched sparse keys pushed to serving at minute-level intervals.' },
   { caption: 'Radar (Stripe post, 2023). Company claim: a mid-2022 move from a model that combined XGBoost and a neural net to a neural net alone cut training time by over 85%, to under two hours.' },
 ];
 

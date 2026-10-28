@@ -57,7 +57,7 @@ export default function AiE2FourDGrid() {
 
       <div className="mt-5 border-t border-line pt-4">
         <div className="mb-3 flex flex-wrap items-center gap-3">
-          <span className="text-sm text-muted">Llama 3 405B configuration (paper Table 4):</span>
+          <span className="text-sm text-muted">Llama 3 405B configuration (from the paper):</span>
           <Seg label="Configuration" value={row} options={TABLE4.map((r) => ({ id: r.id, label: r.label }))} onChange={setRow} />
         </div>
         <div className="overflow-x-auto">

@@ -16,205 +16,161 @@ import AiE1PymkHops from '../../../../components/anim/lessons/AiE1PymkHops.tsx';
 
 A video app has millions of videos and one screen. The viewer opens the app and expects the right twenty videos in the time it takes to blink. Nobody typed a query. The system must guess.
 
-The first guess is easy: show what many people clicked. It works for a week. Then a thumbnail with a shocked face and a false promise climbs the chart. People click it, watch ten seconds, and leave. The click counter goes up. The viewer is worse off. YouTube's own paper says this in plain words: "Ranking by click-through rate often promotes deceptive videos that the user does not complete ('clickbait') whereas watch time better captures engagement" ([Covington and others, YouTube recommendations paper](https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/)).
+The first guess is easy: show what many people clicked. It works for a week. Then a thumbnail with a shocked face and a false promise climbs the chart. People click it, watch ten seconds, and leave. The click counter goes up. The viewer is worse off. YouTube's paper says it plainly: "Ranking by click-through rate often promotes deceptive videos that the user does not complete ('clickbait') whereas watch time better captures engagement" ([Covington and others, YouTube recommendations paper](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/45530.pdf)).
 
-So this case has two hard parts. The first is speed: millions of videos, a few hundred milliseconds. Lesson E1.5 taught the answer, a cascade that gets cheaper-then-heavier. The second is the target: what number should the system push up? A wrong target does damage quietly, and a dashboard shows it as a win.
+So there are two hard parts. The first is speed: millions of videos, a few hundred milliseconds. Lesson [E1.5](/learn/ai/e1-classic-ml/retrieval-ranking/) taught the answer, a cascade that goes from cheap to heavy. The second is the target: what number should the system push up? A wrong target does damage quietly, and a dashboard shows it as a win.
 
-This lesson answers six questions:
+This lesson answers five questions:
 
 1. What is the quality bar, when clicks are the wrong target?
-2. How do we test and guard that bar before the app changes for millions of people?
-3. How is the time budget split across stages, and what does it cost?
-4. How do we build the stages, and how do we keep video vectors fresh?
-5. How do we rank for more than one goal, and how do new videos get a first audience?
-6. Why is the log of past views biased, and how do we measure long-term effects?
+2. How do we test that bar, and where does the time budget go?
+3. How do we build the stages and keep video vectors fresh?
+4. How do we rank for more than one goal, and how do new videos get a first audience?
+5. Why is the log of past views biased, and how do we measure long-term effects?
 
-Then two drills use the same ideas: search ranking, and People You May Know.
+Two drills reuse the ideas: search ranking, and People You May Know.
 
 <CrossTrackLink id="11-breakdowns/youtube">
-The backend lesson on YouTube covers how video bytes reach a screen: upload, transcode, adaptive bitrate, and the CDN. It does not decide which video to show. This lesson is that missing half. We take the video catalog as given and build the system that picks from it.
+The backend lesson on YouTube covers how video bytes reach a screen: upload, transcode, adaptive bitrate, and the CDN. It does not decide which video to show. This lesson is that missing half. We take the catalog as given.
 </CrossTrackLink>
 
 ## Requirements and the quality bar
 
 The product is the home feed of a video app. All traffic figures here are **illustrative**.
 
-**Functional**
+**Functional.** FR1: return about twenty videos for a viewer, and more on scroll. FR2: rank for the viewer's satisfaction, not clicks. FR3: keep the feed diverse and safe (no banned videos, no single creator filling the screen). FR4: give new videos and creators a fair first audience.
 
-- FR1: return a feed of about twenty videos for a viewer, and more on scroll.
-- FR2: rank for the viewer's satisfaction, not for clicks.
-- FR3: keep the feed diverse and safe: no banned videos, no single creator filling the screen, a mix of topics.
-- FR4: give new videos and new creators a fair first audience.
+**Out of scope.** Upload and playback (the YouTube lesson), ads in the feed (lesson [E1.11](/learn/ai/e1-classic-ml/ad-click-prediction/)), the search box (a drill below), and creator payouts.
 
-**Out of scope.** Upload and playback (the YouTube lesson), ads in the feed (lesson E1.11), the search box (a drill below), and creator payouts.
-
-**Non-functional.** Latency per feed request has a budget. Cost per request has a budget. Both come after the target, not before it.
-
-**The target.** A product goal is not a loss function (lesson E1.1). "Long-term satisfaction" cannot be computed from one log line, so we use a chain of proxies and say what each one misses.
+**The target.** A product goal is not a loss function (lesson [E1.1](/learn/ai/e1-classic-ml/problem-framing/)). "Long-term satisfaction" cannot be computed from one log line, so we use a chain of proxies and say what each one misses.
 
 | Level | Signal | What it misses |
 |---|---|---|
-| Training label | A good watch: watched a large share of the video, or liked it | A viewer can watch a bad video to the end because the autoplay timer ran out |
-| Online metric | Total watch time per viewer per day | Watch time alone rewards addictive content and long videos |
-| Guard metrics | Satisfaction survey score, complaints, creator reach, diversity | The survey is sparse and asks only a few percent of viewers |
-| Real goal | The viewer is glad they use the app, a month later | Only the 28-day retention number comes close |
+| Training label | A good watch: a large share watched, or a like | A viewer can finish a bad video because autoplay ran out the timer |
+| Online metric | Watch time per viewer per day | Rewards addictive content and long videos |
+| Guard metrics | Satisfaction survey, complaints, creator reach, diversity | The survey is sparse; it asks only a few percent of viewers |
+| Real goal | The viewer is glad to use the app a month later | Only 28-day retention comes close |
 
-**The bar we set** (our choice, not a source): watch time per viewer goes up, the satisfaction survey does not go down, and 28-day retention is not down. The word "not down" needs a number. We mean the measured change is not below zero by more than the test's error bars, which the holdout in deep dive 3 measures. Google's rules of ML make the same point: "Launch decisions are a proxy for long-term product goals" and "The only easy launch decisions are when all metrics get better (or at least do not get worse)" ([Rules of Machine Learning, Rule 39](https://developers.google.com/machine-learning/guides/rules-of-ml)). A release is blocked by any guard, not only by the main number.
+**The bar** (our choice, not a source): watch time per viewer goes up, the survey does not go down, and 28-day retention is not down. "Not down" means the change is not below zero by more than the error bars that the holdout in deep dive 3 measures. Google's Rules of ML say the same: "Launch decisions are a proxy for long-term product goals", and "The only easy launch decisions are when all metrics get better (or at least do not get worse)" ([Rules of Machine Learning, Rule 39](https://developers.google.com/machine-learning/guides/rules-of-ml)). Any guard can block a release, not only the main number.
 
 ## Eval plan
 
-The eval comes before the design (lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/)). Here the eval has three parts, because each stage fails differently.
+The eval comes before the design (lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/)). Each stage fails differently, so each gets its own check.
 
-**Offline, per stage.** Candidate generation is judged by **recall at k**: of the videos the viewer later watched, what share did the candidate stage put in its k results? If the stage misses the video, no later stage can recover it. The ranker is judged by **NDCG** (normalized discounted cumulative gain), a score for list order. Each video in the list gets a relevance score. A video lower in the list counts for less, by a fixed discount. The sum is divided by the best possible sum for that list, so a perfect order scores 1. Think of it as marks for putting the best video first. The ranker is also judged by **calibration**: when the model says 30% chance of a good watch, about 30% of such videos should get one. Calibration matters because later stages mix scores from several models.
+**Offline, per stage.** Candidate generation is judged by **recall at k**: of the videos the viewer later watched, what share did the stage return in its k results? A video this stage misses cannot be recovered later. The ranker is judged by **NDCG** (normalized discounted cumulative gain), a score for list order: each video has a relevance score, lower positions count for less, and the sum is divided by the best possible sum, so a perfect order scores 1. The ranker is also judged by **calibration**: when it says 30% chance of a good watch, about 30% of such videos should get one.
 
-**A split that does not leak.** Split the log by time, not at random. A random split puts tomorrow's views in the training set and today's in the test set. The YouTube paper found that predicting a viewer's next watch from earlier actions beat predicting a randomly held-out watch, because the random hold-out "leaks future information" ([paper, section 3.4](https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/)). The same paper warns that offline numbers mislead: "live A/B results are not always correlated with offline experiments." So offline is a filter that removes bad ideas. It does not pick the winner.
+**A split that does not leak.** Split the log by time, not at random. The YouTube paper says that holding out a random watch and predicting it from the other items "leaks future information", so it rolls back each viewer's history and uses only earlier actions. The same paper warns that "live A/B results are not always correlated with offline experiments." Offline is a filter that removes bad ideas. It does not pick the winner.
 
-**Online.** An A/B test by viewer (lesson E1.8, and the AI version in [Online Evals and A/B](/learn/ai/a8-evals/online-evals-ab/)) with one primary metric, the guard metrics above, and a **long-term holdout**: a small group of viewers kept on an old frozen system for months. Guard metrics: diversity (how many topics and creators a feed shows), creator reach (how many creators get any audience), and complaints.
+**Online.** An A/B test by viewer (lesson [E1.8](/learn/ai/e1-classic-ml/ab-testing-models/); the AI version is [Online Evals and A/B](/learn/ai/a8-evals/online-evals-ab/)) with one primary metric, the guards above, and a **long-term holdout**: a small group kept on an old frozen system for months.
 
-**The slice that matters.** New viewers (cold start), new videos, and heavy viewers. An average hides all three. A change that helps heavy viewers and hurts new ones can look flat on the average.
+**The slice that matters.** New viewers, new videos, and heavy viewers. An average hides all three.
 
 ## Budgets
 
-**Latency.** Lesson E1.5 gave the funnel: millions of videos, then about a thousand candidates, then a hundred, then the final screen. Each stage gets a slice of the total. This split is **illustrative**, for a 300 ms feed call.
+**Latency.** Lesson [E1.5](/learn/ai/e1-classic-ml/retrieval-ranking/) gave the funnel: millions of videos, about a thousand candidates, a hundred, then the screen. The shares below are **illustrative**, for a 300 ms feed call.
 
-| Stage | Share of the budget | Why |
-|---|---|---|
-| Gateway, auth, viewer features | small | Key-value reads, no model |
-| Candidate generation (vector lookup) | small | ANN is fast by design; the cost is in the index size |
-| Ranker, on several hundred candidates | **largest** | A heavy model runs once per candidate per request |
-| Re-rank and policy | small | Rules and sorting |
-| Response and logging | small | Logging must not block the reply |
+Gateway, viewer features, vector lookup, re-rank, and logging each take a small slice: they are key-value reads, fast ANN search, rules, and non-blocking writes. The ranker, a heavy model run once per candidate, takes the largest.
 
-The conclusion: the ranker owns the budget. Anything that makes the ranker slower, such as more candidates or a bigger model, comes straight out of the headroom of every other stage. So the number of candidates the first stage passes is a design knob, not a detail.
+The conclusion: the ranker owns the budget. More candidates or a bigger model comes straight out of every other stage's headroom, so the number of candidates stage one passes is a design knob.
 
-**Dollars.** The cost of one feed is the ranker. A single anchor, **illustrative**: 100 million viewers a day with 20 feed loads each is billions of ranker calls a day, which is tens of thousands per second at peak. Each call scores hundreds of candidates, so the GPU fleet is sized by candidates per second, not viewers per second. GPU price, from [Lambda's pricing page](https://lambda.ai/pricing), as of 2026-10-28: H100 SXM at **$3.99 per GPU-hour** on the 8-GPU on-demand configuration ($4.29 for a single GPU). We have no sourced throughput for a ranker, because it depends on the model size and the batch. So measure candidates scored per second per GPU on your model, and the fleet cost follows. Two levers cut the bill: fewer candidates per call, and a smaller or distilled ranker (lesson E1.5 covers the cascade idea).
-
-The **embedding refresh job** is the other bill. It re-encodes every viewer and every video on a schedule. It is a batch job: cheap per hour, but it scales with catalog size and viewer count, and it sets how stale the vectors get (deep dive 1).
+**Dollars.** The cost of a feed is the ranker. Its fleet is sized by candidates scored per second, not viewers per second, because each call scores hundreds of candidates. We have no sourced ranker throughput, since it depends on model size and batch, so measure candidates per second per GPU on your model. One price anchor: [Lambda's pricing page](https://lambda.ai/pricing) lists the H100 SXM at $3.99 per GPU-hour on the 8-GPU instance and $4.29 on the 1-GPU instance, as of 2026-10-28. Two levers cut the bill: fewer candidates per call, and a smaller or distilled ranker. The **embedding refresh job** is the other bill: a batch job that re-encodes every viewer and video. It scales with catalog and viewer count and sets how stale vectors get.
 
 ## Core entities and API
 
-**Entities.** `Viewer`, `Video` (creator, age, topic), `Impression` (viewer, video, position, scores, **propensity**, time), `Watch` (impression id, watched seconds, like or skip), `FeedConfig` (objective weights, exploration share, version).
+**Entities.** `Viewer`, `Video` (creator, age, topic), `Impression` (viewer, video, position, scores, **propensity**, weight version, time), `Watch` (impression id, seconds, like or skip), `FeedConfig` (objective weights, exploration share, version).
 
-**API.**
-
-- `GET /feed?viewer=...&cursor=...`: returns videos with an impression id each.
-- `POST /events`: watch, skip, like, report, "not interested". Tied to an impression id.
-- Internal: `POST /embeddings/refresh`, `PUT /feed-config`.
-
-The impression id matters. Without it, you cannot join "what we showed" to "what they did", and everything in deep dive 3 breaks.
+**API.** `GET /feed?viewer=...&cursor=...` returns videos with an impression id each. `POST /events` records watch, skip, like, report, "not interested", tied to an impression id. Internal: `POST /embeddings/refresh`, `PUT /feed-config`. Without the impression id you cannot join "what we showed" to "what they did", and deep dive 3 breaks.
 
 ## A naive design and where it breaks
 
-The first build in most teams is one query: take the videos with the best click rate in the last day, remove the ones this viewer saw, and show them. Here is where it breaks. All figures are illustrative unless a source is named.
+One query: the videos with the best click rate in the last day, minus ones this viewer saw.
 
-| Break | What happens |
-|---|---|
-| Clickbait wins | A deceptive video has a high click rate and a short watch. The metric rewards it (YouTube paper, quoted above). |
-| Everyone sees the same feed | No personalization, so a viewer who likes cooking and a viewer who likes chess get the same list. |
-| New videos never start | A new video has no clicks, so it never ranks, so it never gets clicks. |
-| Rich get richer | Videos shown early collect clicks, rank higher, and collect more. The head grows and the tail starves. |
-| Old items return | Last month's hit is still ahead of today's news because the count is cumulative. |
-| One score, many goals | A single click score cannot hold "watch time" and "viewer felt good". |
+Clickbait wins, because it has a high click rate and a short watch. Everyone sees the same feed. New videos never start, because no clicks means no rank. The rich get richer, as early exposure collects clicks and the tail starves. One score cannot hold "watch time" and "felt good".
 
-All six come from one cause: the system optimizes what is easy to count, over what it showed itself. The rest of the lesson fixes that, one piece at a time.
+All of these come from one cause: the system optimizes what is easy to count, over data its own choices produced. The rest of the lesson fixes that.
 
 ## High-level design
 
-Step through the build. Each step names the requirement it satisfies. New boxes are highlighted.
+Step through the build. Each step names the requirement it satisfies.
 
 <AiE1VideoBuild client:visible />
 
-Read the picture in four rules.
+Four rules from the picture.
 
-1. **Two models, two jobs.** The first is cheap and wide: it must not miss a good video. The second is heavy and narrow: it must order a few hundred well. This is the shape the YouTube paper describes. It "is split according to the classic two-stage information retrieval dichotomy" into candidate generation and ranking ([paper](https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/)). The same cheap-then-precise pattern appears in RAG (the ANN indexes lesson and the reranking lesson in the RAG module: [ANN Indexes](/learn/ai/a5-rag/ann-indexes/), [Reranking and Query Rewriting](/learn/ai/a5-rag/reranking-rewriting/)).
-2. **The ranker is multi-goal.** It outputs several predictions, and one combine step turns them into a score. Deep dive 2.
-3. **The rules sit after the models.** Banned videos, creator caps, and diversity are code in the re-rank step. A model can be tuned to love a topic. A rule cannot be argued with.
-4. **The log is a first-class part.** The impression log is not an afterthought. It carries the propensity of each pick, so the next training run and the next evaluation can correct for what we chose to show.
+1. **Two models, two jobs.** The first is cheap and wide: it must not miss a good video. The second is heavy and narrow: it orders a few hundred well. The YouTube paper "is split according to the classic two-stage information retrieval dichotomy" into candidate generation and ranking. RAG uses the same pattern ([ANN Indexes](/learn/ai/a5-rag/ann-indexes/), [Reranking and Query Rewriting](/learn/ai/a5-rag/reranking-rewriting/)).
+2. **The ranker is multi-goal.** It outputs several predictions, and one combine step makes a score (deep dive 2).
+3. **Rules sit after the models.** Banned videos, creator caps, and diversity are code in re-rank. A model can be tuned to love a topic. A rule cannot be argued with.
+4. **The log is a first-class part.** It carries the propensity of each pick, so training and evaluation can correct for what we chose to show.
 
 ## Deep dive 1: two-tower candidates and embedding refresh lag
 
-**What it is.** A **two-tower model** has two small neural networks. One encodes the viewer into a vector. The other encodes a video into a vector. The score is the dot product of the two (lesson E1.5 built this). A vector is a list of numbers, here a few hundred. A dot product is a quick similarity score: vectors that point the same way score high.
+**What it is.** A two-tower model has one network that encodes the viewer into a vector and one that encodes a video; the score is their dot product. Lesson [E1.5](/learn/ai/e1-classic-ml/retrieval-ranking/) built this. Video vectors are computed ahead and stored in an ANN index ([ANN indexes](/learn/ai/a5-rag/ann-indexes/), [vector databases](/learn/backend/10-advanced/vector-databases/)).
 
-**Picture.** A library where every book and every reader has a position on a big map. To pick books for a reader, find the books closest to the reader on the map. You do not need to look at all books. You need a way to find the nearby ones fast.
+**Picture.** A map where every reader and every book has a position. Find the books nearest the reader without checking them all.
 
-**Why it exists.** The viewer vector comes from one quick network call at request time or from a table. The video vectors are computed ahead of time and stored in an ANN index (the RAG lesson on [ANN indexes](/learn/ai/a5-rag/ann-indexes/), and the backend lesson on [vector databases](/learn/backend/10-advanced/vector-databases/)). The YouTube paper says that at serving time, "the scoring problem reduces to a nearest neighbor search in the dot product space", and that "A/B results were not particularly sensitive to the choice of nearest neighbor search algorithm." Our reading: do not over-invest in the ANN algorithm. Spend effort on what goes into the vectors.
+**Why the effort goes into the vectors.** At serving time, the YouTube paper says, "the scoring problem reduces to a nearest neighbor search in the dot product space", and "A/B results were not particularly sensitive to the choice of nearest neighbor search algorithm." Our reading: do not over-invest in the ANN algorithm. Invest in what goes into the vectors.
 
-**Example: what goes into the viewer vector.** In the YouTube paper, the viewer's recent watches and searches are embedded and averaged, with age and other features. Two choices there are worth copying. First, the **example age**: the paper reports that using the age of the training example as an input "removes an inherent bias towards the past" and "increased the watch time dramatically on recently uploaded videos in A/B testing." A model trained on old logs learns that old videos win, so you tell it how old each training example was, and set age to zero at serving. Second, training examples come from all watches, "even those embedded on other sites", and not just watches of our own recommendations. The paper's reason: "Otherwise, it would be very difficult for new content to surface and the recommender would be overly biased towards exploitation."
+**Example: what goes into the viewer vector.** Two choices from the paper are worth copying. First, **example age** as an input: it "removes an inherent bias towards the past" and "increased the watch time dramatically on recently uploaded videos." Old logs teach that old videos win, so tell the model each example's age and set it to zero at serving. Second, train on all watches, "even those embedded on other sites", not only watches of your own recommendations. Otherwise "it would be very difficult for new content to surface and the recommender would be overly biased towards exploitation."
 
-**The refresh lag.** The viewer vector can be fresh (computed per request) or batch (computed daily). Pinterest's PinnerFormer chose batch on purpose. It builds a viewer embedding from a sequence of the viewer's recent actions, and trains it to predict long-term engagement, not just the next action. The abstract says it is designed for batch infrastructure, that its loss "narrows the gap between daily batch user embeddings and real-time ones" (our paraphrase of the abstract), and that A/B experiments showed improved retention and engagement, with the model in production since Fall 2021 ([PinnerFormer, abstract](https://arxiv.org/abs/2205.04507)). The abstract gives no retention figures, so we give none. Our reading: a daily embedding is a deliberate trade. You give up minute-level freshness for a simple batch pipeline and a model trained for the long run.
+**The refresh lag.** The viewer vector can be fresh (per request) or batch (daily). Pinterest's PinnerFormer chose batch on purpose: it builds the viewer embedding from a sequence of recent actions and trains it to predict long-term engagement. Its abstract says the design significantly closes the gap between daily batch embeddings and realtime ones, that A/B tests showed improved retention and engagement, and that it has been in production since Fall 2021 ([abstract](https://arxiv.org/abs/2205.04507)). The abstract gives no retention figures, so we give none. Our reading: a daily vector trades minute-level freshness for a simple pipeline and a long-run target.
 
-Now the cost of that choice. A viewer who watches ten cooking videos at 9 pm still has the 8 am vector at 9:05. The feed does not notice the new interest until the next refresh. Three ways to cover the gap, in order of cost:
+The cost: a viewer who watches ten cooking videos at 9 pm still has the 8 am vector at 9:05. Three covers, in order of cost.
 
 | Approach | Gain | Pay |
 |---|---|---|
 | Accept the lag | Simplest pipeline | Slow reaction to a new interest |
-| Add recent-session features to the ranker | The ranker sees this session even if the vector is old | Ranker needs a fresh feature read (lesson E1.3) |
-| Add a second candidate source from the current session | Candidates follow the session | One more source to run and test |
+| Session features in the ranker | The ranker sees this session | A fresh feature read (lesson [E1.3](/learn/ai/e1-classic-ml/features-store/)) |
+| A second candidate source from the session | Candidates follow the session | One more source to run and test |
 
-The ranker fix is usually first, because it needs no new index. The candidate stage can be a day old while the ranker is minutes old.
+The ranker fix is usually first: the candidate stage can be a day old while the ranker is minutes old.
 
-**Failure from the batch.** If the refresh job fails, the index serves yesterday's vectors, and the day after, if nobody notices. The feed still returns videos, so no error shows. The fix is a freshness check: store the build time in the index, and alert when the age passes a limit (see the failure table).
+**Failure from the batch.** If the refresh job fails, the index serves yesterday's vectors, then the day before's. No error shows. Store the build time in the index and alert when its age passes a limit.
 
 ## Deep dive 2: ranking for several goals, exploration, and cold start
 
-**What it is.** The ranker predicts more than one outcome for each candidate. A typical set: the chance of a click, the expected watch time, the chance of a like, the chance of a "not interested" tap, and the chance the viewer answers a survey well. A final **combine step** turns these into one score: a weighted sum, with weights set by the product team.
+**What it is.** The ranker predicts several outcomes per candidate: chance of a click, expected watch time, chance of a like, chance of a "not interested" tap, chance of a good survey answer. A **combine step** turns them into one score by a weighted sum, with weights set by the product team.
 
-**Picture.** A judge at a food contest who scores taste, looks, and price. The final rank needs one total. The weights say what the contest cares about. Change the weights, and a different dish wins.
+**Why.** One label cannot hold the goal. YouTube trains with weighted logistic regression, positives weighted by watch time, and the paper says the ranking objective "is constantly being tuned based on live A/B testing results but is generally a simple function of expected watch time per impression" ([paper](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/45530.pdf)). Our reading: the weights are the lever the product team holds. They must be a logged, versioned config, not a number in code.
 
-**Why it exists.** One label cannot hold the goal. YouTube's ranker is trained with weighted logistic regression, where positive examples are weighted by watch time, so the learned odds act as expected watch time. The paper says the final ranking objective is "generally a simple function of expected watch time per impression" and is "constantly being tuned based on live A/B testing results" ([paper](https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/)). Our reading: tuning the weights is the lever the product team holds, and it must be a logged, versioned config, not a number in a code file.
+**Example.** Video A has a high click chance and low expected watch. Video B has a modest click chance and a long expected watch. Click-heavy weights pick A, watch-heavy weights pick B. The incident drill shows what happens when weights move too far.
 
-**Example.** Take two videos. A has a high click chance and low expected watch. B has a modest click chance and a long expected watch and a low "not interested" chance. With weights that favor clicks, A wins. With weights that favor watch time and penalize "not interested", B wins. Both are valid systems. Only one matches the bar. The incident drill below shows what happens when someone moves the weights a little too far.
+**Weight drift.** Each change looks small. After a year the sum may favor clicks again. Log the weight version on every impression, and test every weight change against the guards.
 
-**The weights drift problem.** Each weight change is a product decision, and each looks small. After a year of changes, the sum may favor clicks again. So log the weight version with every impression, and test any weight change with the guard metrics, not only the main one.
-
-**Exploration.** Here is the hard part of ranking. A new video has no history, so the ranker has no reason to show it. A viewer's tastes also change, and the ranker only learns about topics it shows. **Exploration** means spending a small share of slots on videos the system is unsure about, so it can learn. Picture a restaurant that always cooks the same best seller and never tests a new dish. It cannot find a better one by mistake.
-
-Exploration has a price. A slot used to learn is a slot not used on the best known video. So the real design question is how large the share should be. Use the simulator. It shows a made-up world with a few known videos and a few better but unknown ones.
+**Exploration.** A new video has no history, so the ranker has no reason to show it. Tastes also change, and the ranker only learns about topics it shows. **Exploration** spends a small share of slots on videos the system is unsure about. Like a restaurant that always cooks the same best seller, it cannot find a better dish by accident. A learning slot is a slot not spent on the best known video, so the question is how big the share should be.
 
 <AiE1VideoExplore client:visible />
 
-What to notice. With no exploration, the long-term curve is stuck: the system never finds the better videos. With a small share, the long-term curve rises a lot and the short-term curve hardly moves. At a large share, both fall. The best point is a few percent in this model. It is an **illustrative** world, so do not copy the number. The lesson is the shape: a small cost now, a large gain later, a peak in between. Real systems also explore smarter than a coin flip, for example by giving extra exposure to videos whose predicted value is most uncertain. That is a more careful way to spend the same budget.
+Notice: with no exploration the long-term curve is stuck. With a small share it rises a lot and the short-term curve barely moves. At a large share both fall. The peak is a few percent here, in an **illustrative** world, so do not copy the number. The lesson is the shape: a small cost now, a large gain later, a peak between. Real systems also explore smarter than a coin flip, giving extra exposure where the predicted value is most uncertain.
 
-**Cold start.** Two kinds. A **new video** has no watches. Use its content (title, topic, creator history, a video embedding) to get a first estimate, and use the explore slot to collect real data. A **new viewer** has no history. Show broadly popular and region-relevant videos, with the explore share higher, and ask a few interest questions at signup. As watches arrive, switch to the personal vectors. The YouTube paper's example-age feature helps here too, because it lets fresh videos compete.
+**Cold start.** A **new video** has no watches: use its content (title, topic, creator history, a video embedding) for a first estimate and the explore slot for real data. A **new viewer** has no history: show broadly popular, region-relevant videos with a higher explore share, ask a few interest questions at signup, and switch to personal vectors as watches arrive.
 
 ## Deep dive 3: feedback loops, biased logs, and long-term metrics
 
-**What it is.** A **feedback loop** is when the system's output changes its own future input. A recommender shows videos, viewers watch what is shown, and the log of those watches trains the next model. So the model learns from a world it built.
+**What it is.** A **feedback loop** is when a system's output changes its own future input. The recommender shows videos, viewers watch what is shown, and that log trains the next model. The model learns from a world it built. Picture a teacher who tests only the front row and concludes the front row is the best class.
 
-**Picture.** A teacher who tests only the students in the front row, then concludes the front row is the best class. The data came through the teacher's choice of whom to test.
+**Why it matters.** A video never shown has no clicks, and that does not mean nobody wants it. Position makes it worse. Google's rules: "The position of content dramatically affects how likely the user is to interact with it", so "Avoid feedback loops with positional features" ([Rule 36](https://developers.google.com/machine-learning/guides/rules-of-ml)). The search drill shows the effect in a picture.
 
-**Why it exists.** The log records only videos we showed. A video never shown has no clicks, and that does not mean nobody wants it. Position makes it worse. A video at the top gets more looks, so more clicks, whatever its quality. Google's rules say it directly: "The position of content dramatically affects how likely the user is to interact with it", and the advice is to "Avoid feedback loops with positional features" ([Rules of ML, Rule 36](https://developers.google.com/machine-learning/guides/rules-of-ml)). The search drill below shows the position effect in a picture and a fix.
+**What to log.** Four fields on every impression: position and page; model scores and weight version; the **propensity** (the chance the system had of showing this video in this slot, known exactly for a randomly drawn explore slot); and the viewer's group (test arm or holdout). With propensity you can weight each example by the inverse of its chance, so unlikely picks count more. Without it you can only guess.
 
-**What to log so you can correct later.** Four fields for every impression:
+**A randomized slice.** Keep a tiny share of impressions chosen at random, or at random within a band of ranker scores. It is poor for those viewers, so keep it small. It gives unbiased data for measuring position effects and evaluating new models. Our reading: this is the explore slot used twice, once to learn and once to measure honestly.
 
-1. The position and the page.
-2. The scores of the models and the weight version.
-3. The **propensity**: the chance the system had of showing this video in this slot. For the explore slot, this is known exactly, since you drew it at random.
-4. The viewer's group (test arm, holdout).
+**Long-term metrics and the holdout.** A two-week A/B measures two weeks. The harm from a clickbait feed shows later, in who comes back. A **long-term holdout** is a small, fixed random group (a share such as 1% is a design choice, not a standard) kept on an older version, with a rule on how old it may get. Every new version is compared with it on 28-day retention and the survey.
 
-With propensity you can weight each logged example by the inverse of its chance, so videos that were unlikely to be shown count more. Without it, you can only guess.
-
-**A randomized slice.** Keep a very small share of impressions where videos are chosen at random, or at random within a band of the ranker's scores. That slice is poor for the viewers in it, so keep it tiny. It gives you unbiased data to measure position effects and to evaluate new models. Our reading: this is the same explore slot, used twice, once for learning and once for honest measurement.
-
-**Long-term metrics and the holdout.** A two-week A/B test measures two weeks. The harm from a clickbait feed shows up later, in who comes back. So we keep a **long-term holdout**: a small, fixed random group of viewers (a share such as 1% is a design choice, not a standard) who stay on an older system version for a long time, with a rule about how old it may get. Every new version is compared with this group on 28-day retention and the satisfaction survey.
-
-Why not make the holdout bigger? Because those viewers get an older product, which costs them and the business. Why not smaller? Because a small group has wide error bars, and 28-day retention moves slowly. Choose the size from the size of the effect you need to see (lesson E1.8). Two rules keep the holdout honest: assign viewers once, by a stable hash of the viewer id, and never let a team ship a feature to everyone except the holdout without a recorded exception, because that stops the comparison from meaning anything.
-
-**What it looks like when it works.** A new weight set raises watch time by a few percent in the two-week test. The holdout shows that after eight weeks the new group has fewer returning viewers. You roll back, and the loss was caught in weeks, not quarters. This is **illustrative**: no public source gives such a case. The point is the process.
+Size it from the effect you need to see (lesson [E1.8](/learn/ai/e1-classic-ml/ab-testing-models/)): bigger costs those viewers an older product, smaller gives wide error bars. Two rules keep it honest: assign viewers once by a stable hash of the viewer id, and never ship to everyone except the holdout without a recorded exception.
 
 ## Failure modes and an incident drill
 
 | Failure | What happens | Detect | Do |
 |---|---|---|---|
-| Popularity collapse | The feed shows the same head videos to everyone; creator reach and diversity fall | Share of impressions on the top 1% of videos; creator reach | Raise exploration; add a diversity term to re-rank; check that the candidate sources still include non-popular ones |
-| Failed embedding batch | Stale vectors, no error | Index build age; recall of new videos | Block the swap on a failed job; alert on age; fall back to the last good index |
-| Feature outage | Ranker gets default values | Feature coverage per feature (lesson E1.7) | Fail to a simple ranker, not to random order |
-| Weight drift | Objective moves toward clicks | Weight version on each impression; guard metrics | Weight changes pass a guard-metric A/B; revert to the last approved version |
-| Cold-start starvation | New videos get no views | Time to first 1,000 views for new videos | Raise the explore share for new videos |
-| Feedback loop narrowing | The feed gets narrower with each retrain | Topic entropy per viewer over time | Randomized slice; diversity guard; retrain with propensity weights |
-| Candidate stage misses | Good videos never reach the ranker | Recall at k on held-out watches | Add candidate sources; raise k; check the index |
+| Popularity collapse | Same head videos for everyone | Impression share of top 1% of videos; creator reach | Raise exploration; diversity term in re-rank |
+| Failed embedding batch | Stale vectors, no error | Index build age; recall on new videos | Block the swap; alert on age; keep last good index |
+| Feature outage | Ranker gets defaults | Coverage per feature (lesson [E1.7](/learn/ai/e1-classic-ml/drift-monitoring/)) | Fail to a simple ranker, not random order |
+| Weight drift | Objective moves to clicks | Weight version per impression; guards | Guard-metric A/B for weights; revert |
+| Cold-start starvation | New videos get no views | Time to first 1,000 views | Raise explore share for new videos |
+| Feedback narrowing | Feed narrows each retrain | Topic entropy per viewer | Random slice; propensity weights |
+| Candidate misses | Good videos never reach the ranker | Recall at k on held-out watches | More sources; raise k |
 
-**Incident drill: CTR is up and 28-day retention is down.** Illustrative numbers. Work through it.
+**Incident drill: CTR is up and 28-day retention is down.** Illustrative numbers.
 
 <Diagnose
   client:visible
@@ -241,7 +197,7 @@ Why not make the holdout bigger? Because those viewers get an older product, whi
         'The retention holdout was assigned unevenly between old and new viewers',
       ],
       answer: 0,
-      explain: 'Clicks and a lower watch share per clicked video point at deceptive or low-value videos. The config change in week 2 matches. Diversity and creator reach are unchanged, so narrowing is unlikely. A stale index would show as a recall problem, not as higher clicks. An uneven holdout would not line up with a config change.',
+      explain: 'Clicks up with a lower watch share per clicked video points at deceptive or low-value videos, and the week-2 config change matches. Diversity is unchanged, so narrowing is unlikely. A stale index would show as a recall problem, not more clicks. An uneven holdout would not line up with a config change.',
     },
     {
       prompt: 'What do you do first?',
@@ -252,111 +208,70 @@ Why not make the holdout bigger? Because those viewers get an older product, whi
         'Raise the exploration share so the feed shows more new videos',
       ],
       answer: 2,
-      explain: 'The fault is the weight, so revert it, and re-test any new weight against the guard metrics. Daily retraining would learn the clicks faster. More click-like signals add to the same proxy. Exploration helps new videos but does not remove deceptive ones from the top.',
+      explain: 'The fault is the weight, so revert it and re-test any new weight against the guards. Daily retraining learns the clicks faster. More click-like signals feed the same proxy. Exploration does not remove deceptive videos from the top.',
     },
     {
       prompt: 'Which check would have blocked the weight change before launch?',
       options: [
-        'An offline NDCG check on last month of click logs',
+        'An offline NDCG check on the last month of click logs',
         'A guard-metric rule: no launch if the survey or watch share falls',
         'A latency check on the combine step at peak load',
         'A review of the weight change by the ranker model owner',
       ],
       answer: 1,
-      explain: 'The survey score and watch share both fell in the first weeks, so a rule that blocks on any guard would have stopped it. An offline NDCG on click logs would have shown a gain, because the logs reward clicks. Latency was never the problem. A single reviewer is a person, not a rule, and the Rules of ML advise against launching unless the metrics do not get worse.',
+      explain: 'The survey and watch share fell in the first weeks, so a block-on-any-guard rule stops it. Offline NDCG on click logs would show a gain, because the logs reward clicks. Latency was never the problem. A single reviewer is a person, not a rule.',
     },
   ]}
 />
 
-The loss was in the **proxy**, not in the model. Each step was reasonable: clicks fell, a weight was raised, clicks recovered. Only a metric that measures the real goal could say no.
+The loss was in the **proxy**, not the model. Each step was reasonable: clicks fell, a weight rose, clicks recovered. Only a metric for the real goal could say no.
 
 ## Drill: Search ranking
 
-**The task.** A user types a query into the search box of the same video app. Return ten good results in under 200 ms. Take 15 minutes.
+**The task.** A user types a query into the app's search box. Return ten good results in under 200 ms. Take 15 minutes.
 
-**Bar.** Illustrative: NDCG at 10 offline, and online, more users find something to watch from the first page. The guard metrics are the share of queries with no click and the share of reformulated queries.
+**Bar.** Illustrative: NDCG at 10 offline; online, more users find something to watch from the first page. Guards: share of queries with no click, and share of reformulated queries.
 
-**Design.** Search has the same funnel as the feed, with a query in place of a viewer.
+**Design.** The same funnel as the feed, with a query in place of a viewer.
 
-1. **Query understanding.** Fix spelling, find the language, and recognize intent: is this a video, a creator, a topic? Fast and mostly small models and rules.
-2. **Retrieval.** Pull a few hundred to a few thousand videos. Two sources are normal: a keyword index (for exact words) and a vector index (for meaning). The RAG lesson on [hybrid search](/learn/ai/a5-rag/hybrid-rrf/) covers merging the two.
-3. **Learning to rank.** A model scores each candidate for this query and viewer. It uses features like text match, video quality, freshness, and past behavior. This is a ranking task, so the loss compares pairs or lists, not single items.
-4. **Re-rank.** Policy, diversity, and business rules, as in the feed.
+1. **Query understanding.** Fix spelling, detect language and intent (video, creator, or topic). Small models and rules.
+2. **Retrieval.** A keyword index for exact words and a vector index for meaning, merged as in [hybrid search](/learn/ai/a5-rag/hybrid-rrf/).
+3. **Learning to rank.** A model scores each candidate for this query and viewer, using text match, video quality, freshness, and past behavior. The loss compares pairs or lists.
+4. **Re-rank.** Policy, diversity, business rules.
 
-Illustrative latency split for 200 ms: query understanding 15 ms, retrieval 50 ms, learning to rank 60 ms, re-rank 15 ms, network and logging 60 ms. The conclusion is the same as the feed: the heavy model gets the largest slice and the rest must be cheap.
+The latency split is **illustrative** (query understanding 15 ms, retrieval 50, learning to rank 60, re-rank 15, network and logging 60). As in the feed, the heavy model gets the largest slice and the rest must be cheap.
 
-**Position bias in click logs.** This is the new idea. Training data for the ranker is clicks, and clicks depend on where a result was shown. Joachims and colleagues state the problem: where a result appears strongly affects how many clicks it gets, whatever its relevance, so a ranker trained on raw clicks learns that bias. They propose a propensity-weighted method to fix it ([Unbiased Learning-to-Rank with Biased Feedback](https://arxiv.org/abs/1608.04468)). Try it:
+**Position bias in click logs** is the new idea. Training data is clicks, and clicks depend on where a result sat. Joachims and colleagues propose a propensity-weighted method to learn despite this ([Unbiased Learning-to-Rank with Biased Feedback](https://arxiv.org/abs/1608.04468)). Try it.
 
 <AiE1PositionBias client:visible />
 
-Set the bias to 1 and score by raw click rate. The new ranking barely improves on the old one, because the old order made good results look bad. Switch to the divided score and it recovers the true order. Set the bias to 0 and the problem goes away, which is why a randomized slice is useful.
+Set the bias to 1 and score by raw click rate: the new ranking barely improves, because the old order made good results look bad. Switch to the divided score and the true order returns. Set the bias to 0 and the problem goes away, which is why a randomized slice helps.
 
-How real teams cope. Airbnb's search team adds position as a feature during training, because "adding position as a control variable effectively eliminates the position bias prediction from listing rankings." They found a straightforward version cost about 1.3% NDCG, since the model leaned on the position feature, which is set to 0 at scoring. So they apply dropout to the feature: during training, they randomly set position to 0 ([Haldar and others, Improving Deep Learning for Airbnb Search](https://arxiv.org/pdf/2002.05515), Section 4.3). Google's rules point the same way: position features during training, and a neutral default at serving (Rule 36, above).
+How real teams cope. Airbnb adds position as a training feature. A straightforward version cost about 1.3% NDCG, since the model leaned on the feature, which is set to 0 at scoring. So they apply dropout to it: during training, they randomly set position to 0 ([Haldar and others, Improving Deep Learning for Airbnb Search](https://arxiv.org/pdf/2002.05515)). Google's Rule 36 points the same way.
 
-**Evaluation: NDCG offline, interleaving online.** NDCG, defined above, scores a ranking against relevance labels. The labels come from human raters, or from clicks (biased, as shown). In an A/B test, each viewer sees only one ranker. **Interleaving** instead mixes the results of two rankers into one list for the same viewer and credits each ranker with the clicks on its own results. Picture two chefs who each put dishes on the same tasting plate, and you count which chef's dishes get eaten. The Yahoo, Cornell, and Microsoft study of interleaving on two major search engines found that interleaving was usually much more sensitive than the other online measures it tested ([Chapelle and others, 2012](https://www.cs.cornell.edu/people/tj/publications/chapelle_etal_12a.pdf), which also estimates its statistical efficiency). Our reading: that makes it a fast filter for many ranker ideas. The final launch decision still needs an A/B test with guard metrics, since interleaving measures a preference for a list, not long-term retention (lesson E1.8).
+**Evaluation: NDCG offline, interleaving online.** Relevance labels come from raters or from clicks (biased, as shown). In an A/B test each viewer sees one ranker. **Interleaving** mixes two rankers' results into one list for the same viewer and credits each ranker with clicks on its own results, like two chefs sharing one tasting plate. A study on two major search engines found interleaving was in nearly all comparisons "much more sensitive" than the other online measures it tested ([Chapelle and others, 2012](https://www.cs.cornell.edu/people/tj/publications/chapelle_etal_12a.pdf)). Our reading: it is a fast filter for many ranker ideas. The launch call still needs an A/B with guards, since interleaving measures list preference, not retention (lesson [E1.8](/learn/ai/e1-classic-ml/ab-testing-models/)).
 
-**The failure.** A new ranker trained on raw click logs gets a better offline NDCG and shows no win in a live test.
-
-<Diagnose
-  client:visible
-  id="e1-video-search-offline-win-no-lift"
-  title="Offline win, no live lift"
-  scenario="A new search ranker is trained on last quarter's click logs. Offline NDCG improves by 3%. In an interleaved online test it shows no preference. (Illustrative numbers.)"
-  facts={[
-    'training labels: clicks from the production ranker, raw',
-    'offline test labels: clicks from a held-out week, same logging',
-    'share of clicks on positions 1 to 3: 71%',
-    'position used as a model feature: no',
-    'randomized slice in the logs: none',
-    'interleaving: 50.4% of credited clicks to the new ranker, not significant',
-  ]}
-  steps={[
-    {
-      prompt: 'What is the most likely reason the offline gain does not show online?',
-      options: [
-        'Interleaving is too coarse to see a real 3% gain',
-        'The model learned to repeat the old ranking, which the offline labels also reward',
-        'The new ranker is too slow, so the online test drops results',
-        'The held-out week had a different mix of queries than the training data',
-      ],
-      answer: 1,
-      explain: 'Both the training labels and the offline test labels come from the old ranker, whose top results get most clicks. A model that copies the old order scores well offline. A different query mix could matter, but the facts point at the labels. Latency was not reported as a problem. Interleaving is usually more sensitive than the other online measures, not less.',
-    },
-    {
-      prompt: 'What do you change first?',
-      options: [
-        'Train for more epochs until offline NDCG reaches the old ranker plus 5%',
-        'Switch the offline metric from NDCG to accuracy',
-        'Log propensity, add a randomized slice, and train with position handled',
-        'Collect twice as many click logs from the production ranker',
-      ],
-      answer: 2,
-      explain: 'The labels carry the bias, so fix the labels: log where results were shown, add a small random slice for clean data, and handle position in training. More epochs fits the bias harder. A different metric does not remove biased labels. Twice the data is twice the same bias.',
-    },
-  ]}
-/>
+A new ranker trained on raw click logs can show a better offline NDCG and no live win. The cause is that both the training labels and the test labels come from the old ranker. The cure is to log propensity, add a randomized slice, and handle position in training.
 
 ## Drill: People You May Know
 
-**The task.** Suggest other members a person might want to connect with. Take 15 minutes.
+**The task.** Suggest other members a person might connect with. Take 15 minutes.
 
-**Bar.** Illustrative: accept rate, which is the share of shown suggestions that become connections, with guard rails on hides (a viewer tells you "do not show this person") and on reports. Recall at k for candidates, and AUC with calibration for the ranker.
+**Bar.** Illustrative: accept rate (share of shown suggestions that become connections), with guards on hides ("do not show this person") and reports. Recall at k for candidates, AUC with calibration for the ranker.
 
-**Design.** The pipeline has the same shape as the feed. LinkedIn describes its own People You May Know system as a multi-stage funnel. The first stage ("L0") picks "a few thousand candidates" from billions, judged by recall at k. A light ranker (L1) cuts that to "a select few hundred". A rich ranker (L2) of deep networks predicts the chance of events such as invitations sent and accepted. A re-ranker last applies fairness, diversity, and rules, including one that avoids over-showing very active members ([LinkedIn Engineering, February 2024](https://www.linkedin.com/blog/engineering/recommendations/building-a-large-scale-recommendation-system-people-you-may-know)). The post says candidate sources include graph walks such as n-hop neighbors, embedding retrieval, and simple rules such as new members in your area. It does not give latency figures, so we give none.
+**Design.** LinkedIn describes its own system as a multi-stage funnel. The first stage ("L0") picks "a few thousand candidates" from billions, judged by recall at k. A light ranker (L1) cuts that to "a select few hundred". A rich ranker (L2) predicts events such as invitations sent and accepted. A final re-ranker applies fairness and diversity, and avoids "overrepresenting platform power users" ([LinkedIn Engineering](https://www.linkedin.com/blog/engineering/recommendations/building-a-large-scale-recommendation-system-people-you-may-know)). Its candidate sources include graph walks, embedding retrieval, and simple rules such as new members in your area. The post gives no latency figures, so we give none.
 
-**Graph candidates, and why hops explode.** A **hop** is one step along a connection. People at one hop are your connections. At two hops, friends of friends. The count grows by about the average number of connections at each step. Try it:
+**Why hops explode.** A **hop** is one step along a connection: one hop is your connections, two hops are friends of friends. The count multiplies by about the average connection count at each step.
 
 <AiE1PymkHops client:visible />
 
-Set 200 connections and watch the two-hop count pass the ranker's budget, and the three-hop count land in the millions. So the common answer is two hops, with a rule such as "at least two mutual connections", or a sample, or a cheap first score. Our reading: the mutual-connection count is both a filter and a strong feature, since people with more mutual connections are more likely to know you.
+Set 200 connections: the two-hop count passes the ranker's budget and three hops reach the millions. So the usual answer is two hops with a rule such as "at least two mutual connections", a sample, or a cheap first score. Our reading: the mutual count is both a filter and a strong feature.
 
-**Cold start.** A new member has no connections, so the graph gives nothing. Use other signals: the email or phone contacts they chose to upload, the same employer or school, and the same region. The LinkedIn post lists a simple source of this kind: new members in your area.
+**Cold start.** A new member has no graph. Use contacts they chose to upload, the same employer or school, and region.
 
-**Privacy and fairness limits.** A suggestion reveals something. Showing a person to someone says the system thinks they are linked. Our reading, not from the LinkedIn post (which does not discuss privacy): treat these as hard rules, not as model features. Never use a signal the member did not agree to for this use. Honor blocks and "do not suggest" lists at every stage. The LinkedIn post notes fairness re-rankers for protected attributes such as gender and age, so fairness is a stage with its own metrics.
+**Privacy and fairness.** A suggestion reveals something: it says the system thinks two people are linked. Our reading, not from the LinkedIn post: treat these as hard rules, not model features. Never use a signal the member did not agree to for this use. Honor blocks and "do not suggest" lists at every stage. Fairness gets its own stage and metrics.
 
-**Feedback.** Three signals: accept (positive), ignore (weak, since it may only mean "not now"), and hide (strong negative). The post does not describe how these are used, so this is our design. Treat a hide as a lasting rule for that pair, not only as a training example that a model may forget.
-
-**The failure.** A user is shown their ex-partner as a suggestion. The graph said they share many mutual friends, the ranker said accept probability was high, and nothing in the system had a reason to say no.
+**Feedback.** Accept is positive, ignore is weak (it may mean "not now"), hide is a strong negative. The post does not say how these are used, so this is our design: a hide is a lasting rule for that pair, not only a training example a model may forget.
 
 <Diagnose
   client:visible
@@ -381,7 +296,7 @@ Set 200 connections and watch the two-hop count pass the ranker's budget, and th
         'A longer lookback for the mutual-connection count',
       ],
       answer: 2,
-      explain: 'The system treated a hide as a soft label that a weekly retrain may or may not learn. A pair hidden by the user must be removed by a rule at candidate time and again at re-rank, at once. A bigger model or more features would only raise the score. A lower threshold would show more people, not fewer. More mutual connections make this case look stronger.',
+      explain: 'The system treated a hide as a soft label a weekly retrain may or may not learn. A hidden pair must be removed by a rule at candidate time and again at re-rank, at once. A bigger model only raises the score, a lower threshold shows more people, and more mutual connections make this case look stronger.',
     },
     {
       prompt: 'How would you check that the control works?',
@@ -392,7 +307,7 @@ Set 200 connections and watch the two-hop count pass the ranker's budget, and th
         'Wait for the weekly retrain and compare the NDCG',
       ],
       answer: 1,
-      explain: 'A rule can be tested exactly: replay hides and check that suppressed pairs never return. A change in accept rate is too diffuse to show one pair is gone. Asking the owner confirms intent, not behavior. NDCG is an average and says nothing about one pair.',
+      explain: 'A rule can be tested exactly: replay hides and check suppressed pairs never return. Accept rate is too diffuse to show one pair is gone. The owner confirms intent, not behavior. NDCG is an average and says nothing about one pair.',
     },
   ]}
 />
@@ -401,44 +316,41 @@ Set 200 connections and watch the two-hop count pass the ranker's budget, and th
 
 | Topic | Senior answer | Staff answer |
 |---|---|---|
-| Target | "Train a ranker on clicks and watch time." | Names the proxy gap: clicks reward clickbait, watch time rewards long videos. Sets a guard on the survey and on 28-day retention |
-| Funnel | "Two stages: candidates, then a ranker." | Two stages plus re-rank, with a recall bar for stage one, a latency slice per stage, and a rule on how many candidates pass |
-| Exploration | "Add some randomness." | Sets an exploration budget as a number, gives it its own slots, logs its propensity, and reuses it as a clean slice |
-| Log bias | "Retrain daily." | Says the log is made by the old model. Logs position and propensity, handles position in training, keeps a random slice |
-| Long-term | "Run a two-week A/B test." | Keeps a long-term holdout with a size and an age rule; blocks a launch on any guard metric |
-| Rollback | "Redeploy the last model." | Versions the weights and the index. Rollback is one config change, with a gate that triggers it |
-| Freshness | "Embeddings refresh daily." | Stores build time in the index, alerts on age, and lets the ranker read session features so a day-old candidate stage is enough |
+| Target | "Train a ranker on clicks and watch time." | Names the proxy gap: clicks reward clickbait, watch time rewards long videos. Guards on the survey and 28-day retention |
+| Funnel | "Candidates, then a ranker." | Plus re-rank, a recall bar for stage one, a latency slice per stage, a cap on candidates passed |
+| Exploration | "Add some randomness." | A numeric budget with its own slots, logged propensity, reused as a clean slice |
+| Log bias | "Retrain daily." | The log is made by the old model: log position and propensity, handle position in training, keep a random slice |
+| Long-term | "Run a two-week A/B test." | A long-term holdout with a size and an age rule; any guard blocks a launch |
+| Rollback | "Redeploy the last model." | Versioned weights and index; rollback is one config change with a gate that triggers it |
+| Freshness | "Embeddings refresh daily." | Build time in the index, alert on age, session features in the ranker |
 
 ## What experienced teams know
 
-1. **Clicks are not the target.** YouTube says click-through ranking "often promotes deceptive videos" and uses expected watch time ([YouTube paper](https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/)). Our reading: pick the target from what you want in a month, then add guards for what the target misses.
-2. **Offline is a filter, not a verdict.** The same paper says "live A/B results are not always correlated with offline experiments", and that the choice of the surrogate problem has an "outsized importance on performance in A/B testing" that is hard to measure offline. Our reading: budget for online tests from the start.
-3. **Train on more than your own recommendations.** The paper uses all watches, including those from other sources, so new content can surface. Our reading: any source of labels you did not choose is protection against your own feedback loop.
-4. **Position is a feature you control.** Airbnb found that a naive position feature cost about 1.3% NDCG and fixed it with dropout; Google's Rule 36 says to use positional features in training and keep them out of serving ([Airbnb paper](https://arxiv.org/pdf/2002.05515), [Rules of ML](https://developers.google.com/machine-learning/guides/rules-of-ml)). Our reading: log position on day one. You cannot add it to old logs.
-5. **Batch embeddings can be a deliberate choice.** Pinterest's PinnerFormer is built for daily batch embeddings and trained to predict long-term engagement, and the abstract reports retention gains in A/B tests ([abstract](https://arxiv.org/abs/2205.04507), no figures given). Our reading: a daily vector plus fresh ranker features is a common split.
-6. **Re-ranking is where policy lives.** LinkedIn's People You May Know has a final re-rank stage for fairness, diversity, and avoiding over-exposure of very active members ([LinkedIn Engineering](https://www.linkedin.com/blog/engineering/recommendations/building-a-large-scale-recommendation-system-people-you-may-know)). Our reading: keep policy outside the learned models, where it can be tested and audited.
+1. **Clicks are not the target.** YouTube says click ranking "often promotes deceptive videos" and uses expected watch time ([paper](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/45530.pdf)). Our reading: pick the target from what you want in a month, then add guards for what it misses.
+2. **Offline is a filter, not a verdict.** The same paper says the surrogate problem has "outsized importance on performance in A/B testing" but is "very difficult to measure with offline experiments". Our reading: budget for online tests from the start.
+3. **Train on labels you did not choose.** The paper trains on all watches, including other sources, so new content can surface. Our reading: any such source protects against your own feedback loop.
+4. **Position is a feature you control.** Airbnb's naive position feature cost about 1.3% NDCG and dropout fixed it ([Airbnb paper](https://arxiv.org/pdf/2002.05515)); Rule 36 says to train with position and keep it out of serving. Our reading: log position on day one, since you cannot add it to old logs.
+5. **Batch embeddings can be deliberate.** PinnerFormer is built for daily batch embeddings and long-term engagement ([abstract](https://arxiv.org/abs/2205.04507)). Our reading: a daily vector plus fresh ranker features is a common split.
+6. **Re-ranking is where policy lives.** LinkedIn's final stage handles fairness, diversity, and power-user overexposure ([LinkedIn Engineering](https://www.linkedin.com/blog/engineering/recommendations/building-a-large-scale-recommendation-system-people-you-may-know)). Our reading: keep policy outside the learned models, where it can be tested and audited.
 
 ## Trade-offs
 
 | Choice | You gain | You pay | Choose it when |
 |---|---|---|---|
-| Rank by watch time | Resists clickbait | Rewards long and addictive videos | Always, with a survey and a retention guard |
-| Multi-goal ranker with a combine step | One model can serve product changes through weights | Weights drift; each change needs a guard test | You have several goals and a product team that tunes them |
-| Daily batch viewer vectors | Simple pipeline, cheap | Slow reaction to a new interest | Taste changes slowly; the ranker reads session features |
-| Real-time viewer vectors | Fast reaction | Streaming pipeline, more cost, more skew risk | Sessions are short and intent changes fast |
-| Higher exploration share | More learning, fairer to new creators | Weaker feed today | Cold-start is a big share of traffic |
-| Randomized slice | Clean data for measuring bias | Worse results for those viewers | You need unbiased evaluation and training |
-| Long-term holdout | Sees slow harm | Holdout viewers get an older product | A metric moves over weeks, not days |
-| Interleaving for ranking tests | Faster signal with fewer viewers | Measures list preference, not retention | Screening many ranker ideas |
+| Rank by watch time | Resists clickbait | Rewards long, addictive videos | Always, with survey and retention guards |
+| Daily batch viewer vectors | Simple, cheap | Slow reaction to new interest | Taste changes slowly; ranker reads session features |
+| Higher exploration share | More learning, fairer to creators | Weaker feed today | Cold start is a big share of traffic |
+| Long-term holdout | Sees slow harm | Holdout viewers get an older product | A metric moves over weeks |
+| Interleaving | Fast signal, fewer viewers | Measures list preference, not retention | Screening many ranker ideas |
 
 ## Interview lens
 
 <Callout type="tip">
-Say: "My bar is watch time with a survey guard and 28-day retention not down. I build a funnel: a two-tower candidate stage with a recall bar, a multi-goal ranker, and a re-rank for policy and diversity. Viewer vectors refresh daily and the ranker reads session features. I give new videos an explore budget and log position and propensity for every impression. I test offline by stage, online by A/B with guards, and keep a long-term holdout so slow harm shows. If CTR is up and retention is down, I suspect the objective weights first, and I roll back the config."
+Say: "My bar is watch time with a survey guard and 28-day retention not down. I build a funnel: a two-tower candidate stage with a recall bar, a multi-goal ranker, and a re-rank for policy and diversity. Viewer vectors refresh daily and the ranker reads session features. New videos get an explore budget, and I log position and propensity for every impression. I test offline by stage, online by A/B with guards, and keep a long-term holdout. If CTR is up and retention is down, I suspect the objective weights first and roll back the config."
 </Callout>
 
 <Callout type="mistake">
-Do not name clicks as the metric and stop. Do not say "retrain daily" as the answer to a stale or biased feed. Do not train and test on the same old-ranker click logs without saying what bias is in them. Do not skip the cold-start story for new videos. And do not offer a number for exploration or holdout size as a fact: say it is a design choice you would set from a measured effect size.
+Do not name clicks as the metric and stop. Do not say "retrain daily" as the answer to a stale or biased feed. Do not train and test on the same old-ranker click logs without naming their bias. Do not skip cold start for new videos. Do not present an exploration or holdout size as a fact: it is a design choice set from a measured effect size.
 </Callout>
 
 ## Check yourself
@@ -455,18 +367,7 @@ Do not name clicks as the metric and stop. Do not say "retrain daily" as the ans
         'Watch time can be computed before the video is shown to anyone',
       ],
       answer: 2,
-      explain: 'A deceptive thumbnail earns clicks and short watches, so the click metric rewards it. Watch time is not cheaper to log, and clicks are not rare. Watch time is known only after the viewer watches, so it cannot be computed ahead of time.',
-    },
-    {
-      q: 'A recommender trains only on watches that came from its own recommendations. What is the main risk?',
-      options: [
-        'The model grows too large to train on one machine at once',
-        'New videos struggle to surface; the system over-exploits',
-        'The training set gets too many different languages mixed in',
-        'The model forgets older videos too quickly to rank them',
-      ],
-      answer: 1,
-      explain: 'The log only contains what the system already chose to show, so new content gets little signal and the loop reinforces itself. Model size is a different problem. Language mix and forgetting are not what a self-made log causes.',
+      explain: 'A deceptive thumbnail earns clicks and short watches, so the click metric rewards it. Watch time is not cheaper to log, clicks are not rare, and watch time is known only after the viewer watches.',
     },
     {
       q: 'In click logs, why does a good result shown at position 8 look worse than a mediocre one at position 1?',
@@ -477,7 +378,7 @@ Do not name clicks as the metric and stop. Do not say "retrain daily" as the ans
         'Fewer users look at lower positions, so it gets fewer clicks',
       ],
       answer: 3,
-      explain: 'Position changes how many people look, so click rate mixes quality with exposure. Noise from small counts is real but is not the systematic effect. Search engines do not always put the best result first, which is why the old ranker is wrong in this case. Comparing results explains some behavior but is not the main cause.',
+      explain: 'Position changes how many people look, so click rate mixes quality with exposure. Noise is real but is not the systematic effect. Engines do not always put the best result first, which is why the old ranker is wrong here.',
     },
     {
       q: 'Raising the share of slots used for exploration from zero to a few percent usually does what, in the simulator?',
@@ -488,7 +389,7 @@ Do not name clicks as the metric and stop. Do not say "retrain daily" as the ans
         'Leaves both flat, because the ranker ignores the random slots',
       ],
       answer: 0,
-      explain: 'A small share finds the better unknown videos, which pays off later, and costs little now. The second option has the trend backwards. Both falling happens only at a large share. The ranker does not ignore the slots, since they change what the system learns.',
+      explain: 'A small share finds better unknown videos, which pays off later and costs little now. Both falling happens only at a large share. The ranker does not ignore the slots, since they change what the system learns.',
     },
     {
       q: 'Why do teams keep a long-term holdout when they already run two-week A/B tests?',
@@ -499,7 +400,7 @@ Do not name clicks as the metric and stop. Do not say "retrain daily" as the ans
         'It lets every team skip the guard metrics when they launch',
       ],
       answer: 2,
-      explain: 'Harm from a clickbait-leaning feed shows up in who returns weeks later, which a short test cannot see. The holdout does not speed up a test or replace the survey, and guards still apply to every launch.',
+      explain: 'Harm from a clickbait-leaning feed shows up in who returns weeks later, which a short test cannot see. The holdout does not speed up a test or replace the survey, and guards still apply.',
     },
     {
       q: 'In People You May Know, why is a hide stored only as a training example a weak control?',
@@ -510,15 +411,15 @@ Do not name clicks as the metric and stop. Do not say "retrain daily" as the ans
         'Training examples are deleted after one retrain is finished',
       ],
       answer: 1,
-      explain: 'A retrain may or may not push that pair down, and a weekly cycle leaves a long gap. A hard rule removes the pair at once. Hides are not too rare to matter, they can be stored, and training data is normally kept.',
+      explain: 'A retrain may or may not push that pair down, and a weekly cycle leaves a long gap. A hard rule removes the pair at once. Hides can be stored and training data is normally kept.',
     },
   ]}
 />
 
 ## Further reading
 
-- [Deep Neural Networks for YouTube Recommendations](https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/): the two-stage design, watch-time ranking, and example age. You do not need the full paper to follow this lesson.
+- [Deep Neural Networks for YouTube Recommendations](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/45530.pdf): the two-stage design, watch-time ranking, and example age.
 - [PinnerFormer (abstract)](https://arxiv.org/abs/2205.04507): daily batch user embeddings trained for long-term engagement.
 - [Rules of Machine Learning](https://developers.google.com/machine-learning/guides/rules-of-ml): launch decisions and positional features (Rules 36 and 39).
 - [LinkedIn, People You May Know](https://www.linkedin.com/blog/engineering/recommendations/building-a-large-scale-recommendation-system-people-you-may-know): the multi-stage funnel and re-rankers.
-- [Improving Deep Learning for Airbnb Search](https://arxiv.org/pdf/2002.05515): position as a feature with dropout. Section 4.3 covers the position bias.
+- [Improving Deep Learning for Airbnb Search](https://arxiv.org/pdf/2002.05515): position as a feature with dropout.

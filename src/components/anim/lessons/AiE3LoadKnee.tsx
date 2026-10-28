@@ -50,7 +50,7 @@ export default function AiE3LoadKnee() {
 
   return (
     <CacheWidgetFrame title="Load test: throughput against goodput" hint="illustrative model of one replica, not a benchmark">
-      <div className="grid gap-4 text-sm md:grid-cols-[1fr_1.4fr]">
+      <div className="grid gap-4 text-sm">
         <div className="space-y-3">
           <Slider id="e37-rate" label="Offered load (requests per second)" value={rate} min={0.2} max={4.7} step={0.05} on={setRate} show={rate.toFixed(2)} />
           <Slider id="e37-tpot" label="TPOT target" value={tpot} min={25} max={120} step={5} on={setTpot} show={`${tpot} ms`} />

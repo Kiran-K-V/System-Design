@@ -1,0 +1,267 @@
+---
+summary: 'A daily retrain is too slow for items and users that change by the minute. Learn how an online trainer reads an event log, why only the touched embedding rows travel to serving every minute, why dense layers sync daily, and how to guard a fast loop against bad data.'
+requires: ['ai/e1-classic-ml/drift-monitoring', '06-async/pubsub-logs']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE1OnlineStream from '../../../../components/anim/lessons/AiE1OnlineStream.tsx';
+import AiE1OnlineBandwidth from '../../../../components/anim/lessons/AiE1OnlineBandwidth.tsx';
+
+## The problem
+
+A short video is posted at noon. By 12:20 it is going viral. Your recommender retrains once a night, so it learns nothing about this video until tomorrow. For the whole day, the model treats it as a stranger: it has no good representation of it, and users who would love it never see it. By tomorrow the moment has passed.
+
+The same thing happens on the user side. A user who has watched cooking videos for a year suddenly watches five cricket clips in a row. Tonight's retrain will notice. The next fifty requests will not.
+
+The lesson on [drift and model aging](/learn/ai/e1-classic-ml/drift-monitoring/) gave the cause. The data a model reads is not stationary, which means its patterns keep changing. For some products the change is fast. The Monolith paper, from ByteDance, says it directly: "the same user interested in one topic could shift their zeal every next minute" ([Liu and others, Monolith](https://arxiv.org/html/2209.07663v2)). A schedule that retrains once a day cannot follow that.
+
+So we ask a bigger question. Can the model learn from each batch of fresh events while it is serving? That is **online learning**: the model keeps training after it is deployed, on events that arrive as a stream. This lesson answers six questions.
+
+1. Which part of a model needs to change fast, and which part does not?
+2. How do fresh events reach the trainer?
+3. How do the changes reach the servers, and how big are they?
+4. How do we hold a table with millions of IDs that grows forever?
+5. What happens when a machine fails?
+6. What can go wrong when learning is fast?
+
+You should know three things first. The lesson on [embeddings](/learn/ai/a1-model-function/embeddings/) explained that an embedding is a list of numbers that stands for an item or a user. Lesson [pub/sub and logs](/learn/06-async/pubsub-logs/) explained the append-only log we use as the event stream. The lesson on [drift and model aging](/learn/ai/e1-classic-ml/drift-monitoring/) explained why models age.
+
+## Question 1: which part of the model changes fast?
+
+A recommendation model has two kinds of parameters. A **parameter** is a number the model learns.
+
+**Dense parameters** are the weights of the shared layers of a neural network. Every request uses all of them. They hold the general rules, such as "a video the user has watched to the end is a good sign". Picture the rules of a game. They are the same for every player and they change rarely.
+
+**Sparse parameters** are the **embedding rows**. The model has one row of numbers for each user ID and each item ID. Think of a hotel with a card for every guest: the card holds what the hotel knows about that one person. A request reads only the cards of the people involved. The table is sparse because each request touches a tiny part of it.
+
+Here is the key fact for this lesson. When new events arrive, only the rows for the IDs in those events change in a useful way. The video that went viral at noon has one row. The user who watched five cricket clips has one row. The millions of other rows have nothing new to learn in that minute. The Monolith paper builds on exactly this, listing three facts about its models:
+
+- Sparse parameters are most of the model's size.
+- In a short window, only a small share of IDs get trained.
+- Dense parameters "move much slower" than the embeddings.
+
+So the design splits the work. Update the touched rows often. Update the dense layers rarely.
+
+## Question 2: how do fresh events reach the trainer?
+
+Start with the stream. Each click, skip, and purchase is written to an append-only log, like the one in lesson [pub/sub and logs](/learn/06-async/pubsub-logs/). The trainer reads the log. Reading does not remove records, so the same stream can feed a live trainer and also a later replay.
+
+A raw event is not yet a training example. A training example needs the features the model saw when it made the choice, plus the label, which is what the user did next. The two arrive at different times, in no fixed order. A click arrives seconds after the page, and a purchase can arrive days later. So a **joiner** matches them. The Monolith paper describes a streaming job that joins features with user actions by a unique key per request. It keeps features that are still waiting for their label on disk, so that a late purchase can still find its features. The same paper notes that bad cases are far more common than good ones, so it samples the common class down. Sampling shifts the model's raw scores, and so the paper applies a log-odds correction when serving. Lesson [data and labels](/learn/ai/e1-classic-ml/data-labels/) explained the labeling side of this, and lesson [E1.11](/learn/ai/e1-classic-ml/ad-click-prediction/) returns to it for ad clicks.
+
+There is one more idea worth being precise about. Chip Huyen separates two things that people mix up ([real-time machine learning](https://huyenchip.com/2022/01/02/real-time-machine-learning-challenges-and-solutions.html)). **Stateless retraining** trains a new model from scratch each time. **Stateful training** continues training the current model on new data only. Huyen's point is that continual learning "isn't about the retraining frequency, but the manner in which the model is retrained." Once your system can continue training, "the training frequency is just a knob to twist". She reports one company claim: Grubhub cut its training cost 45 times after it moved from stateless daily retraining to stateful daily retraining. We cannot check that figure, and it measures cost for their own models, so treat it as a reason to look, not as a promise.
+
+She also lists honest limits. Stateful training is, as of her writing, about new data only. If you add a feature or change the architecture, "you still have to train the new model from scratch." And many companies "don't have traffic for that retraining schedule to make sense" or have models that "don't decay that fast". She agrees with them. Online learning is a tool for products that age in hours, not a rule for every model.
+
+## Question 3: how do the changes reach the servers?
+
+The trainer holds the newest parameters. The servers answer user requests with their own copy. A change helps no one until it is copied across. This copy is **parameter synchronization**.
+
+The simple plan is to copy the whole model. For a recommender this is a bad plan. The Monolith paper says its production models are "usually several terabytes in size". Copying everything would load the network. It would also need double the memory on the server, to hold the old copy and the new copy at once. And the server cannot stop serving while it takes the copy.
+
+The paper's answer follows from Question 1. The trainer keeps a set of **touched keys**: the IDs whose rows changed since the last sync. Every minute it sends only those rows. This is a small, light payload. It does not cause a memory spike on the server. Once a day, in a quiet hour, it sends the dense layers. The dense copy lags behind the sparse one, and the paper reports that this mismatch is tolerable: it saw "no conspicuous loss".
+
+Step through the picture.
+
+<AiE1OnlineStream client:visible />
+
+How big is the minute-by-minute payload? The size depends on three things: the number of IDs touched, the length of each row, and the width of each number. The paper gives a worked illustration: 100,000 IDs touched in a minute, rows of 1,024 numbers, about 4 KB per row, comes to about 400 MB per minute. That is the paper's own example, not a measured production figure. It is a useful anchor for the design: it is a size you can send every minute, and a full multi-terabyte copy is not.
+
+Use the widget to feel how the size moves. It does the arithmetic. It counts only the raw numbers. It leaves out the keys, the optimizer state, and compression, so a real system will differ.
+
+<AiE1OnlineBandwidth client:visible />
+
+Three things show up when you play with it.
+
+- **The size follows the touched IDs, not the catalogue.** A catalogue ten times larger does not make the sync ten times larger. Only the rows that changed travel. This is why the design scales.
+- **Precision and row length are levers.** Half-size numbers halve the payload. Shorter rows shrink it in proportion.
+- **The copies multiply the load.** If the trainer sends to every serving copy itself, the total rate grows with the number of copies. A real design may let copies fan out from each other.
+
+What do you give up with a longer gap between syncs? Freshness. A sync every minute means a change shows up in the next request, at most a minute later. A sync every hour means up to an hour of lag. The payload per sync grows with the gap, but the total per day shrinks only if the same IDs are touched again and again, so that later changes overwrite earlier ones. For a feed where popular IDs repeat, longer gaps save traffic. For a feed full of one-off IDs, they save little.
+
+## Question 4: how do we hold a table that never stops growing?
+
+New users and new items appear every minute. The embedding table has to grow with them. A common shortcut is the **hash trick**: map every ID to one of a fixed number of slots with a hash function, and accept that two IDs sometimes land in the same slot. The paper's objection is that this assumes IDs are spread evenly and that collisions do no harm. "Unfortunately this is rarely true," it says. A famous creator and an unknown account can share a row, and the unknown one inherits the star's numbers.
+
+Monolith uses a table with no collisions. It is built on **cuckoo hashing**. In plain words, there are two tables and two hash functions. Each ID can live in one of two places. If both are full, the new ID kicks out an occupant, which moves to its other place, and the chain continues until everything fits. Lookups are fast because an ID is in one of exactly two places. The paper reports worst-case constant time for lookups and deletions.
+
+A table that never forgets would run out of memory. The paper gives two ways to keep it small:
+
+- **Frequency filtering.** An ID is admitted only after it has appeared enough times. The paper says IDs that appear a handful of times add little to quality, because their rows are underfit. The threshold is set per model.
+- **Expiry.** An ID that has been inactive for a set time is dropped. The paper says stale IDs, such as a user who left or a video that is out of date, "could not help model in any way but to drain our PS memory". The expiry time is set per table.
+
+The point is that a row has a life: admit, update, expire. Plan for that life, or memory fills with rows nobody reads.
+
+## Question 5: what happens when a machine fails?
+
+The trainer is a set of machines that hold the parameters, called **parameter servers**. One of them will fail. A common cure is a **snapshot**: save the full state to disk on a schedule, and restore from the last snapshot after a failure. Snapshots are not free. For a model of several terabytes they cost memory copies and disk traffic.
+
+Monolith snapshots once a day, not every minute. The paper explains why with a small calculation that we only state in words. A failed machine loses one day of updates to the rows it held. Only a tiny share of users have rows on that machine, and for them the loss is one day of feedback. The dense layers move slowly, so losing one day there is negligible. The paper reports that it "radically" lowered its snapshot frequency and saved compute without a visible loss. This is a result for one system with a very low failure rate per machine. It does not mean that you can skip snapshots. It means the snapshot interval is a trade-off you measure, and it can be much longer than the sync interval.
+
+## Question 6: what can go wrong when learning is fast?
+
+Speed helps and harms by the same road. In the picture above, the last step showed a bad batch entering the log. The trainer learns from it. The minute-level sync carries the damage to every serving copy before anyone looks. A nightly retrain has a built-in delay in which people can catch a problem. An online loop has no such delay unless you build it.
+
+Here are the failure modes, and a guard for each. These are our reading of how the pieces fit, not claims from one source.
+
+| Failure | How it happens | Guard |
+|---|---|---|
+| Bad or hostile data | A bot, a broken client, or an attack floods the log with fake events | Filter events before the joiner; cap how far one ID's row may move in one sync; limit how much one user's events count |
+| Feedback loop | The model shows what it learned; users click what is shown; the log says it was right | Keep an exploration slice with clean labels (lesson [E1.6](/learn/ai/e1-classic-ml/offline-online-metrics/) explained why); watch the variety of what is shown |
+| Silent regression | A bad update lowers quality slowly and no one sees it | Validate on fresh held-out events before a sync leaves the trainer; track a live metric; keep snapshots so you can roll back |
+| Stale dense layers | Sparse rows move ahead of the dense layers they depend on | Sync dense layers on a schedule, and retrain from scratch on a longer schedule |
+| Fixed test set | A test set from last month cannot judge a model that adapts | Evaluate on a rolling window of the newest events |
+
+On the last row, Huyen writes that "a stationary test set no longer suffices" for continually updated models. She names backtests, progressive evaluation, shadow deployment, A/B tests, canary analysis, and bandits as ways to evaluate them ([real-time machine learning](https://huyenchip.com/2022/01/02/real-time-machine-learning-challenges-and-solutions.html)). The lesson on [A/B testing models](/learn/ai/e1-classic-ml/ab-testing-models/) covers the test side. The same article warns that the hard part of continual learning is "to ensure that the updated model is working properly".
+
+Also keep a way back. A snapshot of the last known good state, and a switch that stops the sync, turn a bad hour into a short incident. Without them, the loop speeds up the damage.
+
+## The naive way: retrain faster
+
+The naive reaction is "retrain every hour". It fails for three reasons. A retrain from scratch reads all the history each time, so it costs the full price every hour. A new model then has to be copied to every server, and for a model of several terabytes the copy is slow and needs double the memory. And the retrain still sees events only up to the start of the run, so the newest events always wait.
+
+## The real fix: train on the stream, ship the touched rows
+
+The design has four parts, each from an earlier question.
+
+| Part | Job | Speed |
+|---|---|---|
+| Event log and joiner | Turn actions into labeled examples, waiting for late labels | Continuous |
+| Online trainer | Continue training the current model on each small batch | Continuous |
+| Sparse sync | Send the rows touched since the last sync to every serving copy | Every minute or so |
+| Dense sync and snapshot | Send the shared layers and save a full copy | Daily |
+
+Around the four parts sits the guard layer from Question 6. It is not an add-on. Without it, a fast loop is a risk.
+
+## What experienced teams know
+
+1. **Frequency is a knob, not the idea.** Continual learning means training that continues from the current model, so the update gap becomes a setting you can turn ([Huyen](https://huyenchip.com/2022/01/02/real-time-machine-learning-challenges-and-solutions.html)).
+2. **Ship what changed.** Monolith keeps a set of touched keys and pushes only those rows at minute level, because sparse rows dominate model size and only a small share changes in a short window ([Liu and others, Monolith](https://arxiv.org/html/2209.07663v2)).
+3. **Dense layers can wait.** The same paper syncs dense parameters daily and reports no conspicuous loss from the lag ([Monolith](https://arxiv.org/html/2209.07663v2)).
+4. **Hash collisions are not harmless.** A collisionless table with frequency filtering and expiry is the paper's answer to a growing ID space ([Monolith](https://arxiv.org/html/2209.07663v2)).
+5. **Not every model needs this.** Many companies lack the traffic, or their models do not decay fast enough, to justify minute-level updates ([Huyen](https://huyenchip.com/2022/01/02/real-time-machine-learning-challenges-and-solutions.html)). Measure your decay curve first, as in the lesson on drift.
+6. **Reliability can be traded for freshness.** The paper reports that a long snapshot interval cost almost no quality in its setting, so it spent less on snapshots and more on freshness ([Monolith](https://arxiv.org/html/2209.07663v2)). Check the same trade with your own failure rate.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Nightly retrain from scratch | Simple; easy to test and roll back | The model is a day behind | The model ages in weeks |
+| Stateful daily training | Lower training cost; same release path | Needs lineage tracking and a feature history you can replay | The model ages in days, and training cost matters |
+| Online training, minute-level sparse sync | Follows changes in minutes | A stream stack, a joiner, a guard layer, harder debugging | Items or users change by the minute |
+| Long sync gap | Less network traffic if IDs repeat | More lag | The same hot IDs are touched again and again |
+| Short sync gap | Freshest rows | More traffic; more risk per hour | Viral items and live events |
+| Hash trick table | Fixed memory; easy | Collisions mix unrelated IDs | A small, stable ID space |
+| Collisionless table with expiry | Clean rows for each ID | More code; tuning of filter and expiry | A large ID space that keeps growing |
+| Rare snapshots | Less compute | A failure loses more updates | Failures are rare and recent updates are cheap to lose |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "A model that ages in hours needs updates faster than a daily retrain. I split the parameters. Sparse embedding rows change when their IDs appear in events, so the trainer reads an event log through a joiner and ships only the touched rows to serving every minute. Dense layers move slowly, so they sync daily. I size the sync from touched IDs times row size, not from catalogue size. I guard the loop against bad data and feedback loops, with filters, caps on row change, a clean exploration slice, a validation step before sync, and a snapshot to roll back to." This shows you know what to ship, how often, and how to stay safe.
+</Callout>
+
+<Callout type="mistake">
+Do not say "we will retrain every five minutes" without saying how the update reaches the servers. Do not copy the whole model on each sync. Do not stream updates without a guard, because the loop that fixes stale rows also spreads bad data in a minute. Do not skip the question "does this model age fast enough to need it?"
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'e1-online-sparse-dense-split',
+      q: 'A recommender syncs updated parameters to its servers. Which split matches how the parameters change?',
+      options: [
+        'Dense layers every minute and embedding rows once a day',
+        'The whole model every minute, so all parts stay in step',
+        'Touched rows every minute, dense layers daily',
+        'Nothing, because servers should train their own copy',
+      ],
+      answer: 2,
+      explain: 'Only the rows of IDs seen in recent events change in a useful way, so they are sent often. Dense layers move slowly and are large per update, so a daily copy is enough. Sending everything each minute wastes bandwidth and needs double memory on the server.',
+    },
+    {
+      id: 'e1-online-sync-size-driver',
+      q: 'The catalogue grows from one million items to ten million, but traffic and the share of items touched per minute stay the same. What happens to the size of the minute-level sync?',
+      options: [
+        'It grows ten times, because the table is ten times larger',
+        'About the same, since only touched rows go',
+        'It falls, because larger tables compress better',
+        'It stops, because new items cannot be synced',
+      ],
+      answer: 1,
+      explain: 'The payload follows the number of rows that changed since the last sync, not the size of the table. A bigger table raises memory, not the sync size. Compression and a block on new items are not part of the design.',
+    },
+    {
+      id: 'e1-online-guard-need',
+      q: 'A bot floods the event log with fake clicks. A team with minute-level sync and no guards has what problem that a nightly retrain would partly avoid?',
+      options: [
+        'The harm reaches every serving copy in minutes',
+        'The nightly job would have crashed on the first fake click',
+        'The log cannot store the fake clicks at all',
+        'The servers refuse any update from the trainer',
+      ],
+      answer: 0,
+      explain: 'A fast loop passes bad data to serving before anyone looks. A nightly retrain has a delay in which people can catch it. The log stores fake clicks like any others, and nothing makes the servers refuse an update.',
+    },
+    {
+      id: 'e1-online-stateful-meaning',
+      q: 'What does stateful training mean, as separate from retraining often?',
+      options: [
+        'Training a new model from scratch on all the history each time',
+        'Copying the model to a second data centre as a backup',
+        'Continuing to train the current model on new data only',
+        'Keeping a list of past users in a database table',
+      ],
+      answer: 2,
+      explain: 'Stateful training starts from the current model and uses only the new data. Training from scratch is the stateless way. Backups and user lists are other things. Once training can continue, how often you run it is only a setting.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="e1-online-bad-batch-spreads"
+  title="The fast loop spreads a bad batch"
+  scenario="A shop runs minute-level sparse sync from an online trainer, and dense layers sync daily. At 14:05 the click-through rate on one product category falls sharply and stays down. A partner site started sending test traffic at 14:00. The numbers below are made up for the exercise."
+  facts={[
+    'sparse sync: every minute, touched rows only',
+    'dense sync: daily at 03:00',
+    'new events from 14:00: large burst of clicks from a few client IDs on one category',
+    'trainer: no filter on event source, no cap on row change per sync',
+    'last snapshot: 03:00 today, last known good state'
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause?',
+      options: [
+        'Burst events trained the rows of that category, and the sync spread the changed rows to serving',
+        'The daily dense sync ran too early and broke the ranking layers',
+        'The snapshot at 03:00 was corrupt and is now being served',
+        'The hash table ran out of memory and dropped the category',
+      ],
+      answer: 0,
+      explain: 'The timing matches the burst from 14:00 and the minute-level sparse sync. The dense sync last ran at 03:00 and the snapshot is only used after a failure. Nothing in the facts points to memory pressure.',
+    },
+    {
+      prompt: 'What is the best response, in order?',
+      options: [
+        'Wait for the nightly retrain to overwrite the damage',
+        'Stop the sync, roll the affected rows back to the last good snapshot, then add filters and caps before resuming',
+        'Raise the learning rate so the model recovers faster',
+        'Turn off logging until the traffic returns to normal',
+      ],
+      answer: 1,
+      explain: 'Stopping the sync halts the spread, and the snapshot gives a known good state to restore from. Filters and caps stop a repeat. Waiting keeps users on bad rankings for hours, a higher rate speeds up learning from the bad data, and turning logging off blinds you.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Liu and others: Monolith, real-time recommendation with collisionless embedding tables](https://arxiv.org/html/2209.07663v2). Sections 2.1 to 2.3 cover the hash table, online training, sync, and fault tolerance. You do not need the experiments.
+- [Chip Huyen: Real-time machine learning, challenges and solutions](https://huyenchip.com/2022/01/02/real-time-machine-learning-challenges-and-solutions.html). The part on continual learning has the four stages from manual retraining to continual updates.
+- [Apache Kafka documentation: introduction](https://kafka.apache.org/documentation/#introduction). Background on the event log that feeds the trainer.

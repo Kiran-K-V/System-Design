@@ -75,7 +75,7 @@ export default function AiE2LayoutPlanner() {
       </div>
       <p className="mt-3 text-sm" data-testid="lp-note">{r.note}</p>
       <p className="mt-2 text-xs text-muted">
-        The four layouts are rows of Table 4 in the Llama 3 paper (the last is our own bad example). The paper does not state the micro-batch count m for these runs, so the bubble figure uses the slider value and is illustrative. The planner checks only GPU count and tensor-group placement. It does not check memory.
+        The four layouts are rows of the parallelism table in the Llama 3 paper (the last is our own bad example). The paper does not state the micro-batch count m for these runs, so the bubble figure uses the slider value and is illustrative. The planner checks only GPU count and tensor-group placement. It does not check memory.
       </p>
     </CacheWidgetFrame>
   );

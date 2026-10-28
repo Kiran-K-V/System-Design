@@ -44,7 +44,7 @@ For a backend engineer: weights are like the compiled binary, gradients are a di
 
 ## Question 2: where do the 16 bytes come from?
 
-**What it is.** The count is the standard accounting for mixed-precision training with Adam, given in the ZeRO paper from Microsoft. **Mixed precision** [mid] means the math runs in a 16-bit number format and a few important copies stay in a 32-bit format. Lesson E2.5 covers why. Here we only count bytes.
+**What it is.** The count is the standard accounting for mixed-precision training with Adam, given in the ZeRO paper from Microsoft. **Mixed precision** [mid] means the math runs in a 16-bit number format and a few important copies stay in a 32-bit format. Lesson [E2.5](/learn/ai/e2-training/mixed-precision-checkpoints/) covers why. Here we only count bytes.
 
 | Part | Format | Bytes per parameter |
 |---|---|---|
@@ -116,10 +116,10 @@ Three things to see. The 14 bytes of weights and optimizer states are there befo
     {
       prompt: 'What is the main reason the same weights fit for serving but not for training?',
       options: [
-        'Training also holds gradients, a 32-bit master copy, and two Adam averages, which come to about 16 bytes per parameter',
-        'Training loads the weights twice because of the data loader',
-        'The GPU runs out of compute, not memory',
-        'Adam doubles the number of layers',
+        'It also holds gradients and Adam state, about 16 bytes per parameter',
+        'Training loads the weights twice over because of the data loader pipeline',
+        'The GPU runs out of compute capacity during the first step, not memory',
+        'Adam doubles the number of layers in the model during training',
       ],
       answer: 0,
       explain: 'The 14 GB of weights is the small part. The 16-byte rule puts the states of a 7B model well above 80 GB, so it cannot fit. Compute does not cause an out-of-memory error, and Adam does not add layers.',
@@ -127,10 +127,10 @@ Three things to see. The 14 bytes of weights and optimizer states are there befo
     {
       prompt: 'The engineer turns on activation checkpointing, and the job still runs out of memory on step one. Why?',
       options: [
-        'Checkpointing is broken in Adam',
-        'It only reduces activations, and the weights, gradients, and optimizer states alone do not fit in 80 GB',
-        'It needs more GPUs than the job has',
-        'It raises the batch size by itself',
+        'Checkpointing is not compatible with the Adam optimizer at all',
+        'It cuts only activations; the other three still overflow',
+        'It needs more GPUs than the job currently has available',
+        'It raises the batch size by itself and so adds memory',
       ],
       answer: 1,
       explain: 'Activations are one of four items, and the one that scales with batch. The other three scale with the parameter count and are untouched. Checkpointing helps only when the states fit and activations are what is left over.',
@@ -138,10 +138,10 @@ Three things to see. The 14 bytes of weights and optimizer states are there befo
     {
       prompt: 'Which change actually removes the need for one GPU to hold the full 16 bytes per parameter?',
       options: [
-        'Halve the batch size',
-        'Shard the weights, gradients, and optimizer states across several GPUs, or train only a small adapter with LoRA',
-        'Switch to a longer sequence length',
-        'Run inference first to warm up the GPU',
+        'Halve the batch size of every step to save memory',
+        'Shard the states across GPUs, or train a small LoRA adapter',
+        'Switch to a longer sequence length for each training example',
+        'Run inference first to warm up the GPU and its memory caches',
       ],
       answer: 1,
       explain: 'Sharding spreads the states across devices, and LoRA freezes most weights so they need no gradient or optimizer state. Batch size and sequence length change activations only. The next lesson covers sharding.',
@@ -155,12 +155,12 @@ The 16 bytes per parameter set a floor, and there are four ways to lower what on
 
 | Lever | What it removes | Where it is taught |
 |---|---|---|
-| Shard the states across GPUs | Each GPU holds a share of the 16 bytes, not a full copy | Lesson E2.3 |
+| Shard the states across GPUs | Each GPU holds a share of the 16 bytes, not a full copy | Lesson [E2.3](/learn/ai/e2-training/data-parallel-zero/) |
 | Train fewer parameters (LoRA) | Gradients and optimizer states for frozen weights | [Lesson A11.2](/learn/ai/a11-finetuning/sft-lora/) |
-| Lower the precision of the copies | Bytes per item | Lesson E2.5 |
+| Lower the precision of the copies | Bytes per item | Lesson [E2.5](/learn/ai/e2-training/mixed-precision-checkpoints/) |
 | Checkpoint activations | Most of the activation memory | This lesson |
 
-The first lever is the important one for a pretraining job. It keeps all parameters trainable and keeps the full model quality. Its cost is network traffic, and lesson E2.3 shows how large.
+The first lever is the important one for a pretraining job. It keeps all parameters trainable and keeps the full model quality. Its cost is network traffic, and lesson [E2.3](/learn/ai/e2-training/data-parallel-zero/) shows how large.
 
 ## Trade-offs
 
@@ -174,8 +174,8 @@ The first lever is the important one for a pretraining job. It keeps all paramet
 
 ## What experienced teams know
 
-1. **A small model can already overflow a card.** The [ZeRO paper](https://arxiv.org/abs/1910.02054) notes that a 1.5B-parameter GPT-2 needs at least 24 GB for its states, though the weights are small. Size on the 16 bytes, not on the checkpoint file.
-2. **The accounting varies.** The [Ultra-Scale Playbook](https://nanotron-ultrascale-playbook.static.hf.space/) counts 16 bytes for the common mixed-precision setup and 20 if gradients are kept in 32 bits. Write down which items you count.
+1. **A small model can already overflow a card.** The ZeRO paper notes that a 1.5B-parameter GPT-2 needs at least 24 GB for its states, though the weights are small. Size on the 16 bytes, not on the checkpoint file.
+2. **The accounting varies.** The Ultra-Scale Playbook counts 16 bytes for the common mixed-precision setup and 20 if gradients are kept in 32 bits. Write down which items you count.
 3. **Activations scale with batch and sequence length.** The same Playbook gives a formula that is linear in batch and quadratic in sequence length. Long-context training needs a plan for activations from the start.
 4. **Full recomputation costs real time.** The Playbook reports up to 30 to 40% more compute and time, and 2.7% for a selective scheme on GPT-3 with a 70% cut in activation memory. Measure the speed cost on your model, since it varies.
 5. **The ZeRO paper's headline target.** It states that, with all three sharding stages, a trillion-parameter model can train on 1,024 GPUs, since its 16 TB of states then comes to 16 GB per GPU. That figure is the paper's claim, and it counts states only.
@@ -213,10 +213,10 @@ Of the 16 bytes, 12 belong to the optimizer and its master copy. They are never 
     {
       q: 'Why does the optimizer keep a 32-bit master copy of the weights in mixed precision?',
       options: [
-        'The forward pass needs 32-bit values to be correct',
-        'GPUs cannot store 16-bit numbers in HBM',
-        'A tiny weight update would be rounded away in 16 bits, so updates are added to a precise copy',
-        'It lets the gradients be skipped on some steps',
+        'The forward pass needs 32-bit values to give correct answers at all',
+        'GPUs cannot store 16-bit numbers in their HBM memory at all',
+        'Tiny updates round away in 16 bits, so they go into a precise copy',
+        'It lets the optimizer skip the gradients on some of the steps',
       ],
       answer: 2,
       explain: 'Each step moves a weight by a very small amount, and 16-bit rounding can lose it. The 32-bit copy keeps the sum. The forward pass runs fine in 16 bits, and GPUs store 16-bit values without trouble.',
@@ -225,8 +225,8 @@ Of the 16 bytes, 12 belong to the optimizer and its master copy. They are never 
       q: 'A team enables activation checkpointing. What do they get, and what do they pay?',
       options: [
         'Smaller weights, at the price of lower quality',
-        'Fewer optimizer states, at the price of a slower network',
-        'Less activation memory, at the price of recomputing some forward work during the backward pass',
+        'Fewer optimizer states, at the price of a slower network between GPUs',
+        'Less activation memory, paid for by recomputing some forward work',
         'A larger batch with no cost, since recomputation is free',
       ],
       answer: 2,
@@ -235,9 +235,9 @@ Of the 16 bytes, 12 belong to the optimizer and its master copy. They are never 
     {
       q: 'When does the memory of a training step usually peak?',
       options: [
-        'Near the end of the forward pass, when the activations are all stored and the gradients are not yet large',
+        'Near the end of the forward pass, when activations are all stored',
         'At the very start, before any data is read',
-        'Right after the optimizer step, when all gradients are freed',
+        'Right after the optimizer step, when all the gradients have been freed',
         'Only while the weights are copied to disk',
       ],
       answer: 0,

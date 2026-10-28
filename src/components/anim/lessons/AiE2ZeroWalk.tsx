@@ -28,7 +28,7 @@ const COLORS = { w: 'var(--accent)', g: 'var(--warn)', o: 'var(--muted)' };
 export default function AiE2ZeroWalk() {
   return (
     <AnimFrame title="ZeRO: four GPUs, stage by stage" steps={steps} interval={6500}>
-      {(i, s) => {
+      {(_i, s) => {
         const st = s.stage;
         const parts = [
           { id: 'weights', bytes: 2, color: COLORS.w },

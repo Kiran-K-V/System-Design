@@ -82,7 +82,7 @@ Now try your own case. Pick a model, a stage, and a GPU count. The calculator ap
 
 <AiE2ZeroCalc client:visible />
 
-Read the result as a plan, not a promise. The calculator counts model states. Activations and buffers also need room, and lesson E2.2 covered how to cut activations.
+Read the result as a plan, not a promise. The calculator counts model states. Activations and buffers also need room, and lesson [E2.2](/learn/ai/e2-training/memory-per-parameter/) covered how to cut activations.
 
 ## Question 4: what does sharding cost?
 
@@ -110,9 +110,9 @@ The stages are a ladder. Each rung saves more memory and adds more risk. A simpl
 | The states fit on one GPU with room for activations | Plain data parallel. No sharding. |
 | The states almost fit | Stage 1 or 2, which add no network traffic |
 | The states do not fit even at stage 2 | Stage 3 (FSDP), and check that the network can overlap the gathers |
-| A single layer is too large for one GPU, or stage 3 is too slow | Split the model itself: lesson E2.4 |
+| A single layer is too large for one GPU, or stage 3 is too slow | Split the model itself: lesson [E2.4](/learn/ai/e2-training/model-parallelism/) |
 
-The last row needs one note. In stage 3, a GPU gathers a whole layer's weights to run that layer, so one layer must fit on one GPU. Our reading: that is a real limit of sharding, and it is one reason very large models use model parallelism as well. Lesson E2.4 covers it.
+The last row needs one note. In stage 3, a GPU gathers a whole layer's weights to run that layer, so one layer must fit on one GPU. Our reading: that is a real limit of sharding, and it is one reason very large models use model parallelism as well. Lesson [E2.4](/learn/ai/e2-training/model-parallelism/) covers it.
 
 The Playbook also gives a rule of thumb that data parallel size should not grow past about 512. It is guidance from one guide, not a law.
 
@@ -132,10 +132,10 @@ The Playbook also gives a rule of thumb that data parallel size should not grow 
     {
       prompt: 'What is the most likely cause of the slow-down?',
       options: [
-        'Stage 3 gathers each layer\'s weights over the network, and the link between servers is slower than the link inside one server',
-        'Stage 3 trains a different model, so it needs more steps',
-        'Stage 3 stores fewer gradients, so the update is less accurate',
-        'The optimizer states were moved to the CPU by default',
+        'Stage 3 gathers weights over the slow link between servers',
+        'Stage 3 trains a different model, so it needs many more steps to match',
+        'Stage 3 stores fewer gradients, so each update is a little less accurate',
+        'The optimizer states were moved to the CPU by default, which is slow',
       ],
       answer: 0,
       explain: 'Stage 3 adds weight gathers in the forward and backward pass. Inside a server the fast link may keep up. Between servers the gather may not finish before the layer needs it, so GPUs wait. Sharding does not change the math or the model.',
@@ -143,10 +143,10 @@ The Playbook also gives a rule of thumb that data parallel size should not grow 
     {
       prompt: 'Which action best attacks that cause?',
       options: [
-        'Increase the sequence length',
-        'Use the lowest stage that fits, and keep the gathers on the fastest links, for example by combining sharding with other kinds of parallelism',
-        'Turn off prefetching so layers load one at a time',
-        'Add more servers, so the gathers are spread thinner',
+        'Increase the sequence length of every training example',
+        'Use the lowest stage that fits, and keep gathers on fast links',
+        'Turn off prefetching so layers load strictly one at a time',
+        'Add more servers, so the gathers are spread thinner over the network',
       ],
       answer: 1,
       explain: 'The aim is to keep the heavy gathers on fast links, and to shard no more than needed. Turning off prefetching removes the overlap that hides the cost. More servers add more slow-link traffic. Lesson E2.4 covers combining parallelism kinds.',
@@ -166,9 +166,9 @@ The Playbook also gives a rule of thumb that data parallel size should not grow 
 
 ## What experienced teams know
 
-1. **Stages 1 and 2 are nearly free.** The [ZeRO paper](https://arxiv.org/abs/1910.02054) states the same communication volume as data parallel for both. If the states almost fit, try them before stage 3.
+1. **Stages 1 and 2 are nearly free.** The ZeRO paper states the same communication volume as data parallel for both. If the states almost fit, try them before stage 3.
 2. **Stage 3 costs 1.5 times the traffic.** The paper puts it at 3 units against 2. Check your link speed before you pick it.
-3. **Prefetching decides whether stage 3 is cheap.** The [Ultra-Scale Playbook](https://nanotron-ultrascale-playbook.static.hf.space/) says the cost is manageable because the next layer's weights are gathered during the current layer's compute. It works only if the network is fast enough.
+3. **Prefetching decides whether stage 3 is cheap.** The Ultra-Scale Playbook says the cost is manageable because the next layer's weights are gathered during the current layer's compute. It works only if the network is fast enough.
 4. **Overlap the gradient sync.** The same guide says to start each gradient's all-reduce as soon as it is ready and to use buckets, rather than wait for the backward pass to end.
 5. **Do the sums per GPU, not in total.** The paper's 7.5B example shows 120 GB falling to 1.9 GB per GPU at stage 3 on 64 GPUs. The total memory used is still 16 bytes times the model, so you save memory per device, not in total.
 6. **Sharding leaves activations alone.** The ZeRO paper treats activation memory as a separate problem and discusses checkpointing for it. Plan both.
@@ -196,8 +196,8 @@ An all-reduce gives every GPU the full sum. Break it in two. A reduce-scatter ma
       q: 'In plain data parallel training, what is split across the GPUs, and what is copied?',
       options: [
         'The batch is copied and the model is split',
-        'The batch is split and the model is copied to every GPU',
-        'Both are split into equal parts',
+        'The batch is split, and the model is copied',
+        'Both are split into equal parts across the GPUs',
         'Both are copied, and only the gradients differ',
       ],
       answer: 1,
@@ -209,7 +209,7 @@ An all-reduce gives every GPU the full sum. Break it in two. A reduce-scatter ma
         'They skip the gradient averaging step',
         'They keep the gradients in memory instead of sending them',
         'They shard the batch instead of the states',
-        'An all-reduce is a reduce-scatter plus an all-gather, so splitting it that way moves the same data',
+        'The same bytes move, in two steps instead of one',
       ],
       answer: 3,
       explain: 'The same bytes cross the network, in two steps instead of one. Skipping the averaging step would leave the copies different, and the batch is not what ZeRO shards.',
@@ -217,8 +217,8 @@ An all-reduce gives every GPU the full sum. Break it in two. A reduce-scatter ma
     {
       q: 'What extra work makes ZeRO stage 3 (FSDP) cost more traffic than stage 2?',
       options: [
-        'It gathers each layer\'s weights from the other GPUs before using the layer, in both the forward and the backward pass',
-        'It sends the activations to a parameter server',
+        'It gathers each layer\'s weights before use, in both passes',
+        'It sends the activations to a separate parameter server each step',
         'It repeats the optimizer step on every GPU',
         'It compresses the gradients to 8 bits',
       ],
@@ -229,9 +229,9 @@ An all-reduce gives every GPU the full sum. Break it in two. A reduce-scatter ma
       q: 'A team has a model whose states almost fit on one GPU. What is the best first move?',
       options: [
         'ZeRO stage 3, because it saves the most memory',
-        'Stage 1 or 2, which cut memory with no added traffic, before trying stage 3',
+        'Try stage 1 or 2 first, since they add no traffic',
         'Remove the optimizer to save memory',
-        'Move to a smaller batch and ignore sharding',
+        'Move to a smaller batch and skip sharding altogether',
       ],
       answer: 1,
       explain: 'Use the lowest stage that fits. Stages 1 and 2 add no network cost. Stage 3 is for when the weights themselves do not fit. Removing the optimizer would stop training from working, and a smaller batch changes only activations.',

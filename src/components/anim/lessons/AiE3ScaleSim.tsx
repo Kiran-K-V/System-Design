@@ -50,7 +50,7 @@ export default function AiE3ScaleSim() {
 
   return (
     <CacheWidgetFrame title="Spike simulator: warm pool, dropped traffic, cost" hint="illustrative, 30 minutes, 1 GPU per replica, $4 per GPU-hour">
-      <div className="grid gap-4 text-sm md:grid-cols-[1fr_1.4fr]">
+      <div className="grid gap-4 text-sm">
         <div className="space-y-3">
           <Slider id="e38-cold" label="Cold start time of one replica" value={cold} min={30} max={900} step={30} on={setCold} show={`${cold} s`} />
           <Slider id="e38-pool" label="Warm pool (idle replicas that hold weights)" value={pool} min={0} max={12} step={1} on={setPool} show={String(pool)} />

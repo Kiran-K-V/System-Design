@@ -1,0 +1,274 @@
+---
+summary: 'An offline metric measures a model on old logs. An online metric measures what users do with it. Learn the metrics on each side, why the old model biases the log, why an offline gain can leave revenue flat, and the checks that keep the two honest.'
+requires: ['ai/e1-classic-ml/problem-framing', 'ai/e1-classic-ml/retrieval-ranking']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE1ThresholdMatrix from '../../../../components/anim/lessons/AiE1ThresholdMatrix.tsx';
+import AiE1LogBias from '../../../../components/anim/lessons/AiE1LogBias.tsx';
+import AiE1OfflineOnline from '../../../../components/anim/lessons/AiE1OfflineOnline.tsx';
+
+## The problem
+
+Google's Rules of Machine Learning tells a short story about a developer called Alice. She adds a feature to a model that predicts app installs. The model's loss, the number it was trained to push down, falls. She runs a live experiment. The install rate goes up. Then she goes to the launch review, and "someone points out that the number of daily active users drops by 5%." The team decides not to launch ([Rules of ML, Rule 39](https://developers.google.com/machine-learning/guides/rules-of-ml)).
+
+Three numbers moved in three directions. The loss said "better". The install rate said "better". The daily users said "worse". Each number was true. No single number was the product.
+
+This is the gap this lesson is about. Every ML team has two kinds of measurement, and they answer different questions.
+
+- An **offline metric** scores a model on data you already have. It is fast, cheap, and repeatable. It says how well the model fits the past.
+- An **online metric** scores a model on live users. It is slow, costly, and noisy. It says what the model does to the product.
+
+You need both. The offline number lets you try a hundred ideas a week. The online number tells you which of them were any good. The trouble is that the first is only a rough guide to the second, and teams forget this. This lesson answers six questions.
+
+1. Which offline metrics exist, and what does each one measure?
+2. Why does a threshold change the picture, and what does the picture hide?
+3. Why does the log, the old data, lie to a new model?
+4. Why do offline gains often fail online?
+5. Which online metrics should you watch?
+6. What checks keep the two sides honest?
+
+Lesson [from business goal to ML objective](/learn/ai/e1-classic-ml/problem-framing/) taught the chain from a business goal to a proxy. This lesson is the measurement side of that chain. Lesson [two-tower retrieval and the ranking cascade](/learn/ai/e1-classic-ml/retrieval-ranking/) gave you the funnel of retrieval and ranking. We use it here when we ask how to score a ranked list.
+
+## Question 1: which offline metrics exist?
+
+An offline metric needs three things: a model, a set of past examples, and the true answer for each example. Here the true answer is the **label**: for each past case, what really happened. Lesson [data and labels](/learn/ai/e1-classic-ml/data-labels/) covered where labels come from and why they arrive late.
+
+Which metric you use depends on what the model's output is used for. Here are the four families. Think of them as four different questions you can ask a fortune-teller.
+
+**Classification metrics: did you call the yes-or-no correctly?** The model flags a case as "bad" or "fine". Two numbers matter. **Precision** is, of the cases flagged, the share that were truly bad. **Recall** is, of the truly bad cases, the share that were flagged. A fraud filter with high precision rarely blocks an honest buyer. A filter with high recall rarely lets a thief through. Lesson [data and labels](/learn/ai/e1-classic-ml/data-labels/) showed why plain **accuracy**, the share of all cases called correctly, misleads when bad cases are rare.
+
+**Ranking-quality metrics: did you put the good ones near the top?** In a feed or a search, the model does not say yes or no. It sorts a list, and the user reads from the top. Two metrics are common.
+
+- **Precision@k** looks at only the top k items and asks what share of them were good. Picture a shop window. Only the first few shelves matter, so you check only those. It is simple. Its weakness is that it counts a good item at rank 1 the same as one at rank 10.
+- **NDCG** (normalized discounted cumulative gain) fixes this. A good item high in the list earns more credit than the same item lower down. The credit is also scaled by how good the item is, if you have graded labels such as "perfect", "good", "poor". The total is then compared with the best possible order of the same items. A score of 1 means your order matches the best one. Picture a teacher who marks an exam answer higher when the key point comes in the first line. Lesson [RAG evaluation](/learn/ai/a5-rag/rag-evaluation/) gives the exact discount if you want it. You do not need it here.
+
+**Score-quality metrics: how good is the whole ranking in one number?** **AUC** (area under the curve) is the chance that a random bad case gets a higher score than a random fine case. 0.5 is a coin flip and 1.0 is perfect. It looks at the order of scores, not at any one threshold. Rule 33 in the Rules of ML gives a useful way to use it: train on data up to one date, test on the days after, and expect AUC to be "reasonably close", not radically worse.
+
+**Calibration: do the numbers mean what they say?** A model outputs 0.3. Does that mean 30 in 100 such cases really are bad? A model is **calibrated** when its scores match real rates. To check, group predictions by score and compare each group's average score with the share that really turned out bad. A model can have a perfect AUC and still be badly calibrated, because AUC only cares about order. Calibration matters whenever the score itself is used, as a price, a bid, or a risk cut-off. Lesson [E1.11](/learn/ai/e1-classic-ml/ad-click-prediction/) shows an ad auction where this decides the revenue.
+
+| Question | Metric | Looks at | Weak spot |
+|---|---|---|---|
+| Right yes or no? | Precision, recall | One threshold | Changes when you move the threshold |
+| Good items on top? | Precision@k, NDCG | The top of a ranked list | Needs labels for the items shown |
+| Whole ranking quality? | AUC | Order of all scores | Blind to threshold, calibration, and rare-class cost |
+| Scores mean what they say? | Calibration | Score against real rate | Needs many cases per score group |
+
+Each metric is a lens. None of them is the product. The next two questions show how each lens can fool you.
+
+## Question 2: what does a threshold do?
+
+Many models output a score, and a rule turns the score into an action: block the payment, show the offer, send the alert. The **threshold** is the score above which the action happens.
+
+Every case then falls into one of four boxes. This grid is the **confusion matrix**.
+
+- **True positive**: flagged, and truly bad. A good catch.
+- **False positive**: flagged, but fine. A false alarm. An honest buyer is blocked.
+- **False negative**: not flagged, but truly bad. A miss. A thief gets through.
+- **True negative**: not flagged, and fine. Nothing happened, which is the goal.
+
+Precision and recall are read from this grid. Precision compares the true positives with all the flagged cases. Recall compares them with all the truly bad cases. Move the threshold up and you flag fewer cases: precision tends to rise and recall falls. Move it down and the reverse happens. The right place on that seesaw is a business choice, not a statistics choice. It depends on what a miss costs against what a false alarm costs.
+
+Try it. The widget holds one model fixed. Slide the threshold and watch the four boxes. Then change the share of truly bad cases from 50% to 1% and watch precision. The AUC does not move at all.
+
+<AiE1ThresholdMatrix client:visible />
+
+Two things should stand out. First, precision falls sharply when bad cases get rare, even though the model did not change. A filter that looks sharp on a test set with half bad cases can flood people with false alarms when only 1 in 100 is bad in production. So the share of bad cases in your test set must match what you expect live, or you must say so. Second, AUC stayed fixed while every other number moved. AUC describes the model's ordering skill. It does not describe what happens at the threshold you ship. A team that watches only AUC will miss the change that matters to users.
+
+## Question 3: why does the log lie?
+
+The offline test uses a **log**: a record of past requests, what the system showed, and what the user did. For a model that ranks a feed, the log says "we showed these items and the user clicked this one".
+
+Here is the catch. The log was written while the old model was in charge. It only holds labels for the things the old model chose to show. For everything else it says nothing. This is the **selection bias** from lesson [data and labels](/learn/ai/e1-classic-ml/data-labels/), now seen from the metric side.
+
+Rule 35 puts it in one line: "When you switch your ranking algorithm radically enough that different results show up, you have effectively changed the data that your algorithm is going to see in the future." Step through the picture to see what this does to a test.
+
+<AiE1LogBias client:visible />
+
+Read the third step again. A new model proposes two items the old model never showed. The replay has no label for them, so it counts them as misses. The new model is punished for being different. The same mistake can go the other way. If the old model happened to hide a bad item, the replay never sees that the new model would show it, and the new model looks better than it is.
+
+There is a second, quieter effect: a **feedback loop**. A model trained on the log learns to show what the log already contains. The next log contains more of the same. Over months the system narrows. It becomes very good at predicting the clicks that its own past choices made possible.
+
+The fix has a simple core: keep some data that the old model did not choose. Rule 34 describes it for a filter. Label 1% of all traffic as "held out", let it through, and use those cases as clean training data. For a ranking system the same idea is a small **exploration slice**: a small share of requests where items are chosen at random or by a wide rule, and logged apart. This slice is your unbiased test set. It costs a little in short-term quality. It is the only part of the log you can trust to judge a model that behaves differently from the old one. Lesson [E1.10](/learn/ai/e1-classic-ml/video-recommendation/) builds this into a full design.
+
+## Question 4: why do offline gains fail online?
+
+Now you can list the reasons in one place. When an offline metric rises and the online number stays flat, one of four things has usually happened.
+
+1. **The log was biased.** The replay could not judge the choices that differ from the old model, so the offline gain is partly an artefact. This is Question 3.
+2. **The metric was not the goal.** The model was tuned for a proxy, such as clicks or loss, and the proxy moved while the goal did not. Lesson [E1.1](/learn/ai/e1-classic-ml/problem-framing/) covered this in detail. Rule 25 states a version of it for model choice: "utilitarian performance trumps predictive power." Its advice is plain: "if there is some change that improves log loss but degrades the performance of the system, look for another feature."
+3. **The gain was too small to see.** An online test has noise. A 0.5% offline gain may map to an online change smaller than the noise. The lesson on [A/B testing models](/learn/ai/e1-classic-ml/ab-testing-models/) shows how many users it takes to see such a change.
+4. **The world moved.** The offline test data is old. Users, items, and prices changed after it was logged. The lesson on [drift and model aging](/learn/ai/e1-classic-ml/drift-monitoring/) covers how fast a model ages.
+
+The scatter below puts the whole picture in front of you. Each dot is one past experiment: how much the offline metric rose, and what the online test then showed. The data is made up for teaching, not from any real company. The shape is what real teams describe.
+
+<AiE1OfflineOnline client:visible />
+
+Look at it in two ways. First, with every experiment shown, the dots are scattered and the link is weak. Offline gain gives a hint, not a verdict. Second, press "Only big offline winners". Those are the experiments a team would have been proudest of. Most of them did nothing online, and some lost. The bigger the offline gain, the more tempting it is to ship without a test. That is the case where a test matters most.
+
+Does this mean offline metrics are useless? No. They are good at ruling out bad ideas quickly, and a model that is clearly worse offline is usually worse online. What they cannot do is rank two close models or promise a business gain. Use them as a filter, and use the online test as the judge. Rule 24 adds a cheap check that sits between the two: before any user sees a new model, run old and new on a sample of requests and measure how much their results differ. If the difference is tiny, "you can tell without running an experiment that there will be little change". If it is large, look at the cases that differ most, and ask whether the change is good.
+
+## Question 5: which online metrics should you watch?
+
+An **online metric** is measured on real users, normally in a randomized test (see [A/B testing models](/learn/ai/e1-classic-ml/ab-testing-models/)). Think of three layers, and watch all of them.
+
+- **The primary metric** is the one you want to move: clicks, watch time, orders, revenue. Choose one before the test starts. Lesson [E1.1](/learn/ai/e1-classic-ml/problem-framing/) explains how to choose it from the business goal.
+- **Guardrail metrics** are numbers that must not get worse while you chase the primary one. Examples are page load time, complaint rate, refund rate, and daily active users. Alice's story is a guardrail story: the install rate rose and the daily users fell. Rule 39 says "the only easy launch decisions are when all metrics get better (or at least do not get worse)." Any other case needs judgement, and the team has to agree on it up front.
+- **Long-term metrics** are the ones that take weeks: retention, repeat purchases, returns. They are close to the real goal, and they are the slowest. Many teams keep a small **holdout**, a group of users who stay on the old model for a long period, so the slow effects have time to appear.
+
+An analogy helps. A doctor gives a patient a new drug and watches the main symptom. That is the primary metric. The doctor also watches blood pressure and liver tests, which are the guardrails. A month later the doctor checks how the patient feels. That is the long-term metric. A drug that fixes the symptom and damages the liver is not a win.
+
+A common mistake is to watch only the metric the model was trained on. A model trained to raise clicks will raise clicks. Whether people stayed longer, or came back, is another question. Add a metric the model was not trained on. Then it cannot game the check by design.
+
+## The naive way: one offline number
+
+The naive plan has four steps. Pick AUC. Train until AUC is highest on a random test split. Ship the winner. Watch revenue next quarter.
+
+It fails in several places, and now you can name them. The random split lets future data leak into the past (lesson [data and labels](/learn/ai/e1-classic-ml/data-labels/) explained why). AUC ignores the threshold you ship and the calibration of the score. The log hides everything the old model did not show. The proxy may not match the goal. And revenue next quarter has too many other causes to point at the model.
+
+## The real fix: three layers of measurement
+
+Use each measurement for what it is good at.
+
+| Layer | Question it answers | Cost | When to use it |
+|---|---|---|---|
+| Offline metrics on a time split | Is this idea worth a live test? | Cheap, minutes | Every experiment, as a filter |
+| Pre-launch checks: delta between models, slices, feature coverage | Is the change sane and is the data healthy? | Cheap, hours | Before any user sees the model |
+| Online test with guardrails and a holdout | Does this help users and the business? | Costly, weeks | Every launch decision |
+
+One check on the second row deserves a note: **feature coverage**. Coverage is the share of requests in which a feature has a real value. Rule 10 gives the case: "a feature column could be populated in 90% of the examples, and suddenly drop to 60% of the examples." A model with a half-empty feature can still output plausible scores, and no offline metric computed on old data will show it. Measure coverage on live traffic, and alert on it. The lesson on [drift and model aging](/learn/ai/e1-classic-ml/drift-monitoring/) builds this into a full monitoring ladder, and lesson [training-serving skew](/learn/ai/e1-classic-ml/training-serving-skew/) explains why training and serving can disagree about a feature.
+
+Slices belong in the same row. An overall score can hide a group the model serves badly: new users, one country, one device. Compute each metric for the groups that matter and compare. A gain overall with a loss in one slice is a finding. It is not a rounding error.
+
+## What experienced teams know
+
+1. **A launch is a judgement across several metrics.** Google's guide tells the Alice story: loss down, installs up, daily users down 5%, no launch. It adds that there are no "hit points" identifying the health of your product ([Rules of ML, Rule 39](https://developers.google.com/machine-learning/guides/rules-of-ml)). Decide the guardrails before the test.
+2. **When the model metric and the system metric disagree, trust the system.** If a change "improves log loss but degrades the performance of the system", look for another feature, and after it happens often, revisit the objective ([Rule 25](https://developers.google.com/machine-learning/guides/rules-of-ml)).
+3. **Test on the days after the training data.** Train through one date, test from the next day on, and expect a small drop, not a collapse ([Rule 33](https://developers.google.com/machine-learning/guides/rules-of-ml)).
+4. **Hold out a small clean slice.** Google's example labels 1% of traffic as held out, so a filter's training data is not shaped only by what it let through. They note the approach gets less workable when the filter blocks 95% of bad cases or more ([Rule 34](https://developers.google.com/machine-learning/guides/rules-of-ml)).
+5. **Measure the delta between models before launch.** Compare old and new results on a sample of requests. A tiny difference predicts a tiny effect, and a model compared with itself should show a low difference, ideally zero ([Rule 24](https://developers.google.com/machine-learning/guides/rules-of-ml)).
+6. **A stationary test set is not enough.** Chip Huyen writes that when models adapt to changing environments, "a stationary test set no longer suffices", and lists backtests, shadow deployment, A/B tests, and canary analysis as ways to evaluate ([Huyen, real-time ML](https://huyenchip.com/2022/01/02/real-time-machine-learning-challenges-and-solutions.html)).
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| Offline metric only | Fast and cheap loops | No view of the real effect; log bias | Early filtering of many ideas |
+| Online test for every change | The real effect | Weeks and many users | Any launch decision |
+| AUC as the headline | Threshold-free, stable | Hides calibration and the cost of the cut-off | Comparing rankers when only order matters |
+| Precision and recall at a threshold | Matches the shipped action | Moves with the threshold and the bad-case share | The score drives a block or an alert |
+| Calibration check | Scores can be used as prices or risks | Needs many cases per score group | Auctions, bids, and risk limits |
+| Exploration slice | Clean data to judge new behavior | A small loss in short-term quality | Systems where the old model shapes the log |
+| Long-term holdout | Sees slow effects such as retention | A group of users stuck on an old model | Feeds and recommendations |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "I use offline metrics as a filter and the online test as the judge. Offline, I split by time and report the metric that matches how the score is used: precision and recall at the shipped threshold, NDCG for a ranked list, and calibration if the score is a price. I worry that the log was written by the old model, so I keep a small exploration slice for clean labels. Online, I fix one primary metric and guardrails before the test, and I keep a long-term holdout. I also watch feature coverage on live traffic." This shows you know where each number can fool you.
+</Callout>
+
+<Callout type="mistake">
+Do not say "AUC went up, so the model is better" as if it ends the question. Do not quote accuracy for a rare event. Do not trust an offline replay for a model that picks different items from the old one without saying that the log has no labels for the new picks.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      id: 'e1-offon-threshold-fixed-model',
+      q: 'A fraud model is fixed. In production the share of bad payments falls from 1 in 2 to 1 in 100. Which number stays the same, and which one gets worse?',
+      options: [
+        'Precision stays the same and AUC gets worse',
+        'AUC stays the same and precision gets worse',
+        'Both stay the same, because the model did not change',
+        'Recall gets worse and AUC stays the same',
+      ],
+      answer: 1,
+      explain: 'AUC measures how well the model orders bad cases above fine ones, and that does not depend on how common bad cases are. Precision falls because flagged cases now include many more false alarms for each real catch. Recall stays the same, since it only looks at the bad cases.',
+    },
+    {
+      id: 'e1-offon-log-bias-replay',
+      q: 'A new ranker puts items in its top 3 that the old ranker never showed. You test it by replaying the log. What is the main problem with the result?',
+      options: [
+        'The log is far too small to compute any metric at all on it',
+        'The replay runs the model far too slowly to be of any use',
+        'The new items always earn more clicks than the old items do',
+        'No labels exist for new items, so they count as misses',
+      ],
+      answer: 3,
+      explain: 'The log only has labels for items the old model showed. A pick it never showed has no label and is treated as a miss, which punishes the new model for being different. Log size and speed are separate concerns, and nothing says new items get more clicks.',
+    },
+    {
+      id: 'e1-offon-hidden-bad-item',
+      q: 'The old ranker happened to hide a poor item. The new ranker would show it near the top. How does an offline replay of the log judge this choice?',
+      options: [
+        'It cannot see the harm, so the new model looks better than it is',
+        'It catches the harm, because the log records every item in the catalogue',
+        'It scores the choice as a miss, so the new model looks worse than it is',
+        'It refuses to run, because the log is missing an item',
+      ],
+      answer: 0,
+      explain: 'The log never recorded users reacting to the hidden item, so the replay has nothing to count against the new model. The bias can run in either direction. Here it flatters the new model. The log holds only what was shown, not the whole catalogue.',
+    },
+    {
+      id: 'e1-offon-guardrail-purpose',
+      q: 'What is the job of a guardrail metric in an online test?',
+      options: [
+        'It is the main goal and it alone decides whether the model wins',
+        'It replaces the offline metric once the model has launched',
+        'It must not get worse while the primary metric improves',
+        'It is another name for the loss that the model was trained on',
+      ],
+      answer: 2,
+      explain: 'A guardrail guards against harm the primary metric cannot see, such as slower pages or fewer daily users. It does not decide the win by itself, and it is a live product measure, not the offline training loss.',
+    },
+  ]}
+/>
+
+<Diagnose
+  client:visible
+  id="e1-offon-auc-up-revenue-flat"
+  title="AUC up two percent, revenue flat"
+  scenario="A team replaces the product ranker with a new model. Offline AUC rises by about 2% on a random split of last quarter's log. Four weeks of live testing show revenue per user flat inside the noise. The numbers below are made up for the exercise."
+  facts={[
+    'offline test: random split of last quarter log, AUC 0.81 to 0.83',
+    'new model top 10 differs from the old model top 10 in about 40% of slots',
+    'training label: click on a shown item',
+    'online test: 4 weeks, randomized by user, revenue per user flat',
+    'exploration slice in the log: none',
+  ]}
+  steps={[
+    {
+      prompt: 'Which offline problem is most likely to have hidden the true effect?',
+      options: [
+        'The log only has labels for items the old model showed, and the new model picks many others',
+        'AUC is not defined for ranking problems',
+        'A 2% gain is always large enough to show online',
+        'The test ran for four weeks, which is too long',
+      ],
+      answer: 0,
+      explain: 'The new top 10 differs in many slots, and with no exploration slice the log has no clean labels for the new picks. That bias can both inflate and deflate the offline number. AUC is defined for ranking, and a longer test does not hurt.',
+    },
+    {
+      prompt: 'What is the best next step?',
+      options: [
+        'Ship anyway, since AUC rose',
+        'Run the next test with a small exploration slice and check whether clicks translate into revenue',
+        'Drop the guardrails so the test shows a gain',
+        'Retrain on the same random split with more data',
+      ],
+      answer: 1,
+      explain: 'An exploration slice gives clean labels for what the new model would show, and checking whether the click label maps to revenue tests the proxy. Shipping ignores the flat result. Dropping guardrails hides harm. More data on the same split repeats both the leak and the bias.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Google: Rules of Machine Learning](https://developers.google.com/machine-learning/guides/rules-of-ml). Rules 24, 25, 33, 34, 35, and 39 are the source of the checks and the Alice story used here.
+- [Chip Huyen: Real-time machine learning, challenges and solutions](https://huyenchip.com/2022/01/02/real-time-machine-learning-challenges-and-solutions.html). Read the part on evaluating continually updated models.
+- [Chip Huyen: Data distribution shifts and monitoring](https://huyenchip.com/2022/02/07/data-distribution-shifts-and-monitoring.html). Read the part on accuracy-related metrics and label delay.

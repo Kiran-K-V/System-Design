@@ -75,7 +75,7 @@ export default function AiE2CkptCalc() {
         </div>
       </div>
       <p className="mt-3 text-xs text-muted">
-        Model: waste = C/T + (T/2 + R)/M, where C is the stall per checkpoint, T the interval, M the mean time between failures, and R the restart time. It assumes failures arrive at random with a constant rate, a failure loses half an interval on average, and T is much smaller than M. Setting the slope to zero gives T = sqrt(2 x C x M), the Young/Daly formula (first by Young, refined by Daly; see the survey by Benoit et al. in Further reading). All slider values are illustrative, not measurements of any real cluster.
+        Model: waste = C/T + (T/2 + R)/M, where C is the stall per checkpoint, T the interval, M the mean time between failures, and R the restart time. It assumes failures arrive at random with a constant rate, a failure loses half an interval on average, and T is much smaller than M. Setting the slope to zero gives T = sqrt(2 x C x M), Young's first-order formula (Daly later added the restart time inside the root and a higher-order version; see Further reading). The restart time R lowers the useful share but, in this form, does not move the optimum. All slider values are illustrative, not measurements of any real cluster.
       </p>
     </CacheWidgetFrame>
   );

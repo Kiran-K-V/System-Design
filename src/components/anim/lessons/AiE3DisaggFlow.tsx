@@ -13,6 +13,7 @@ const K = (w: number): Blk => ({ kind: 'K', w });
 
 // Panel 1: one GPU, whole prefill. Panel 2: one GPU, chunked. Panel 3: two pools.
 const WHOLE: Blk[] = [...D(5), P(150), ...D(10)];
+const STEADY: Blk[] = D(25);
 const CHUNK: Blk[] = [...D(5), ...[0, 1, 2, 3].flatMap((): Blk[] => [P(34), ...D(1)]), ...D(10)];
 const PREFILL_POOL: Blk[] = [P(150)];
 const DECODE_POOL: Blk[] = D(23);
@@ -88,7 +89,7 @@ export default function AiE3DisaggFlow() {
             <HandText x={24} y={34} anchor="start" size={TEXT_SIZES.heading} color="var(--fg)">
               One GPU, whole prefill
             </HandText>
-            <Row blocks={WHOLE} y={ROW.whole} keyPrefix="w" />
+            <Row blocks={s.whole === 'steady' ? STEADY : WHOLE} y={ROW.whole} keyPrefix={`w${s.whole}`} />
             {s.whole === 'stall' && (
               <g>
                 <SketchArrow points={[[stallStart, ROW.whole + 32], [stallStart + 150, ROW.whole + 32]]} head="both" seed={seedOf('stallarrow')} stroke="var(--bad)" />

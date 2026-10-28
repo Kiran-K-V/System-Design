@@ -1,0 +1,263 @@
+---
+summary: 'Serving a big model means splitting it over GPUs, and every split adds talk between them. See why more tensor parallelism gives less and less speed, when to run copies instead of one big group, and why a mixture of experts holds all its experts in memory yet needs an all-to-all exchange and a balanced router.'
+requires: ['ai/e2-training/model-parallelism', 'ai/a2-inference-cost/gpu-memory-math', 'ai/e3-inference-deep/disaggregation']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import AiE3ParSplit from '../../../../components/anim/lessons/AiE3ParSplit.tsx';
+import AiE3MoeRouter from '../../../../components/anim/lessons/AiE3MoeRouter.tsx';
+
+## The problem
+
+You serve a 70B model on 2 GPUs. Users want faster answers. A teammate says: "Use 8 GPUs. Four times the GPUs, a quarter of the time." You try it. The answer gets faster, but not by anything close to four times. The bill is four times higher.
+
+Then a second request arrives. The team wants to serve a mixture-of-experts model that has a smaller compute cost per token. You expect a small bill. The model needs a lot of memory, so it still needs many GPUs. And one day, a step takes twice as long as normal, only because one part of the model got a lot of traffic.
+
+Both problems have one root. When you split a model over GPUs, the GPUs must talk. The talk costs time. [Lesson E2.4](/learn/ai/e2-training/model-parallelism/) showed the four splits for training and the rule that the split which talks most must use the fastest link. This lesson uses the same splits for serving, where the goal is different. In training you chase throughput over a long run. In serving you chase a latency target for each user.
+
+The questions on the way are:
+
+1. Why does tensor parallelism give less speed at each doubling?
+2. What does pipeline parallelism buy in serving?
+3. When should you run copies of a smaller group instead of one big group?
+4. Why does a mixture of experts keep every expert in memory, and what does it add on the network?
+5. What happens when one expert is hot, and what fixes it?
+
+## Why more tensor parallelism gives less
+
+[Lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/) gave the floor of a decode step: the weight bytes divided by the memory speed of the GPUs that hold them. A decode step is mostly reading weights. **Tensor parallelism** [senior] (TP) cuts each weight matrix into slices, one per GPU, so that each GPU reads only its slice. With twice the GPUs, each reads half as much, and the read time halves.
+
+That is the gain. Now the cost. After each slice has done its share, the GPUs must add their partial results together. This is an **all-reduce** [mid]: every GPU adds in its part, and every GPU ends with the sum. The Megatron-LM design needs two of them per layer in the forward pass. A decode step runs the forward pass once, so the number of syncs is the same whatever the number of GPUs, and each sync now spans more GPUs. Also, each sync sits in the middle of the work. The next layer cannot start until it ends, so nothing hides it.
+
+So the step time has two parts. The read part falls as you add GPUs. The sync part stays or grows. The read part is large at first, so the early doublings help. Later, the sync part is a large share, and more GPUs help little.
+
+Think of a team of painters on one wall. Two painters double the speed. Eight painters get in each other's way, and they must stop often to agree on the colour.
+
+The animation shows this with a simple model. Step through 2, 4, and 8 GPUs, then look at the layouts.
+
+<AiE3ParSplit client:visible />
+
+The numbers in the animation are illustrative. We chose the sync cost to show the shape. The shape matches what Databricks measured. Their guide says that, unlike in training, adding GPUs gives "significant diminishing returns" for inference latency. They name two reasons: communication overhead inside the node, and lower use of memory bandwidth (MBU, from lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)) when each GPU reads less. For Llama2-70B, going from 4 to 8 GPUs cut latency only to about 0.7 times at small batch sizes. That is a vendor measurement on their setup. It is one data point, not a law.
+
+Two more points about TP in serving.
+
+- **Keep it inside one server.** The E2.4 rule holds. TP talks a lot, so it needs NVLink [mid], the direct GPU-to-GPU link. Across servers, the network is far slower, and the sync would dominate.
+- **A split is also a memory tool.** A 70B model in 16-bit needs more than one H100 for the weights alone (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). TP also makes room for the KV cache, because each GPU holds less weight. So the lowest TP degree that fits the weights and the cache is a sensible start. Go higher only for a latency target that you cannot meet otherwise.
+
+## What pipeline parallelism buys in serving
+
+**Pipeline parallelism** [senior] (PP) cuts the model by layers. GPU 1 holds the first group of layers, GPU 2 the next, and so on. A token's data passes from stage to stage.
+
+Does it make one token faster? No. The token still has to pass through every layer, one after another. The time for one token does not fall. What PP gives is **throughput**: while stage 2 works on one batch, stage 1 can already start the next. It also sends less data than TP. The SARATHI paper notes that PP is popular for deployment across nodes because of its lower communication overhead than TP. Our reading: use TP inside a server for latency and PP across servers when the model is too big for one server.
+
+PP has a known weakness, the **bubble**: a stage sits idle when no batch is ready for it. In serving, the work per batch varies, because a prefill batch is large and a decode batch is small. The SARATHI paper says the varying prefill and decode times lead to unequal micro-batches, and so to more bubbles. Its fix is the uniform hybrid batch of chunked prefill, from [lesson E3.5](/learn/ai/e3-inference-deep/disaggregation/). For GPT-3 with pipeline parallelism, the paper reports bubbles cut by 6.29 times and end-to-end throughput up 1.91 times. That is a paper claim on its own setup.
+
+## Shard or replicate?
+
+You have 8 GPUs. You can run one group of 8 with TP. Or two groups of 4. Or four groups of 2. Each group is a full copy of the model, and each copy serves its own users. A copy is a **replica** [junior].
+
+This is the same question as scaling a stateless web service. One huge machine is the fastest for one request. Several smaller machines serve more requests in total. Here the choice moves two numbers in opposite directions:
+
+- **Per-user speed.** A bigger group has a faster step, so one user sees more tokens per second.
+- **Total speed.** More groups mean more users served in parallel.
+
+Look at the last step of the animation. In the model, the 8-way group gives the best speed for one user. Four groups of 2 give the most tokens per second in total, at a slower step for each user. Pick by your latency target. If a 4-way group already meets your TPOT, a second replica of it serves twice the users. If you add more TP to chase speed you do not need, you pay for sync you could have avoided.
+
+Replicas also help with failure and with load. When one copy fails, the others still serve. You can scale by adding a copy, as you would add a web server. You can also place a copy on each server so that all TP traffic stays on NVLink. The cost of many copies is memory: each copy holds the full weights, so less room is left per GPU for the KV cache. The model in the animation ignores this limit, and real systems cannot.
+
+## Mixture of experts: all the experts in memory
+
+[Lesson A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/) introduced the **mixture of experts** [mid] (MoE) model. A normal layer has one feed-forward block. An MoE layer has many, called experts. A small network, the **router** [mid], picks a few experts for each token. Only those run.
+
+The Mixtral paper gives the example. Each layer has 8 experts. The router picks 2 per token. Each token can use 47B parameters in total, but only 13B are active during a step. So the compute per token is like a 13B model.
+
+Memory is different. The router can send a token to any expert, so every expert must be in GPU memory. Memory follows the total, not the active count. A 47B model at 16 bits needs about 94 GB for weights alone.
+
+Now the effect on a decode step. A step reads weights, and decode is limited by memory reads (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)). With a batch of one token, only 2 of the 8 experts are read. With a bigger batch, different tokens pick different experts, and soon nearly all experts are read. The widget below shows this under an even-routing assumption. The DeepSpeed-MoE paper states the cost side: inference is often limited by memory bandwidth, and an MoE model can be up to 10 times larger than a dense model of the same quality, so it could need much more bandwidth to match the dense model's latency. So an MoE saves compute but not memory, and at large batches it does not save memory reads either. It saves most when the batch is small, or when compute is what limits you.
+
+## Expert parallelism and the all-to-all
+
+You cannot always fit all experts on one GPU. **Expert parallelism** [senior] (EP) puts different experts on different GPUs. It does not cut any matrix in pieces. Instead, each token goes to the GPU that holds its chosen expert.
+
+That needs an **all-to-all** [mid]. Every GPU sends a different bundle to every other GPU, and then every GPU sends the results back. Picture a sorting office where every worker has letters for every other worker. Everyone walks to everyone else, then walks back.
+
+Is this claim sourced? Yes. The DeepSpeed-MoE paper states that expert parallelism needs all-to-all communication between all expert-parallel devices. It also reports two opposite effects when the number of GPUs grows for a fixed MoE model. Each GPU holds fewer experts and reads less data, which helps. But more communication between experts on different GPUs can hurt. In its tests on a 52B model with 128 experts, going from 8 to 64 GPUs, a tuned system gained more than it lost, and the paper reports higher throughput per GPU as GPUs were added. A plain PyTorch baseline did not. That is a paper claim from 2022, on its own setup. Our reading: the all-to-all is real, its size depends on your links and your software, and you must measure it.
+
+The same paper handles the parts that are not experts. The attention and other shared parts of the model are not split by EP. They still sit on each GPU, and their read time is limited by one GPU. The authors use tensor slicing inside a node for those parts and data parallelism across nodes. So an MoE server often combines several splits from this lesson.
+
+## When one expert is hot
+
+The router decides how many tokens each expert gets. Nothing forces it to spread them evenly. In a real workload, some prompts, such as code or one language, may send many tokens to the same expert. We found no primary source in our reading that measures hot experts in serving, so treat the next section as our model, built on one fact: in EP, a step ends when the busiest GPU ends.
+
+Why? The all-to-all brings tokens to experts. Every GPU runs its experts, then the results go back. Nobody can go on until the slowest GPU is done. If one GPU holds a hot expert, it has the most work, and every other GPU waits for it. The step time follows the hot expert. Adding GPUs does not help, because one expert is still one expert.
+
+Try it. Raise the share of routing that goes to expert 4. Watch the step time. Then add copies of that expert on the lightest GPUs.
+
+<AiE3MoeRouter client:visible />
+
+What the widget shows:
+
+1. **At an even share, the load is even.** The step has no extra wait. Only the fixed all-to-all cost remains.
+2. **A hot expert makes one GPU the bottleneck.** The step time grows with the load of that GPU. Moving other experts around does not help much, because the hot expert alone is the load.
+3. **Copies of the hot expert spread its tokens.** With enough copies, the load evens out. The price is the memory of each copy, in every MoE layer that has a hot expert.
+4. **A bigger batch evens out randomness but not a real skew.** A hot share stays hot.
+
+What are the real fixes? These are our reading of the mechanism, not measured results from a source:
+
+- **Replicate the hot expert** onto lighter GPUs, as in the widget. It costs memory, and it needs a router that knows about the copies.
+- **Rebalance placement over time**, from the observed load. Experts that are hot together should not share a GPU.
+- **Watch expert load as a metric.** The first sign is a step time that rises with no change in batch size.
+- **Do not drop tokens at a cap unless the model was built for it.** Dropping a token changes the answer.
+
+## What experienced teams know
+
+**Find the smallest group that fits.** Databricks reports sub-linear gains from more tensor parallelism and names communication and lower bandwidth use as causes. Start at the lowest TP degree that holds the weights and the cache. Add replicas for load.
+
+**Keep TP inside one server.** Each sync is on the critical path. The Megatron-LM rule, quoted in lesson [E2.4](/learn/ai/e2-training/model-parallelism/), is to use TP up to the number of GPUs in one server.
+
+**Memory follows the total parameters in an MoE.** The Mixtral paper gives 47B total and 13B active. Size the GPUs by the total. Expect compute like a 13B model, and weight reads that grow with the batch as more experts are touched.
+
+**Treat the all-to-all as a cost to measure.** The DeepSpeed-MoE paper had to build custom communication code to make expert parallelism scale, because it saw large overhead from the default library at scale. Do not assume your engine hides it.
+
+**Watch expert load.** A rising step time at constant batch size points to a skewed router. This is our reading, and you must check it on your own traces.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose when |
+|---|---|---|---|
+| More tensor parallelism | A faster step for each user | Sync on every layer, with falling returns, and a need for NVLink | A tight TPOT target that a smaller group cannot meet |
+| Replicas of a smaller group | More total users, simple scaling, failure isolation | Full weights in every copy, so less KV room per GPU | Load is high and the smaller group already meets the target |
+| Pipeline parallelism | Fits a model across servers with modest traffic | No faster token, and bubbles when batches vary | The model does not fit on one server |
+| MoE model | Compute of the active parameters, quality of the total | Memory for all experts, and a hard-to-balance router | Compute limits you and memory is available |
+| Expert parallelism | Fits many experts, each GPU reads less | All-to-all traffic every layer, and exposure to a hot expert | Experts do not fit on one GPU |
+| Copies of a hot expert | Evens the load | Extra memory per copy, in every affected layer | One expert gets a large share and memory is spare |
+
+## Interview lens
+
+<Callout type="tip">
+Start from the cost: "A split trades reading time for talking time. Tensor parallelism cuts the read of each step but adds a sync per layer on the critical path, so the returns fall, and it must stay inside one NVLink server. Databricks saw about 0.7 times latency from 4 to 8 GPUs on Llama2-70B. So I use the smallest group that fits and meets the target, and I add replicas for load." For MoE: "Memory follows the total, compute follows the active parameters. Expert parallelism needs an all-to-all, and the step ends with the busiest GPU, so I watch expert load and replicate a hot expert."
+</Callout>
+
+<Callout type="mistake">
+Do not say that eight GPUs are eight times faster. Do not say an MoE model with 13B active parameters needs the memory of a 13B model. It needs the memory of all 47B. Do not put tensor parallelism across servers on a normal network. And do not claim that a hot expert is a measured rate in production. Without your own traces, it is a risk to watch, not a number.
+</Callout>
+
+## Check yourself
+
+<Diagnose
+  client:visible
+  id="e3-par-hot-expert"
+  title="One expert is hot and every step follows it"
+  scenario="A team serves an MoE model with expert parallelism on 4 GPUs, 2 experts on each. After a new customer starts sending mostly code, step time rises by about half. Total traffic and batch size did not change. The numbers are illustrative."
+  facts={[
+    'GPU 2 is at full use. GPUs 1, 3, and 4 are mostly idle during each step',
+    'expert 4, which lives on GPU 2, gets about 40% of all routing slots',
+    'an even share would be about 12.5%',
+    'there is spare memory on every GPU',
+  ]}
+  steps={[
+    {
+      prompt: 'Why does the step time follow expert 4?',
+      options: [
+        'The step ends only when the busiest GPU is done, and GPU 2 has the most work',
+        'The all-to-all always sends every token to GPU 2 first',
+        'GPU 2 has less memory bandwidth than the others',
+        'Expert 4 has more parameters than the other experts',
+      ],
+      answer: 0,
+      explain: 'Every GPU must finish its experts before the results go back, so the slowest GPU sets the pace. The load, not the hardware or the expert size, is what differs. The all-to-all moves tokens to the experts they chose, not to one GPU.',
+    },
+    {
+      prompt: 'What fixes it best, given the spare memory?',
+      options: [
+        'Add two more GPUs and keep one copy of every expert',
+        'Move expert 3 away from GPU 2 and leave expert 4 where it is',
+        'Place copies of expert 4 on the idle GPUs so its tokens are shared',
+        'Lower the batch size until the step is fast again',
+      ],
+      answer: 2,
+      explain: 'One expert is the load, so you must split its work. Extra copies on idle GPUs do that and use the spare memory. Extra GPUs without copies leave expert 4 alone on one GPU. Moving expert 3 helps a little, but expert 4 is still the bottleneck.',
+    },
+  ]}
+/>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why does doubling the GPUs in a tensor-parallel group not halve the time of a decode step?',
+      options: [
+        'The weights get bigger when they are split across more GPUs in the group',
+        'Reading halves, but each layer still needs a sync that cannot be hidden',
+        'GPUs refuse to share memory with each other unless the model is copied',
+        'The model needs twice as many layers when it runs on twice as many GPUs',
+      ],
+      answer: 1,
+      explain: 'Only the read part shrinks. The syncs happen at every layer and sit on the critical path, so they become a larger share. The weights are the same size in total, and the layer count does not change.',
+    },
+    {
+      q: 'What does pipeline parallelism do for a single token in a serving system?',
+      options: [
+        'It makes the token faster, because each GPU has fewer layers to run in turn',
+        'It does not speed up one token, which still passes every layer in turn',
+        'It removes the KV cache, because each stage only holds a few layers of it',
+        'It splits each weight matrix so that all GPUs work on the same token at once',
+      ],
+      answer: 1,
+      explain: 'A pipeline puts layers on different GPUs. One token still goes through all of them one after another. The gain is that several batches can be in flight at once. Splitting each matrix is tensor parallelism, not pipeline.',
+    },
+    {
+      q: 'You have 8 GPUs and a model whose 4-GPU group already meets your latency target. What is the best use of the other 4 GPUs?',
+      options: [
+        'Join them to the first group for 8-way tensor parallelism',
+        'Keep them idle as a spare',
+        'Run a second copy of the 4-GPU group to serve more users',
+        'Put the KV cache on them over the network',
+      ],
+      answer: 2,
+      explain: 'The latency target is met, so more tensor parallelism buys speed you do not need and adds sync cost. A second replica doubles the users you serve. An idle spare wastes the hardware, and a remote KV cache would be slow.',
+    },
+    {
+      q: 'Mixtral 8x7B has 47B total and 13B active parameters. Which statement about serving it is right?',
+      options: [
+        'Memory is sized by 13B and compute by 47B',
+        'Memory and compute are both sized by 13B',
+        'Memory is sized by 47B and compute by 13B',
+        'Memory and compute are both sized by 47B',
+      ],
+      answer: 2,
+      explain: 'The router can send a token to any expert, so every expert must be in memory. Only the chosen experts do arithmetic for a token, so compute follows the active count. The first option reverses the two.',
+    },
+    {
+      q: 'Which extra network operation does expert parallelism add to every MoE layer?',
+      options: [
+        'An all-to-all that moves tokens to experts and back',
+        'A broadcast of the full KV cache to every GPU that holds an expert',
+        'A second full copy of all the model weights on every GPU in the group',
+        'A checkpoint of all expert weights to disk after every single layer',
+      ],
+      answer: 0,
+      explain: 'Tokens must reach the GPUs that hold their experts, and the outputs must come back. That is an all-to-all. A broadcast of the KV cache or a checkpoint is not part of the layer.',
+    },
+    {
+      q: 'In expert parallelism, why can one hot expert slow the whole step even when the average GPU load is low?',
+      options: [
+        'The step ends when the busiest GPU ends, so the hot expert sets the pace',
+        'Hot experts use much more memory per token than the other experts do',
+        'The router stops sending tokens to all of the other experts in the layer',
+        'Cold experts must be copied to the hot GPU before each step can run',
+      ],
+      answer: 0,
+      explain: 'The results of all experts are gathered before the next layer. The most loaded GPU takes longest, and the others wait. The average load hides this. Memory use and routing to other experts are not the cause.',
+    },
+  ]}
+/>
+
+## Further reading
+
+- [Databricks, LLM Inference Performance Engineering: Best Practices](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices): the tensor parallelism section, with its measurement on Llama2-70B and the reasons for diminishing returns.
+- [Mixtral of Experts](https://arxiv.org/abs/2401.04088): the 47B total and 13B active parameters and the router. It has no serving-communication analysis.
+- [DeepSpeed-MoE: Advancing Mixture-of-Experts Inference and Training to Power Next-Generation AI Scale](https://arxiv.org/abs/2201.05596): expert parallelism, the all-to-all, and tensor slicing for the non-expert parts. You do not need the training half.
+- [SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills](https://arxiv.org/abs/2308.16369): pipeline bubbles in inference, in its second section.

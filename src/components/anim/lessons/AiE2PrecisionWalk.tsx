@@ -53,7 +53,7 @@ const steps: Step[] = [
     tone: 'bad',
   },
   {
-    caption: `Keep a master copy in FP32. It has 23 bits after the leading 1, so its gap near 1.0 is about a hundred thousand times smaller than BF16's, and ${U} fits. The updates add up in the master copy: after ${N} steps it holds ${f(res.master, 4)}.`,
+    caption: `Keep a master copy in FP32. It has 23 bits after the leading 1, so its gap near 1.0 is about 65,000 times smaller than BF16's (16 more bits), and ${U} fits. The updates add up in the master copy: after ${N} steps it holds ${f(res.master, 4)}.`,
     bf16: res.bf16Only,
     master: res.master,
     update: true,

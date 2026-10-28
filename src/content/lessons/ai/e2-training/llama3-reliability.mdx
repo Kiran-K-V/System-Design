@@ -9,21 +9,19 @@ import Diagnose from '../../../../components/lesson/Diagnose.tsx';
 import AiE2LlamaCauses from '../../../../components/anim/lessons/AiE2LlamaCauses.tsx';
 import AiE2FourDGrid from '../../../../components/anim/lessons/AiE2FourDGrid.tsx';
 
-The one source is the Llama 3 paper from Meta, "The Llama 3 Herd of Models" (July 2024). We read version 3 on 2026-10-28, in full for the infrastructure and reliability sections (3.3 and 3.4). Every claim from the paper is marked **Paper claim**. Every inference of ours is marked **Our reading**. Lesson [E2.6](/learn/ai/e2-training/failures-at-scale/) taught the general ideas: failures grow with cluster size, detection, spares and restart. This lesson does not repeat them. It reads one real system and asks what it published.
+The one source is the Llama 3 paper from Meta, "The Llama 3 Herd of Models" (July 2024). We read version 3 on 2026-10-28, in full for the infrastructure and reliability section (3.3). Every claim from the paper is marked **Paper claim**. Every inference of ours is marked **Our reading**. Lesson [E2.6](/learn/ai/e2-training/failures-at-scale/) taught the general ideas: failures grow with cluster size, the four kinds of break, and the detect, replace, reload, redo loop. This lesson does not repeat them. It reads one real system and asks what it published.
 
 ## What they built and why it was hard
 
 Meta trained its largest Llama 3 model, with 405 billion parameters, on up to 16,384 GPUs. **Paper claim**: "Llama 3 405B is trained on up to 16K H100 GPUs, each running at 700W TDP with 80GB HBM3". HBM3 is the fast stacked memory attached to each GPU. The model was "pre-trained using 3.8 × 10^25 FLOPs" on 15.6 trillion text tokens. A **FLOP** is one arithmetic operation on a number. The total is the work budget of the run (the core lesson on [scaling laws](/learn/ai/a1-model-function/scaling-laws/) shows where a budget like this comes from).
 
-Why is this hard to keep running? The paper says: "The complexity and potential failure scenarios of 16K GPU training surpass those of much larger CPU clusters that we have operated. Moreover, the synchronous nature of training makes it less fault-tolerant—a single GPU failure may require a restart of the entire job."
-
-Two jobs have to be done at once. Keep the GPUs busy while they run. And keep them running at all. The paper treats both. The first is measured by **model FLOPs utilization**, or MFU: the share of the chip's peak arithmetic speed that goes into useful model math. The second is **effective training time**, which the paper defines as "the time spent on useful training over the elapsed time" (lesson E2.6). The two multiply. A fast job that is down a third of the time is slow.
+Why is this hard to keep running? Lesson [E2.6](/learn/ai/e2-training/failures-at-scale/) quoted the paper's answer: training is synchronous, so one GPU failure can restart the whole job. Two jobs have to be done at once. Keep the GPUs busy while they run, and keep them running at all. The first is measured by **model FLOPs utilization**, or MFU: the share of the chip's peak arithmetic speed that goes into useful model math. The second is **effective training time**, the share of elapsed time spent on useful training. The two multiply. A fast job that is down a third of the time is slow.
 
 ## The before
 
 The paper does not describe an earlier Meta design for this problem, so we cannot show a "before" from the source. We can build one from its numbers. This is **Our reading**.
 
-Take the 54-day snapshot the paper reports: 419 unexpected interruptions. Divide time by count and you get one unexpected stop about every 3 hours, around the clock. Now picture the plain design. A job runs. A GPU fails. The job dies. A person gets paged, looks, restarts it. Every stop costs the time it takes a person to notice and act, plus the restart. At that rate a person who needs even an hour per stop would keep the cluster idle a third of the time. At 16,384 GPUs, an hour of idle cluster is a large bill.
+Take the 54-day snapshot the paper reports: 419 unexpected interruptions. Divide time by count and you get one unexpected stop about every 3 hours, around the clock. Now picture the plain design. A job runs. A GPU fails. The job dies. A person gets paged, looks, restarts it. At that rate a person who needs even an hour per stop would keep the cluster idle a third of the time. At 16,384 GPUs, an hour of idle cluster is a large bill.
 
 So the plain design is not slow, it is impossible at this size. Whatever Meta did had to work without a person for nearly every stop. Step through the data for the snapshot.
 
@@ -31,51 +29,43 @@ So the plain design is not slow, it is impossible at this size. Whatever Meta di
 
 ## The design
 
-The paper describes four layers of the design. We take them in turn: the machine, the layout of work, the tools that find problems, and the work outside the code.
+The paper describes four layers of the design: the machine, the layout of work, the tools that find problems, and the work outside the code.
 
 ### The machine
 
-**Paper claim.** Each server "is equipped with eight GPUs and two CPUs", and the eight GPUs are joined by NVLink, the very fast link inside a server. Jobs are scheduled by MAST, "Meta's global-scale training scheduler". A **scheduler** is the program that decides which machines run which job. Storage is Tectonic, Meta's general-purpose distributed file system. The paper gives it "240 PB of storage out of 7,500 servers equipped with SSDs", with "a sustainable throughput of 2 TB/s and a peak throughput of 7 TB/s", and notes that "a major challenge is supporting the highly bursty checkpoint writes that saturate the storage fabric for short durations." A checkpoint, as lesson E2.6 explained, is the saved copy used to restart. The paper adds that each GPU's model state in a checkpoint ranges "from 1 MB to 4 GB per GPU".
+**Paper claim.** Each server "is equipped with eight GPUs and two CPUs", joined by NVLink, the very fast link inside a server. Jobs are scheduled by MAST, "Meta's global-scale training scheduler". A **scheduler** is the program that decides which machines run which job. Storage is Tectonic, Meta's distributed file system: "240 PB of storage out of 7,500 servers equipped with SSDs", with "a sustainable throughput of 2 TB/s and a peak throughput of 7 TB/s". The paper names the hard part: "the highly bursty checkpoint writes that saturate the storage fabric for short durations." A checkpoint is the saved copy used to restart (lesson [E2.6](/learn/ai/e2-training/failures-at-scale/)).
 
-The network is a RoCE fabric. **RoCE** (RDMA over Converged Ethernet) lets one machine write straight into another machine's memory over ordinary Ethernet switches, with little work by the CPU. **Paper claim**: the cluster "comprises 24K GPUs connected by a three-layer Clos network". A footnote says "we use only up to 16K of these 24K GPUs for Llama 3 pre-training". A **Clos network** is a set of switch layers wired so that many paths join any two racks. The bottom layer has racks of 16 GPUs. Above it, a pod of 3,072 GPUs has "full bisection bandwidth", which means that no part of the pod is starved when all GPUs talk at once. Eight pods make the cluster, and there "the aggregation layer does not maintain full bisection bandwidth and instead has an oversubscription ratio of 1:7". **Oversubscription** means that the links going up are thinner than the links coming in, so a crowd can block each other. The paper then says the parallelism methods and the scheduler "are all optimized to be aware of network topology, aiming to minimize network communication across pods."
+The network is a RoCE fabric. **RoCE** (RDMA over Converged Ethernet) lets one machine write straight into another machine's memory over ordinary Ethernet switches, with little work by the CPU. **Paper claim**: a 24K-GPU cluster, of which "up to 16K" were used for Llama 3 pre-training. A pod of 3,072 GPUs has "full bisection bandwidth", which means no part of the pod is starved when all GPUs talk at once. Eight pods join through an aggregation layer with "an oversubscription ratio of 1:7": the links going up are thinner than the links coming in, so a crowd can block each other. The paper says the parallelism methods and the scheduler are "optimized to be aware of network topology, aiming to minimize network communication across pods."
 
 The reliability point: the machine has a shape, and the job has to be placed to fit it.
 
 ### The layout of work: four dimensions
 
-The model does not fit on one GPU, so the work is split in four ways at once. Lesson E2.4 teaches each in depth. In one line each. **Tensor parallelism** (TP) splits each weight matrix across GPUs. **Pipeline parallelism** (PP) puts different layers on different GPUs, like stations on a line. **Context parallelism** (CP) splits a very long input among GPUs. **Data parallelism** (DP) keeps full copies of the model that each see different data. The paper's DP is a sharded version, FSDP, that spreads the optimizer state and gradients (lesson E2.3).
-
-**Paper claim.** "GPUs are divided into parallelism groups in the order of [TP, CP, PP, DP]." A GPU's position is a list of four numbers. Pick a GPU in the widget and see who shares each kind of group. The 16-GPU example is the paper's own. Below it, the three real configurations from the paper.
+The model does not fit on one GPU, so the work is split four ways at once: tensor, pipeline, context and data parallelism, all taught in lesson [E2.4](/learn/ai/e2-training/model-parallelism/). **Paper claim.** "GPUs are divided into parallelism groups in the order of [TP, CP, PP, DP]." A GPU's position is a list of four numbers. Pick a GPU in the widget and see who shares each kind of group. The 16-GPU example is the paper's own. Below it are the three real configurations from the paper.
 
 <AiE2FourDGrid client:visible />
 
-Read the three rows. In the first two, TP is 8, PP is 16, CP is 1, and DP changes from 64 to 128 as the cluster doubles from 8,192 to 16,384 GPUs. MFU slips from 43% to 41%. **Paper claim**: the drop "is due to the lower batch size per DP group needed to keep the global tokens per batch constant during training." In plain words: each step must still use 16 million tokens, so twice the data groups means half the batch each, and the groups spend more of their time waiting for each other. In the third row, the context is 131,072 tokens. CP becomes 16 and DP becomes 8. MFU is 38%.
+Lesson [E2.4](/learn/ai/e2-training/model-parallelism/) explains why MFU slips from 43% to 41% when the cluster doubles. The third row shows what long context costs: a 131,072-token input needs CP 16 and DP 8, and MFU is 38%.
 
-**Our reading.** The first two rows show that TP is 8, and a server has 8 GPUs, joined by the fast NVLink. The groups are made in the order TP, CP, PP, DP, and TP comes first, so a tensor group likely fills one server and keeps its heavy traffic on the fastest link. We did not find the paper saying this in so many words, so check it before you rely on it. It does match the reason lesson E2.4 gave for why TP stays inside a node. It also means that a GPU failure takes out a whole server's tensor group, and with PP at 16 and CP at 1, the tensor and pipeline groups together span 128 GPUs that hold one slice of the model. A fault in any one of the 128 stalls that slice, and, since the job is synchronous, every other data group waits.
+**Paper claim**: the innermost dimension "requires the highest network bandwidth and lowest latency, and hence is usually constrained to within the same server." TP is innermost and is 8, and a server has 8 GPUs, so a tensor group fills one server. **Our reading**: one dead GPU therefore removes a whole server's tensor group. With PP at 16 and CP at 1, the tensor and pipeline groups together span 128 GPUs that hold one full copy of the model. A fault in any one of the 128 stalls that copy, and since the job is synchronous, every other data group waits.
 
 ### Tools that find the problem
 
-Detection is where most of the paper's reliability section goes.
+Detection is where most of the paper's reliability section goes. Lesson [E2.6](/learn/ai/e2-training/failures-at-scale/) explained the ideas: a flight recorder, live tracing, watchdog time-outs and comparing ranks to find stragglers. Here is what the paper adds.
 
-**The flight recorder.** **Paper claim**: "We extensively use PyTorch's built-in NCCL flight recorder, a feature that captures collective metadata and stack traces into a ring buffer, and hence allowing us to diagnose hangs and performance issues quickly at scale." NCCL is Nvidia's library that GPUs use to exchange data with each other, and a **collective** is one such exchange among a group, for instance averaging gradients across all GPUs. The paper says it "efficiently record[s] every communication event and the duration of each collective operation, and also automatically dump[s] tracing data on NCCLX watchdog or heartbeat timeout." NCCLX is Meta's own fork of NCCL, "significantly" faster "especially for higher latency networks". A ring buffer is a fixed-size memory that overwrites its oldest entry, as the black box of an aircraft does. Lesson E2.6 explains the idea.
+**Paper claim**: Meta uses "PyTorch's built-in NCCL flight recorder", which "captures collective metadata and stack traces into a ring buffer", and it "automatically dump[s] tracing data on NCCLX watchdog or heartbeat timeout." NCCL is Nvidia's library that GPUs use to exchange data, and a **collective** is one such exchange among a group. NCCLX is Meta's fork of it, which "significantly improves the performance of NCCL, especially for higher latency networks".
 
-**Switching on more detail live.** **Paper claim**: heavier tracing is enabled "selectively as needed live in production through online configuration changes … without needing a code release or job restart." A restart to turn on debugging would cost the thing you are trying to save.
-
-**Turning a stall into an error.** **Paper claim**: failures of "the remote GPU or NVLink connectivity often manifest as stalled load/store operations within CUDA kernels without returning a clear error code." And: "NCCLX enhances the speed and accuracy of failure detection and localization through a tight co-design with PyTorch". The system "monitors the state of the communication library and automatically times out when such a stall is detected." The paper also says that "stalls due to NVLink failures cannot be completely prevented". So the design does not prevent the stall. It finds it and ends it fast. When a collective fails, the library gives "a snapshot of the failing NCCLX collective's internal state, including finished and pending data transfers between all ranks." A **rank** is the number of one GPU in the job.
-
-**Stragglers.** **Paper claim**: "Even a single straggler can slow down thousands of other GPUs, often appearing as functioning but slow communications." Meta "developed tools to prioritize potentially problematic communications from selected process groups", and "by investigating just a few top suspects, we were usually able to effectively identify the stragglers."
+**Paper claim**: "stalls due to NVLink failures cannot be completely prevented", but the system "monitors the state of the communication library and automatically times out when such a stall is detected". When a collective fails, the library gives "a snapshot of the failing NCCLX collective's internal state, including finished and pending data transfers between all ranks." A **rank** is the number of one GPU in the job. So the design does not prevent the stall. It finds it and ends it fast. For stragglers, the paper names no method beyond ranking suspect communications and checking "a few top suspects".
 
 ### Recovery and automation
 
-**Paper claim**: "To increase the effective training time, we reduced job startup and checkpointing time, and developed tools for fast diagnosis and problem resolution." And the whole loop worked without people: "significant manual intervention was required only three times during this period, with the rest of issues handled by automation." Maintenance, such as "firmware and Linux kernel upgrades", is automated too, and the paper says it "resulted in at least one training interruption daily".
-
-Note what is claimed and what is not. The sentence says startup and checkpoint time were reduced. It does not say from what or to what.
+**Paper claim**: the whole loop worked without people: "significant manual intervention was required only three times during this period, with the rest of issues handled by automation." Maintenance such as "firmware and Linux kernel upgrades" is automated too, and "resulted in at least one training interruption daily". The paper says startup and checkpoint time were reduced. It does not say from what or to what.
 
 ### Outside the code
 
 Two items in the paper are not about software at all. **Paper claim**: "we noted a diurnal 1-2% throughput variation based on time-of-day. This fluctuation is the result of higher mid-day temperatures impacting GPU dynamic voltage and frequency scaling." That is, a hot afternoon makes the chips slow themselves down. And: "tens of thousands of GPUs may increase or decrease power consumption at the same time, for example, due to all GPUs waiting for checkpointing or collective communications to finish, or the startup or shutdown of the entire training job. When this happens, it can result in instant fluctuations of power consumption across the data center on the order of tens of megawatts, stretching the limits of the power grid."
 
-**Our reading.** A checkpoint is a moment when every GPU waits for storage at once. The paper says that this synchronised wait pulls the power draw down for the whole data centre together. A design choice in the software shows up in the power grid.
+**Our reading.** A checkpoint is a moment when every GPU waits at once. A design choice in the software shows up in the power grid.
 
 ## The numbers
 
@@ -84,35 +74,29 @@ Every figure we use, with what it measures. The paper has no dollar figures and 
 | Figure | What it measures, exactly | Source | Label |
 |---|---|---|---|
 | Up to 16K H100s, 700 W, 80 GB HBM3 | Compute used for Llama 3 405B pre-training | Llama 3 paper, July 2024 | Paper claim |
-| 24K-GPU RoCE cluster, 3,072-GPU pods, 1:7 at the top | Network the job ran on; only up to 16K GPUs used | Same | Paper claim |
 | 3.8 × 10^25 FLOPs, 15.6T tokens | Pre-training compute and data of the 405B model | Same | Paper claim |
 | 466 interruptions in 54 days | All job interruptions in a 54-day snapshot of pre-training | Same | Paper claim |
 | 47 planned, 419 unexpected | Planned: automated maintenance or operator actions such as config or dataset updates | Same | Paper claim |
-| Faulty GPU 148 (30.1%), HBM3 72 (17.2%), software bug 54 (12.9%), network switch or cable 35 (8.4%), host maintenance 32 (7.6%) | Count and share of the 419 unexpected interruptions, by root cause | Same, root-cause table | Paper claim |
+| Faulty GPU 148 (30.1%), HBM3 72 (17.2%), software bug 54 (12.9%), network switch or cable 35 (8.4%), host maintenance 32 (7.6%) | Count and share of the 419 unexpected interruptions, by root cause. The first row does not add up: see "Our reading" | Same, root-cause table | Paper claim |
 | About 78% hardware, GPU 58.7% | Share of unexpected interruptions attributed to confirmed or suspected hardware, and to GPU issues | Same | Paper claim |
 | More than 90% effective training time | "Time spent on useful training over the elapsed time", while supporting automated maintenance | Same | Paper claim |
 | 3 manual interventions | Times that "significant manual intervention" was needed in the snapshot | Same | Paper claim |
 | MFU 43%, 41%, 38% | BF16 MFU at 8,192 GPUs, 16,384 GPUs, and 16,384 GPUs with a 131,072-token context | Same, parallelism table | Paper claim |
-| 430, 400, 380 TFLOPs per GPU | Achieved per-GPU rate for the same three rows | Same | Paper claim |
-| 1 MB to 4 GB per GPU | Size of the model state each GPU saves in a checkpoint | Same | Paper claim |
-| 240 PB, 2 TB/s sustained, 7 TB/s peak | Storage fabric used for pre-training | Same | Paper claim |
 | 1 to 2% throughput swing | Day-night variation of training speed | Same | Paper claim |
 
-**Not published.** How many spare nodes there were, or whether there were any. How long detection, replacement, startup and checkpoint load took, before or after the work to shorten them. How often checkpoints were taken. The lost time, as against the count, for each cause. How "effective training time" counts planned maintenance. The length of the whole run and its total interruption count beyond the 54-day snapshot. Cost. The share of interruptions that a person had to find by hand beyond the three that needed "significant" intervention. Whether elastic training was tried.
+**Not published.** How many spare nodes there were, or whether there were any. How long detection, replacement, startup and checkpoint load took, before or after the work to shorten them. How often checkpoints were taken. The lost time, as against the count, for each cause. How "effective training time" counts planned maintenance. The length of the whole run. Cost. Whether elastic training was tried.
 
 ## Our reading
 
-**The table counts stops, not lost time.** A faulty GPU is 148 stops. A rare network hang might cost more hours than all of them. The paper gives counts only. Do not rank causes by cost from this table. Rank them by count, and then ask how long each took.
+**The table counts stops, not lost time.** A faulty GPU is the biggest row by count. A rare network hang might cost more hours than all of them. Rank causes by count from this table, and then ask how long each took.
 
-**Two figures in the first row do not agree.** **Our reading**: 148 out of 419 is about 35%, not 30.1%. The other rows match their count divided by 419. The paper's 58.7% for GPU issues matches a count of about 246 in the GPU rows, not the 268 that the printed counts give. So either the first-row count or the first-row share is off, and we cannot tell which from the page. We quote both as printed, we use no derived figure from that row, and we would ask the authors. The totals are unaffected: 466, 47, and 419 all agree with the text.
+**Two figures in the first row do not agree.** **Our reading**: 148 out of 419 is about 35%, not 30.1%. The other rows match their count divided by 419. The paper's 58.7% for GPU issues matches a count of about 246 in the GPU rows, not the 268 that the printed counts give. So either the first-row count or the first-row share is off, and we cannot tell which from the page. We quote both as printed and use no derived figure from that row. The totals are unaffected: 466, 47, and 419 all agree with the text.
 
-**What more than 90% implies.** Ten per cent of 54 days is about 130 hours. Spread over 466 interruptions, that is at most about 17 minutes each, and less, since the paper says "higher than 90%". This is a ceiling on the average cost of one stop, if every lost minute came from stops. It tells you the average stop was cheap. It does not say how: detection, replacement, startup, checkpoint load and redone work together fit inside it. It also covers planned stops, so the unplanned ones cost less than that.
+**What more than 90% implies.** Ten per cent of 54 days is about 130 hours. Spread over 466 interruptions, that is at most about 17 minutes each, and less, since the paper says "higher than 90%". This is a ceiling on the average cost of one stop, if every lost minute came from stops. It tells you the average stop was cheap. It does not say how. It also covers planned stops, so the unplanned ones cost less than that.
 
-**Effective time and MFU multiply.** MFU is the speed while running. Effective time is the share of time running. **Our reading**: a team that quotes 41% MFU and above 90% effective time is describing about 37% or more of peak useful work over the whole snapshot. The two kinds of loss have different cures. A stall-fixing tool raises effective time. A better batch layout raises MFU.
+**Effective time and MFU multiply.** **Our reading**: a team that quotes 41% MFU and above 90% effective time is describing about 37% or more of peak useful work over the whole snapshot. The two kinds of loss have different cures. A stall-fixing tool raises effective time. A better batch layout raises MFU.
 
-**Hardware dominates the cause list, so the toolbox is hardware-shaped.** With about 78% of unexpected stops tied to hardware, replace-and-resume and diagnose-the-machine tools pay back more than software debugging. Software bugs are still the third row at 54, so the code path is not free of faults. This is a count-based judgment, so it may shift if you weigh by hours lost.
-
-**The snapshot may cover most of the run.** **Our reading**, by order of magnitude: 16,384 GPUs at roughly 400 TFLOPs each do about 6.5 × 10^18 operations a second. A budget of 3.8 × 10^25 FLOPs at that speed takes about two months. So a 54-day snapshot is a large part of the run, not a small sample of it. The paper does not say if it is the whole run, and the speeds changed across the phases, so treat this as a plausibility check.
+**Hardware dominates the cause list, so the toolbox is hardware-shaped.** With about 78% of unexpected stops tied to hardware, replace-and-resume and diagnose-the-machine tools pay back more than software debugging. Software bugs are still the third row, so the code path is not free of faults. This is a count-based judgment, so it may shift if you weigh by hours lost.
 
 **What we would test before copying any of it.** Count your own interruptions by cause for a month. Measure each stage of your own loop: detect, replace, load, redo. Check whether your tensor groups fit inside a server, and what one dead GPU removes from a job. Log hang evidence on every time-out. The paper gives the shape of a good design, not the settings.
 
@@ -121,9 +105,7 @@ Every figure we use, with what it measures. The paper has no dollar figures and 
 | Idea | When it fits | When it does not |
 |---|---|---|
 | Record every collective in a ring buffer and dump it on time-out | Any multi-node job, where a hang has no error message | Single-node jobs, where logs already show who waited |
-| Enable heavier tracing live, without a restart | Long runs, where a restart costs hours | Short jobs that you can rerun in the debug mode |
 | Turn stalls into time-outs, then act on them | Jobs on shared fast links, where stalls hide | Never skip: an undetected stall costs all the GPUs |
-| Compare ranks to find stragglers | Large jobs, where one slow GPU hides in the average | Small jobs with few ranks, where a plain log is enough |
 | Fit tensor groups inside a server | Layouts whose heaviest traffic needs the fastest link | Models small enough for no tensor splitting at all |
 | Automate recovery, including maintenance | A stop every few hours | A rare failure that a person can handle |
 | Report effective time and MFU separately | Always, since they have different causes | Never combine them in one figure without saying how |
@@ -149,7 +131,7 @@ Do not say "Meta has a 3% failure rate" or quote 466 as the failure count. 47 of
       options: [
         'All 466 were hardware failures that needed a replacement node',
         'It is a measured failure rate for the whole run of the model',
-        'It counts 419 unexpected stops plus 47 planned maintenance stops',
+        'It counts 419 unexpected stops plus 47 planned ones',
         'It counts only the stops that needed a person to fix them',
       ],
       answer: 2,
@@ -161,26 +143,26 @@ Do not say "Meta has a 3% failure rate" or quote 466 as the failure count. 47 of
         'Software debugging tools matter more than anything that touches machines',
         'The cause mix is the same in any cluster, so copy the 78% to plan spares',
         'Checkpoints are no longer needed, because hardware faults fix themselves',
-        'Fast replace-and-resume and machine diagnosis pay back most, in this data',
+        'Replace-and-resume and machine diagnosis pay back most here',
       ],
       answer: 3,
       explain: 'If most stops come from machines, tools that find the bad machine and swap it out cut the most lost time. The software bug row is still large, so debugging is not free. The mix belongs to Meta\'s hardware and software, and checkpoints are what makes a restart cheap.',
     },
     {
-      q: 'MFU in the paper slips from 43% to 41% when the job grows from 8,192 to 16,384 GPUs. What reason does the paper give?',
+      q: 'In the Llama 3 405B layout, a tensor group fills one server and the tensor and pipeline groups together span 128 GPUs. What follows from one dead GPU?',
       options: [
-        'The extra GPUs are older and run at a lower clock speed than the rest',
-        'The batch per data-parallel group must shrink to keep tokens per batch fixed',
-        'More failures happen at the larger size and pull the average down',
-        'The tensor groups have to be spread across servers at the larger size',
+        'Only the dead GPU stops, and the other 127 carry on with its share',
+        'The 128 GPUs holding one model copy stall, and every other group waits',
+        'Only its own server stops, because pipeline stages never wait for each other',
+        'The job keeps full speed, because data parallel copies replace the lost GPU',
       ],
       answer: 1,
-      explain: 'The global batch stays at 16M tokens, so doubling the data-parallel groups halves the batch each one gets, and they wait on each other more. Failures lower effective training time, not MFU. TP stays at 8 in both rows.',
+      explain: 'Each GPU holds a slice that no other GPU can compute, so the whole copy of the model stalls, and the other data groups wait at the next gradient exchange. The paper does not say Meta kept running with fewer GPUs. Pipeline stages depend on each other, and data parallel copies do not hold the dead GPU\'s slice.',
     },
     {
       q: 'The paper says one straggler can slow thousands of GPUs, and that no alarm fires. What approach did Meta describe for finding it?',
       options: [
-        'Prioritize suspect communications within process groups and check a few top suspects',
+        'Rank suspect communications and check the few top suspects',
         'Kill the job on any step that is slower than the best step recorded',
         'Wait for the hardware to report a fault code, since stragglers log one',
         'Compare the loss curve against an earlier run on different data',
@@ -210,7 +192,7 @@ Do not say "Meta has a 3% failure rate" or quote 466 as the failure count. 47 of
     {
       prompt: 'Which stage do you attack first?',
       options: [
-        'Raise the MFU of the running job, since 44% is far below peak',
+        'Raise the MFU of the running job, since 44% is far below the peak value',
         'Cut the time until a hang is noticed, the largest single stage',
         'Halve the checkpoint interval, so less work is redone',
         'Buy spare nodes, so the 15-minute wait is gone',
@@ -223,7 +205,7 @@ Do not say "Meta has a 3% failure rate" or quote 466 as the failure count. 47 of
       options: [
         'A bigger log file so the engineers can read more when they wake up',
         'A rule that restarts the job every 6 hours whether it hangs or not',
-        'A watchdog on collectives that raises an error, and a trace dump on time-out',
+        'A watchdog that turns stalls into errors, plus a trace dump',
         'A second copy of every checkpoint on faster storage',
       ],
       answer: 2,

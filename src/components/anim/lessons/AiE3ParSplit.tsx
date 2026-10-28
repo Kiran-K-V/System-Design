@@ -28,7 +28,7 @@ const steps: Step[] = [
     n: 4,
   },
   {
-    caption: `Eight GPUs. Reading falls again to ${f1(s8.readMs)} ms, but sync is now a large share: ${f1(s8.commMs)} ms. The step is ${f1(s8.totalMs)} ms. Doubling the GPUs bought about ${((1 - s8.totalMs / s4.totalMs) * 100).toFixed(0)}% less time, not 50%. A paper-style measurement shows the same shape: Databricks saw only about a 0.7x time on Llama2-70B going from 4 to 8 GPUs.`,
+    caption: `Eight GPUs. Reading falls again to ${f1(s8.readMs)} ms, but sync is now a large share: ${f1(s8.commMs)} ms. The step is ${f1(s8.totalMs)} ms. Doubling the GPUs bought about ${((1 - s8.totalMs / s4.totalMs) * 100).toFixed(0)}% less time, not 50%. Databricks measured the same shape: on Llama2-70B, going from 4 to 8 GPUs cut latency only to about 0.7x at small batch sizes (vendor blog).`,
     n: 8,
   },
   {

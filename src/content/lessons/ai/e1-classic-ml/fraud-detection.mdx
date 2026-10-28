@@ -1,0 +1,447 @@
+---
+summary: 'Fraud scoring is a rare-event problem with late labels and an opponent who adapts. Set the threshold from the cost of both errors, train only on payments old enough to be labeled, keep a fast rules layer beside the model, and decide in advance how the system fails. Drill: bot and spam detection.'
+requires: ['ai/e1-classic-ml/data-labels', 'ai/e1-classic-ml/training-serving-skew', 'ai/e1-classic-ml/ab-testing-models', '11-breakdowns/payment-system']
+---
+
+import Callout from '../../../../components/lesson/Callout.astro';
+import Quiz from '../../../../components/lesson/Quiz.tsx';
+import Diagnose from '../../../../components/lesson/Diagnose.tsx';
+import CrossTrackLink from '../../../../components/CrossTrackLink.astro';
+import AiE1FraudBuild from '../../../../components/anim/lessons/AiE1FraudBuild.tsx';
+import AiE1FraudLabels from '../../../../components/anim/lessons/AiE1FraudLabels.tsx';
+import AiE1FraudThreshold from '../../../../components/anim/lessons/AiE1FraudThreshold.tsx';
+
+## The problem
+
+A customer taps "Pay". Behind that tap, a stranger may be using a stolen card. If you let the payment through and it is fraud, you lose the goods or the cash, and you pay a fee when the real cardholder disputes it. If you block it and it was a real customer, you lose the sale and maybe the customer.
+
+Stripe, in its engineering post on Radar (2023-03-29), says fraud is roughly 1 in every 1,000 payments and that Radar incorrectly blocks 0.1% of the legitimate payments made on Stripe (company claim). Read that pair again. Fraud is rare. A model that blocks good traffic at a tiny rate still blocks a lot of good traffic in absolute terms, because good traffic is almost all of the traffic.
+
+Three things make this problem hard: fraud is rare, so plain accuracy tells you nothing; the truth arrives weeks late; and the other side adapts, so your data describes yesterday's attacker.
+
+This lesson builds a real-time fraud scorer. The lesson answers: what is the bar at 1 in 1,000, how to pick a threshold, how to train when labels take months, how to choose a model when merchants want reasons, how to react to a new attack faster than a retrain, and what happens when a part breaks. A drill at the end applies the same machinery to bot and spam detection.
+
+<CrossTrackLink id="11-breakdowns/payment-system">
+The backend case study builds the money side of a payment: an idempotent request, a ledger, and a reconciliation job. This lesson sits in front of it. The scorer decides whether that payment request should proceed at all. The backend rate limiter case is a close relative of the rules layer below, which also counts events per key and acts when the count is too high.
+</CrossTrackLink>
+
+## Requirements and the quality bar
+
+The product is a scoring service that every payment calls before it is authorized. Numbers below are **illustrative** unless a source is named. The Stripe figures are **company claims** from the Radar post.
+
+**Functional**
+
+- FR1: score every payment in real time.
+- FR2: turn the score into an action: allow, ask the customer to prove identity (3DS, see below), send to a human reviewer, or block.
+- FR3: learn from outcomes, including outcomes that arrive late.
+- FR4: explain a decline to the merchant.
+
+**Out of scope.** Account takeover and login fraud (the drill touches the same ideas), chargeback disputes handling, and the payment ledger itself.
+
+**3DS** (3D Secure) is an extra identity check, usually a code or an app approval from the cardholder's bank. Stripe's docs list it as one of four actions its rules can take: request 3DS, allow, block, or send to review ([Stripe, risk evaluation](https://docs.stripe.com/radar/risk-evaluation)). A picture: a bouncer who, when unsure, asks for ID instead of turning you away. The why: it turns a hard yes or no into a cheaper middle option. The example: a payment with a score in the grey zone gets a 3DS prompt. A real customer passes in seconds. A thief with only the card number usually cannot.
+
+**Non-functional, in words.** Fast (the customer is waiting). Honest about rare events (the bar must work at 1 in 1,000). Safe when parts fail. Quick to react to a new attack.
+
+**The deadline.** Stripe says Radar decides in under 100 ms across more than 1,000 characteristics of a payment (company claim). Our reading: 100 ms is a whole-decision ceiling, so every stage inside it, feature reads included, has a share of it.
+
+**The bar.** One sentence: **recall at a fixed false-positive rate**.
+
+- **Recall** is the share of real fraud that you catch.
+- **False-positive rate** (FPR) is the share of *good* payments that you wrongly block.
+
+Fix the second at a level the business can live with, then compare models on the first. A picture: you set the width of a net so that it only snags a few good fish by mistake, and then you ask how many bad fish it catches. The why: at 1 in 1,000, a model can block nothing, be 99.9% accurate, and catch zero fraud. Lesson [E1.2](/learn/ai/e1-classic-ml/data-labels/) shows why accuracy fails on rare events. The example: the Stripe pair above is an operating point. "0.1% of good payments blocked" is the false-positive rate. Recall at that point is what the model team is trying to raise. Stripe's post reports recall changes as relative effects (a drop of about 1.5% if XGBoost were removed on its own) and does not publish a recall level, so we do not know the absolute number.
+
+There is a second metric the threshold forces on you: **precision**, the share of your blocks that were truly fraud. With a rare event it is lower than people expect. The widget below shows it. At 0.1% FPR on a good model, about half of all blocks are good customers. That is not a bug. It is arithmetic of rare events, and it is why a block is not the only action you can take.
+
+## Eval plan
+
+Per lesson [A0.2](/learn/ai/a0-orientation/ai-design-method/), the eval comes before the design.
+
+**Offline.** Split by time, never at random (lesson [E1.2](/learn/ai/e1-classic-ml/data-labels/)). Train on payments up to a cutoff. Test on a later window. Both sides must contain only payments old enough to carry their labels, or the newest fraud will be scored as good traffic. Report recall at the fixed false-positive rate, plus the whole curve, **per slice**: new accounts, high-value orders, each country, each payment method. One strong average can hide a slice where the model is blind.
+
+**Delayed labels.** The offline set is always weeks behind. State the cutoff date in the report.
+
+**Shadow mode, then canary.** Before a new model acts, run it in **shadow**: it scores live traffic, its score is logged, and it changes nothing. Then compare it to the old model on the same payments. When shadow looks good, send a small share of traffic to it as a **canary** and watch block rate, review volume, and the early fraud signals. Lesson [E1.8](/learn/ai/e1-classic-ml/ab-testing-models/) covers the test design. Two fraud-specific points:
+
+- A blocked payment never produces a chargeback, so you cannot see its label. Block rate and review outcomes are your online guardrails, not only fraud loss.
+- Stripe's docs say that for "a small subset of payments" it modifies the reported risk score "so we can measure the performance of our models and obtain data for subsequent model development" ([Stripe, risk evaluation](https://docs.stripe.com/radar/risk-evaluation)). Our reading: this is a holdout. If you only ever see outcomes for payments the model let through, you only learn about the part of the world the model already approves. A small, logged, randomized slice that is allowed regardless of score gives you unbiased labels. It costs some fraud loss on purpose. Choose that spend deliberately.
+
+**The slice that matters.** New cardholders, new merchants, and the first hours of a new attack.
+
+## Budgets
+
+**Latency.** Our reading, not a published split: feature reads are usually the biggest slice (many keyed reads), model inference is smaller (tabular models are small), and rules and logging are tiny. Write the log after the response. As in ad ranking (lesson [E1.11](/learn/ai/e1-classic-ml/ad-click-prediction/)), the budget goes to reading data.
+
+**Dollars, in two parts.**
+
+*Cost of the two errors.* This is the part that sets the threshold. A false block costs the margin on a lost sale, a support contact, and some chance the customer does not come back. A missed fraud costs the goods or cash, plus the dispute fee, plus the damage to your dispute rate with the card network. Stripe's docs state that a dispute debits the amount "plus a dispute fee" ([Stripe, how disputes work](https://docs.stripe.com/disputes/how-disputes-work)). The two costs are rarely equal, and they differ by merchant. A seller of digital goods that cannot be recovered has a higher miss cost than one that ships physical goods it can intercept.
+
+*Serving cost per million scores.* A tabular model on CPUs is cheap, and the feature store usually costs more than the model. I give no figure because I did not load a compute price page I could cite. As a formula: instance price per hour, divided by scores per hour at target load, times one million. State the utilization you assumed.
+
+**Try it.** The widget below does the arithmetic. Pick a model strength, move the threshold, and change the two costs. Everything in it is illustrative.
+
+<AiE1FraudThreshold client:visible />
+
+What to see. At the default costs, the cheapest threshold for the good model blocks about 0.07% of good payments. Raise the cost of a miss and it moves left (block more). Raise the cost of a false block and it moves right. Switch to the strong model and total cost falls a lot, but you still must choose a point on the curve.
+
+The conclusion: **the threshold is a business decision, not a model output.** The model gives you a ranking. The costs give you the cut.
+
+## Core entities and API
+
+| Entity | What it holds |
+|---|---|
+| Payment | Amount, currency, card or payment method, merchant, device and network data, timestamp |
+| Score | A number from 0 to 99 and a model version. Stripe's docs use a 0 to 99 risk score, with 65 and above as elevated and 75 and above as high by default ([Stripe, risk evaluation](https://docs.stripe.com/radar/risk-evaluation)) |
+| Decision | Allow, 3DS, review, or block, plus which rule or threshold produced it |
+| Outcome | A label that arrives later: review result, issuer decline, early fraud warning, chargeback |
+
+The API is one synchronous call: `score(payment) -> {score, decision, reasons}`. A second path, asynchronous, takes outcomes: `report_outcome(payment_id, label, source)`. The call must be idempotent on the payment id (lesson [B:03 idempotency](/learn/03-api-design/idempotency/) covers the pattern), or a retried payment is scored twice and may be treated as a velocity spike.
+
+## A naive design and where it breaks
+
+The first version everyone builds: train a classifier on last year's payments with the chargeback flag as the label. Block when the predicted probability is above 0.5. Retrain every quarter.
+
+Here is how it breaks, in four weeks.
+
+- **Week 1.** It looks fine offline at 99.9% accuracy.
+- **Week 2.** It catches almost nothing: almost every payment has a fraud probability far below 0.5.
+- **Week 3.** A new attack starts, and the next retrain is two months away.
+- **Week 4.** Someone guesses a lower cut, and block rate doubles. Nobody knows why, because training features were recomputed later and do not match what the service saw (lesson [E1.4](/learn/ai/e1-classic-ml/training-serving-skew/)).
+
+Every step names a missing part: a cost-based threshold, a labeling plan, a fast layer, and a served-feature log.
+
+## High-level design
+
+Step through the build. Each step names the requirement it meets.
+
+<AiE1FraudBuild client:visible />
+
+Read the picture in five rules.
+
+1. **One call, one deadline.** The scoring API owns the 100 ms and decides what to do if a part is late.
+2. **Features come from an online store.** The read is a key lookup, not a query over raw data (lesson [E1.3](/learn/ai/e1-classic-ml/features-store/)).
+3. **A rules layer sits beside the model.** Analysts can edit it in minutes. The model needs a retrain cycle, so rules carry the first response to a new attack.
+4. **Log the features as served.** Training reads this log. Training and serving then cannot disagree.
+5. **A fallback path exists before you need it.** Section "Failure modes" says how to choose it.
+
+**The model shape.** A fraud model is usually a **gradient-boosted tree model** (a stack of small decision trees, each fixing the errors of the last, for example XGBoost) or a **deep neural network**. Both read a row of features and output a score. Stripe's post says it started with simpler models such as logistic regression, and that in mid-2022 it moved from a model that combined XGBoost with a neural net ("Wide and Deep") to a neural net alone (company claim).
+
+The features are the real work. They are the evidence about the payment.
+
+- **Payment facts:** amount, currency, card type, whether the billing and shipping address match.
+- **Velocity features:** how many cards this IP used in the last hour, how many payments this card made in the last ten minutes, how many accounts this device opened today. A picture: a counter per key that ticks up and expires. The why: a single payment may look normal, but a burst of them from one place does not. The example: a thief testing stolen numbers produces many small payments from one device with many different cards.
+- **History:** how old is this account, how many past payments cleared, any prior disputes.
+- **Network signals:** things seen across many merchants. Stripe's docs say its models use "data across our network of businesses" ([Stripe, risk evaluation](https://docs.stripe.com/radar/risk-evaluation)). Our reading: a card that was just refused at five other shops is evidence no single merchant has.
+
+## Deep dive 1: label delay and imbalance
+
+**What is a label here?** For each payment, a yes or no: was it fraud? The truth comes from several places, with very different delays.
+
+- **Issuer decline or a human reviewer.** Minutes to days. Fast, but noisy. An issuer may decline for reasons that are not fraud.
+- **Early fraud warning.** A message from the card networks that flags a payment the issuer suspects. Stripe's docs say that about 40% of Visa and Mastercard early fraud warnings become fraud disputes, and that the rate varies by network and amount (company claim, [Stripe, how disputes work](https://docs.stripe.com/disputes/how-disputes-work)). So it is a strong signal but not a label.
+- **Chargeback.** The cardholder's bank reverses the payment. This is the closest to truth, and it is the slowest. Stripe's docs say card networks "typically allow cardholders to initiate disputes within 120 days of the original payment", with longer windows in some cases, and that the dispute lifecycle can take 2 to 3 months to complete.
+
+So a payment from last week has almost no chargeback labels yet, even if it is fraud. Look at the picture.
+
+<AiE1FraudLabels client:visible />
+
+The shape in the widget is **illustrative**. The 120-day window is sourced. What matters is the direction: young payments carry fewer labels than their eventual number, so their fraud looks like good traffic.
+
+**Why this breaks naive training.** If you train on everything up to today, the young rows teach the model that recent traffic is safe, which is the opposite of the truth. It is a bias against exactly the newest, most relevant patterns. Lesson [E1.2](/learn/ai/e1-classic-ml/data-labels/) names this label delay and gives the general fix.
+
+**The fixes, in order of use.**
+
+1. **Train only on matured payments.** Pick a cutoff age at which most of the labels are in. Everything younger waits. The model is a few weeks behind, but its labels are honest. The rules layer covers the gap.
+2. **Add fast proxy labels** for the young rows: reviewer outcomes, issuer declines, early fraud warnings. Weight them below chargebacks, and check them against chargebacks when those arrive.
+3. **Evaluate the same way.** Your test window must also use matured rows. A test on young rows will say the new model is worse at catching fraud that has not been labeled yet.
+4. **Track the label lag** as a metric. If the lag grows, the model is reading an older world than you think.
+
+**The trade-off.** A long wait gives clean labels and a model that is slow to learn. A short wait learns fast and learns some wrong answers. The choice is a policy: set it per attack speed, and say it out loud.
+
+**Imbalance.** The positive class is about 1 in 1,000. Downsample the good payments to cut cost, then correct the score so it is still a probability (lesson [E1.11](/learn/ai/e1-classic-ml/ad-click-prediction/) shows how). Or weight the positive class in the loss. Fraud forgives this more than ads do, because the threshold comes from cost, not price. None of these replaces the main lever: more data. Stripe says that a 10x increase in training transaction data produced significant improvements, and that a 100x experiment was in progress (company claim). Our reading: for a rare class, more history means more fraud examples, and examples are the scarce item.
+
+## Deep dive 2: model choice, and why a decline needs a reason
+
+**Question: why not always use the biggest model?** Because there are three costs beyond accuracy.
+
+1. **Time.** Stripe says the move to a neural net alone cut training time by over 85%, to under two hours, and that removing XGBoost on its own would have cost about 1.5% recall (company claim). The post also describes a new multi-branch network design. Our reading: training time matters in fraud because the retrain loop is a defense. A model you can retrain in two hours can react to a pattern within a day. A model that needs two days cannot.
+2. **Serving cost.** Each extra millisecond is taken from the same 100 ms budget as the feature reads.
+3. **Explanation.** A merchant whose payment was declined asks why.
+
+**Question: why does a merchant need a reason?** A decline hurts a real person at a real shop. The merchant can fix its data (a missing billing address), write an allow rule for a known good customer, or spot a real attack. Stripe's post says its risk insights, launched in 2020, show which transaction features contributed to a decline, and notes that deep neural nets are harder to explain than simpler models, a trade-off the team accepted (company claim). It also says users can improve the data they send and write custom allow or block rules.
+
+**How reasons are made.** A second step finds which features pushed the score up most, for example by comparing to a baseline with one feature neutralized. The top few become **reason codes**, such as "many cards used from this device in the last hour". They must come from the features the model actually saw, which is why the served-feature log matters again. Show merchants the reasons and customers a generic message, so a fraudster learns less.
+
+Our reading: choose the simplest model that meets the recall bar at the fixed false-positive rate, then spend the effort on features, labels, and the loop. Stripe's own sentence about a Boolean feature for distributed attacks makes the point: the feature improved performance less than expected, because the model already captured those patterns (company claim). Features that duplicate what the model already knows are wasted work, so test each new feature in shadow before you build the pipeline for it.
+
+## Deep dive 3: adversarial drift, and the rules layer
+
+**Question: how is fraud drift different from the drift in lesson [E1.7](/learn/ai/e1-classic-ml/drift-monitoring/)?** In normal drift, the world moves by itself. Here an opponent moves because of what you do. Block one tactic and the next one appears. This is **adversarial drift**. The decay curve of a fraud model is steeper than that of a movie recommender, and it steepens right after you improve the model.
+
+Stripe's post says the mix has shifted from mainly stolen-card fraud to a mix of traditional card fraud and high-velocity card testing attacks (company claim). Card testing, in Stripe's docs, is a person trying "to determine whether stolen card information is valid", usually with scripts that test many card numbers at once, often with small payments that a cardholder is less likely to notice ([Stripe, card testing](https://docs.stripe.com/disputes/prevention/card-testing)). The same page says simple filters on a single signal, such as an IP address, "are usually not sufficient" on their own.
+
+**Three layers of response, by speed.**
+
+| Layer | Speed | What it does | Weakness |
+|---|---|---|---|
+| Rules | Minutes | A velocity rule, a blocklist entry, a new 3DS trigger | Blunt, can block good traffic, needs cleanup |
+| Features | Days | A new signal added to the store and the model | Needs a retrain and a shadow run |
+| Retrain | Hours to weeks | The model learns the new pattern | Needs labels, and labels are late |
+
+**The rules layer is not a failure of the model.** It is the only part that moves as fast as the attacker. Treat it as code: version it, review it, give each rule an owner and an expiry date, and measure each rule's hits and false blocks. A rule written during an attack and never reviewed becomes the cause of next year's incident. Stripe's docs list velocity rules among its custom rules, such as limiting the number of customers created from one IP address in a day.
+
+**A real failure pattern from the same page.** Stripe's card-testing page warns that excessive retries of payments, called dunning, can "look like card testing if they come in extreme spikes with low success rate", and that issuers can then harden their stance toward the business. Our reading: a rule or a model that reads "many failed attempts" as an attack can fire on your own billing system. When you change a retry job, tell the fraud team.
+
+**How often to retrain.** Measure it: build the decay curve from lesson [E1.7](/learn/ai/e1-classic-ml/drift-monitoring/) and retrain when the extra loss costs more than a retrain. Also trigger one on an event, such as a spike in review rejects.
+
+**Online learning.** A model that updates every few minutes reacts faster, but an attacker can poison fresh unlabeled traffic and a bad update goes live at once. Most fraud teams keep the model on a schedule and the rules layer on the fast path. Lesson [E1.9](/learn/ai/e1-classic-ml/online-learning/) covers online learning.
+
+## Failure modes and an incident drill
+
+|---|---|---|---|
+| Feature store down or slow | The scorer misses its deadline or gets default values | Timeout rate; share of requests with default features | Fallback rules; choose open or closed per segment (see below) |
+| Feature pipeline change | A feature's meaning or scale shifts; scores move | Score histogram against yesterday; per-feature drift | Roll back the pipeline; pin feature versions to the model |
+| New attack wave | Loss rises in a pocket; the model has not seen it | Spike in a velocity feature, in reviews, in early fraud warnings | Rules first; features next; retrain after |
+| Label pipeline stall | No new chargebacks join; the model trains on stale or biased rows | Label lag; share of positives in new training data | Pause retrain; serve the last good model |
+| Over-blocking after a retrain | Good customers blocked | Block rate by segment; support contacts | Roll back; add block rate to the deploy gate |
+| Retry or campaign looks like an attack | Your own traffic trips velocity rules | Block reasons tied to your own jobs | Allowlist the job; add its calendar to the monitor |
+| Attacker probes the threshold | A script sends payments to learn what passes | Many near-threshold scores from one source | Add noise or friction near the cut; rate limit the source |
+
+**Fail open or fail closed?** If the scorer is down, you pick one of two bad outcomes. Fail open means allow payments without a score: you keep the sales and take the fraud risk. Fail closed means block or step up everything: you stop the fraud and the revenue. The right answer depends on the merchant, the order value, and how long the outage lasts, so decide it **before** the outage and write it down. A common middle path: fall back to a small fixed set of rules, allow small payments from known customers, and ask for 3DS on the rest.
+
+Stripe's docs show what a vendor chose for one case. If risk evaluation fails with an error, the payment is reported with "unknown risk" and, in the example outcome on that page, the charge type is `authorized` ([Stripe, risk evaluation](https://docs.stripe.com/radar/risk-evaluation)). Our reading: that is a fail-open choice for the evaluation step, and it also shows the value of a distinct label for "we did not score this", so that analysts can count those payments later.
+
+**Incident drill: block rate doubles after a feature-pipeline change.** Illustrative numbers. Work through it.
+
+<Diagnose
+  client:visible
+  id="e1-fraud-block-rate-doubles"
+  title="Block rate doubles after a pipeline change"
+  scenario="On Tuesday morning the block rate went from 0.4% of payments to 0.9%. Support reports many angry real customers. The model was not retrained. Yesterday evening a data engineer shipped a change to the feature pipeline that computes 'payments from this device in the last hour'. (Illustrative numbers.)"
+  facts={[
+    'block rate: 0.4% on Monday, 0.9% on Tuesday after 07:00',
+    'model version unchanged since last Thursday',
+    'mean score of allowed payments: 18 on Monday, 31 on Tuesday',
+    'feature device_payments_1h: mean 1.2 on Monday, 3.4 on Tuesday',
+    'the new job counts retried and failed attempts as payments; the old one counted only completed payments',
+    'fraud reports in the review queue: flat',
+    'the served-feature log stored the new values; the offline training set was built with the old definition',
+  ]}
+  steps={[
+    {
+      prompt: 'What is the most likely cause of the jump in blocks?',
+      options: [
+        'A new fraud wave hit on Tuesday morning',
+        'The model forgot what it learned, so it blocks at random',
+        'A feature now has a different meaning, which pushes scores up',
+        'Customers changed their behavior overnight for no reason',
+      ],
+      answer: 2,
+      explain: 'The model and the fraud reports did not change, but a velocity feature rose from 1.2 to 3.4 right after the pipeline change, and the new job counts failed and retried attempts. The model reads the high count as a burst of activity and raises scores. This is training-serving skew caused by a definition change, which lesson E1.4 describes. A real wave would show in review outcomes. A model does not forget by itself.',
+    },
+    {
+      prompt: 'What do you do first?',
+      options: [
+        'Raise the block threshold until the block rate looks normal again',
+        'Retrain the model on Tuesday data so that it adapts',
+        'Roll back the pipeline change, and pause the rule that fires on the feature',
+        'Wait a day to see whether the block rate settles by itself',
+      ],
+      answer: 2,
+      explain: 'Good customers are being blocked now, and the cause is known, so undo it. Raising the threshold would hide the shift and let real fraud through. Retraining on Tuesday data would teach the model that the broken feature is normal. Waiting lengthens the harm.',
+    },
+    {
+      prompt: 'What structure keeps this from happening again?',
+      options: [
+        'A rule that nobody may edit the pipeline on a Monday',
+        'Version each feature with the model, and gate deploys on feature and score drift',
+        'Remove velocity features from the model entirely',
+        'Ask support to report angry customers more quickly',
+      ],
+      answer: 1,
+      explain: 'The bug was an unannounced change to the meaning of a feature. Pin feature versions to the model version, and compare each feature and the score histogram to the last day before a change goes live. Dropping velocity features loses real signal. A calendar rule and faster support reports do not stop a change from shipping.',
+    },
+  ]}
+/>
+
+The harm in this drill is a block-rate harm. Nothing was wrong with the model. The lesson: define a feature once, version it with the model, and put block rate and score drift on the deploy gate.
+
+## Drill: bot detection, and spam and phishing detection
+
+**The task.** A site is under attack by scripts. Some create fake accounts, some post spam, some try stolen logins, some test card numbers. Take 15 minutes. Design the detector.
+
+**The idea.** Bot, spam, and phishing detection share one shape with payment fraud: a rare, adaptive opponent, a cheap decision that must be fast, and an expensive decision that can be slower. The structure is a **cascade**: a stack of detectors, cheap ones first, each passing on only the cases it cannot settle. Lesson [A13.8](/learn/ai/a13-cases/voice-agent/) builds the same cascade for content moderation. Here is the version for bots.
+
+**The cascade.**
+
+1. **Rate limits and simple rules.** Cost: almost nothing. Count requests per IP, per account, per device. Block the obvious. The weakness: bots spread across many IPs, so a single-key limit is not enough on its own.
+2. **Signals from the client.** Does the client run a browser, or fake one? Cloudflare's docs describe a lightweight, invisible JavaScript check that can block, challenge, or pass a request on to other engines ([Cloudflare, detection engines](https://developers.cloudflare.com/bots/concepts/bot-detection-engines/)).
+3. **A model over behavior.** Features such as request timing, page order, and header patterns. Cloudflare says its machine-learning engine, which it calls Adaptive Intelligence, "accounts for the majority of all bot detections" and uses supervised learning (company claim, same page). Its output is a bot score from 1 to 99, described as "the predicted probability that a client is human" ([Cloudflare, bot score](https://developers.cloudflare.com/bots/concepts/bot-score/)).
+4. **A challenge** (CAPTCHA or a proof of work) for the grey zone, instead of a block. Modern CAPTCHAs use many risk factors to add friction for risky behavior while staying "mostly invisible" to legitimate users (company claim, [Stripe, card testing](https://docs.stripe.com/disputes/prevention/card-testing)).
+5. **Humans and slow signals** for the hardest cases: a report button, a review queue, and later evidence such as a later spam complaint.
+
+**The bar.** This is the same bar as payments: recall at a fixed false-positive rate. The false positive here is a real person told they are a bot, so it is even more costly, since a person cannot appeal a silent block. Keep a path for a real user to prove they are human.
+
+**What differs from payments.**
+
+- **Labels are cheaper and noisier.** A user report, a challenge result, or a honeypot (a hidden form field a human never fills in) gives labels in minutes. Weight reporters by past accuracy, since reports can be abused.
+- **Not all bots are bad.** Cloudflare lists "verified bots", described as "non-malicious automated traffic (used to power search engines and other applications)". Keep an allow list and verify identity.
+- **Thresholds need review.** Cloudflare says scores can shift as the model retrains, so rules that use a score should be reviewed periodically.
+- **A header bug can block real people.** Requests with a missing or empty User-Agent header get a score of 1 from the heuristics engine, which hits corporate proxies that strip the header (Cloudflare docs).
+- **Spam and phishing add content.** The signal an attacker cannot hide is often the account and sending pattern, not the words.
+
+**The failure.** A bot operator learns your score threshold by probing, then tunes its traffic to sit just under it. This is the "attacker probes the threshold" row in the table above.
+
+<Diagnose
+  client:visible
+  id="e1-fraud-bot-threshold-probing"
+  title="Bots settle just under the line"
+  scenario="A site blocks sign-ups with a bot score of 20 or lower, and challenges scores from 21 to 40. Over three weeks, blocks fall by 60%. Fake accounts do not fall. The score histogram now has a tall spike at 41 to 45 that did not exist before. (Illustrative numbers.)"
+  facts={[
+    'threshold: block at 20 or lower, challenge from 21 to 40, allow above 40',
+    'blocks: down 60% in three weeks; fake accounts: unchanged',
+    'score histogram: new spike at 41 to 45',
+    'most accounts in the spike come from a small set of subnets and are created at regular intervals',
+    'challenge pass rate for the spike accounts: not applicable, they are never challenged',
+  ]}
+  steps={[
+    {
+      prompt: 'What explains the new spike?',
+      options: [
+        'The model got better, so fewer bots remain and the rest score higher',
+        'A bot operator found the cut and tuned its traffic to land just above it',
+        'Real users changed their behavior in the same three weeks',
+        'The histogram is a sampling artifact with no meaning',
+      ],
+      answer: 1,
+      explain: 'Blocks fell but fake accounts did not, so the bots did not go away. A new spike just past the challenge band, from a few subnets at regular intervals, shows traffic that was shaped to score above the line. A better model would lower fake accounts too. Real users would not cluster on a few subnets at fixed intervals.',
+    },
+    {
+      prompt: 'Which response fits best?',
+      options: [
+        'Move the cut up by 5 points and wait for the next move',
+        'Add features that the bot cannot easily match, widen the challenge band, and add signals such as subnet and creation rhythm',
+        'Publish the threshold so that honest users know the rule',
+        'Turn off the score and use only a CAPTCHA for everyone',
+      ],
+      answer: 1,
+      explain: 'A fixed cut is a target that the operator can learn, so a small move only restarts the chase. Add signals the operator cannot control cheaply, such as the subnet cluster and the regular timing, and make the grey zone wider so that a hard line does not exist. Publishing the cut helps the attacker. Challenging everyone adds friction for real users and still leaves a single point for the bots to beat.',
+    },
+  ]}
+/>
+
+**Sources for this drill.** The detection-engine and bot-score pages from Cloudflare and the card-testing page from Stripe, all cited above. We do not use any figure about the share of bots or spam on the internet, because we did not find a primary source we could load.
+
+## Staff answer vs senior answer
+
+| Topic | Senior answer | Staff answer |
+|---|---|---|
+| Model | "Train a gradient-boosted model on chargebacks." | The model is a ranking. The product is a decision that uses cost, rules, a model, and a fallback, each owned |
+| Bar | "AUC" or accuracy | Recall at a fixed false-positive rate, per slice, on matured payments, with the cutoff date stated |
+| Threshold | "Use 0.5", or tune on the offline set | Set from the cost of a false block and of a miss, per merchant segment, and re-check when either cost changes |
+| Labels | "Join chargebacks." | Matured-only training, fast proxy labels with lower weight, a lag metric, and a randomized holdout for unbiased truth |
+| Reaction | "Retrain more often." | Rules for minutes, features for days, retrain for weeks; each rule has an owner and an expiry |
+| Features | "Use a feature store." | Log served features, version them with the model, and put feature and score drift on the deploy gate |
+
+## What experienced teams know
+
+1. **Keep a holdout so that you can still learn.** Stripe's docs say it modifies the reported score for a small subset of payments to measure model performance and gather data for later development ([Stripe, risk evaluation](https://docs.stripe.com/radar/risk-evaluation), company claim). Our reading: without randomized outcomes for payments that the model would block, you can only measure what you allow, and each new model inherits the blind spots of the last.
+2. **More data can beat a cleverer feature.** Stripe says a 10x increase in training data brought significant gains, and that a Boolean feature for distributed attacks helped less than expected because the model already captured those patterns ([Drapeau, How we built it: Stripe Radar](https://stripe.dev/blog/how-we-built-it-stripe-radar), company claim). Our reading: before you build a feature, test whether the model already has it.
+3. **Training time is a defense.** The same post says moving to a neural net alone cut training time by over 85%, to under two hours (company claim). Our reading: when the opponent adapts, a short retrain loop is a security property, not only a convenience.
+4. **Explanations are part of the product.** Stripe launched risk insights in 2020 so merchants can see which features raised a score, and accepted that neural nets are harder to explain (company claim, same post). Our reading: if a merchant cannot act on a decline, the decline is a support ticket.
+5. **Fast signals are real signals, not labels.** About 40% of Visa and Mastercard early fraud warnings become fraud disputes, and the rate varies by network and amount ([Stripe, how disputes work](https://docs.stripe.com/disputes/how-disputes-work), company claim). Our reading: use them as weighted proxy labels, and let chargebacks overrule them later.
+6. **Your own traffic can look like an attack.** Stripe's docs warn that spiky payment retries with a low success rate can look like card testing ([Stripe, card testing](https://docs.stripe.com/disputes/prevention/card-testing)). Our reading: give the fraud team the calendar of your own jobs, campaigns, and retries.
+
+## Trade-offs
+
+| Choice | You gain | You pay | Choose it when |
+|---|---|---|---|
+| Block at a low threshold | Less fraud | More blocked good customers | A miss costs far more than a false block |
+| Block at a high threshold | Fewer false blocks | More fraud through | A false block is costly: high-value repeat buyers |
+| Step up with 3DS in the grey zone | A cheaper middle option | Friction, some drop-off | Scores cluster near the cut |
+| Rules layer | Reaction in minutes | Blunt, needs cleanup | An attack is live |
+| Retrain on schedule | A stable, testable model | Reaction in weeks | Normal operation |
+| Randomized holdout | Unbiased labels | Some deliberate fraud loss | Always, at a small and capped share |
+
+## Interview lens
+
+<Callout type="tip">
+Say: "At 1 in 1,000, accuracy is useless, so my bar is recall at a fixed false-positive rate, per slice, on matured payments. I set the block threshold from the cost of a false block against the cost of a miss, and I use 3DS or review in the grey zone. Labels arrive in weeks, so I train on matured rows, add fast proxy labels with a lower weight, and keep a small randomized holdout. A rules layer reacts in minutes, features in days, retraining in weeks. I log served features and version them with the model. I decide fail open or fail closed before the outage. New models go shadow, then canary, gated on block rate and review outcomes." Then name the reason codes for merchants.
+</Callout>
+
+<Callout type="mistake">
+Do not report accuracy or a 0.5 cut on a rare event. Do not train on young payments as if their missing labels meant "good". Do not let the model be the only defense against a live attack. Do not recompute features for training that you could have logged. Do not leave the fail-open choice to the moment of the outage. Do not let a rule written in an incident live forever without an owner and an expiry.
+</Callout>
+
+## Check yourself
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Fraud is about 1 in 1,000 payments. A model blocks nothing and reports 99.9% accuracy. What does that tell you?',
+      options: [
+        'The model is excellent, because accuracy is near perfect',
+        'Nothing useful, because the rare class makes accuracy trivial',
+        'The model is overfit, because accuracy is too high to be true',
+        'The data is mislabeled, because no model reaches 99.9%',
+      ],
+      answer: 1,
+      explain: 'If almost every payment is good, a model that blocks nothing is right 99.9% of the time and catches zero fraud. The bar must be recall at a fixed false-positive rate, which looks at the fraud class and the cost of blocking good payments.',
+    },
+    {
+      q: 'Why do you train on payments that are several weeks old, instead of on everything up to today?',
+      options: [
+        'Old payments describe current fraud better than new ones do',
+        'Recent data is larger, so training on it is much slower',
+        'Recent fraud has no label yet and counts as good traffic',
+        'Card networks forbid training on payments that are recent',
+      ],
+      answer: 2,
+      explain: 'Chargebacks come weeks or months after the payment, so recent fraud still carries a good label. Training on it teaches the model that new patterns are safe. A matured-only set has honest labels, and the rules layer covers the gap.',
+    },
+    {
+      q: 'A new model has better recall at the same false-positive rate. Why can the cheapest threshold still move?',
+      options: [
+        'The cut depends on the cost of both errors, not on the model',
+        'A better model always needs a higher threshold to stay honest',
+        'The card network fixes the threshold and nobody can change it',
+        'The best threshold depends only on how many features exist',
+      ],
+      answer: 0,
+      explain: 'The model gives a ranking. The cut comes from the cost of a false block against the cost of a missed fraud, so when either cost changes, or the score distribution changes, the best cut changes too. The card networks do not set it.',
+    },
+    {
+      q: 'Why keep a rules layer beside a model that retrains every week?',
+      options: [
+        'Rules are always more accurate than any model is',
+        'A retrain is free, so rules save no time at all',
+        'Regulators require a rule behind every blocked payment',
+        'Rules react in minutes, and a retrain cannot',
+      ],
+      answer: 3,
+      explain: 'A fast attack can do its damage before the next retrain, and a retrain also needs labels that have not arrived. Analysts can edit a rule at once. Rules are blunt, so each needs an owner and an expiry. They are not more accurate than a model.',
+    },
+    {
+      q: 'The scoring service times out for ten minutes. What should have been decided before it happened?',
+      options: [
+        'Which engineer is on call tonight, and nothing else about it',
+        'Fail open or closed per payment type, and the fallback rules',
+        'How to retrain the model while the outage is still going on',
+        'Whether to turn off the rules layer to save some time here',
+      ],
+      answer: 1,
+      explain: 'During an outage you must either allow unscored payments or block them, and the right answer depends on order value and recoverability. Decide it ahead, write down the fallback rules, and label unscored payments so you can review them. Retraining does not help in the moment.',
+    },
+  ]}
+/>
+
+## Further reading
+
+Start with the Stripe post. Read the two docs pages for the parts the post leaves out.
+
+- [How we built it: Stripe Radar (Stripe, 2023)](https://stripe.dev/blog/how-we-built-it-stripe-radar): scale, the move to a neural net alone, features, explainability.
+- [Stripe docs: how disputes work](https://docs.stripe.com/disputes/how-disputes-work): the dispute window, the lifecycle, early fraud warnings.
+- [Stripe docs: transaction risk prevention](https://docs.stripe.com/radar/risk-evaluation): risk scores, risk levels, rules actions, the holdout note.
+- [Stripe docs: protect yourself from card testing](https://docs.stripe.com/disputes/prevention/card-testing): how bot-driven card testing works and how to slow it down.
+- [Cloudflare docs: bot detection engines](https://developers.cloudflare.com/bots/concepts/bot-detection-engines/): a layered bot detector, in a vendor's words.
