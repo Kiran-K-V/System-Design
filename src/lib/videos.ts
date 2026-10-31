@@ -258,6 +258,14 @@ export const slugOf = (v: Pick<Video, 'title'>) =>
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, '');
 export const seriesHref = (v: Pick<Video, 'title'>) => `${BASE}/videos/${slugOf(v)}/`;
 
+/** Where a link to a video goes: its series page, or the hub with the talk's player open. */
+export const videoHref = (v: Video) => (v.kind === 'series' ? seriesHref(v) : `${BASE}/videos/?play=${v.yt}`);
+
+/** Hub link filtered to one track. */
+export const videosHref = (track?: TrackId) => `${BASE}/videos/${track ? `?track=${track}` : ''}`;
+
+export const videosForLesson = (lessonId: string) => videos.filter((v) => v.pairs === lessonId);
+
 export function episodesOf(v: Pick<Video, 'yt' | 'title'>): { total: number; items: Episode[] } {
   const p = (playlists as Record<string, { total: number; items: Episode[] }>)[v.yt];
   if (!p) throw new Error(`playlists.json has no episodes for "${v.title}". Run node scripts/sync-playlists.mjs`);
