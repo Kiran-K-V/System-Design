@@ -275,7 +275,8 @@ export function totalLength(items: Episode[]) {
 // Episode progress per series: watched episode ids and the last one opened. Client only.
 
 const EP_KEY = 'sd-episodes';
-type EpStore = Record<string, { done: string[]; last?: string }>;
+/** `at`: when `last` was set, so the hub can resume the most recent series. */
+type EpStore = Record<string, { done: string[]; last?: string; at?: number }>;
 
 export function loadEpisodes(): EpStore {
   try {
@@ -292,7 +293,10 @@ export function saveEpisode(pl: string, patch: { done?: [string, boolean]; last?
     const [v, on] = patch.done;
     s.done = on ? [...new Set([...s.done, v])] : s.done.filter((x) => x !== v);
   }
-  if (patch.last) s.last = patch.last;
+  if (patch.last) {
+    s.last = patch.last;
+    s.at = Date.now();
+  }
   try {
     localStorage.setItem(EP_KEY, JSON.stringify(all));
   } catch {}
