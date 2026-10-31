@@ -70,7 +70,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'The gateway writes one log record: tenant, alias, the model that really answered, token counts, latency, and a "fell back" flag. Without that flag, a quality dip after an outage has no visible cause. Token counts here feed cost metering (lesson A3.9).',
+      'The gateway writes one log record: tenant, alias, the model that really answered, token counts, latency, and a "fell back" flag. Without that flag, a quality dip after an outage has no visible cause. Token counts here feed cost metering (the Cost Metering per Request and per Tenant lesson).',
     active: 'log',
     tones: { gw: 'ok', cache: 'warn', a: 'bad', b: 'ok', log: 'ok' },
     subs: { gw: 'answered by B', cache: 'miss', a: '529', b: '200 OK', log: 'fell_back' },

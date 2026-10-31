@@ -33,11 +33,11 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR2: search events',
-    caption: 'Search by name, city, or date needs a search index, a store built to find text fast (lesson 8.5). A feed of database changes copies each event change into it (lesson 6.5). The index can lag, because a new event can wait a moment.',
+    caption: 'Search by name, city, or date needs a search index, a store built to find text fast (the Elasticsearch lesson). A feed of database changes copies each event change into it (the Change Data Capture lesson). The index can lag, because a new event can wait a moment.',
   },
   {
     req: 'NFR: reads outnumber writes',
-    caption: 'Event pages and popular searches barely change, so a cache answers most of them (lesson 5.3). The booking path stays away from this cache.',
+    caption: 'Event pages and popular searches barely change, so a cache answers most of them (the Cache Strategies lesson). The booking path stays away from this cache.',
   },
   {
     req: 'FR3: book a ticket',
@@ -56,7 +56,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: a live seat map',
-    caption: 'Seat changes are pushed to every viewer over a one-way live connection (lesson 2.5), so a fan does not click a seat that is already gone. The seat map is a hint. The hold step decides.',
+    caption: 'Seat changes are pushed to every viewer over a one-way live connection (the Real-time Transport lesson), so a fan does not click a seat that is already gone. The seat map is a hint. The hold step decides.',
     packets: [{ from: 'seats', to: 'feed' }],
   },
 ];

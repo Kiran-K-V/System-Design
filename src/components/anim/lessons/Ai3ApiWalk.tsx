@@ -63,7 +63,7 @@ const steps: S[] = [
     turn: 1, res: false, hiReq: { system: A, msgs: A }, hiRes: {}, meter: false,
   },
   {
-    caption: 'The reply is a list of content blocks, not one string. Here it is one text block. A reply can also hold tool_use blocks (lesson A3.4). "stop_reason" says why generation ended. "end_turn" means the model finished by itself.',
+    caption: 'The reply is a list of content blocks, not one string. Here it is one text block. A reply can also hold tool_use blocks (the Tool-calling Protocol lesson). "stop_reason" says why generation ended. "end_turn" means the model finished by itself.',
     turn: 1, res: true, hiReq: {}, hiRes: { content: A, stop: O }, meter: false,
   },
   {

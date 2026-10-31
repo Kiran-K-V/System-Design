@@ -18,14 +18,14 @@ const steps: Step[] = [
     packets: [{ from: 'client', to: 'auth' }],
   },
   {
-    caption: 'Step 1, authentication. The gateway checks the token: its signature, its expiry time, and who it was issued for (lesson 3.5). The token is valid, so the request carries the caller’s identity forward. The gateway can reject a bad request here without touching any backend.',
+    caption: 'Step 1, authentication. The gateway checks the token: its signature, its expiry time, and who it was issued for (the Auth Basics lesson). The token is valid, so the request carries the caller’s identity forward. The gateway can reject a bad request here without touching any backend.',
     tones: { auth: 'ok' },
     subs: { auth: 'token valid' },
     active: 'auth',
     packets: [{ from: 'auth', to: 'limit' }],
   },
   {
-    caption: 'Step 2, rate limiting (lesson 7.4). The gateway looks up this caller’s bucket and takes one token. The bucket has tokens left, so the request passes. The limit lives in the gateway so that no backend has to count requests.',
+    caption: 'Step 2, rate limiting (the Rate Limiting Algorithms lesson). The gateway looks up this caller’s bucket and takes one token. The bucket has tokens left, so the request passes. The limit lives in the gateway so that no backend has to count requests.',
     tones: { auth: 'ok', limit: 'ok' },
     subs: { auth: 'token valid', limit: '37 tokens left' },
     active: 'limit',

@@ -17,7 +17,7 @@ Each service could call Apple, Google, an SMS vendor, and an email vendor by its
 
 A **notification system** is one shared service. Services send it a request. It decides whether to send, picks the channel, calls the outside **provider** (the vendor that really delivers the message), and records what happened.
 
-This case study follows the six steps of the [design method](/learn/00-orientation/design-method/). It adds three new ideas: fan-out over several channels, priority lanes, and safe retries against unreliable vendors. It does not re-teach queues, retries, or rate limiting. It links to the lessons that do.
+This case study follows the six steps of the [design method](/learn/backend/00-orientation/design-method/). It adds three new ideas: fan-out over several channels, priority lanes, and safe retries against unreliable vendors. It does not re-teach queues, retries, or rate limiting. It links to the lessons that do.
 
 ## Requirements
 
@@ -34,7 +34,7 @@ This case study follows the six steps of the [design method](/learn/00-orientati
 - 10M notifications per day on average. We design for bursts of 5,000 per second.
 - An accepted notification is never silently dropped.
 - An OTP reaches the SMS vendor within about 5 seconds, even during a campaign.
-- A user never receives the same notification twice, even though the pipeline can redeliver (lesson [6.3](/learn/06-async/delivery-semantics/)).
+- A user never receives the same notification twice, even though the pipeline can redeliver (the [Delivery Semantics](/learn/backend/06-async/delivery-semantics/) lesson).
 - One user gets at most a set number of messages per hour.
 
 The average rate is about 100 per second. The burst is about 50 times the average. The design is about the burst, not the average.
@@ -55,7 +55,7 @@ The average rate is about 100 per second. The burst is about 50 times the averag
 | `PUT /v1/users/{id}/preferences` | Set opt-outs and quiet hours. |
 | `GET /v1/notifications/{id}` | Status per channel. |
 
-The idempotency key comes from the caller (lesson [3.4](/learn/03-api-design/idempotency/)). A caller that retries after a timeout gets the same notification, not a second one.
+The idempotency key comes from the caller (the [Idempotency](/learn/backend/03-api-design/idempotency/) lesson). A caller that retries after a timeout gets the same notification, not a second one.
 
 Data flow is a simple chain here, so we skip a separate data-flow step.
 
@@ -68,11 +68,11 @@ Step through the build. Each step adds boxes for one requirement.
 Read the finished picture from left to right.
 
 - The **intake API** answers fast. It validates, writes to a log, checks preferences, and enqueues. It never calls a vendor itself, so a slow vendor cannot slow the callers.
-- Each **channel** has its own queue and worker pool (lesson [6.1](/learn/06-async/queues/)). The pools differ because the vendors differ. They have different latency, different limits, and different failure patterns.
+- Each **channel** has its own queue and worker pool (the [Queues](/learn/backend/06-async/queues/) lesson). The pools differ because the vendors differ. They have different latency, different limits, and different failure patterns.
 - **Preferences** are checked before the enqueue. Dropping an unwanted message early is cheaper than dropping it after the work.
 - **Campaigns** are expanded in the background. A 3M-user campaign becomes 3M small messages in the bulk lane. The API call itself finishes in milliseconds.
-- A **key-value store** such as Redis (lesson [8.2](/learn/08-technologies/redis/)) keeps per-user token buckets and dedupe keys.
-- **Failures** go to a retry queue, and after N tries to a dead-letter queue (lesson [6.4](/learn/06-async/backpressure-dlq/)).
+- A **key-value store** such as Redis (the [Redis](/learn/backend/08-technologies/redis/) lesson) keeps per-user token buckets and dedupe keys.
+- **Failures** go to a retry queue, and after N tries to a dead-letter queue (the [Backpressure and Dead-letter Queues](/learn/backend/06-async/backpressure-dlq/) lesson).
 
 ## Deep dive: a campaign must not starve an OTP
 
@@ -89,19 +89,19 @@ The fix has two parts.
 
 The cost is small. The campaign finishes a little later, and nobody is waiting on a campaign to the second.
 
-How many workers do we need? Use the throughput rule from lesson [1.3](/learn/01-one-machine/throughput-vs-latency/): a worker's speed depends on how many calls it keeps in flight and how long each call takes. Size the bulk pool to fill its share of the vendor limit. Size the urgent pool to cover its small reserve.
+How many workers do we need? Use the throughput rule from the [Throughput vs Latency](/learn/backend/01-one-machine/throughput-vs-latency/) lesson: a worker's speed depends on how many calls it keeps in flight and how long each call takes. Size the bulk pool to fill its share of the vendor limit. Size the urgent pool to cover its small reserve.
 
-Link to the sibling case: the [rate limiter](/learn/11-breakdowns/rate-limiter/) shows how a token bucket is built. Here we use one in two places: per user, and per vendor.
+Link to the sibling case: the [rate limiter](/learn/backend/11-breakdowns/rate-limiter/) shows how a token bucket is built. Here we use one in two places: per user, and per vendor.
 
 ## Deep dive: retries without a storm
 
-Vendors fail. They time out, answer 429 ("slow down") or 503. A worker must not give up after one try. It also must not retry at once. The reason is that a thousand workers retrying together can keep a struggling vendor down (lesson [7.2](/learn/07-reliability/timeouts-retries/)).
+Vendors fail. They time out, answer 429 ("slow down") or 503. A worker must not give up after one try. It also must not retry at once. The reason is that a thousand workers retrying together can keep a struggling vendor down (the [Timeouts, Retries, Backoff](/learn/backend/07-reliability/timeouts-retries/) lesson).
 
 The rules we apply:
 
 - **Backoff with jitter.** Wait 1 second, then about 2, then about 4, with random spread. Failed messages go to a retry queue with a delay, so a worker is never blocked while it waits.
 - **Retry only what can work.** Retry timeouts, 429, and 5xx. Do not retry "invalid phone number". Send that to the dead-letter queue at once.
-- **A circuit breaker per vendor** (lesson [7.3](/learn/07-reliability/circuit-breaker/)). When most calls fail, stop calling for a while. Messages wait in the queue, and the vendor gets room to recover. A second SMS vendor can take over for urgent traffic.
+- **A circuit breaker per vendor** (the [Circuit Breaker and Bulkhead](/learn/backend/07-reliability/circuit-breaker/) lesson). When most calls fail, stop calling for a while. Messages wait in the queue, and the vendor gets room to recover. A second SMS vendor can take over for urgent traffic.
 - **A limit on tries.** After N tries the message goes to the dead-letter queue. A person or a job can replay it when the vendor is back.
 
 Vendors also publish quotas, and exceeding them gets you throttled. For example, FCM documents its throttling and quotas. Read the quota of the vendor you name in the interview and size the pool from it.
@@ -110,7 +110,7 @@ Vendors also publish quotas, and exceeding them gets you throttled. For example,
 
 Queues deliver at least once. A worker can send an SMS, get the vendor "ok", and crash before it acknowledges the queue message. The queue then gives the message to another worker, which sends it again.
 
-You cannot get exactly-once from the queue. You make the send idempotent instead (lesson [3.4](/learn/03-api-design/idempotency/)).
+You cannot get exactly-once from the queue. You make the send idempotent instead (the [Idempotency](/learn/backend/03-api-design/idempotency/) lesson).
 
 - If the vendor supports an idempotency key, send the notification id as the key. The vendor drops the repeat.
 - If it does not, keep a dedupe record. Before the send, check the key `notification_id + channel`. Then set it after a successful send.
@@ -119,7 +119,7 @@ Both leave a small window. A crash between "vendor accepted" and "record written
 
 ## Numbers
 
-Treat the figures in this lesson as assumptions. Three facts matter. The burst is far above the average. A campaign is large enough to block a single shared queue for minutes. And the intake log is small enough for one database with a retention job (lesson [4.7](/learn/04-data/sharding/) covers sharding if rows grow). Lesson [1.5](/learn/01-one-machine/numbers-to-know/) lists the numbers worth knowing.
+Treat the figures in this lesson as assumptions. Three facts matter. The burst is far above the average. A campaign is large enough to block a single shared queue for minutes. And the intake log is small enough for one database with a retention job (the [Sharding](/learn/backend/04-data/sharding/) lesson covers sharding if rows grow). The [Numbers to Know](/learn/backend/01-one-machine/numbers-to-know/) lesson lists the numbers worth knowing.
 
 ## Trade-offs
 

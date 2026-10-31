@@ -36,7 +36,7 @@ const sockets = (skip: string[] = []): FlowEdge[] =>
 
 const steps: Step[] = [
   {
-    caption: 'Three users watch one channel. Each holds a socket (lesson 2.5) to one connection server. That server is state: it knows these sockets and nobody else does. Each server also writes "who is on me" into a registry with a short expiry, so other parts of the system can find a user.',
+    caption: 'Three users watch one channel. Each holds a socket (the Real-time Transport lesson) to one connection server. That server is state: it knows these sockets and nobody else does. Each server also writes "who is on me" into a registry with a short expiry, so other parts of the system can find a user.',
     note: 'sockets live on connection servers',
     edges: [...sockets(), { from: 'g1', to: 'reg', dashed: true, label: 'Ann, Bo', labelAt: [-8, -14] }, { from: 'g2', to: 'reg', dashed: true, label: 'Cy', labelAt: [-34, 10] }],
     active: ['reg'],
@@ -49,7 +49,7 @@ const steps: Step[] = [
     active: ['log'],
   },
   {
-    caption: 'The API publishes to a pub/sub channel (lesson 6.2). Each connection server subscribes to the channels its own users watch. So the bus sends the message to the 2 servers that have a member, not to every server in the fleet, and not once per user.',
+    caption: 'The API publishes to a pub/sub channel (the Pub/Sub and Logs lesson). Each connection server subscribes to the channels its own users watch. So the bus sends the message to the 2 servers that have a member, not to every server in the fleet, and not once per user.',
     note: 'one publish, one copy per interested server',
     edges: [...sockets(), { from: 'api', to: 'bus', label: 'publish 42', labelAt: [-8, -24] }, { from: 'bus', to: 'g1' }, { from: 'bus', to: 'g2' }],
     packets: [

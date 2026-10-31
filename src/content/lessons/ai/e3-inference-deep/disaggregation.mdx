@@ -13,7 +13,7 @@ import AiE3DisaggTradeoff from '../../../../components/anim/lessons/AiE3DisaggTr
 
 Your chat service runs well all day. Median time per token is steady. Then a user pastes a 30-page contract and asks for a summary. For about a second, every other user on that GPU sees their answer stop in mid-sentence. The dashboard shows high throughput. Users still complain.
 
-[Lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/) gave you the two phases. **Prefill** [junior] reads the whole prompt in one pass. **Decode** [junior] then makes one token per pass. The first is limited by arithmetic. The second is limited by memory reads. [Lesson E3.1](/learn/ai/e3-inference-deep/continuous-batching/) showed that the scheduler mixes both kinds of work in one batch, and it ended with a warning: a long new prompt makes one iteration very long.
+[The Prefill vs Decode: TTFT and TPOT lesson](/learn/ai/a2-inference-cost/prefill-decode/) gave you the two phases. **Prefill** [junior] reads the whole prompt in one pass. **Decode** [junior] then makes one token per pass. The first is limited by arithmetic. The second is limited by memory reads. [The Continuous Batching Internals lesson](/learn/ai/e3-inference-deep/continuous-batching/) showed that the scheduler mixes both kinds of work in one batch, and it ended with a warning: a long new prompt makes one iteration very long.
 
 This lesson follows that warning to the end. You will see two cures. The first keeps both phases on one GPU and cuts the prompt into pieces. The second puts the phases on different GPUs. The questions on the way are:
 
@@ -30,7 +30,7 @@ Picture one kitchen with one stove. A cook is frying twenty small orders, and ea
 
 On a GPU the same thing happens, for the reason A2.2 gave. A decode step is short because it reads the weights once and does little arithmetic. A prefill step does arithmetic for every prompt token, so it is long. When one batch holds both, the batch runs as long as its longest part. The decode users wait for the prefill to end. That wait is added to their TPOT.
 
-The effect also runs the other way. The DistServe paper, which we use below, reports that adding decode work to a prefill slows the prefill as well, especially when the GPU is already full. So one GPU that serves both phases hurts both targets. The paper calls this **prefill-decode interference** [senior], and it lists a second problem, **resource coupling** [senior]: both phases must use the same GPU count and the same split of the model, even though they have different needs. Lesson [E3.6](/learn/ai/e3-inference-deep/parallelism-moe/) covers the splits.
+The effect also runs the other way. The DistServe paper, which we use below, reports that adding decode work to a prefill slows the prefill as well, especially when the GPU is already full. So one GPU that serves both phases hurts both targets. The paper calls this **prefill-decode interference** [senior], and it lists a second problem, **resource coupling** [senior]: both phases must use the same GPU count and the same split of the model, even though they have different needs. The [Parallelism and MoE for Inference](/learn/ai/e3-inference-deep/parallelism-moe/) lesson covers the splits.
 
 The animation below shows three layouts. Step through it once. Do not look at the last two steps yet. First read the first two steps and find the gap.
 
@@ -44,7 +44,7 @@ Chunked prefill cuts the prompt into pieces of equal size. Each iteration carrie
 
 Why does this help? A prefill chunk is big enough to use all the arithmetic of the GPU. The decode work that rides along is cheap, because it only adds a few rows to a batch that already reads the weights. The paper says the piggybacked decodes cost up to an order of magnitude less than the same decodes in a decode-only batch. The gap between tokens stays about as long as one chunk, not one whole prompt.
 
-[Lesson E3.1](/learn/ai/e3-inference-deep/continuous-batching/) showed the vLLM policy for this: decodes go in first, and a token budget per iteration limits the prefill chunk. That budget is the knob.
+[The Continuous Batching Internals lesson](/learn/ai/e3-inference-deep/continuous-batching/) showed the vLLM policy for this: decodes go in first, and a token budget per iteration limits the prefill chunk. That budget is the knob.
 
 ### What it costs
 
@@ -66,12 +66,12 @@ The picture is a restaurant with a prep kitchen and a grill. Prep chefs do the l
 Why does it help? Three reasons.
 
 1. **No interference.** The decode pool never runs a prefill. Its steps are steady, so TPOT is steady.
-2. **Each pool is tuned for its own target.** The prefill pool serves TTFT. Its batch can be small, so a prompt starts fast. The decode pool serves TPOT. Its batch can be large, because decode gains from batching (lesson [A2.4](/learn/ai/a2-inference-cost/batching-throughput/)). With one GPU for both, you must choose one batch size for both.
+2. **Each pool is tuned for its own target.** The prefill pool serves TTFT. Its batch can be small, so a prompt starts fast. The decode pool serves TPOT. Its batch can be large, because decode gains from batching (the [Batching and Throughput](/learn/ai/a2-inference-cost/batching-throughput/) lesson). With one GPU for both, you must choose one batch size for both.
 3. **Each pool picks its own split of the model.** The DistServe paper gave the prefill and decode instances different parallel degrees. For OPT-175B, its search chose a tensor degree of 3 for the prefill instance and 4 for the decode instance. We do not need those numbers. The point is that the two phases got different shapes.
 
 ### What it costs: the KV cache must travel
 
-The decode GPU cannot start without the prompt's KV cache. The prefill GPU built it. So it must cross a link. [Lesson A2.3](/learn/ai/a2-inference-cost/kv-cache/) showed that the KV cache of a long prompt is big. The DistServe paper gives an example: the cache of one 512-token request on OPT-66B is about 1.13 GB.
+The decode GPU cannot start without the prompt's KV cache. The prefill GPU built it. So it must cross a link. [The KV Cache lesson](/learn/ai/a2-inference-cost/kv-cache/) showed that the KV cache of a long prompt is big. The DistServe paper gives an example: the cache of one 512-token request on OPT-66B is about 1.13 GB.
 
 How long the move takes depends on the link. Inside one server, GPUs talk over **NVLink** [mid], a direct GPU-to-GPU link. Between servers, they use a network such as **InfiniBand** [mid], a fast network made for clusters. The first is much faster than a normal network card. Step 5 and step 6 of the animation show a fast and a slow link. The user waits for the move before the second token, because the decode GPU needs the cache to make it.
 
@@ -80,7 +80,7 @@ Two ways to cut this wait appear in the papers.
 - **Use the fast link.** DistServe places the prefill and decode instances of the same model stage on one machine, so the transfer runs over NVLink. On its test cluster, the link between machines was only 25 Gbps. With that placement, the paper reports that the transfer was less than 0.1% of total latency for OPT-175B, and over 95% of requests had a transfer delay under 30 ms.
 - **Overlap the move with the prefill.** Splitwise starts sending the KV cache of layer 1 while layer 2 is still computing. Each layer's cache leaves as soon as it exists. In the Splitwise test with two machines, the paper reports that a one-shot transfer added a 64% delay to the second token, and the overlapped transfer added 16.5%. Overall, the overlapped transfer cost 0.8% of end-to-end latency, against up to 3% for the one-shot transfer. Layer-by-layer sending also frees the cache memory on the prompt machine sooner.
 
-Now use the simulator. It is our own model, not a benchmark. It uses the same 70B-class numbers as lessons [A2.2](/learn/ai/a2-inference-cost/prefill-decode/) and A2.3. Do these three tests.
+Now use the simulator. It is our own model, not a benchmark. It uses the same 70B-class numbers as lessons [Prefill vs Decode: TTFT and TPOT](/learn/ai/a2-inference-cost/prefill-decode/) and A2.3. Do these three tests.
 
 1. Set the link to the 25 Gbps network and raise the prompt length. Watch the "First token" bar of the split pools.
 2. Switch the link to the fast fabric, then to NVLink.
@@ -98,7 +98,7 @@ Look also at the SLO sliders. A red bar means that layout misses your target. Th
 
 ## What goodput adds
 
-**Goodput** [mid] is the request rate a GPU can serve while it still meets both the TTFT target and the TPOT target. Plain throughput counts every token. A server can have a record throughput while many users miss one target. [Lesson E3.7](/learn/ai/e3-inference-deep/serving-engines/) builds the metric in full. Here you need only one point.
+**Goodput** [mid] is the request rate a GPU can serve while it still meets both the TTFT target and the TPOT target. Plain throughput counts every token. A server can have a record throughput while many users miss one target. [The Serving Engines and Metrics lesson](/learn/ai/e3-inference-deep/serving-engines/) builds the metric in full. Here you need only one point.
 
 The DistServe paper chose goodput per GPU as its goal. Its abstract says the system raises "the maximum rate that can be served within both TTFT and TPOT constraints on each GPU". That is why a split can win even when it uses the same number of GPUs. The same GPUs serve more requests that are on time.
 

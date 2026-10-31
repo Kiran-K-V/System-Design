@@ -11,7 +11,7 @@ import AiE3FlashTraffic from '../../../../components/anim/lessons/AiE3FlashTraff
 
 ## The problem
 
-[Lesson A1.4](/learn/ai/a1-model-function/attention-cost/) said that FlashAttention fixes the memory problem of attention without changing the answer, and that the arithmetic stays quadratic. It gave the label. This lesson gives the mechanism, and a test for it: a team writes an attention kernel, counts the arithmetic, finds that it is small, and the kernel is still slow. Where does the time go?
+[The Attention and Its Cost lesson](/learn/ai/a1-model-function/attention-cost/) said that FlashAttention fixes the memory problem of attention without changing the answer, and that the arithmetic stays quadratic. It gave the label. This lesson gives the mechanism, and a test for it: a team writes an attention kernel, counts the arithmetic, finds that it is small, and the kernel is still slow. Where does the time go?
 
 The answer is in the memory system of the GPU. A GPU is very fast at arithmetic. Moving numbers in and out of its big memory is slower. When a step does little arithmetic per number moved, the step waits for memory, not for math. Attention in its plain form is full of such steps.
 
@@ -25,17 +25,17 @@ The questions are:
 
 ## Two memories on one GPU
 
-A GPU has a large, slow-ish memory and a small, very fast one. **HBM** [junior] (high bandwidth memory) is the large one on the card, where weights and the KV cache live ([lesson A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). **SRAM** [junior] (static RAM) is the small, fast memory inside the chip, next to the math units. Think of HBM as a warehouse across town and SRAM as the workbench in front of you. You do the work on the bench. A trip to the warehouse costs far more than a step of work.
+A GPU has a large, slow-ish memory and a small, very fast one. **HBM** [junior] (high bandwidth memory) is the large one on the card, where weights and the KV cache live ([the GPU Memory Math lesson](/learn/ai/a2-inference-cost/gpu-memory-math/)). **SRAM** [junior] (static RAM) is the small, fast memory inside the chip, next to the math units. Think of HBM as a warehouse across town and SRAM as the workbench in front of you. You do the work on the bench. A trip to the warehouse costs far more than a step of work.
 
 The FlashAttention paper gives figures for an A100: HBM is 40 GB at 1.5 TB/s, and SRAM is 20 MB at about 19 TB/s. So SRAM is roughly 10 times faster, and about 2,000 times smaller. The paper also states that on modern GPUs "compute speed has out-paced memory speed", so many operations wait on memory.
 
 How does a GPU program use these memories? A **kernel** [mid] is one function that runs on the GPU. The paper describes the execution model: each kernel loads its inputs from HBM, computes, and writes its outputs back to HBM. If a task has three steps and each step is its own kernel, the data makes three round trips to the warehouse.
 
-[Lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/) taught the test for what limits a step: **arithmetic intensity** [mid], the number of operations per byte moved. A step with high intensity waits for the math units (compute-bound). A step with low intensity waits for memory (memory-bound). The paper lists the kinds: a matrix multiply with a large inner size is compute-bound. Element-wise steps (activation, dropout) and reductions (sum, softmax) are memory-bound, because each number is used once or twice and then written back.
+[The Prefill vs Decode: TTFT and TPOT lesson](/learn/ai/a2-inference-cost/prefill-decode/) taught the test for what limits a step: **arithmetic intensity** [mid], the number of operations per byte moved. A step with high intensity waits for the math units (compute-bound). A step with low intensity waits for memory (memory-bound). The paper lists the kinds: a matrix multiply with a large inner size is compute-bound. Element-wise steps (activation, dropout) and reductions (sum, softmax) are memory-bound, because each number is used once or twice and then written back.
 
 ## Naive solution: write the score matrix to HBM
 
-Recall attention from [lesson A1.4](/learn/ai/a1-model-function/attention-cost/). For a sequence of N tokens, each head has three matrices of N rows and d columns: queries Q, keys K, and values V. Here d is the **head width** [mid], 64 or 128 in common models. Attention is three steps:
+Recall attention from [the Attention and Its Cost lesson](/learn/ai/a1-model-function/attention-cost/). For a sequence of N tokens, each head has three matrices of N rows and d columns: queries Q, keys K, and values V. Here d is the **head width** [mid], 64 or 128 in common models. Attention is three steps:
 
 1. Multiply Q by the transpose of K. The result is the score matrix S, with N rows and N columns. Every token scores every other token.
 2. Apply softmax to each row of S. The result is the probability matrix P, also N by N.
@@ -118,13 +118,13 @@ All of these are training numbers from 2022 on A100 GPUs. Gains are larger on th
 
 ## What about inference?
 
-Inference has two phases ([lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/)).
+Inference has two phases ([the Prefill vs Decode: TTFT and TPOT lesson](/learn/ai/a2-inference-cost/prefill-decode/)).
 
 **Prefill** reads the whole prompt at once. Every prompt token is a query, so the score matrix is N by N, as in training. Our reading: the same problem appears, and the same fix applies. Long prompts are where an N by N matrix would hurt most. The forward pass is all that runs, so the recomputation trick is not needed.
 
-**Decode** makes one token per pass. There is one new query. Its scores are one row of length n (the context so far), not a matrix. That row is small, and there is no N² matrix to avoid. The cost of attention in decode is different: the engine must read the whole KV cache of the request from HBM at every step. That is memory-bound by nature ([lesson A2.3](/learn/ai/a2-inference-cost/kv-cache/)), and tiling does not remove the reads of keys and values.
+**Decode** makes one token per pass. There is one new query. Its scores are one row of length n (the context so far), not a matrix. That row is small, and there is no N² matrix to avoid. The cost of attention in decode is different: the engine must read the whole KV cache of the request from HBM at every step. That is memory-bound by nature ([the KV Cache lesson](/learn/ai/a2-inference-cost/kv-cache/)), and tiling does not remove the reads of keys and values.
 
-So the FlashAttention idea (fuse the steps, keep intermediates on chip, never store scores) is the most valuable in prefill and in training. Inference engines still use the same principle in decode kernels: read each key and value block once, from HBM, and do the work next to it. The PagedAttention kernel of [lesson E3.2](/learn/ai/e3-inference-deep/paged-attention/) is an example from the vLLM paper: it fuses the block read with the attention step, and reads several tokens of a block together. We did not verify how a given engine mixes the two kernels, so check your engine's docs for its attention backend.
+So the FlashAttention idea (fuse the steps, keep intermediates on chip, never store scores) is the most valuable in prefill and in training. Inference engines still use the same principle in decode kernels: read each key and value block once, from HBM, and do the work next to it. The PagedAttention kernel of [the PagedAttention lesson](/learn/ai/e3-inference-deep/paged-attention/) is an example from the vLLM paper: it fuses the block read with the attention step, and reads several tokens of a block together. We did not verify how a given engine mixes the two kernels, so check your engine's docs for its attention backend.
 
 ## Limits
 
@@ -138,7 +138,7 @@ So the FlashAttention idea (fuse the steps, keep intermediates on chip, never st
 
 ## What experienced teams know
 
-**Count bytes before FLOPs.** The paper's argument against approximate attention is that FLOP reduction "may not correlate with wall-clock speed". When a custom operator is slow, look at memory traffic first. This is the same habit as in [lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/): name the ceiling before you fix anything.
+**Count bytes before FLOPs.** The paper's argument against approximate attention is that FLOP reduction "may not correlate with wall-clock speed". When a custom operator is slow, look at memory traffic first. This is the same habit as in [the Prefill vs Decode: TTFT and TPOT lesson](/learn/ai/a2-inference-cost/prefill-decode/): name the ceiling before you fix anything.
 
 **Anything you add between the matrix multiplies must live inside the kernel.** Masking, dropout and similar element-wise steps each cost another pass over an N by N matrix if they run outside. The paper fuses them into the one kernel. A custom variant that adds a step outside the fused kernel gives the traffic back.
 

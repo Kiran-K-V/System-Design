@@ -22,12 +22,12 @@ const edges: BuildEdge[] = [
 const steps: BuildStep[] = [
   {
     req: 'FR1: upload a file',
-    caption: 'The client asks the metadata service for permission. The service records the file and returns a pre-signed URL, a link that lets the client write one object to storage for a few minutes (lesson 8.11). The client sends the bytes straight to object storage. App servers never carry file bytes.',
+    caption: 'The client asks the metadata service for permission. The service records the file and returns a pre-signed URL, a link that lets the client write one object to storage for a few minutes (the Blob Storage and CDN lesson). The client sends the bytes straight to object storage. App servers never carry file bytes.',
     packets: [{ from: 'client', to: 'meta' }, { from: 'client', to: 's3', delay: 0.8 }],
   },
   {
     req: 'NFR: files up to 50 GB',
-    caption: 'No new box. The client cuts a big file into chunks and uploads each as one part of a multipart upload (many small requests joined at the end), so a failure costs one chunk, not the whole file (lesson 9.6).',
+    caption: 'No new box. The client cuts a big file into chunks and uploads each as one part of a multipart upload (many small requests joined at the end), so a failure costs one chunk, not the whole file (the Handling Large Blobs lesson).',
     active: ['client', 's3'],
   },
   {

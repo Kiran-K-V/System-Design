@@ -20,10 +20,10 @@ const steps: Step[] = [
     weak: '',
   },
   {
-    caption: 'Relational. Facts live in tables, one row per fact, joined by keys. A user is stored once. The posts table points at it with user_id. The database can answer questions you did not plan, because every column can be filtered, joined, and indexed (lesson 4.3), and a transaction can change several rows together (lesson 4.4).',
+    caption: 'Relational. Facts live in tables, one row per fact, joined by keys. A user is stored once. The posts table points at it with user_id. The database can answer questions you did not plan, because every column can be filtered, joined, and indexed (the Indexing lesson), and a transaction can change several rows together (the Transactions and Isolation lesson).',
     shape: 'relational',
     good: 'Any filter, any join,\nmulti-row transactions.\nQ1, Q2 and Q3 all work.',
-    weak: 'All writes go through one\nmachine until you split\nthe data (lesson 4.7).',
+    weak: 'All writes go through one\nmachine until you split\nthe data (the Sharding lesson).',
   },
   {
     caption: 'Key-value. The whole database is a map from a key to a value. The database does not look inside the value, so it is just stored bytes. Get and put by key are the fastest operations any store offers. Redis, a popular key-value store, can also add 1 to a stored number in one safe step (INCR), which suits counters. The price: there is no query by anything but the key.',
@@ -38,7 +38,7 @@ const steps: Step[] = [
     weak: 'Many-to-many links and\nshared facts are your\ncode. Q2 is hard.',
   },
   {
-    caption: 'Wide-column. A row is addressed by a partition key, which picks the machine, and a clustering key, which sorts the rows stored together on that machine. All of Ana\'s posts sit together, newest first. Q1 is one sequential read. The store only appends writes to files and merges them later (the LSM tree of lesson 4.3), so writes are fast. The price: you ask only what the keys were built for.',
+    caption: 'Wide-column. A row is addressed by a partition key, which picks the machine, and a clustering key, which sorts the rows stored together on that machine. All of Ana\'s posts sit together, newest first. Q1 is one sequential read. The store only appends writes to files and merges them later (the LSM tree of the Indexing lesson), so writes are fast. The price: you ask only what the keys were built for.',
     shape: 'wide',
     good: 'Huge write rates. "Latest\nN rows for one key" is\none partition read.',
     weak: 'A new question needs a\nnew table. Cassandra:\n"a table for each query".',

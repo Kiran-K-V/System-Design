@@ -16,7 +16,7 @@ const without: CompareVariant = {
   ],
   steps: [
     { caption: 'The user sends message 181. The prompt holds all 180 earlier messages plus the new one. The post says the average message has a dialogue history of 180 messages.', packets: [{ from: 'user', to: 'route', label: 'turn' }], active: ['route'] },
-    { caption: 'Any server may take it. The GPU has no saved work for this dialogue, so prefill reads every message again. Prefill is the first pass over the prompt (lesson A2.2).', packets: [{ from: 'route', to: 'gpu', label: '181 msgs' }], active: ['gpu'], tones: { gpu: 'bad' } },
+    { caption: 'Any server may take it. The GPU has no saved work for this dialogue, so prefill reads every message again. Prefill is the first pass over the prompt (the Prefill vs Decode: TTFT and TPOT lesson).', packets: [{ from: 'route', to: 'gpu', label: '181 msgs' }], active: ['gpu'], tones: { gpu: 'bad' } },
     { caption: 'The reply streams back and the work for the 180 old messages is thrown away. Turn 182 pays the same price again. The post calls refilling the cache on every turn "prohibitively expensive".', tones: { gpu: 'bad' }, notes: [{ x: 470, y: 225, text: 'repeated every turn', anchor: 'middle', tone: 'bad' }] },
   ],
 };

@@ -53,7 +53,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Over a whole 1,000-token sequence the naive path computes 1 + 2 + ... + 1,000 = 500,500 K/V sets. The cache computes 1,000. Work falls from quadratic to linear. This is the same idea as lesson A1.4: attention reads the past, so keep the past.',
+      'Over a whole 1,000-token sequence the naive path computes 1 + 2 + ... + 1,000 = 500,500 K/V sets. The cache computes 1,000. Work falls from quadratic to linear. This is the same idea as the Attention and Its Cost lesson: attention reads the past, so keep the past.',
     view: 'cells',
     tokens: 6,
     kv: ['stored', 'stored', 'stored', 'stored', 'stored', 'stored'],

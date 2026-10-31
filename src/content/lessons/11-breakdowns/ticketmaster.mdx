@@ -15,7 +15,7 @@ Tickets for an IPL final go on sale at 10:00 on a ticketing app. The stadium has
 
 This breaks two ways. The first is **double booking**: two people pay for seat 12A. That is not a slow page, it is a broken promise, so booking needs strong consistency. The second is **load**. A crowd that is far bigger than the number of seats floods every part of the system.
 
-Lesson [9.4](/learn/09-patterns/contention/) taught the general ideas for fights over one row. This case study applies them and adds two things. One is a seat hold that expires on its own. The other is a virtual waiting room.
+The [Dealing with Contention](/learn/backend/09-patterns/contention/) lesson taught the general ideas for fights over one row. This case study applies them and adds two things. One is a seat hold that expires on its own. The other is a virtual waiting room.
 
 ## Requirements
 
@@ -53,31 +53,31 @@ WHERE event_id = $event AND seat_id = $seat
        OR (status = 'held' AND hold_expires_at < now()));
 ```
 
-If the statement reports 1 row changed, the fan holds the seat. If it reports 0, someone else does. The database makes this safe. In PostgreSQL's default isolation level, a second `UPDATE` on the same row waits for the first to finish. Then the second update re-checks the `WHERE` clause against the new version of the row. The docs say the condition "is re-evaluated to see if the updated version of the row still matches the search condition". So the second statement sees the hold and matches nothing. Lesson [4.4](/learn/04-data/transactions/) explains these isolation rules. Other databases offer the same idea as a conditional write.
+If the statement reports 1 row changed, the fan holds the seat. If it reports 0, someone else does. The database makes this safe. In PostgreSQL's default isolation level, a second `UPDATE` on the same row waits for the first to finish. Then the second update re-checks the `WHERE` clause against the new version of the row. The docs say the condition "is re-evaluated to see if the updated version of the row still matches the search condition". So the second statement sees the hold and matches nothing. The [Transactions and Isolation](/learn/backend/04-data/transactions/) lesson explains these isolation rules. Other databases offer the same idea as a conditional write.
 
 **Why not lock the row for the whole checkout?** A fan may take minutes to approve a UPI request or type a card number. A lock held that long blocks everyone else and can freeze the table if the fan walks away. A hold is not a lock held by a connection. It is data in a row, with a clock.
 
 **Expiry needs no job.** The `WHERE` clause already treats a hold with `hold_expires_at < now()` as free. So when a fan abandons checkout, nothing has to run. A cron job (a task that a timer runs on a fixed schedule) that frees expired holds once a minute would leave seats stuck for up to a minute. That job would need its own care. Implicit expiry is exact. A background sweep can still tidy old rows for the seat map, but correctness does not depend on it.
 
-**Redis as an alternative.** You can keep the hold as a key: `SET seat:42:12A user NX EX 600` ([lesson 8.2](/learn/08-technologies/redis/)). `NX` means set only if absent, and `EX 600` expires it after 600 seconds. It is fast and it expires natively. The cost is a second system. The seat's final state still has to be written to the database. Redis can lose a key in a failover. So many designs use the key as a fast first gate and the database as the truth.
+**Redis as an alternative.** You can keep the hold as a key: `SET seat:42:12A user NX EX 600` ([the Redis lesson](/learn/backend/08-technologies/redis/)). `NX` means set only if absent, and `EX 600` expires it after 600 seconds. It is fast and it expires natively. The cost is a second system. The seat's final state still has to be written to the database. Redis can lose a key in a failover. So many designs use the key as a fast first gate and the database as the truth.
 
 **Several seats at once.** A fan holds 4 seats together. Do it in one transaction, and take the seats in a fixed order, such as sorted by seat id. If two fans want overlapping seats and each takes them in a different order, they can deadlock. A deadlock is two requests that each wait for a row the other one holds, so neither can ever move on. A fixed order prevents that.
 
-**Confirm.** Payment takes time, and the hold may expire in the middle. Confirm with a second conditional update: set status to sold `WHERE held_by = $user AND hold_expires_at > now()`. Charge the UPI or card payment with an idempotency key ([lesson 3.4](/learn/03-api-design/idempotency/)). If the payment succeeds but the seat update matches 0 rows, because the hold lapsed and someone else took the seat, refund the payment. To make that rare, give the hold a little more time than the payment timeout.
+**Confirm.** Payment takes time, and the hold may expire in the middle. Confirm with a second conditional update: set status to sold `WHERE held_by = $user AND hold_expires_at > now()`. Charge the UPI or card payment with an idempotency key ([the Idempotency lesson](/learn/backend/03-api-design/idempotency/)). If the payment succeeds but the seat update matches 0 rows, because the hold lapsed and someone else took the seat, refund the payment. To make that rare, give the hold a little more time than the payment timeout.
 
 ## Deep dive 2: a crowd of ten million
 
 With hundreds of fans per seat, most fans will lose. The question is how to fail them gracefully and cheaply.
 
-A **virtual waiting room** puts fans in a queue before the booking path. A fan who arrives gets a place in line, and the page shows their position. A sorted set ([lesson 8.2](/learn/08-technologies/redis/)), a Redis structure that keeps items ordered by a number, can hold the line. The number is the arrival time. A controller admits a batch at a fixed rate. The controller gives each admitted fan a signed token with an expiry time. A signed token is a short string that only our servers can create, like a stamped wristband. Anyone can check the stamp, and nobody can forge it. The booking service refuses any request without a valid token. The token check is cheap and needs no database call.
+A **virtual waiting room** puts fans in a queue before the booking path. A fan who arrives gets a place in line, and the page shows their position. A sorted set ([the Redis lesson](/learn/backend/08-technologies/redis/)), a Redis structure that keeps items ordered by a number, can hold the line. The number is the arrival time. A controller admits a batch at a fixed rate. The controller gives each admitted fan a signed token with an expiry time. A signed token is a short string that only our servers can create, like a stamped wristband. Anyone can check the stamp, and nobody can forge it. The booking service refuses any request without a valid token. The token check is cheap and needs no database call.
 
 The admission rate is the control knob. Choose it from what booking can handle, such as the few dozen new fans a second above. Raise it as seats stay available, and lower it when holds pile up.
 
 A queue does not remove the seat fight. Admitted fans still compete for seats, so the conditional hold stays. The queue protects the system. The conditional update protects the data.
 
-**Live seat map.** Polling the seat map from 10 million browsers is out of the question. Stream changes with SSE, server-sent events, a one-way live connection from server to browser ([lesson 2.5](/learn/02-networking/real-time-transport/)), but only to admitted fans, who number in the thousands. Waiting fans see only their queue position. Treat the map as a hint. If a fan clicks a seat that was taken a moment ago, the hold returns 409. The page refreshes that seat. The hold step is always the judge.
+**Live seat map.** Polling the seat map from 10 million browsers is out of the question. Stream changes with SSE, server-sent events, a one-way live connection from server to browser ([the Real-time Transport lesson](/learn/backend/02-networking/real-time-transport/)), but only to admitted fans, who number in the thousands. Waiting fans see only their queue position. Treat the map as a hint. If a fan clicks a seat that was taken a moment ago, the hold returns 409. The page refreshes that seat. The hold step is always the judge.
 
-**Search and the event page** at this scale are mostly cacheable. Cache the event page and common searches for a few seconds, and serve the page from a CDN ([lesson 2.7](/learn/02-networking/cdn-proxies/)). Postgres full-text search is enough at first. Move to a search index with change data capture only when the volume or ranking needs demand it.
+**Search and the event page** at this scale are mostly cacheable. Cache the event page and common searches for a few seconds, and serve the page from a CDN ([the CDN and Proxies lesson](/learn/backend/02-networking/cdn-proxies/)). Postgres full-text search is enough at first. Move to a search index with change data capture only when the volume or ranking needs demand it.
 
 ## Trade-offs
 

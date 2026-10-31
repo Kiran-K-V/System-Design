@@ -34,7 +34,7 @@ const steps: BuildStep[] = [
   {
     req: 'Requirement 1: upload the bytes, and resume',
     caption:
-      'The service starts a multipart upload in blob storage and gives the client signed URLs. The client sends parts straight to storage, in parallel (lesson 8.11). If the connection drops, the client asks which parts are done and sends only the rest.',
+      'The service starts a multipart upload in blob storage and gives the client signed URLs. The client sends parts straight to storage, in parallel (the Blob Storage and CDN lesson). If the connection drops, the client asks which parts are done and sends only the rest.',
     packets: [{ from: 'api', to: 'blob' }, { from: 'creator', to: 'blob', delay: 0.9 }],
   },
   {

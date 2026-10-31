@@ -14,7 +14,7 @@ import LongRunningStatus from '../../../components/anim/lessons/LongRunningStatu
 
 A user asks for a report export, a video transcode, or a bulk import. The work takes 5 minutes. A web request cannot wait that long.
 
-- **Timeouts fire in the middle.** Browsers, load balancers, and gateways cut idle or slow requests ([lesson 2.4](/learn/02-networking/load-balancing/), [lesson 7.2](/learn/07-reliability/timeouts-retries/)). The client sees an error while the work may still be running.
+- **Timeouts fire in the middle.** Browsers, load balancers, and gateways cut idle or slow requests ([the Load Balancing lesson](/learn/backend/02-networking/load-balancing/), [the Timeouts, Retries, Backoff lesson](/learn/backend/07-reliability/timeouts-retries/)). The client sees an error while the work may still be running.
 - **A held connection is a held thread.** Each waiting request ties up memory and a worker slot, so a burst of exports starves fast requests.
 - **A retry makes it worse.** The client times out and retries. Now two copies of the job run, and the report is built twice.
 - **A deploy kills the work.** If the server restarts mid-job, the job vanishes and nobody knows.
@@ -39,18 +39,18 @@ New here is the **job record**, the status API, and the lease with its heartbeat
 ## The mechanism: accept, queue, work, report
 
 1. **Accept.** The API validates the request and writes a **job record** with status `QUEUED`. The record holds the job id, the owner, the input, and the idempotency key.
-2. **Queue.** The API puts a message that holds the job id on a queue ([lesson 6.1](/learn/06-async/queues/)).
+2. **Queue.** The API puts a message that holds the job id on a queue ([the Queues lesson](/learn/backend/06-async/queues/)).
 3. **Reply.** The API returns **202 Accepted** and the job id, plus a status URL such as `/jobs/42`. The code 202 means "I took it. It is not done." The reply takes milliseconds.
 4. **Work.** A worker takes the message, sets `RUNNING`, does the work, saves the result, and sets `SUCCEEDED` or `FAILED`.
 5. **Report.** The client finds out through one of three routes.
 
-Write the job record and the queue message so they cannot disagree. If the API writes the record and the process dies before it enqueues, the job is stuck `QUEUED` forever. The outbox from [lesson 6.5](/learn/06-async/cdc/) fixes this: the message is saved in the same database transaction as the record, and a separate process sends it. A sweeper also works. This is a small background job that finds old `QUEUED` records and puts them on the queue again.
+Write the job record and the queue message so they cannot disagree. If the API writes the record and the process dies before it enqueues, the job is stuck `QUEUED` forever. The outbox from [the Change Data Capture lesson](/learn/backend/06-async/cdc/) fixes this: the message is saved in the same database transaction as the record, and a separate process sends it. A sweeper also works. This is a small background job that finds old `QUEUED` records and puts them on the queue again.
 
 ### Three ways to report status
 
-- **Poll.** The client calls `GET /jobs/42` on a timer and sees `QUEUED`, `RUNNING`, or `SUCCEEDED`. Use backoff so ten thousand waiting clients do not hammer the API ([lesson 7.2](/learn/07-reliability/timeouts-retries/)).
+- **Poll.** The client calls `GET /jobs/42` on a timer and sees `QUEUED`, `RUNNING`, or `SUCCEEDED`. Use backoff so ten thousand waiting clients do not hammer the API ([the Timeouts, Retries, Backoff lesson](/learn/backend/07-reliability/timeouts-retries/)).
 - **Webhook.** A webhook is a reverse call: the service sends an HTTP request to a URL the client registered earlier, when the job ends. It saves calls. It needs a public endpoint on the client, signature checks, and retries when the call fails.
-- **Push.** The service sends updates over an open connection such as SSE or a WebSocket ([lesson 2.5](/learn/02-networking/real-time-transport/)). Best for live progress. It needs a connection to hold.
+- **Push.** The service sends updates over an open connection such as SSE or a WebSocket ([the Real-time Transport lesson](/learn/backend/02-networking/real-time-transport/)). Best for live progress. It needs a connection to hold.
 
 Most systems offer poll as the base and add one of the others. A poll always works when the others fail.
 
@@ -60,11 +60,11 @@ Most systems offer poll as the base and add one of the others. A poll always wor
 
 This is the core problem. A worker takes a job and then crashes, or a deploy stops it, or the machine is lost. The queue cannot tell a dead worker from a slow one. If nothing handles this, the job is lost.
 
-The answer is a **lease**: the worker does not own the job forever. It borrows it for a fixed time. If the lease runs out, the job goes back to the queue for another worker. In SQS, the queue service from Amazon, this is the **visibility timeout**. A received message is hidden until it is deleted or the timeout ends. Then it reappears. The default is 30 seconds ([lesson 6.1](/learn/06-async/queues/)).
+The answer is a **lease**: the worker does not own the job forever. It borrows it for a fixed time. If the lease runs out, the job goes back to the queue for another worker. In SQS, the queue service from Amazon, this is the **visibility timeout**. A received message is hidden until it is deleted or the timeout ends. Then it reappears. The default is 30 seconds ([the Queues lesson](/learn/backend/06-async/queues/)).
 
 A lease raises a question. What if the job really needs 20 minutes? A lease longer than the job is too slow to recover from a crash. A lease shorter than the job hands it to a second worker while the first still runs. The answer is a **heartbeat**: while the worker is alive, it renews the lease. When the heartbeats stop, the lease runs out soon, and recovery is fast. The lease can be short, with a long job.
 
-In SQS the renewal is a call to `ChangeMessageVisibility`. The docs state a hard limit of 12 hours from the first receive, and extending does not reset it. For work longer than that, split it, or use a workflow engine, a service that stores the steps of a long job and runs them for you (lesson [8.9](/learn/08-technologies/temporal/)). Temporal is one such engine, and it has a real Activity Heartbeat. Its docs say the server does not detect a worker that crashes unless you set a timeout. So set one.
+In SQS the renewal is a call to `ChangeMessageVisibility`. The docs state a hard limit of 12 hours from the first receive, and extending does not reset it. For work longer than that, split it, or use a workflow engine, a service that stores the steps of a long job and runs them for you (the [Temporal](/learn/backend/08-technologies/temporal/) lesson). Temporal is one such engine, and it has a real Activity Heartbeat. Its docs say the server does not detect a worker that crashes unless you set a timeout. So set one.
 
 Step through it.
 
@@ -74,13 +74,13 @@ A heartbeat can also carry **progress**. Temporal's docs say a heartbeat may car
 
 ## Retries need idempotency
 
-The lease gives you **at-least-once** work, never exactly-once. Worker A may have written the output file, or charged a card, before it died. Worker B then runs the job again. To make that safe, the effect must be **idempotent** ([lesson 3.4](/learn/03-api-design/idempotency/)):
+The lease gives you **at-least-once** work, never exactly-once. Worker A may have written the output file, or charged a card, before it died. Worker B then runs the job again. To make that safe, the effect must be **idempotent** ([the Idempotency lesson](/learn/backend/03-api-design/idempotency/)):
 
 - **Dedupe key.** Use the job id as an idempotency key on every outside call. The payment API sees the same key and returns the saved result.
 - **Write once.** Write the output to a path derived from the job id. A second write replaces the same file with the same bytes.
 - **Record with the effect.** Save "step 3 done" in the same transaction as the step's database change. A repeat finds the mark and skips.
 
-Also set a retry limit. A **poison job** crashes every worker that touches it. After a set number of attempts, move it to a dead-letter queue and mark it `FAILED` ([lesson 6.4](/learn/06-async/backpressure-dlq/)). Retries use backoff with jitter ([lesson 7.2](/learn/07-reliability/timeouts-retries/)) and only for errors that can go away, such as a timeout. A validation error will fail the same way each time.
+Also set a retry limit. A **poison job** crashes every worker that touches it. After a set number of attempts, move it to a dead-letter queue and mark it `FAILED` ([the Backpressure and Dead-letter Queues lesson](/learn/backend/06-async/backpressure-dlq/)). Retries use backoff with jitter ([the Timeouts, Retries, Backoff lesson](/learn/backend/07-reliability/timeouts-retries/)) and only for errors that can go away, such as a timeout. A validation error will fail the same way each time.
 
 A repeat of the client's own `POST` is a different duplicate. The client times out waiting for the 202 and posts again. The idempotency key in the request lets the API return the same job id for both posts.
 
@@ -92,7 +92,7 @@ These are derived from stated assumptions, not measured values.
 - **Heartbeat load.** Many running jobs, each heartbeating often, add up to a steady stream of calls. Pick the interval with that load in mind. Pick an interval well under the lease, so one missed heartbeat does not lose the job.
 - **Polling load.** Thousands of clients polling every few seconds make a large stream of requests. Nearly all of them answer "still running." A webhook or push replaces those requests with one message per job.
 
-For how queue depth and wait time grow when arrivals exceed capacity, see [lesson 1.3](/learn/01-one-machine/throughput-vs-latency/).
+For how queue depth and wait time grow when arrivals exceed capacity, see [the Throughput vs Latency lesson](/learn/backend/01-one-machine/throughput-vs-latency/).
 
 ## Trade-offs
 
@@ -102,7 +102,7 @@ For how queue depth and wait time grow when arrivals exceed capacity, see [lesso
 | Queue and workers with a job record | Fast reply. Survives crashes. Scales workers on queue depth | A status API. At-least-once means idempotent work | Most background work |
 | Short lease with heartbeat | Fast recovery. Long jobs possible | Heartbeat traffic. Code to renew. A stalled heartbeat loses the job | Jobs longer than a minute |
 | Long lease, no heartbeat | Simple worker | A crash delays the job for the whole lease | Short, uniform jobs |
-| Workflow engine | Retries, timers, heartbeats, and state built in | Another system. Strict rules for the code you write ([lesson 8.9](/learn/08-technologies/temporal/)) | Multi-step jobs with waits |
+| Workflow engine | Retries, timers, heartbeats, and state built in | Another system. Strict rules for the code you write ([the Temporal lesson](/learn/backend/08-technologies/temporal/)) | Multi-step jobs with waits |
 
 <Callout type="tip">
 Say: "The API validates, writes a job record, enqueues the id, and returns 202 with a job id. A worker leases the job and heartbeats while it works. If the worker dies, the lease expires and another worker takes the job, so the job must be idempotent. The client polls the status URL, or gets a webhook. After N failed attempts the job goes to a dead-letter queue." Name the duplicate cases: worker retries and client retries.
@@ -113,7 +113,7 @@ Do not hold the HTTP connection for minutes and call it "async with a bigger tim
 </Callout>
 
 <Callout type="deep" title="Fencing a slow worker">
-A lease can expire while worker A is only slow, not dead (a long garbage-collection pause, for example, when the runtime freezes the program for a moment to free memory). Then B starts, and A wakes up and finishes too. Both write results. Idempotent effects make that harmless. When they do not, give each attempt a number. Then let the store accept a write only from the newest attempt. That is a fencing token. The same idea appears with ZooKeeper locks in [lesson 8.8](/learn/08-technologies/zookeeper/).
+A lease can expire while worker A is only slow, not dead (a long garbage-collection pause, for example, when the runtime freezes the program for a moment to free memory). Then B starts, and A wakes up and finishes too. Both write results. Idempotent effects make that harmless. When they do not, give each attempt a number. Then let the store accept a write only from the newest attempt. That is a fencing token. The same idea appears with ZooKeeper locks in [the ZooKeeper / etcd lesson](/learn/backend/08-technologies/zookeeper/).
 </Callout>
 
 ## Check yourself

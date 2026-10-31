@@ -15,7 +15,7 @@ import AsyncCdcFlow from '../../../components/anim/lessons/AsyncCdcFlow.tsx';
 A product row changes: the price drops from 10 to 9. That one change must reach other places.
 
 - The **search index** (a separate system, such as Elasticsearch, built for fast text search) must show the new price.
-- The **cache** must drop its old copy (lesson 5.5).
+- The **cache** must drop its old copy (the [Invalidation and Stampede](/learn/backend/05-caching/invalidation-stampede/) lesson).
 - The **analytics warehouse** (a database built for large reports, kept apart from the live one) must record the change.
 - Other services may want to react.
 
@@ -29,7 +29,7 @@ The application updates Postgres (a popular database), then the search index, th
 
 <AsyncOutboxWalk mode="dual" client:visible />
 
-Swapping the order does not help. If you publish first and the database then rejects the write, you have told the world about a change. That change never happened. A retry loop cannot help after the process itself is gone. The Microservices.io outbox write-up names the root cause. A service cannot easily update its database and send a message **atomically**. Two-phase commit (lesson 4.4) is often not available.
+Swapping the order does not help. If you publish first and the database then rejects the write, you have told the world about a change. That change never happened. A retry loop cannot help after the process itself is gone. The Microservices.io outbox write-up names the root cause. A service cannot easily update its database and send a message **atomically**. Two-phase commit (the [Transactions and Isolation](/learn/backend/04-data/transactions/) lesson) is often not available.
 
 **2. A race.** Two requests change the same row at nearly the same time. Their writes reach the two systems in different orders. The copies disagree for good.
 
@@ -39,7 +39,7 @@ Swapping the order does not help. If you publish first and the database then rej
 
 ## The mechanism: read the log
 
-The database already has an ordered record of every committed change: the write-ahead log (WAL, lesson 4.2). Replication (lesson 4.6) already depends on it. **Change data capture** (CDC) reads that log and turns each change into an event. The app writes one place. Whatever commits to the database shows up in the log, no matter which code path wrote it. And the log is in commit order.
+The database already has an ordered record of every committed change: the write-ahead log (WAL, the [How a Database Stores Data](/learn/backend/04-data/storage-engines/) lesson). Replication (the [Replication](/learn/backend/04-data/replication/) lesson) already depends on it. **Change data capture** (CDC) reads that log and turns each change into an event. The app writes one place. Whatever commits to the database shows up in the log, no matter which code path wrote it. And the log is in commit order.
 
 Debezium is a common open source tool that does this job. It runs a small program called a **connector** for each kind of database. The MySQL connector reads the binlog, which is MySQL's name for its write-ahead log. The PostgreSQL connector reads a logical replication stream (the log, decoded into row changes) through a **replication slot**. A replication slot is a bookmark the database keeps for one reader. The database keeps it so it does not delete log that reader still needs. It decodes the log with a plug-in (an add-on module that turns the raw log bytes into readable changes): `pgoutput`, which is built in, or `decoderbufs`. The position in the log is the **LSN** (log sequence number). Think of it as a page number in a ledger that only grows. A reader that saved "I am at 41" knows exactly where to continue.
 
@@ -49,17 +49,17 @@ What the connector does, from the Debezium docs:
 
 - **First start: a snapshot.** A snapshot is a consistent copy of the data as it is at one moment. PostgreSQL purges (deletes) old WAL after some time, so the log alone cannot rebuild the table. The connector takes a consistent snapshot of the existing rows, then streams changes from that point. The `snapshot.mode` default is `initial`.
 - **It stores each event's LSN.** After a restart it resumes from the last stored position.
-- **Output.** It usually runs inside Kafka Connect (a Kafka tool that hosts connectors and keeps them running) and writes one topic per table by default. A topic is a named log inside Kafka (lesson 6.2). Debezium Server and an embedded engine are alternatives. The stream is the log of lesson 6.2. So any number of consumers can read it, each with its own offset.
+- **Output.** It usually runs inside Kafka Connect (a Kafka tool that hosts connectors and keeps them running) and writes one topic per table by default. A topic is a named log inside Kafka (the [Pub/Sub and Logs](/learn/backend/06-async/pubsub-logs/) lesson). Debezium Server and an embedded engine are alternatives. The stream is the log of the [Pub/Sub and Logs](/learn/backend/06-async/pubsub-logs/) lesson. So any number of consumers can read it, each with its own offset.
 
 What it does **not** promise:
 
-- **At-least-once, not exactly-once.** In normal operation and graceful shutdown, consumers see each event once. After a failure, Debezium's FAQ says consumers can see an event at least once. The FAQ adds that consumers "may likely see at least some messages duplicated during recovery". The walk above shows how. Make consumers idempotent (lesson 6.3), which means that handling the same event twice gives the same result as handling it once.
+- **At-least-once, not exactly-once.** In normal operation and graceful shutdown, consumers see each event once. After a failure, Debezium's FAQ says consumers can see an event at least once. The FAQ adds that consumers "may likely see at least some messages duplicated during recovery". The walk above shows how. Make consumers idempotent (the [Delivery Semantics](/learn/backend/06-async/delivery-semantics/) lesson), which means that handling the same event twice gives the same result as handling it once.
 - **No DDL events.** DDL means the commands that change the table layout, such as adding a column. These changes are not sent as events.
 - **Commit-time publishing.** Changes appear when the transaction commits.
 - **Generated columns.** These are columns the database computes from other columns. `pgoutput` does not capture them.
 
 <Callout type="deep" title="The cost of a bookmark: WAL on the primary">
-A replication slot keeps WAL until its reader confirms it. The PostgreSQL manual warns that slots "will prevent removal of required resources even when there is no connection using them". The manual also says a slot nobody needs should be dropped. The setting `max_slot_wal_keep_size` caps how much WAL slots may keep. Its default is `-1`, which means no limit. So a stopped connector can fill the primary's disk with WAL (lesson 4.6). Alert on slot lag. Drop slots you no longer use.
+A replication slot keeps WAL until its reader confirms it. The PostgreSQL manual warns that slots "will prevent removal of required resources even when there is no connection using them". The manual also says a slot nobody needs should be dropped. The setting `max_slot_wal_keep_size` caps how much WAL slots may keep. Its default is `-1`, which means no limit. So a stopped connector can fill the primary's disk with WAL (the [Replication](/learn/backend/04-data/replication/) lesson). Alert on slot lag. Drop slots you no longer use.
 </Callout>
 
 ## The outbox pattern
@@ -70,7 +70,7 @@ The **transactional outbox** fixes this. In the same transaction that changes th
 
 <AsyncOutboxWalk mode="outbox" client:visible />
 
-Debezium ships an outbox event router for this. It expects a table with the columns `id`, `aggregatetype`, `aggregateid`, `type`, and `payload`. By default it sends events to a topic named `outbox.event.${routedByValue}`. It uses `aggregateid` as the message key. An aggregate is one business thing, such as one order. The key decides the partition (one lane of a topic, lesson 6.2), and the same key always gets the same lane. So all events of one aggregate go to the same partition. Events in that group keep their order (lesson 6.2). It ignores delete events on the outbox table, so you can clean old rows without publishing anything.
+Debezium ships an outbox event router for this. It expects a table with the columns `id`, `aggregatetype`, `aggregateid`, `type`, and `payload`. By default it sends events to a topic named `outbox.event.${routedByValue}`. It uses `aggregateid` as the message key. An aggregate is one business thing, such as one order. The key decides the partition (one lane of a topic, the [Pub/Sub and Logs](/learn/backend/06-async/pubsub-logs/) lesson), and the same key always gets the same lane. So all events of one aggregate go to the same partition. Events in that group keep their order (the [Pub/Sub and Logs](/learn/backend/06-async/pubsub-logs/) lesson). It ignores delete events on the outbox table, so you can clean old rows without publishing anything.
 
 The costs come from the Microservices.io pattern page. A developer can forget to write the outbox row. The relay can publish a message more than once, so consumers must be idempotent. You also run a cleanup job.
 
@@ -92,7 +92,7 @@ The costs come from the Microservices.io pattern page. A developer can forget to
 | CDC on business tables | No app changes. Catches every writer. Commit order. | Events mirror your schema. Slot and log care. A connector to run. | Search indexing, cache invalidation, warehouse sync |
 | Outbox + CDC relay | Events are business facts. Written atomically. | An extra table and a cleanup. Developers must write the row. | Microservice events that other teams depend on |
 | Outbox + polling relay | No log access needed | Polling delay and database load | No access to the log, low volume |
-| Two-phase commit across stores | Atomic across both | Blocking, rarely available (lesson 4.4) | Rare |
+| Two-phase commit across stores | Atomic across both | Blocking, rarely available (the [Transactions and Isolation](/learn/backend/04-data/transactions/) lesson) | Rare |
 
 ## Interview lens
 

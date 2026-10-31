@@ -34,7 +34,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: never charge twice',
-    caption: 'The request carries an idempotency key (lesson 3.4). The API saves key and response. A retry with the same key gets the saved response and does not start a second charge.',
+    caption: 'The request carries an idempotency key (the Idempotency lesson). The API saves key and response. A retry with the same key gets the saved response and does not start a second charge.',
     packets: [{ from: 'api', to: 'idem', label: 'key seen?' }],
   },
   {
@@ -44,7 +44,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: every cent is auditable',
-    caption: 'A state change writes ledger rows in the same database transaction. A ledger is an add-only list of money movements, and the debits and credits of each payment add up to the same total as the payment row (lesson 4.4). Either both commit or neither does. A balance is the sum of its rows, never a number edited in place.',
+    caption: 'A state change writes ledger rows in the same database transaction. A ledger is an add-only list of money movements, and the debits and credits of each payment add up to the same total as the payment row (the Transactions and Isolation lesson). Either both commit or neither does. A balance is the sum of its rows, never a number edited in place.',
     packets: [{ from: 'api', to: 'ledger', label: 'entries' }],
   },
   {

@@ -85,7 +85,7 @@ export default function AiE3DisaggTradeoff() {
         ))}
       </div>
       <p className="mt-3 text-xs text-muted">
-        Model. A decode step takes {DECODE_STEP_MS} ms. Prefill costs {PREFILL_MS_PER_TOKEN} ms per token. A mixed step costs the decode step plus its prefill piece. KV is {KV_BYTES_PER_TOKEN / 1024} KiB per token (Llama 3 70B, lesson A2.3), so this prompt holds {gib.toFixed(2)} GiB to move. Link speeds are examples from papers and the H100 page. Green bars meet your target, red bars miss it. Other users, queueing, and the decode pool size are left out.
+        Model. A decode step takes {DECODE_STEP_MS} ms. Prefill costs {PREFILL_MS_PER_TOKEN} ms per token. A mixed step costs the decode step plus its prefill piece. KV is {KV_BYTES_PER_TOKEN / 1024} KiB per token (Llama 3 70B, the KV Cache lesson), so this prompt holds {gib.toFixed(2)} GiB to move. Link speeds are examples from papers and the H100 page. Green bars meet your target, red bars miss it. Other users, queueing, and the decode pool size are left out.
       </p>
     </div>
   );

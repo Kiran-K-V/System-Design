@@ -81,7 +81,7 @@ export default function AiE3SpecSpeedup() {
         </div>
       </div>
       <p className="mt-3 text-xs text-muted">
-        Model. Each guessed token is kept with the same chance (the paper's simplifying assumption). The batch row assumes the large step is memory-bound until the tokens it checks pass the H100 ridge point of about 295 (lesson A2.2). Every user then checks the guess length plus one positions, so the step grows once the batch is large. The draft is treated as memory-bound at any batch. Real servers differ.
+        Model. Each guessed token is kept with the same chance (the paper's simplifying assumption). The batch row assumes the large step is memory-bound until the tokens it checks pass the H100 ridge point of about 295 (the Prefill vs Decode: TTFT and TPOT lesson). Every user then checks the guess length plus one positions, so the step grows once the batch is large. The draft is treated as memory-bound at any batch. Real servers differ.
       </p>
     </div>
   );

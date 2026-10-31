@@ -12,7 +12,7 @@ import RedisLeaderboard from '../../../components/anim/lessons/RedisLeaderboard.
 
 Redis is an in-memory data structure server. It keeps its data in RAM, the computer's fast working memory. RAM is much faster than disk, but its contents vanish when the power goes off. Redis offers rich types, not just a plain key-value map. The types are strings, hashes (a record of named fields), lists, sets (unique values), sorted sets, and streams (an append-only log). Disk persistence is optional.
 
-You met Redis in Module 5 as a [shared cache](/learn/05-caching/cache-placement) and as the place where [cache strategies](/learn/05-caching/cache-strategies) and [eviction](/learn/05-caching/eviction) happen. This lesson looks inside it. The same engine also does leaderboards, counters, rate limits, and locks. Each of those uses a data structure, not a cache trick.
+You met Redis in Module 5 as a [shared cache](/learn/backend/05-caching/cache-placement) and as the place where [cache strategies](/learn/backend/05-caching/cache-strategies) and [eviction](/learn/backend/05-caching/eviction) happen. This lesson looks inside it. The same engine also does leaderboards, counters, rate limits, and locks. Each of those uses a data structure, not a cache trick.
 
 ## The internal model
 
@@ -32,7 +32,7 @@ Look at the difference between a cheap and an expensive command. `GET` and `ZADD
 
 A normal Redis client sends a command, then waits for the reply. The docs call this a request/response protocol. One trip out and back is a **round trip**, and its time is the round trip time (RTT). The docs give an extreme example. If the RTT is 250 ms, a client waiting for each reply gets at most four requests per second. Even a server that can process 100,000 requests per second cannot change that limit.
 
-Inside one data center (a building full of servers) the RTT is much smaller. Lesson 5.2 used ~0.5 ms. It still adds up when you send thousands of commands in a row.
+Inside one data center (a building full of servers) the RTT is much smaller. The [Cache Placement](/learn/backend/05-caching/cache-placement/) lesson used ~0.5 ms. It still adds up when you send thousands of commands in a row.
 
 **Pipelining** means sending many commands without waiting for each reply, then reading all replies at once. It also helps the server. The docs explain that without pipelining each command needs a `read()` and a `write()` system call. A system call asks the operating system to do work, such as reading from the network. Each call means a switch from your program's space (user space) to the operating system's space (kernel space), and that switch costs time. With pipelining, one `read()` takes in many commands and one `write()` sends many replies. The docs say the rate "initially increases almost linearly with longer pipelines, and eventually reaches 10 times the baseline". The server queues replies in memory, so send batches (the docs suggest about 10,000 commands), not one giant stream.
 
@@ -57,23 +57,23 @@ Redis offers two ways to write to disk, and you can use both.
 | **RDB** | A point-in-time snapshot, taken by a forked child process (a copy of the running server that writes the file while the original keeps serving) | Compact and quick to restart from. You can lose everything since the last snapshot. |
 | **AOF** (append-only file) | A log of every write | Larger files. Durability depends on `appendfsync`. Fsync is the call that forces the operating system to write buffered data onto the disk. |
 
-The `appendfsync` setting has three policies: `always`, `everysec` (the default), and `no`. The docs say that with `everysec` "you may lose 1 second of data". So an acknowledged write can still be lost in a crash. This is the same fsync trade-off as in [lesson 4.2](/learn/04-data/storage-engines), with a clear label.
+The `appendfsync` setting has three policies: `always`, `everysec` (the default), and `no`. The docs say that with `everysec` "you may lose 1 second of data". So an acknowledged write can still be lost in a crash. This is the same fsync trade-off as in [the How a Database Stores Data lesson](/learn/backend/04-data/storage-engines/), with a clear label.
 
 ### Replication and Redis Cluster
 
-Replication means a second server keeps a copy of the data. The main server is the primary. Redis replication is asynchronous: "Redis uses asynchronous replication." That means the primary answers the client first and sends the change to the copy later. Replicas (the copies) are read-only by default. The `WAIT` command asks for acknowledgement from a number of replicas, which makes loss less likely. The docs say it still does not make the guarantee strict. A failover is when a replica takes over after the primary dies. After a failover, writes the old primary acknowledged can be gone ([lesson 4.6](/learn/04-data/replication)).
+Replication means a second server keeps a copy of the data. The main server is the primary. Redis replication is asynchronous: "Redis uses asynchronous replication." That means the primary answers the client first and sends the change to the copy later. Replicas (the copies) are read-only by default. The `WAIT` command asks for acknowledgement from a number of replicas, which makes loss less likely. The docs say it still does not make the guarantee strict. A failover is when a replica takes over after the primary dies. After a failover, writes the old primary acknowledged can be gone ([the Replication lesson](/learn/backend/04-data/replication/)).
 
-Redis Cluster shards the keyspace, which means it splits the data across several servers. It cuts the keyspace into **16,384 hash slots**, which are numbered buckets. A key's slot is `CRC16(key) mod 16384`. CRC16 is a function that turns any text into a number, and "mod" is the remainder after division, so the result is a bucket number from 0 to 16,383. Each primary owns a subset of the slots. This is a fixed-slot cousin of [consistent hashing](/learn/04-data/consistent-hashing): you move whole slots between nodes, not individual keys. Multi-key commands work only when all keys are in one slot. A **hash tag**, the part of a key in braces such as `{user:7}:cart`, makes keys share a slot.
+Redis Cluster shards the keyspace, which means it splits the data across several servers. It cuts the keyspace into **16,384 hash slots**, which are numbered buckets. A key's slot is `CRC16(key) mod 16384`. CRC16 is a function that turns any text into a number, and "mod" is the remainder after division, so the result is a bucket number from 0 to 16,383. Each primary owns a subset of the slots. This is a fixed-slot cousin of [consistent hashing](/learn/backend/04-data/consistent-hashing): you move whole slots between nodes, not individual keys. Multi-key commands work only when all keys are in one slot. A **hash tag**, the part of a key in braces such as `{user:7}:cart`, makes keys share a slot.
 
 ### Locks, with a warning
 
 For one Redis instance, the docs show the lock as `SET resource_name my_random_value NX PX 30000`. A lock here means a key that only one client can create at a time. The holder of the key owns the lock. `NX` means "only if the key does not exist". `PX 30000` is an expiry (a TTL, time to live) of 30000 ms, so the key vanishes after 30 seconds and a crashed holder cannot lock forever. To release, check that the stored value still matches your random value, then delete it. Do the check and delete in one Lua script (see the pipelining section), so no one can slip in between the check and the delete. Otherwise you might delete a lock another client took after yours expired.
 
-Redlock is a recipe that extends this to N=5 separate primaries and asks for a majority, 3. The docs themselves warn that Redis expiry does not use a monotonic clock. A monotonic clock only moves forward at a steady rate. The normal wall clock can jump forward or back, for example when the machine corrects its time. A jump can make a lock expire too early or too late, so two clients can think they hold it. They advise **fencing tokens**: a number that grows with each lock grant. The protected resource, such as a database, checks it and rejects a client with an old number. A lock that only guards efficiency (avoid duplicate work) can be a Redis lock. A lock that guards correctness needs a fencing token or a consensus system, which is a group of servers that agree on one answer even when some fail ([lesson 4.11](/learn/04-data/consensus)).
+Redlock is a recipe that extends this to N=5 separate primaries and asks for a majority, 3. The docs themselves warn that Redis expiry does not use a monotonic clock. A monotonic clock only moves forward at a steady rate. The normal wall clock can jump forward or back, for example when the machine corrects its time. A jump can make a lock expire too early or too late, so two clients can think they hold it. They advise **fencing tokens**: a number that grows with each lock grant. The protected resource, such as a database, checks it and rejects a client with an old number. A lock that only guards efficiency (avoid duplicate work) can be a Redis lock. A lock that guards correctness needs a fencing token or a consensus system, which is a group of servers that agree on one answer even when some fail ([the Consensus lesson](/learn/backend/04-data/consensus/)).
 
 ## When to use it
 
-- A shared cache in front of a database (cache-aside, [lesson 5.3](/learn/05-caching/cache-strategies)).
+- A shared cache in front of a database (cache-aside, [the Cache Strategies lesson](/learn/backend/05-caching/cache-strategies/)).
 - Leaderboards and "top K" lists with sorted sets.
 - Counters and rate limiters (code that caps how many requests a client may make). Atomic increments are cheap because commands run one at a time.
 - Sessions and short-lived tokens, with a TTL (an expiry time after which Redis deletes the key).
@@ -83,10 +83,10 @@ Redlock is a recipe that extends this to N=5 separate primaries and asks for a m
 
 | Situation | Why | Look at |
 |---|---|---|
-| The only copy of data you cannot lose | Async replication and `everysec` fsync can lose acknowledged writes | [PostgreSQL](/learn/08-technologies/postgresql) |
-| Data far larger than RAM | Everything lives in memory, so cost grows with data size | [DynamoDB](/learn/08-technologies/dynamodb) or [Cassandra](/learn/08-technologies/cassandra) |
+| The only copy of data you cannot lose | Async replication and `everysec` fsync can lose acknowledged writes | [PostgreSQL](/learn/backend/08-technologies/postgresql) |
+| Data far larger than RAM | Everything lives in memory, so cost grows with data size | [DynamoDB](/learn/backend/08-technologies/dynamodb) or [Cassandra](/learn/backend/08-technologies/cassandra) |
 | Multi-key transactions (several changes that must all happen or none) across many keys on a cluster | Keys must share a slot | A database with transactions |
-| Lock that guards correctness, with no fencing | Clock jumps and pauses can break it | [ZooKeeper / etcd](/learn/08-technologies/zookeeper) |
+| Lock that guards correctness, with no fencing | Clock jumps and pauses can break it | [ZooKeeper / etcd](/learn/backend/08-technologies/zookeeper) |
 
 ## Numbers
 

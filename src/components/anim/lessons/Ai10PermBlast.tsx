@@ -69,7 +69,7 @@ export default function Ai10PermBlast() {
         <p className="mt-2 text-sm">
           Worst thing an injection can do alone: <span className="font-semibold" style={{ color: bad ? 'var(--bad)' : 'var(--fg)' }}>{WORST[b.worst]}</span>.
         </p>
-        <p className="mt-1 text-xs text-muted">Approval cuts the second bar, not the first. A prompt that people approve by reflex gives the first bar back (lesson A7.3).</p>
+        <p className="mt-1 text-xs text-muted">Approval cuts the second bar, not the first. A prompt that people approve by reflex gives the first bar back (the Human-in-the-Loop lesson).</p>
       </div>
 
       <div className="mt-5 border-t border-line pt-4">

@@ -27,7 +27,7 @@ const steps: Step[] = [
     active: [],
   },
   {
-    caption: 'An agent has two nodes: one that calls the model and one that runs tools. Add an edge from tools back to agent and the graph has a cycle. This is the loop from lesson A6.1 drawn as a graph. The next steps add what the loop needs to be safe.',
+    caption: 'An agent has two nodes: one that calls the model and one that runs tools. Add an edge from tools back to agent and the graph has a cycle. This is the loop from the Agent Loop lesson drawn as a graph. The next steps add what the loop needs to be safe.',
     nodes: [...base, AGENT, TOOLS],
     edges: [{ from: 'start', to: 'agent' }, { from: 'agent', to: 'tools' }, { from: 'tools', to: 'agent', bend: 55, label: 'back', labelAt: [0, 14] }],
     notes: [{ x: 360, y: 250, text: 'A cycle, and so far no way out.', anchor: 'middle', tone: 'bad' }],
@@ -62,7 +62,7 @@ const steps: Step[] = [
     active: ['agent'],
   },
   {
-    caption: 'Why draw it this way. Each node is a step you can name, test with a fixed state, retry, and trace. The state can be saved after every node, which gives checkpoints. A runtime that persists them can resume after a crash (lesson A7.1). You get this only because the steps are explicit.',
+    caption: 'Why draw it this way. Each node is a step you can name, test with a fixed state, retry, and trace. The state can be saved after every node, which gives checkpoints. A runtime that persists them can resume after a crash (the Durable Execution and the Graph Runtime lesson). You get this only because the steps are explicit.',
     nodes: [...base, AGENT, TOOLS, { ...STATE, tone: 'ok' }],
     edges: [{ from: 'start', to: 'agent' }, { from: 'agent', to: 'tools' }, { from: 'tools', to: 'agent', bend: 55 }, { from: 'agent', to: 'end', bend: 85, dashed: true, tone: 'ok' }],
     notes: [{ x: 280, y: 238, text: 'saved after each node: resume, replay, debug', anchor: 'start', tone: 'ok' }],

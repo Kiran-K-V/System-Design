@@ -17,7 +17,7 @@ A cache holds a copy. Two things can go wrong with a copy.
 1. **It is stale.** The database changed. The copy did not. Readers see old data.
 2. **It disappears at a bad moment.** The entry expires or is deleted while thousands of readers want it. All of them miss together, and all of them go to the database.
 
-Lesson 5.3 showed how a write can leave a stale copy behind. Lesson 5.4 showed how a full cache drops entries. This lesson is about the rest. The lesson covers how to remove stale copies on purpose. It also covers what to do so that removing a copy does not hurt more than keeping a copy.
+The [Cache Strategies](/learn/backend/05-caching/cache-strategies/) lesson showed how a write can leave a stale copy behind. The [Eviction](/learn/backend/05-caching/eviction/) lesson showed how a full cache drops entries. This lesson is about the rest. The lesson covers how to remove stale copies on purpose. It also covers what to do so that removing a copy does not hurt more than keeping a copy.
 
 The second problem took Facebook offline for about 2.5 hours in 2010. [The story](#incident) is in Part 2, after the numbers.
 
@@ -36,10 +36,10 @@ A TTL alone fails when staleness hurts sooner. A user changes her display name a
 | Method | How it works | Staleness | Main risk |
 |---|---|---|---|
 | **TTL only** | Entry expires after N seconds | Up to N seconds | Everything stale for N seconds. Stampede at expiry |
-| **Delete on write** | After the database write, delete the key. The next read refills it | Short, if the delete runs | A late reader refills with old data (the race in lesson 5.3). A failed delete leaves stale data |
+| **Delete on write** | After the database write, delete the key. The next read refills it | Short, if the delete runs | A late reader refills with old data (the race in the [Cache Strategies](/learn/backend/05-caching/cache-strategies/) lesson). A failed delete leaves stale data |
 | **Update on write** | Write the new value into the cache too | Short | Two writers can land in different orders in the cache and the database |
-| **Versioned keys** | Put a version in the key: `user:42:v7`. A write bumps the version. Readers build the key from the version | None for the key, once readers see the new version | An extra lookup for the version. Old keys sit unused until eviction (lesson 5.4) removes them |
-| **Event-driven** | A change-data-capture stream (lesson 6.5) reads the database log and deletes keys | Seconds, the stream delay | A new pipeline to run. Events can be late or repeated, so deletes must be safe to repeat |
+| **Versioned keys** | Put a version in the key: `user:42:v7`. A write bumps the version. Readers build the key from the version | None for the key, once readers see the new version | An extra lookup for the version. Old keys sit unused until eviction (the [Eviction](/learn/backend/05-caching/eviction/) lesson) removes them |
+| **Event-driven** | A change-data-capture stream (the [Change Data Capture](/learn/backend/06-async/cdc/) lesson) reads the database log and deletes keys | Seconds, the stream delay | A new pipeline to run. Events can be late or repeated, so deletes must be safe to repeat |
 
 Combine them. A common pattern: **delete on write plus a TTL as a safety net**. The delete gives freshness in the normal case. The TTL bounds the damage when the delete fails.
 
@@ -53,7 +53,7 @@ Facebook's memcache paper is plain about it: the system provides *best-effort ev
 
 A product page key is read thousands of times per second. It is cached with a TTL. Rebuilding it takes a short moment: three queries and some work.
 
-Most of the time the database sees none of these reads. Then the TTL runs out. Until the first rebuild finishes, every read misses. The busier the key and the slower the rebuild, the more reads pile up in that gap. Each one finds an empty cache. Each one queries the database for the same row. (This is the same idea as Little's law in lesson 1.3: the requests in flight grow with the arrival rate and with the time each one takes.)
+Most of the time the database sees none of these reads. Then the TTL runs out. Until the first rebuild finishes, every read misses. The busier the key and the slower the rebuild, the more reads pile up in that gap. Each one finds an empty cache. Each one queries the database for the same row. (This is the same idea as Little's law in the [Throughput vs Latency](/learn/backend/01-one-machine/throughput-vs-latency/) lesson: the requests in flight grow with the arrival rate and with the time each one takes.)
 
 This is a **cache stampede**, also called a **thundering herd**. A popular entry expires, and many requests try to rebuild it at the same time. It gets worse in a loop. The extra load slows the database. The rebuild now takes longer. More reads miss during that longer gap, so the database slows more. A slow rebuild feeds the herd.
 
@@ -106,7 +106,7 @@ Facebook's memcache builds the lock into the cache. When a get misses, memcache 
 
 <LeaseHerd client:visible />
 
-The token does two jobs. It lets one client rebuild. And a delete by a writer voids the token, so a slow reader's late fill is refused. That is the stale-set race from lesson 5.3. 
+The token does two jobs. It lets one client rebuild. And a delete by a writer voids the token, so a slow reader's late fill is refused. That is the stale-set race from the [Cache Strategies](/learn/backend/05-caching/cache-strategies/) lesson. 
 
 Facebook limits how fast tokens leave: by default a server returns a token once every 10 seconds per key. Any request in that window gets "wait a short time". The paper's own data covers keys prone to herds. That data shows a peak database query rate of 17K per second without leases. With leases, that peak is 1.3K per second.
 
@@ -168,7 +168,7 @@ Each key alone is harmless. Together they are a stampede that is 10,000 keys wid
 
 Jitter is the cheapest fix in this lesson. One line of code: `ttl = base * (1 + random() * 0.1)`. The expiry is spread over a window. The rebuilds are spread with it. Meanwhile, the database sees a ramp, not a wall.
 
-For a cache that restarts or loses a node, jitter does not help. The keys vanish at once. The cold cache trap in lesson 5.1 needs other defenses. Replicate the cache, so one node loss does not empty it. Warm it before you send traffic. **Cap the concurrency** that can reach the database, so extra misses wait or fail fast instead of crushing it.
+For a cache that restarts or loses a node, jitter does not help. The keys vanish at once. The cold cache trap in the [Why Cache](/learn/backend/05-caching/why-cache/) lesson needs other defenses. Replicate the cache, so one node loss does not empty it. Warm it before you send traffic. **Cap the concurrency** that can reach the database, so extra misses wait or fail fast instead of crushing it.
 
 ## Part 4: Requests for keys that do not exist
 
@@ -177,7 +177,7 @@ A cache stores what exists. What if the key is not in the database either? A scr
 Two fixes:
 
 - **Negative caching.** Cache the *absence* too: store "not found" with a short TTL. The second request for the same missing id hits the cache. The risk: if the row is created later, the cache says "not found" until the TTL ends. Delete the negative entry when you create the row, and keep its TTL short.
-- **Bloom filter.** A Bloom filter (lesson 10.3) is a small bit table. It answers "definitely not in the set" or "maybe in the set". Put all valid ids in it. Check it first. If it says "definitely not", reject the request without touching the cache or the database. A "maybe" can be a false alarm, so the database check stays.
+- **Bloom filter.** A Bloom filter (the [Big-data Structures](/learn/backend/10-advanced/big-data-structures/) lesson) is a small bit table. It answers "definitely not in the set" or "maybe in the set". Put all valid ids in it. Check it first. If it says "definitely not", reject the request without touching the cache or the database. A "maybe" can be a false alarm, so the database check stays.
 
 Validation helps too: reject an id with a wrong format before it reaches any cache.
 

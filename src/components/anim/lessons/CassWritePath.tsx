@@ -39,7 +39,7 @@ const SST2: Box = { entries: [e(5, 'Di'), e(7, 'Ana2')] };
 
 const steps: Step[] = [
   {
-    caption: 'One replica node, three storage parts. The commit log is a file on disk. The memtable is a sorted structure in memory. SSTables are immutable sorted files on disk. This is the log-structured design from lesson 4.2. A client write for partition key 7 is about to arrive.',
+    caption: 'One replica node, three storage parts. The commit log is a file on disk. The memtable is a sorted structure in memory. SSTables are immutable sorted files on disk. This is the log-structured design from the How a Database Stores Data lesson. A client write for partition key 7 is about to arrive.',
     log: [],
     mem: [],
     arrows: [],

@@ -142,7 +142,7 @@ function steps(scn: Scenario, fix: boolean): Step[] {
   return [
     {
       caption:
-        'A chat app splits its data over two shards (lesson 4.7). Alice’s question lives on shard 1. Bob’s reply will live on shard 2. Each shard has a follower that serves reads.',
+        'A chat app splits its data over two shards (the Sharding lesson). Alice’s question lives on shard 1. Bob’s reply will live on shard 2. Each shard has a follower that serves reads.',
       a: { sub: '(no messages)' },
       b: { sub: '(no messages)' },
       active: [],

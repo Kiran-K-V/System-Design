@@ -15,7 +15,7 @@ You serve a 70B model on 2 GPUs. Users want faster answers. A teammate says: "Us
 
 Then a second request arrives. The team wants to serve a mixture-of-experts model that has a smaller compute cost per token. You expect a small bill. The model needs a lot of memory, so it still needs many GPUs. And one day, a step takes twice as long as normal, only because one part of the model got a lot of traffic.
 
-Both problems have one root. When you split a model over GPUs, the GPUs must talk. The talk costs time. [Lesson E2.4](/learn/ai/e2-training/model-parallelism/) showed the four splits for training and the rule that the split which talks most must use the fastest link. This lesson uses the same splits for serving, where the goal is different. In training you chase throughput over a long run. In serving you chase a latency target for each user.
+Both problems have one root. When you split a model over GPUs, the GPUs must talk. The talk costs time. [The Tensor, Pipeline, Sequence, and Expert Parallelism lesson](/learn/ai/e2-training/model-parallelism/) showed the four splits for training and the rule that the split which talks most must use the fastest link. This lesson uses the same splits for serving, where the goal is different. In training you chase throughput over a long run. In serving you chase a latency target for each user.
 
 The questions on the way are:
 
@@ -27,7 +27,7 @@ The questions on the way are:
 
 ## Why more tensor parallelism gives less
 
-[Lesson A2.2](/learn/ai/a2-inference-cost/prefill-decode/) gave the floor of a decode step: the weight bytes divided by the memory speed of the GPUs that hold them. A decode step is mostly reading weights. **Tensor parallelism** [senior] (TP) cuts each weight matrix into slices, one per GPU, so that each GPU reads only its slice. With twice the GPUs, each reads half as much, and the read time halves.
+[The Prefill vs Decode: TTFT and TPOT lesson](/learn/ai/a2-inference-cost/prefill-decode/) gave the floor of a decode step: the weight bytes divided by the memory speed of the GPUs that hold them. A decode step is mostly reading weights. **Tensor parallelism** [senior] (TP) cuts each weight matrix into slices, one per GPU, so that each GPU reads only its slice. With twice the GPUs, each reads half as much, and the read time halves.
 
 That is the gain. Now the cost. After each slice has done its share, the GPUs must add their partial results together. This is an **all-reduce** [mid]: every GPU adds in its part, and every GPU ends with the sum. The Megatron-LM design needs two of them per layer in the forward pass. A decode step runs the forward pass once, so the number of syncs is the same whatever the number of GPUs, and each sync now spans more GPUs. Also, each sync sits in the middle of the work. The next layer cannot start until it ends, so nothing hides it.
 
@@ -39,12 +39,12 @@ The animation shows this with a simple model. Step through 2, 4, and 8 GPUs, the
 
 <AiE3ParSplit client:visible />
 
-The numbers in the animation are illustrative. We chose the sync cost to show the shape. The shape matches what Databricks measured. Their guide says that, unlike in training, adding GPUs gives "significant diminishing returns" for inference latency. They name two reasons: communication overhead inside the node, and lower use of memory bandwidth (MBU, from lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)) when each GPU reads less. For Llama2-70B, going from 4 to 8 GPUs cut latency only to about 0.7 times at small batch sizes. That is a vendor measurement on their setup. It is one data point, not a law.
+The numbers in the animation are illustrative. We chose the sync cost to show the shape. The shape matches what Databricks measured. Their guide says that, unlike in training, adding GPUs gives "significant diminishing returns" for inference latency. They name two reasons: communication overhead inside the node, and lower use of memory bandwidth (MBU, from the [Prefill vs Decode: TTFT and TPOT](/learn/ai/a2-inference-cost/prefill-decode/) lesson) when each GPU reads less. For Llama2-70B, going from 4 to 8 GPUs cut latency only to about 0.7 times at small batch sizes. That is a vendor measurement on their setup. It is one data point, not a law.
 
 Two more points about TP in serving.
 
 - **Keep it inside one server.** The E2.4 rule holds. TP talks a lot, so it needs NVLink [mid], the direct GPU-to-GPU link. Across servers, the network is far slower, and the sync would dominate.
-- **A split is also a memory tool.** A 70B model in 16-bit needs more than one H100 for the weights alone (lesson [A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/)). TP also makes room for the KV cache, because each GPU holds less weight. So the lowest TP degree that fits the weights and the cache is a sensible start. Go higher only for a latency target that you cannot meet otherwise.
+- **A split is also a memory tool.** A 70B model in 16-bit needs more than one H100 for the weights alone (the [GPU Memory Math](/learn/ai/a2-inference-cost/gpu-memory-math/) lesson). TP also makes room for the KV cache, because each GPU holds less weight. So the lowest TP degree that fits the weights and the cache is a sensible start. Go higher only for a latency target that you cannot meet otherwise.
 
 ## What pipeline parallelism buys in serving
 
@@ -52,7 +52,7 @@ Two more points about TP in serving.
 
 Does it make one token faster? No. The token still has to pass through every layer, one after another. The time for one token does not fall. What PP gives is **throughput**: while stage 2 works on one batch, stage 1 can already start the next. It also sends less data than TP. The SARATHI paper notes that PP is popular for deployment across nodes because of its lower communication overhead than TP. Our reading: use TP inside a server for latency and PP across servers when the model is too big for one server.
 
-PP has a known weakness, the **bubble**: a stage sits idle when no batch is ready for it. In serving, the work per batch varies, because a prefill batch is large and a decode batch is small. The SARATHI paper says the varying prefill and decode times lead to unequal micro-batches, and so to more bubbles. Its fix is the uniform hybrid batch of chunked prefill, from [lesson E3.5](/learn/ai/e3-inference-deep/disaggregation/). For GPT-3 with pipeline parallelism, the paper reports bubbles cut by 6.29 times and end-to-end throughput up 1.91 times. That is a paper claim on its own setup.
+PP has a known weakness, the **bubble**: a stage sits idle when no batch is ready for it. In serving, the work per batch varies, because a prefill batch is large and a decode batch is small. The SARATHI paper says the varying prefill and decode times lead to unequal micro-batches, and so to more bubbles. Its fix is the uniform hybrid batch of chunked prefill, from [the Prefill and Decode Disaggregation lesson](/learn/ai/e3-inference-deep/disaggregation/). For GPT-3 with pipeline parallelism, the paper reports bubbles cut by 6.29 times and end-to-end throughput up 1.91 times. That is a paper claim on its own setup.
 
 ## Shard or replicate?
 
@@ -69,13 +69,13 @@ Replicas also help with failure and with load. When one copy fails, the others s
 
 ## Mixture of experts: all the experts in memory
 
-[Lesson A2.1](/learn/ai/a2-inference-cost/gpu-memory-math/) introduced the **mixture of experts** [mid] (MoE) model. A normal layer has one feed-forward block. An MoE layer has many, called experts. A small network, the **router** [mid], picks a few experts for each token. Only those run.
+[The GPU Memory Math lesson](/learn/ai/a2-inference-cost/gpu-memory-math/) introduced the **mixture of experts** [mid] (MoE) model. A normal layer has one feed-forward block. An MoE layer has many, called experts. A small network, the **router** [mid], picks a few experts for each token. Only those run.
 
 The Mixtral paper gives the example. Each layer has 8 experts. The router picks 2 per token. Each token can use 47B parameters in total, but only 13B are active during a step. So the compute per token is like a 13B model.
 
 Memory is different. The router can send a token to any expert, so every expert must be in GPU memory. Memory follows the total, not the active count. A 47B model at 16 bits needs about 94 GB for weights alone.
 
-Now the effect on a decode step. A step reads weights, and decode is limited by memory reads (lesson [A2.2](/learn/ai/a2-inference-cost/prefill-decode/)). With a batch of one token, only 2 of the 8 experts are read. With a bigger batch, different tokens pick different experts, and soon nearly all experts are read. The widget below shows this under an even-routing assumption. The DeepSpeed-MoE paper states the cost side: inference is often limited by memory bandwidth, and an MoE model can be up to 10 times larger than a dense model of the same quality, so it could need much more bandwidth to match the dense model's latency. So an MoE saves compute but not memory, and at large batches it does not save memory reads either. It saves most when the batch is small, or when compute is what limits you.
+Now the effect on a decode step. A step reads weights, and decode is limited by memory reads (the [Prefill vs Decode: TTFT and TPOT](/learn/ai/a2-inference-cost/prefill-decode/) lesson). With a batch of one token, only 2 of the 8 experts are read. With a bigger batch, different tokens pick different experts, and soon nearly all experts are read. The widget below shows this under an even-routing assumption. The DeepSpeed-MoE paper states the cost side: inference is often limited by memory bandwidth, and an MoE model can be up to 10 times larger than a dense model of the same quality, so it could need much more bandwidth to match the dense model's latency. So an MoE saves compute but not memory, and at large batches it does not save memory reads either. It saves most when the batch is small, or when compute is what limits you.
 
 ## Expert parallelism and the all-to-all
 
@@ -115,7 +115,7 @@ What are the real fixes? These are our reading of the mechanism, not measured re
 
 **Find the smallest group that fits.** Databricks reports sub-linear gains from more tensor parallelism and names communication and lower bandwidth use as causes. Start at the lowest TP degree that holds the weights and the cache. Add replicas for load.
 
-**Keep TP inside one server.** Each sync is on the critical path. The Megatron-LM rule, quoted in lesson [E2.4](/learn/ai/e2-training/model-parallelism/), is to use TP up to the number of GPUs in one server.
+**Keep TP inside one server.** Each sync is on the critical path. The Megatron-LM rule, quoted in the [Tensor, Pipeline, Sequence, and Expert Parallelism](/learn/ai/e2-training/model-parallelism/) lesson, is to use TP up to the number of GPUs in one server.
 
 **Memory follows the total parameters in an MoE.** The Mixtral paper gives 47B total and 13B active. Size the GPUs by the total. Expect compute like a 13B model, and weight reads that grow with the batch as more experts are touched.
 

@@ -38,7 +38,7 @@ const edges: BuildEdge[] = [
 const steps: BuildStep[] = [
   {
     req: 'FR1: notify one user',
-    caption: 'The smallest design. A sender service calls the intake API. The API puts the message on a queue (lesson 6.1). A push worker takes it and calls the push provider (APNs from Apple or FCM from Google, the phone makers delivery services). The sender is not blocked while the provider is slow.',
+    caption: 'The smallest design. A sender service calls the intake API. The API puts the message on a queue (the Queues lesson). A push worker takes it and calls the push provider (APNs from Apple or FCM from Google, the phone makers delivery services). The sender is not blocked while the provider is slow.',
     packets: [{ from: 'sender', to: 'api', label: 'send' }, { from: 'api', to: 'queues', label: 'enqueue', delay: 0.9 }],
   },
   {
@@ -67,12 +67,12 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: no duplicates, per-user limit',
-    caption: 'A fast key-value store (lesson 8.2) holds two things. A token bucket per user (lesson 7.4) caps how many messages one user gets. A dedupe key per message stops a redelivered message from being sent twice.',
+    caption: 'A fast key-value store (the Redis lesson) holds two things. A token bucket per user (the Rate Limiting Algorithms lesson) caps how many messages one user gets. A dedupe key per message stops a redelivered message from being sent twice.',
     packets: [{ from: 'push', to: 'limit', label: 'seen?' }],
   },
   {
     req: 'NFR: providers fail',
-    caption: 'When a provider call fails, the worker puts the message on a retry queue with a delay that grows (backoff with jitter, lesson 7.2). After N tries it goes to a dead-letter queue (lesson 6.4). Drawn from one worker to keep the picture clear.',
+    caption: 'When a provider call fails, the worker puts the message on a retry queue with a delay that grows (backoff with jitter, the Timeouts, Retries, Backoff lesson). After N tries it goes to a dead-letter queue (the Backpressure and Dead-letter Queues lesson). Drawn from one worker to keep the picture clear.',
     packets: [{ from: 'email', to: 'retry', label: 'failed', tone: 'warn' }],
   },
 ];

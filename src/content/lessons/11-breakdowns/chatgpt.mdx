@@ -49,7 +49,7 @@ A **token** is a chunk of text, roughly three-quarters of an English word. A mod
 
 ### Why SSE and not a WebSocket
 
-Data flows one way: tokens go from server to client. The client sends one prompt, then waits. Server-sent events (SSE, lesson [2.5](/learn/02-networking/real-time-transport/)) fit this. The server keeps one HTTP response open and writes small events into it, like a person reading a letter aloud one line at a time. It is plain HTTP, and it passes through proxies and load balancers. It has a built-in resume: each event may carry an `id`, and a browser that reconnects sends `Last-Event-ID`. OpenAI's API docs describe streaming over server-sent events with `stream=true`. They also say that without it, the API generates the whole output before it sends anything.
+Data flows one way: tokens go from server to client. The client sends one prompt, then waits. Server-sent events (SSE, the [Real-time Transport](/learn/backend/02-networking/real-time-transport/) lesson) fit this. The server keeps one HTTP response open and writes small events into it, like a person reading a letter aloud one line at a time. It is plain HTTP, and it passes through proxies and load balancers. It has a built-in resume: each event may carry an `id`, and a browser that reconnects sends `Last-Event-ID`. OpenAI's API docs describe streaming over server-sent events with `stream=true`. They also say that without it, the API generates the whole output before it sends anything.
 
 A WebSocket works too, but you must build reconnect and resume yourself. Choose it only if the client sends frequent messages in the middle of a run.
 
@@ -77,14 +77,14 @@ Three more rules finish the picture.
 
 If the stream is tied to one connection and one process, then a phone that changes network, or a deploy that restarts a gateway, kills the answer, and the GPU time is wasted.
 
-Separate the **run** from the **connection**. This is the long-running task pattern of lesson [9.7](/learn/09-patterns/long-running-tasks/).
+Separate the **run** from the **connection**. This is the long-running task pattern of the [Long-running Tasks](/learn/backend/09-patterns/long-running-tasks/) lesson.
 
 1. The API creates a run with an id and returns it.
-2. The GPU worker writes each token to a buffer under that run id, with an increasing sequence number. Any fast, append-only store serves: a log, or a Redis stream. Redis is an in-memory data store that answers in about a millisecond (lesson [8.2](/learn/08-technologies/redis/)).
+2. The GPU worker writes each token to a buffer under that run id, with an increasing sequence number. Any fast, append-only store serves: a log, or a Redis stream. Redis is an in-memory data store that answers in about a millisecond (the [Redis](/learn/backend/08-technologies/redis/) lesson).
 3. The stream gateway reads the buffer and sends each token as an SSE event. The gateway uses the sequence number as the event `id`.
 4. The connection dies. The run does not. The worker keeps writing.
 5. The client reconnects, to any gateway, with `Last-Event-ID: 212`. The gateway reads the buffer from 213 and continues.
-6. When the run ends, the final message is written once to the conversation store, keyed by the run id. So a retry cannot store the message twice (lesson [3.4](/learn/03-api-design/idempotency/)).
+6. When the run ends, the final message is written once to the conversation store, keyed by the run id. So a retry cannot store the message twice (the [Idempotency](/learn/backend/03-api-design/idempotency/) lesson).
 
 A gateway deploy now costs a reconnect, not an answer. Keep the buffer for some minutes after the run ends, so a late reconnect still gets the tail.
 
@@ -92,11 +92,11 @@ A gateway deploy now costs a reconnect, not an answer. Keep the buffer for some 
 
 Counting requests is not enough. One request with a 100,000-token prompt costs a thousand times more than one with 100. OpenAI's rate-limit guide lists limits in requests per minute, requests per day, and tokens per minute. The guide says you can hit any of them first. These are API limits, but the lesson is general: limit what costs money.
 
-Use two token buckets per user (lesson [7.4](/learn/07-reliability/rate-limiting/)), one for requests and one for tokens. The token cost is unknown until the answer ends. So charge a worst-case amount at admission. That amount is prompt tokens plus the maximum answer length. Refund the unused part when the run ends. The buckets live in Redis, which is fast enough to check on every request. An empty bucket gets the HTTP status `429` ("too many requests") with a `Retry-After` header that says how many seconds to wait, as OpenAI's guide describes.
+Use two token buckets per user (the [Rate Limiting Algorithms](/learn/backend/07-reliability/rate-limiting/) lesson), one for requests and one for tokens. The token cost is unknown until the answer ends. So charge a worst-case amount at admission. That amount is prompt tokens plus the maximum answer length. Refund the unused part when the run ends. The buckets live in Redis, which is fast enough to check on every request. An empty bucket gets the HTTP status `429` ("too many requests") with a `Retry-After` header that says how many seconds to wait, as OpenAI's guide describes.
 
 ### Conversation storage and context cost
 
-Messages are written once and read in order. The access pattern fits a wide-column or key-value store (lessons [8.3](/learn/08-technologies/cassandra/) and [8.4](/learn/08-technologies/dynamodb/)). Use the conversation id as the partition key, which decides the machine that stores the row, so one chat stays together. Use a sequence number as the sort key, which keeps messages in order inside it. The chat list is a second table keyed by user, sorted by last activity.
+Messages are written once and read in order. The access pattern fits a wide-column or key-value store (lessons [Cassandra](/learn/backend/08-technologies/cassandra/) and [DynamoDB](/learn/backend/08-technologies/dynamodb/)). Use the conversation id as the partition key, which decides the machine that stores the row, so one chat stays together. Use a sequence number as the sort key, which keeps messages in order inside it. The chat list is a second table keyed by user, sorted by last activity.
 
 The model has no memory. Each turn, the context builder sends the history again, as part of the prompt. The most text a model can read in one go is its **context window**. That is the cost driver. Each turn sends all earlier turns again, so the text the model reads grows with every turn. Over a long chat, the model reads the same early messages many times. Most of what it reads is old text, not new text.
 
@@ -104,7 +104,7 @@ Keep the history inside a budget. Drop the oldest turns, or replace them with a 
 
 ## Numbers
 
-The scale is an assumption, so size it in words. Prompts arrive at tens of thousands per second at peak. Each answer streams for several seconds. By Little's law (concurrency equals arrival rate times time in system, lesson [1.3](/learn/01-one-machine/throughput-vs-latency/)), that means hundreds of thousands of streams at once. Each GPU server holds a few hundred streams, so the fleet is large. Continuous batching raises streams per server, so scheduling is the first thing you tune. Storage is small next to compute. Messages are cold, append-only data.
+The scale is an assumption, so size it in words. Prompts arrive at tens of thousands per second at peak. Each answer streams for several seconds. By Little's law (concurrency equals arrival rate times time in system, the [Throughput vs Latency](/learn/backend/01-one-machine/throughput-vs-latency/) lesson), that means hundreds of thousands of streams at once. Each GPU server holds a few hundred streams, so the fleet is large. Continuous batching raises streams per server, so scheduling is the first thing you tune. Storage is small next to compute. Messages are cold, append-only data.
 
 ## Trade-offs
 

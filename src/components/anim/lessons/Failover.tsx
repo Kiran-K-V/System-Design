@@ -77,7 +77,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Fencing stops it. Every request carries an epoch. Followers and storage reject epoch 7 because 8 is newer. The old leader learns it is deposed and becomes a follower. Its extra write was never replicated, so it is discarded. But who hands out epoch numbers and who agrees on them? That needs consensus (lesson 4.11).',
+      'Fencing stops it. Every request carries an epoch. Followers and storage reject epoch 7 because 8 is newer. The old leader learns it is deposed and becomes a follower. Its extra write was never replicated, so it is discarded. But who hands out epoch numbers and who agrees on them? That needs consensus (the Consensus lesson).',
     l: { label: 'Old leader', sub: 'rejected: epoch 7 < 8', tone: 'warn' },
     f1: { label: 'New leader', sub: 'epoch 8 · log 43', tone: 'ok' },
     f2: { label: 'Follower 2', sub: 'log 43' },

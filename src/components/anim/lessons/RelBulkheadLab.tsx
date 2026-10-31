@@ -39,7 +39,7 @@ export default function RelBulkheadLab() {
       hint={`Pool of ${POOL} threads. A: ${RATE_A} calls/s at ${LAT_A * 1000} ms. B: ${RATE_B} calls/s.`}
       caption={
         <>
-          Model: threads in use = calls per second x seconds each call holds a thread (Little&apos;s law, lesson 1.3). When demand is above the pool, a call gets a thread with probability pool / demand.
+          Model: threads in use = calls per second x seconds each call holds a thread (Little&apos;s law, the Throughput vs Latency lesson). When demand is above the pool, a call gets a thread with probability pool / demand.
           In the split modes B owns {BULK_B} threads and A owns {POOL - BULK_B}. With the breaker open, B calls fail at once and hold no thread (trial calls ignored). The numbers are examples. The shape is the lesson:
           without a wall, the slow dependency takes every thread, and the healthy one starves.
         </>

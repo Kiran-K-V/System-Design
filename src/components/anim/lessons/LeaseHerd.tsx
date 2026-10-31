@@ -33,7 +33,7 @@ const BEATS: { m: SeqMessage; caption: string }[] = [
   {
     m: { from: 'Client A', to: 'Cache', label: 'SET k = v2 (L1)', tone: 'ok' },
     caption:
-      'A fills the cache and shows its token L1. The cache checks that L1 is still valid and stores v2. If a writer had deleted k since the lease was issued, L1 would be void and this set would be refused. That also blocks the stale-set race from lesson 5.3.',
+      'A fills the cache and shows its token L1. The cache checks that L1 is still valid and stores v2. If a writer had deleted k since the lease was issued, L1 would be void and this set would be refused. That also blocks the stale-set race from the Cache Strategies lesson.',
   },
   {
     m: { from: 'Client B', to: 'Cache', label: 'get k (retry)' },

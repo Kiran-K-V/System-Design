@@ -16,7 +16,7 @@ const steps: Step[] = [
   { caption: 'Start from a golden set: questions, each with the chunk ids that hold the answer and a short reference answer. Here, 200 questions (illustrative). Every later number is computed against it.', active: 0 },
   { caption: 'Run only the retriever and check whether the gold chunk is in the top 5. Case A: recall@5 is 0.95. Retrieval looks healthy. No LLM call was needed, so this meter is cheap and exact.', active: 1, recall: 0.95, tag: 'case A' },
   { caption: 'Now generate answers from the retrieved chunks. A judge splits each answer into claims and checks each against the context. Faithfulness is only 0.62. The right facts were retrieved and the model did not use them. Fix the prompt, the context order, or the model.', active: 2, recall: 0.95, faith: 0.62, tag: 'case A: generation broke' },
-  { caption: 'The judge is itself an LLM. It adds cost and variance, so check it against a few human labels before you trust it. Full eval method is in lesson A8.2.', active: 3, recall: 0.95, faith: 0.62, tag: 'case A' },
+  { caption: 'The judge is itself an LLM. It adds cost and variance, so check it against a few human labels before you trust it. Full eval method is in the Error Analysis lesson.', active: 3, recall: 0.95, faith: 0.62, tag: 'case A' },
   { caption: 'Case B, a different system: recall@5 is 0.55 and faithfulness is 0.97. The model stays faithful to what it is given, but the right chunk is missing in 45% of questions. Prompt work cannot help. Fix chunking, hybrid search, or reranking.', active: 1, recall: 0.55, faith: 0.97, tag: 'case B: retrieval broke' },
 ];
 

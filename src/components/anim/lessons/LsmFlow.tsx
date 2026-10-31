@@ -42,7 +42,7 @@ const S3: Sst = { slot: 3, name: 'SST-3', born: 8, entries: [e('a', '9', 'ok'), 
 
 const steps: LsmStep[] = [
   {
-    caption: 'An LSM engine has three parts. A memtable: a sorted map in RAM. A write-ahead log on disk: a file where every write is recorded first, so a crash cannot lose it (lesson 4.2). And SSTables: sorted, immutable files on disk. Our memtable holds only 3 entries so we can watch it fill.',
+    caption: 'An LSM engine has three parts. A memtable: a sorted map in RAM. A write-ahead log on disk: a file where every write is recorded first, so a crash cannot lose it (the How a Database Stores Data lesson). And SSTables: sorted, immutable files on disk. Our memtable holds only 3 entries so we can watch it fill.',
     mem: [],
     wal: [],
     ssts: [],

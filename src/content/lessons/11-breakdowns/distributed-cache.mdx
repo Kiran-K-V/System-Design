@@ -9,7 +9,7 @@ import Diagnose from '../../../components/lesson/Diagnose.tsx';
 import DistributedCacheBuild from '../../../components/anim/lessons/DistributedCacheBuild.tsx';
 import DistributedCacheCompare from '../../../components/anim/lessons/DistributedCacheCompare.tsx';
 
-Here the cache is the product, not a helper. You are asked to design the cache itself: a service that other teams use to store key-value pairs in memory. This case study follows the six steps of [lesson 0.3](/learn/00-orientation/design-method/). It adds little that is new in mechanism. It asks you to **combine** three earlier lessons and to find the one problem they do not solve: the hot key.
+Here the cache is the product, not a helper. You are asked to design the cache itself: a service that other teams use to store key-value pairs in memory. This case study follows the six steps of [the A Method for Any Design lesson](/learn/backend/00-orientation/design-method/). It adds little that is new in mechanism. It asks you to **combine** three earlier lessons and to find the one problem they do not solve: the hot key.
 
 ## Requirements
 
@@ -33,7 +33,7 @@ Here the cache is the product, not a helper. You are asked to design the cache i
 - Replicas. One extra copy of each range roughly doubles the node count.
 - Load per node. If keys spread evenly, each node sees a small share of the request rate. Capacity is set by memory here, not by request rate.
 - LRU overhead. A linked list is a chain of entries in which each one points to the one before and the one after. Those two pointers cost a small, fixed amount per entry. On large values that is nothing. On tiny values it is a big share. Small values make exact LRU costly.
-- Latency. A round trip inside one data center is well under a millisecond (lesson [1.2](/learn/01-one-machine/latency-numbers/)). One round trip from the client to the owning node leaves most of the 10 ms budget unused. A proxy in the middle adds a second hop. A client library that knows the ring avoids it.
+- Latency. A round trip inside one data center is well under a millisecond (the [Latency Numbers](/learn/backend/01-one-machine/latency-numbers/) lesson). One round trip from the client to the owning node leaves most of the 10 ms budget unused. A proxy in the middle adds a second hop. A client library that knows the ring avoids it.
 
 ## Core entities
 
@@ -59,7 +59,7 @@ Step through the build.
 
 ### One node first
 
-Start with the hot path of one machine. A hash map gives constant-time access: it finds a value from its key in one step, however many entries there are. A doubly linked list orders entries by last use, like a stack of papers where the one you touched last goes on top. A get moves the entry to the front. When memory is full, the node removes the entry at the back. Lesson [5.4](/learn/05-caching/eviction/) walks through it.
+Start with the hot path of one machine. A hash map gives constant-time access: it finds a value from its key in one step, however many entries there are. A doubly linked list orders entries by last use, like a stack of papers where the one you touched last goes on top. A get moves the entry to the front. When memory is full, the node removes the entry at the back. The [Eviction](/learn/backend/05-caching/eviction/) lesson walks through it.
 
 Exact LRU must update the list on every read, which means a lock on a shared structure. Real caches avoid that cost. Redis samples a few keys and evicts the least recently used of them. The default sample size is 5, and its docs report almost no loss on skewed access. Say you would take the approximation.
 
@@ -69,15 +69,15 @@ Exact LRU must update the list on every read, which means a lock on a shared str
 
 ### Placing keys: the ring
 
-With 20 nodes, `hash(key) % 20` sends each key to a node. Going to 21 nodes changes `hash % N` for nearly everyone. Nearly all the keys move. Each moved key is a miss, so the database behind the cache takes almost all the traffic at once. The ring of lesson [4.8](/learn/04-data/consistent-hashing/) moves only a small share, about one node's worth. The ring is a circle of positions. Each node sits at a point on the circle, and a key belongs to the first node you meet walking around from the key's own point. A new node takes over only the stretch just before it, so only the keys in that stretch move.
+With 20 nodes, `hash(key) % 20` sends each key to a node. Going to 21 nodes changes `hash % N` for nearly everyone. Nearly all the keys move. Each moved key is a miss, so the database behind the cache takes almost all the traffic at once. The ring of the [Consistent Hashing](/learn/backend/04-data/consistent-hashing/) lesson moves only a small share, about one node's worth. The ring is a circle of positions. Each node sits at a point on the circle, and a key belongs to the first node you meet walking around from the key's own point. A new node takes over only the stretch just before it, so only the keys in that stretch move.
 
 Use **virtual nodes**: each physical node owns many points on the ring, such as 128 (assumption). Many points per node smooth out the load, so no node gets a much larger arc than the rest. They also spread the load of a failed node over many survivors, not just its single neighbor. A binary search over the sorted points finds the owner quickly.
 
-Where does the ring live? In the **client library**, loaded from a small config service that all nodes agree on (lesson [8.8](/learn/08-technologies/zookeeper/)). Clients refresh it when membership changes. A stale ring only sends a request to a node that no longer owns the key. That is a miss, not an error, which a cache can tolerate. Redis Cluster takes a related approach: 16,384 fixed numbered buckets, called hash slots, each key going to slot `hash(key) % 16,384` and each slot assigned to a node (lesson [8.2](/learn/08-technologies/redis/)).
+Where does the ring live? In the **client library**, loaded from a small config service that all nodes agree on (the [ZooKeeper / etcd](/learn/backend/08-technologies/zookeeper/) lesson). Clients refresh it when membership changes. A stale ring only sends a request to a node that no longer owns the key. That is a miss, not an error, which a cache can tolerate. Redis Cluster takes a related approach: 16,384 fixed numbered buckets, called hash slots, each key going to slot `hash(key) % 16,384` and each slot assigned to a node (the [Redis](/learn/backend/08-technologies/redis/) lesson).
 
 ### Replication for availability
 
-If a node dies, its range is gone and its keys miss. Misses are survivable, but a whole range missing at once sends a spike to the database. Keep a copy: each key range is also stored on the next distinct node around the ring (lesson [4.6](/learn/04-data/replication/)). Skip virtual nodes that belong to the same machine.
+If a node dies, its range is gone and its keys miss. Misses are survivable, but a whole range missing at once sends a spike to the database. Keep a copy: each key range is also stored on the next distinct node around the ring (the [Replication](/learn/backend/04-data/replication/) lesson). Skip virtual nodes that belong to the same machine.
 
 Copy **asynchronously**. A write is acknowledged by the primary, and the copy follows. If the primary dies before the copy arrives, you lose a recent write. For a cache that costs a stale value or a miss, never the only copy of the data. This is the trade that eventual consistency gives you: lower write latency and higher availability, in return for stale reads.
 
@@ -91,7 +91,7 @@ Now the problem the ring cannot solve. A single key gets enormous traffic. A cel
 
 **Adding nodes does not help**, because one key still lives on one node. Three tools:
 
-1. **Near cache.** Each app server keeps the hot value in its own memory for a second or two (lesson [5.2](/learn/05-caching/cache-placement/)). With a few hundred app servers, the owner then sees at most one read per app server per second for that key. The owner does not see every user read. The price is a value that is up to two seconds old.
+1. **Near cache.** Each app server keeps the hot value in its own memory for a second or two (the [Cache Placement](/learn/backend/05-caching/cache-placement/) lesson). With a few hundred app servers, the owner then sees at most one read per app server per second for that key. The owner does not see every user read. The price is a value that is up to two seconds old.
 2. **Read copies under suffixed names.** Store `hot#0` to `hot#3`. Names hash to different nodes. Readers pick one at random. A write updates every copy.
 3. **Split a write-hot key.** A counter becomes sub-counters that are summed on read.
 

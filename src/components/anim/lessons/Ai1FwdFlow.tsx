@@ -38,7 +38,7 @@ const steps: Step[] = [
     note: 'input: 1 integer',
   },
   {
-    caption: 'Embedding: the id selects a row of the table (lesson A1.2). The token is now a vector of 4,096 numbers. This is a lookup, not a matrix multiply, so it costs about 0 FLOPs even though the table holds 0.52B parameters.',
+    caption: 'Embedding: the id selects a row of the table (the Embeddings lesson). The token is now a vector of 4,096 numbers. This is a lookup, not a matrix multiply, so it costs about 0 FLOPs even though the table holds 0.52B parameters.',
     active: 1,
     flops: 0,
     note: 'lookup: 0 FLOPs',
@@ -71,7 +71,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Softmax turns 128,000 scores into probabilities that sum to 1. Sampling picks one token (lesson A1.5). Total: 15.0 GFLOPs for this token. The rule of thumb "2 FLOPs per parameter" gives 2 × 8.03B = 16.1 GFLOPs. The gap is the input table, which is a lookup (2 × 0.52B = 1.05 GFLOPs).',
+      'Softmax turns 128,000 scores into probabilities that sum to 1. Sampling picks one token (the Sampling and Decoding lesson). Total: 15.0 GFLOPs for this token. The rule of thumb "2 FLOPs per parameter" gives 2 × 8.03B = 16.1 GFLOPs. The gap is the input table, which is a lookup (2 × 0.52B = 1.05 GFLOPs).',
     active: 6,
     flops: 32 * layerF + headF,
     note: 'total ≈ 15.0 GFLOPs (2N rule: 16.1)',

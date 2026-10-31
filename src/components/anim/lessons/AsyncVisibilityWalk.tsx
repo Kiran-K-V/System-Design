@@ -47,7 +47,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Worker 2 receives A. A is hidden again, with a new 30 second timer. Worker 1 may have done half of the job before it crashed. So the job must be safe to run again (lesson 3.4).',
+      'Worker 2 receives A. A is hidden again, with a new 30 second timer. Worker 1 may have done half of the job before it crashed. So the job must be safe to run again (the Idempotency lesson).',
     buffer: [m('A', { hidden: true }), m('C')],
     workers: [{ label: 'Worker 1', state: 'down' }, { label: 'Worker 2', state: 'busy', msg: m('A', { tone: 'accent' }) }],
     meter: { label: 'timer for A: 30 s left', fill: 1, tone: 'warn' },

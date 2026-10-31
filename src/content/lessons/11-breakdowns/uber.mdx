@@ -18,7 +18,7 @@ Two things make this hard.
 - **Location writes are huge.** Positions change all the time, and the system needs the latest one.
 - **Matching is a race.** Many riders want the same few nearby drivers. One driver must never get two rides.
 
-This case adds three ideas: high-rate location updates, proximity search for nearby drivers, and matching under contention. The proximity mechanism is in lesson [10.1](/learn/10-advanced/proximity-search/). The contention patterns are in lesson [9.4](/learn/09-patterns/contention/). Redis is lesson [8.2](/learn/08-technologies/redis/).
+This case adds three ideas: high-rate location updates, proximity search for nearby drivers, and matching under contention. The proximity mechanism is in the [Proximity Search](/learn/backend/10-advanced/proximity-search/) lesson. The contention patterns are in the [Dealing with Contention](/learn/backend/09-patterns/contention/) lesson. Redis is the [Redis](/learn/backend/08-technologies/redis/) lesson.
 
 All company-scale claims about Uber are left out here. They are unverified. Every number below is an interview assumption we derive.
 
@@ -66,7 +66,7 @@ POST  /drivers/location   { lat, long }                  -> ok
 PATCH /rides/:rideId      { action: "accept" | "decline" } -> Ride
 ```
 
-The driver's id comes from the session token (lesson [3.5](/learn/03-api-design/auth/)), not from the body. A caller must not be able to move another driver. Make `POST /rides` safe to retry with an idempotency key (lesson [3.4](/learn/03-api-design/idempotency/)). Otherwise a double tap books two cars.
+The driver's id comes from the session token (the [Auth Basics](/learn/backend/03-api-design/auth/) lesson), not from the body. A caller must not be able to move another driver. Make `POST /rides` safe to retry with an idempotency key (the [Idempotency](/learn/backend/03-api-design/idempotency/) lesson). Otherwise a double tap books two cars.
 
 ## High-level design
 
@@ -82,7 +82,7 @@ The naive design runs `UPDATE drivers SET lat=?, long=? WHERE id=?` on a relatio
 
 The better design keeps only the latest position in memory. Redis `GEOADD` stores a position under a member name (the driver id). The docs give its cost as O(log N) per item. A second `GEOADD` on the same member **replaces** the old position. So the store never grows past one entry per driver.
 
-One Redis instance is not enough for millions of writes per second. Lesson [8.2](/learn/08-technologies/redis/) shows that a single instance does tens of thousands of commands per second without pipelining. A single instance does more with pipelining, which sends many commands in one network trip. So we split the index. **Shard by place, not by driver id.** A search needs the neighbors of one point. If neighbors sit on different shards, every search becomes a scatter-gather over all shards (send the question to every shard, then merge the answers) (lesson [4.7](/learn/04-data/sharding/)). With a shard per city or region, one search touches one shard.
+One Redis instance is not enough for millions of writes per second. The [Redis](/learn/backend/08-technologies/redis/) lesson shows that a single instance does tens of thousands of commands per second without pipelining. A single instance does more with pipelining, which sends many commands in one network trip. So we split the index. **Shard by place, not by driver id.** A search needs the neighbors of one point. If neighbors sit on different shards, every search becomes a scatter-gather over all shards (send the question to every shard, then merge the answers) (the [Sharding](/learn/backend/04-data/sharding/) lesson). With a shard per city or region, one search touches one shard.
 
 Drivers near a region border are a corner case. Query the neighbor region too when the search circle crosses the border. That is a known cost of space-based sharding.
 
@@ -94,7 +94,7 @@ You can also cut the write rate. A parked driver can ping less often than a movi
 
 ### Proximity search
 
-Lesson [10.1](/learn/10-advanced/proximity-search/) explained **geohash** [mid]. The geohash is a code that turns a latitude and longitude into a short string. This way, nearby points share a prefix. Redis GEO stores each point as a geohash score in a sorted set. So a range scan on the score finds points in one area. A B-tree on two plain columns cannot do this well. The reason is that a range on latitude and a range on longitude do not combine into one scan.
+The [Proximity Search](/learn/backend/10-advanced/proximity-search/) lesson explained **geohash** [mid]. The geohash is a code that turns a latitude and longitude into a short string. This way, nearby points share a prefix. Redis GEO stores each point as a geohash score in a sorted set. So a range scan on the score finds points in one area. A B-tree on two plain columns cannot do this well. The reason is that a range on latitude and a range on longitude do not combine into one scan.
 
 The matching service runs `GEOSEARCH` with `FROMLONLAT`, `BYRADIUS`, and `ASC`. Redis added `GEOSEARCH` in version 6.2.0. The docs give its complexity as O(N + log M). N is the number of items in the grid cells that cover the circle. M is the number of items inside the shape. It is fast when the radius is small. Use a radius of about 2 km in a city and widen it in steps if nothing is found.
 
@@ -104,15 +104,15 @@ The search returns nearby drivers in distance order. Distance in a straight line
 
 <UberLock client:visible />
 
-Reach for the contention toolbox from lesson [9.4](/learn/09-patterns/contention/). The naive "read status, then write" fails because the check and the write are separate steps. An in-process lock does not help, because two matchers run on two servers.
+Reach for the contention toolbox from the [Dealing with Contention](/learn/backend/09-patterns/contention/) lesson. The naive "read status, then write" fails because the check and the write are separate steps. An in-process lock does not help, because two matchers run on two servers.
 
 A lock with a time limit works. Create `driver:17` only if it does not exist, with an expiry of 10 seconds. One matcher wins. If the winner crashes, the key expires and the driver is free again. A lock that ends by itself is a **lease** [senior].
 
-Be honest about the limit. Lesson [8.2](/learn/08-technologies/redis/) warns that a Redis lock is safe for efficiency but not proof against pauses and clock jumps. If a matcher pauses past the expiry, a second matcher may take the lock. Meanwhile, the first matcher still thinks it holds the lock. The final write to the driver or ride record should therefore carry a **fencing token**. This token is a number that grows with each lock grant. The record rejects a write if the token is too old (lesson [4.11](/learn/04-data/consensus/)). A conditional update on the ride row gives the same protection with no extra system. An example is "set driver only if the ride is still unassigned".
+Be honest about the limit. The [Redis](/learn/backend/08-technologies/redis/) lesson warns that a Redis lock is safe for efficiency but not proof against pauses and clock jumps. If a matcher pauses past the expiry, a second matcher may take the lock. Meanwhile, the first matcher still thinks it holds the lock. The final write to the driver or ride record should therefore carry a **fencing token**. This token is a number that grows with each lock grant. The record rejects a write if the token is too old (the [Consensus](/learn/backend/04-data/consensus/) lesson). A conditional update on the ride row gives the same protection with no extra system. An example is "set driver only if the ride is still unassigned".
 
-**Unresponsive drivers.** The offer waits about 10 seconds. If the matching service holds that timer in memory, a restart loses it and the rider waits forever. A durable timer (Temporal, lesson [8.9](/learn/08-technologies/temporal/)) survives restarts. With a 1 minute budget and 10 seconds per offer, one rider can try only a handful of drivers. The rider tries them one after another. That is why offers to the nearest few drivers are sometimes sent at once. The extra offers are cancelled when one driver says yes. It trades driver annoyance for speed.
+**Unresponsive drivers.** The offer waits about 10 seconds. If the matching service holds that timer in memory, a restart loses it and the rider waits forever. A durable timer (Temporal, the [Temporal](/learn/backend/08-technologies/temporal/) lesson) survives restarts. With a 1 minute budget and 10 seconds per offer, one rider can try only a handful of drivers. The rider tries them one after another. That is why offers to the nearest few drivers are sometimes sent at once. The extra offers are cancelled when one driver says yes. It trades driver annoyance for speed.
 
-**Bursts.** If 100,000 requests arrive from one place, put requests on a queue (lesson [8.6](/learn/08-technologies/kafka/)) and match them in order. Commit the offset only after a match, so a crashed matcher does not lose the request. Say the policy aloud: first come, first served, or nearest driver first.
+**Bursts.** If 100,000 requests arrive from one place, put requests on a queue (the [Kafka](/learn/backend/08-technologies/kafka/) lesson) and match them in order. Commit the offset only after a match, so a crashed matcher does not lose the request. Say the policy aloud: first come, first served, or nearest driver first.
 
 ## Numbers
 

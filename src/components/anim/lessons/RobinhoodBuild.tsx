@@ -38,7 +38,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR1: push, do not poll',
-    caption: 'Each stock symbol gets its own channel. A push gateway holds the app sessions and sends a symbol only to sessions that watch it, at most once per second. This is the pattern of lesson 9.3, applied to prices.',
+    caption: 'Each stock symbol gets its own channel. A push gateway holds the app sessions and sends a symbol only to sessions that watch it, at most once per second. This is the pattern of the Real-time Updates lesson, applied to prices.',
     packets: [{ from: 'cons', to: 'topics' }, { from: 'topics', to: 'gate', delay: 0.5 }, { from: 'gate', to: 'app', delay: 1 }],
   },
   {

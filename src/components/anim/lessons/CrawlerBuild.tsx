@@ -32,7 +32,7 @@ const edges: BuildEdge[] = [
 const steps: BuildStep[] = [
   {
     req: 'Goal: crawl from seed URLs',
-    caption: 'Seed URLs go into the frontier, the list of URLs still to fetch. A fetcher asks the frontier for the next URL and downloads the page. The frontier is a queue (lesson 6.1), so workers can scale out.',
+    caption: 'Seed URLs go into the frontier, the list of URLs still to fetch. A fetcher asks the frontier for the next URL and downloads the page. The frontier is a queue (the Queues lesson), so workers can scale out.',
     packets: [{ from: 'seeds', to: 'frontier', label: 'seed' }, { from: 'frontier', to: 'fetch', delay: 0.9 }, { from: 'fetch', to: 'web', delay: 1.8 }],
   },
   {
@@ -52,7 +52,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'Quality: no lost work',
-    caption: 'A failed fetch goes back to the queue and is tried again after a delay. After 5 failures (our assumption) the URL moves to a dead-letter queue, a holding line for failures (lesson 6.4), for a human or a later job to inspect.',
+    caption: 'A failed fetch goes back to the queue and is tried again after a delay. After 5 failures (our assumption) the URL moves to a dead-letter queue, a holding line for failures (the Backpressure and Dead-letter Queues lesson), for a human or a later job to inspect.',
     packets: [{ from: 'frontier', to: 'dlq', label: 'gave up' }],
   },
 ];

@@ -22,7 +22,7 @@ export function bestGamma(alpha: number, c: number, max = 12): number {
   return best;
 }
 
-export const RIDGE = 295; // H100 BF16 ridge point from lesson A2.2 (FLOPs per byte, about tokens per weight read)
+export const RIDGE = 295; // H100 BF16 ridge point from the Prefill vs Decode: TTFT and TPOT lesson (FLOPs per byte, about tokens per weight read)
 
 /** Relative step time of a large-model pass that checks `tokens` positions, in units of the memory-bound floor. */
 function stepTime(tokens: number): number {

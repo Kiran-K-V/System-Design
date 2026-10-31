@@ -38,7 +38,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Server 1 crashes. The load balancer takes it out of the pool (lesson 2.4). Its 800 requests per second go to the other two. Each now has to serve 1,200 against a capacity of 1,000.',
+      'Server 1 crashes. The load balancer takes it out of the pool (the Load Balancing lesson). Its 800 requests per second go to the other two. Each now has to serve 1,200 against a capacity of 1,000.',
     headline: 'Demand 2,400. Two servers can serve at most 2,000.',
     headTone: 'warn',
     servers: [{ load: 0, down: true, tag: 'crashed' }, { load: 1200 }, { load: 1200 }],

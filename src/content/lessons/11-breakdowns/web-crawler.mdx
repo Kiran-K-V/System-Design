@@ -19,7 +19,7 @@ Three things make it hard at scale.
 - **Other people's servers.** Every fetch uses a site's bandwidth and CPU. A crawler that fetches too fast looks like an attack, and sites block it. Sites also publish a small text file called `robots.txt` at a fixed address, such as `example.com/robots.txt`. It lists which paths a crawler may not visit. Think of a "staff only" sign on a door. Good crawlers read it before the first fetch and obey it.
 - **Messy input.** Pages fail, time out, repeat, link in circles, and sometimes generate endless links on purpose.
 
-This case adds four ideas. One is a **URL frontier** [mid] (the list of URLs still to fetch) with a queue per host. Others are politeness rules including `robots.txt`, dedupe by URL and by content hash, and DNS caching. It builds on queues (lesson [6.1](/learn/06-async/queues/)), retries and dead-letter queues (lesson [6.4](/learn/06-async/backpressure-dlq/)), and the Bloom filter (a small structure that answers "seen this before?" using little memory) from lesson [10.3](/learn/10-advanced/big-data-structures/).
+This case adds four ideas. One is a **URL frontier** [mid] (the list of URLs still to fetch) with a queue per host. Others are politeness rules including `robots.txt`, dedupe by URL and by content hash, and DNS caching. It builds on queues (the [Queues](/learn/backend/06-async/queues/) lesson), retries and dead-letter queues (the [Backpressure and Dead-letter Queues](/learn/backend/06-async/backpressure-dlq/) lesson), and the Bloom filter (a small structure that answers "seen this before?" using little memory) from the [Big-data Structures](/learn/backend/10-advanced/big-data-structures/) lesson.
 
 ## Requirements
 
@@ -48,7 +48,7 @@ The limit that matters in practice is not bandwidth. It is politeness, as the de
 
 - **URL**: address, depth, status, and a pointer to its stored page.
 - **Host**: a site name with its cached `robots.txt` rules and its last fetch time.
-- **Page**: raw HTML and extracted text, kept in blob storage (lesson [8.11](/learn/08-technologies/blob-storage/)).
+- **Page**: raw HTML and extracted text, kept in blob storage (the [Blob Storage and CDN](/learn/backend/08-technologies/blob-storage/) lesson).
 - **Content hash**: a fingerprint of a page's text.
 
 ## Interface
@@ -80,21 +80,21 @@ The naive frontier is one first-in-first-out queue. Pages link to pages on the s
 
 The Stanford information retrieval book describes a common design. Front queues order URLs by priority. Back queues each hold URLs from a **single host**. A table maps hosts to back queues. A heap (a structure that always gives you the smallest item first) holds, for each back queue, the earliest time that host may be contacted again. A worker takes the queue with the earliest ready time. The worker fetches one URL, then puts the host back with a new ready time. The book notes a rule of thumb: wait about ten times as long as the last fetch took.
 
-A simple version fits in Redis (lesson [8.2](/learn/08-technologies/redis/)). One key per host holds a rate limit or lock, set with an expiry of one second. Compare with the rate limiters of lesson [7.4](/learn/07-reliability/rate-limiting/). A fetcher that cannot take the key picks another host.
+A simple version fits in Redis (the [Redis](/learn/backend/08-technologies/redis/) lesson). One key per host holds a rate limit or lock, set with an expiry of one second. Compare with the rate limiters of the [Rate Limiting Algorithms](/learn/backend/07-reliability/rate-limiting/) lesson. A fetcher that cannot take the key picks another host.
 
 Politeness has a cost. At 1 request per second per host, a crawler that wants tens of thousands of pages per second must keep tens of thousands of different hosts in flight. A huge host cannot be finished fast. A host with 10 million pages would take months at that pace. So set a page budget per host, or crawl its pages at a lower priority.
 
 **`robots.txt`.** Before the first fetch from a host, download `/robots.txt` and cache the rules. The robots.txt rules say a crawler should not use a cached copy for more than 24 hours. They also say a parser must read at least 500 KB of the file. If the file is unreachable because of server or network errors, the crawler must assume **complete disallow**. These errors are status 500 to 599. If the file is simply unavailable (a client error such as 404), the crawler may access any resource. Mix these up and you either crawl a site that said no, or skip a site that said yes. Note the order: a failing server blocks you, a missing file frees you.
 
-**DNS.** Each fetch needs the host's IP address (lesson [2.2](/learn/02-networking/dns/)). At tens of thousands of fetches per second, lookups would pile up and the resolver would become a bottleneck. Cache the answer per host and honor its TTL. One lookup then serves thousands of pages on the same host. Run a local resolver cache so workers share the result.
+**DNS.** Each fetch needs the host's IP address (the [DNS](/learn/backend/02-networking/dns/) lesson). At tens of thousands of fetches per second, lookups would pile up and the resolver would become a bottleneck. Cache the answer per host and honor its TTL. One lookup then serves thousands of pages on the same host. Run a local resolver cache so workers share the result.
 
 ### Fault tolerance: stages, queues, retries
 
 The naive crawler fetches, parses, and stores in one process. A crash in parsing throws away a download that took time and used someone else's bandwidth.
 
-Split it into stages. The fetcher writes raw HTML to blob storage and hands over an id. The parser reads that id. Each stage reads from a queue with a visibility timeout (lesson [6.1](/learn/06-async/queues/)). If a worker dies, the message becomes visible again and another worker takes it. Delivery is at least once (lesson [6.3](/learn/06-async/delivery-semantics/)), so the stages must be **idempotent**. Processing the same URL twice must give the same result, and not two copies.
+Split it into stages. The fetcher writes raw HTML to blob storage and hands over an id. The parser reads that id. Each stage reads from a queue with a visibility timeout (the [Queues](/learn/backend/06-async/queues/) lesson). If a worker dies, the message becomes visible again and another worker takes it. Delivery is at least once (the [Delivery Semantics](/learn/backend/06-async/delivery-semantics/) lesson), so the stages must be **idempotent**. Processing the same URL twice must give the same result, and not two copies.
 
-Retry a failed fetch with backoff (wait longer after each failure) and jitter (add a random delay so retries do not arrive together) (lesson [7.2](/learn/07-reliability/timeouts-retries/)). After 5 tries (assumption) move the URL to a dead-letter queue (lesson [6.4](/learn/06-async/backpressure-dlq/)). Retry some errors and not others. A timeout is worth another try. A 404 is not.
+Retry a failed fetch with backoff (wait longer after each failure) and jitter (add a random delay so retries do not arrive together) (the [Timeouts, Retries, Backoff](/learn/backend/07-reliability/timeouts-retries/) lesson). After 5 tries (assumption) move the URL to a dead-letter queue (the [Backpressure and Dead-letter Queues](/learn/backend/06-async/backpressure-dlq/) lesson). Retry some errors and not others. A timeout is worth another try. A 404 is not.
 
 ### Dedupe: by URL and by content
 
@@ -104,8 +104,8 @@ There are two different duplicates.
 
 An in-memory set of 10 billion URLs does not fit on one machine. Even if you hash each URL to 8 bytes, the hashes alone take tens of GB. Two ways to hold that:
 
-- A sharded key-value store, split by hash (lesson [4.7](/learn/04-data/sharding/)). Exact, but each check is a network call.
-- A **Bloom filter** (lesson [10.3](/learn/10-advanced/big-data-structures/)). With a 1% false positive rate, the filter needs only about 10 bits per item, several times less memory than the hashes. A Bloom filter never says "unseen" about a URL it has seen, so it never causes a repeat fetch. But 1% of new URLs are wrongly called "seen". That is about 100 million pages never crawled at this scale. For a crawl of the web that loss is often acceptable. State it as a choice.
+- A sharded key-value store, split by hash (the [Sharding](/learn/backend/04-data/sharding/) lesson). Exact, but each check is a network call.
+- A **Bloom filter** (the [Big-data Structures](/learn/backend/10-advanced/big-data-structures/) lesson). With a 1% false positive rate, the filter needs only about 10 bits per item, several times less memory than the hashes. A Bloom filter never says "unseen" about a URL it has seen, so it never causes a repeat fetch. But 1% of new URLs are wrongly called "seen". That is about 100 million pages never crawled at this scale. For a crawl of the web that loss is often acceptable. State it as a choice.
 
 **Different URLs, the same page.** Mirrors, tracking links, and print versions have different URLs and the same content. Store a **content hash** [mid]: a fixed-size fingerprint of the page text, such as a 32-byte SHA-256. Index it, and skip pages whose hash is already known. This index is also large at this scale. This finds exact copies only. Pages that differ slightly need other near-duplicate methods; the Stanford book has a chapter on it.
 

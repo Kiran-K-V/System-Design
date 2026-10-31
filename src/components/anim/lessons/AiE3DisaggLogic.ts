@@ -2,7 +2,7 @@
 
 export const DECODE_STEP_MS = 25; // memory-bound floor of one decode step (illustrative; same order as A2.2 for a 70B model on 2 GPUs)
 export const PREFILL_MS_PER_TOKEN = 0.05; // compute-bound prefill cost (illustrative; about 0.1 s for 2,000 tokens, as in A2.2)
-export const KV_BYTES_PER_TOKEN = 327680; // Llama 3 70B BF16, from lesson A2.3
+export const KV_BYTES_PER_TOKEN = 327680; // Llama 3 70B BF16, from the KV Cache lesson
 export const LAYERS = 80; // Llama 3 70B
 
 export interface Link {

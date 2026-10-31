@@ -48,7 +48,7 @@ const steps: Step[] = [
     sandbox: 'held',
   },
   {
-    caption: 'After each step the runtime saves state. If the worker dies now, another worker restores the last checkpoint and goes on instead of starting over. This needs idempotent tools, because the step after the checkpoint may run twice (lesson A7.1).',
+    caption: 'After each step the runtime saves state. If the worker dies now, another worker restores the last checkpoint and goes on instead of starting over. This needs idempotent tools, because the step after the checkpoint may run twice (the Durable Execution and the Graph Runtime lesson).',
     at: 'ckpt',
     status: 'running',
     sandbox: 'held',

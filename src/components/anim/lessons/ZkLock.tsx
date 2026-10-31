@@ -74,7 +74,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Danger. A may not be dead. It may have paused for a long garbage collection, and wakes up believing it still holds the lock. The lock service cannot reach into A. The fix is a fencing token (lesson 4.6): A sends its number, 1, with every write. The resource has seen 2 from B, so it rejects A.',
+      'Danger. A may not be dead. It may have paused for a long garbage collection, and wakes up believing it still holds the lock. The lock service cannot reach into A. The fix is a fencing token (the Replication lesson): A sends its number, 1, with every write. The resource has seen 2 from B, so it rejects A.',
     msg: 'A wakes up and writes with token 1.',
     clients: [{ sub: 'stale, token 1', tone: 'warn' }, { sub: 'holds lock', tone: 'ok' }, { sub: 'waiting' }],
     nodes: [{ label: 'lock-0001', hidden: true, note: 'A’s write: refused', noteTone: 'bad' }, { label: 'lock-0002', tone: 'ok', note: 'resource saw token 2', noteTone: 'ok' }, { label: 'lock-0003' }],

@@ -45,7 +45,7 @@ This pattern adds almost nothing new. It is a recipe that combines earlier lesso
 
 ## Naive solution: one distributed transaction
 
-The first idea is to wrap all three steps in one transaction, using two-phase commit (2PC, [lesson 4.4](/learn/04-data/transactions/)). A coordinator asks every participant to prepare. Each participant writes its change durably, keeps its locks, and votes yes. When all vote yes, the coordinator records "commit" and tells everyone.
+The first idea is to wrap all three steps in one transaction, using two-phase commit (2PC, [the Transactions and Isolation lesson](/learn/backend/04-data/transactions/)). A coordinator asks every participant to prepare. Each participant writes its change durably, keeps its locks, and votes yes. When all vote yes, the coordinator records "commit" and tells everyone.
 
 Look at the protocol to see why this blocks. After a participant votes yes, it has promised to commit if told to. It may not decide alone, because the coordinator may already have told another participant to commit. So it keeps its locks and waits. If the coordinator crashes after the votes, every participant sits there holding locks. Each participant keeps those locks until the coordinator comes back and reads its log. Every other request that needs those rows waits too.
 
@@ -56,7 +56,7 @@ That is one cost. There are two more.
 
 Microservices.io, which documents the saga pattern, states the same conclusion in its forces list: "2PC is not an option."
 
-The second naive idea is to call the three services in order from one request handler. Each service call gets its own retry. That fails when the handler dies. Nothing remembers how far the order got. It is the dual-write problem from [lesson 6.5](/learn/06-async/cdc/) with three writes instead of two. Dual write means changing two systems with two separate calls, so a crash between them leaves one changed and one not.
+The second naive idea is to call the three services in order from one request handler. Each service call gets its own retry. That fails when the handler dies. Nothing remembers how far the order got. It is the dual-write problem from [the Change Data Capture lesson](/learn/backend/06-async/cdc/) with three writes instead of two. Dual write means changing two systems with two separate calls, so a crash between them leaves one changed and one not.
 
 ## The mechanism: a saga
 
@@ -69,9 +69,9 @@ Step through an order that fails at step 3.
 Four rules make compensation work.
 
 1. **A compensation is a new action, not a rollback.** The charge committed and stays in the history. The refund is a second record. Microservices.io notes that a saga has no automatic rollback: a developer must design each compensation.
-2. **Compensations must be retried until they succeed, and they must be idempotent.** A refund that runs twice must refund once ([lesson 3.4](/learn/03-api-design/idempotency/)). A compensation that can fail for good leaves the system broken.
+2. **Compensations must be retried until they succeed, and they must be idempotent.** A refund that runs twice must refund once ([the Idempotency lesson](/learn/backend/03-api-design/idempotency/)). A compensation that can fail for good leaves the system broken.
 3. **Put steps that cannot be undone last.** You cannot unsend an email. Reserve stock and take payment first. Send the confirmation only after every step has succeeded.
-4. **Expect visible middle states.** A saga has no isolation. Isolation is the "I" in ACID, the four promises of a database transaction from lesson [4.4](/learn/04-data/transactions/): all or nothing, valid data, no peeking at half-done work, and saved on disk. Between step 2 and the refund, the order is PENDING and the card is charged. Other readers can see that. A status field such as PENDING and CANCELLED makes the state honest, and the UI can show "processing."
+4. **Expect visible middle states.** A saga has no isolation. Isolation is the "I" in ACID, the four promises of a database transaction from the [Transactions and Isolation](/learn/backend/04-data/transactions/) lesson: all or nothing, valid data, no peeking at half-done work, and saved on disk. Between step 2 and the refund, the order is PENDING and the card is charged. Other readers can see that. A status field such as PENDING and CANCELLED makes the state honest, and the UI can show "processing."
 
 ## Who drives the saga
 
@@ -86,13 +86,13 @@ A rule of thumb: choreography suits two or three steps with little branching. Or
 
 ## Reliable events: the outbox
 
-Every step does two things: change its database and publish an event. If it does them as two separate writes, a crash between them breaks the saga ([lesson 6.5](/learn/06-async/cdc/) shows that failure). The fix is the **transactional outbox**. The step writes its business row and an outbox row in one local transaction. A relay, a small process that copies rows to the queue, reads the outbox. It either polls the table on a timer or tails the database log, which means reading the database's own record of changes as they happen. Then it publishes to the broker, the server that holds the queue. The event exists if and only if the change committed.
+Every step does two things: change its database and publish an event. If it does them as two separate writes, a crash between them breaks the saga ([the Change Data Capture lesson](/learn/backend/06-async/cdc/) shows that failure). The fix is the **transactional outbox**. The step writes its business row and an outbox row in one local transaction. A relay, a small process that copies rows to the queue, reads the outbox. It either polls the table on a timer or tails the database log, which means reading the database's own record of changes as they happen. Then it publishes to the broker, the server that holds the queue. The event exists if and only if the change committed.
 
-The relay can publish the same row twice, for example if it crashes before marking the row sent. So the next step must be idempotent. It can store the event id and skip a repeat ([lesson 6.3](/learn/06-async/delivery-semantics/)). I give no polling interval here, because the right value depends on your latency target and load. I also found no primary source that fixes one.
+The relay can publish the same row twice, for example if it crashes before marking the row sent. So the next step must be idempotent. It can store the event id and skip a repeat ([the Delivery Semantics lesson](/learn/backend/06-async/delivery-semantics/)). I give no polling interval here, because the right value depends on your latency target and load. I also found no primary source that fixes one.
 
 ## Workflow engines: the orchestrator you do not build
 
-Writing a durable orchestrator yourself means writing a state table, a retry timer, and a recovery scan. You also write a way to resume after a crash. A **workflow engine** gives you that. [Temporal](/learn/08-technologies/temporal/) (lesson 8.9) keeps an Event History, a saved log of every step. If a worker dies, another worker replays the workflow code, which means it runs the code again and feeds it the saved answers instead of redoing the work. Then it continues from the last recorded step. Your saga becomes ordinary code:
+Writing a durable orchestrator yourself means writing a state table, a retry timer, and a recovery scan. You also write a way to resume after a crash. A **workflow engine** gives you that. [Temporal](/learn/backend/08-technologies/temporal/) (the [Temporal](/learn/backend/08-technologies/temporal/) lesson) keeps an Event History, a saved log of every step. If a worker dies, another worker replays the workflow code, which means it runs the code again and feeds it the saved answers instead of redoing the work. Then it continues from the last recorded step. Your saga becomes ordinary code:
 
 ```ts
 // Pseudocode, not a real SDK call.
@@ -236,7 +236,7 @@ Atomicity is replaced by "eventually all steps done or all compensated." Consist
         'Lower the client timeout to 500 ms to fail faster',
       ],
       answer: 0,
-      explain: 'A key lets the payment service return the saved refund for a repeat (lesson 3.4). More retries add more duplicates. No retries leave some refunds unsent. A shorter timeout makes the duplicates more frequent.',
+      explain: 'A key lets the payment service return the saved refund for a repeat (the Idempotency lesson). More retries add more duplicates. No retries leave some refunds unsent. A shorter timeout makes the duplicates more frequent.',
     },
   ]}
 />

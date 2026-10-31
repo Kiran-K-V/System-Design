@@ -31,7 +31,7 @@ const edges: BuildEdge[] = [
 ];
 
 const steps: BuildStep[] = [
-  { req: 'FR1: one front door for every team', caption: 'Every team calls one internal API with its own gateway key. The gateway checks the key and maps an alias such as chat-main to a real model. Only the gateway holds provider keys (lesson A3.8).', packets: [{ from: 'apps', to: 'gw', label: 'request' }] },
+  { req: 'FR1: one front door for every team', caption: 'Every team calls one internal API with its own gateway key. The gateway checks the key and maps an alias such as chat-main to a real model. Only the gateway holds provider keys (the Multi-provider Gateway and Fallbacks lesson).', packets: [{ from: 'apps', to: 'gw', label: 'request' }] },
   { req: 'NFR: no tenant starves another', caption: 'Before any provider call, the gateway takes tokens from the team bucket. The bucket holds the team share of the provider limit. A team over its share gets a 429 from the gateway and the provider never sees the call. Deep dive 1.', packets: [{ from: 'gw', to: 'quota', label: 'reserve' }] },
   { req: 'NFR: fail over within 5 seconds', caption: 'The router picks the target and sends the call. On a failure that another provider can fix, it moves to the fallback, inside a retry budget. Deep dive 3.', packets: [{ from: 'gw', to: 'router', label: 'call' }, { from: 'router', to: 'pa', label: 'send', delay: 0.9 }] },
   { req: 'FR2: lower cost on repeats', caption: 'An exact-match cache answers a repeated request with no provider call. The tenant id is part of the key, so one team can never be served another team’s answer.', packets: [{ from: 'gw', to: 'cache', label: 'key' }] },

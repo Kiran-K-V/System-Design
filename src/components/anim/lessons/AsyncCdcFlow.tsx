@@ -40,7 +40,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'The database already writes every committed change to its write-ahead log (lesson 4.2). That log feeds replicas (lesson 4.6). The change sits in the log at position LSN 41. We add no extra write.',
+      'The database already writes every committed change to its write-ahead log (the How a Database Stores Data lesson). That log feeds replicas (the Replication lesson). The change sits in the log at position LSN 41. We add no extra write.',
     active: ['db'],
     packets: [],
     db: 'WAL: LSN 41',
@@ -72,7 +72,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Two independent consumers read the stream. One updates the search index. The other deletes the cache key (lesson 5.5). A new consumer, such as analytics, can join later with no change to the app or the database.',
+      'Two independent consumers read the stream. One updates the search index. The other deletes the cache key (the Invalidation and Stampede lesson). A new consumer, such as analytics, can join later with no change to the app or the database.',
     active: ['search', 'cache'],
     packets: [
       { from: 'stream', to: 'search', label: 'price=9' },
@@ -98,7 +98,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'The connector restarts and resumes from its saved position, LSN 41. It reads LSN 42 again and publishes event 2 again. A crash can cause a repeat, so treat this as at-least-once. Setting the price to 8 twice is harmless. Consumers must be idempotent (lesson 6.3).',
+      'The connector restarts and resumes from its saved position, LSN 41. It reads LSN 42 again and publishes event 2 again. A crash can cause a repeat, so treat this as at-least-once. Setting the price to 8 twice is harmless. Consumers must be idempotent (the Delivery Semantics lesson).',
     active: ['connector', 'stream'],
     packets: [{ from: 'connector', to: 'stream', label: 'price=8' }],
     db: 'WAL: LSN 42',

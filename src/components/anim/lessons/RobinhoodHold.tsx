@@ -21,7 +21,7 @@ const naive: CompareVariant = {
     { caption: 'Two orders of $800 arrive together. The account has $1,000 of buying power, enough for one of them.', active: ['a', 'b'] },
     { caption: 'The service handles each order on its own thread. Both read the balance, and both see $1,000.', packets: [{ from: 'svc', to: 'acct' }, { from: 'acct', to: 'svc', delay: 0.6 }], notes: [{ x: 610, y: 260, text: 'both read $1,000', size: 14 }] },
     { caption: 'Each thread checks 800 <= 1,000 and passes. Neither sees the other. Each then runs power = power - 800.', tones: { a: 'ok', b: 'ok' }, active: ['svc'] },
-    { caption: 'Both orders go to the exchange. The account ends at 1,000 - 800 - 800 = -$600. The check was right when it ran, but the data changed before the write. This is a check-then-act race, one of the anomalies in lesson 4.4.', tones: { acct: 'bad', a: 'bad', b: 'bad' }, notes: [{ x: 610, y: 260, text: 'power = -$600', size: 14, tone: 'bad' }] },
+    { caption: 'Both orders go to the exchange. The account ends at 1,000 - 800 - 800 = -$600. The check was right when it ran, but the data changed before the write. This is a check-then-act race, one of the anomalies in the Transactions and Isolation lesson.', tones: { acct: 'bad', a: 'bad', b: 'bad' }, notes: [{ x: 610, y: 260, text: 'power = -$600', size: 14, tone: 'bad' }] },
   ],
 };
 

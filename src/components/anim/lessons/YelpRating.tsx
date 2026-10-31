@@ -89,7 +89,7 @@ const atomic: CompareVariant = {
       active: ['row'],
     },
     {
-      caption: 'The database takes a row lock for each update (lesson 4.4), so the two run one after the other. Result: sum 46, count 12. The average is 46 / 12 = 3.83. Both reviews count.',
+      caption: 'The database takes a row lock for each update (the Transactions and Isolation lesson), so the two run one after the other. Result: sum 46, count 12. The average is 46 / 12 = 3.83. Both reviews count.',
       tones: { row: 'ok', a: 'ok', b: 'ok' },
       notes: [{ x: 330, y: 265, text: 'row: sum 46, count 12 (avg 3.83)', anchor: 'middle', tone: 'ok' }],
       active: ['row'],

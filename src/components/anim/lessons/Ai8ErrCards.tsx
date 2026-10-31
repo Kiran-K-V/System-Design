@@ -38,7 +38,7 @@ const steps: Step[] = [
   { caption: 'Group notes that look alike. Seven notes about wrong or made-up policy fall into one pile. Three refusals form a second pile. Two order mix-ups form a third. This first grouping is rough.', phase: 'coarse' },
   { caption: 'Look inside the big pile. "Old refund page" means the system fetched the wrong document. "Invented 30 days" means the answer contained a rule that no document had. These two need different fixes, so split the pile. Now there are four groups.', phase: 'fine' },
   { caption: 'Label all 40 failed traces the same way and count each group. The counts are illustrative: 14, 10, 9, and 7 failures. Now you can see that the biggest single group is wrong documents, not the refusals people talked about most.', phase: 'bars' },
-  { caption: 'Each count turns into an action. The largest group gets a fix first. A group that a program can check, such as the order id, gets a code check. A fuzzy group, such as over-refusal, gets a judge, which lesson A8.4 teaches.', phase: 'act' },
+  { caption: 'Each count turns into an action. The largest group gets a fix first. A group that a program can check, such as the order id, gets a code check. A fuzzy group, such as over-refusal, gets a judge, which the Code Checks and LLM Judges lesson teaches.', phase: 'act' },
 ];
 
 const coarseKey = (g: Group) => (g === 'doc' || g === 'invent' ? 'policy' : g);

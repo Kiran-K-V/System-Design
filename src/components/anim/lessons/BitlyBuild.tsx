@@ -42,7 +42,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'Quality: redirect in about 100 ms',
-    caption: 'A cache sits in front of the table (lesson 5.3). Hot codes answer from memory. Only a miss reads the table.',
+    caption: 'A cache sits in front of the table (the Cache Strategies lesson). Hot codes answer from memory. Only a miss reads the table.',
     packets: [{ from: 'redir', to: 'cache' }],
   },
   {

@@ -27,7 +27,7 @@ interface Step {
 const steps: Step[] = [
   {
     caption:
-      'Task: rewrite a 10-line file, changing a small part. The old file is on the left. Plain decoding writes the new file one token per pass: 110 tokens (11 lines of 10 tokens) is 110 passes. Each pass reads all the model weights, so each pass is slow (lesson A2.2). Numbers here are made up to show the shape.',
+      'Task: rewrite a 10-line file, changing a small part. The old file is on the left. Plain decoding writes the new file one token per pass: 110 tokens (11 lines of 10 tokens) is 110 passes. Each pass reads all the model weights, so each pass is slow (the Prefill vs Decode: TTFT and TPOT lesson). Numbers here are made up to show the shape.',
     passes: 0,
     rows: 0,
     window: [],

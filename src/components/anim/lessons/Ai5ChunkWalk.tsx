@@ -68,7 +68,7 @@ const steps: Step[] = [
     ctx: true,
   },
   {
-    caption: 'Anthropic measured the effect on top-20 retrieval failures (1 minus recall@20): 5.7% with plain embeddings, 3.7% with contextual embeddings, 2.9% adding contextual BM25, 1.9% adding a reranker. Each stage removes failures. Lesson A5.5 adds the BM25 half and lesson A5.6 the reranker.',
+    caption: 'Anthropic measured the effect on top-20 retrieval failures (1 minus recall@20): 5.7% with plain embeddings, 3.7% with contextual embeddings, 2.9% adding contextual BM25, 1.9% adding a reranker. Each stage removes failures. The Hybrid Search and Reciprocal Rank Fusion lesson adds the BM25 half and the Reranking and Query Rewriting lesson the reranker.',
     view: 'fail',
   },
 ];

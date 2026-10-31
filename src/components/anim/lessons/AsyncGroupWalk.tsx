@@ -48,7 +48,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'The timeout expires. The group rebalances: it removes C2 and moves its partitions to C1. C1 starts each partition at the committed offset, not at the end. So the second C is read again. If C2 had finished it before the crash, the work is done twice (lesson 6.3).',
+      'The timeout expires. The group rebalances: it removes C2 and moves its partitions to C1. C1 starts each partition at the committed offset, not at the end. So the second C is read again. If C2 had finished it before the crash, the work is done twice (the Delivery Semantics lesson).',
     logs: [[done('A'), done('A')], [done('B')], [done('C'), nxt('C'), k('C')], [done('D'), nxt('D')]],
     members: [{ name: 'C1', owns: [0, 1, 2, 3] }],
   },

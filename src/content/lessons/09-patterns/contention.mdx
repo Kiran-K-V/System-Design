@@ -18,7 +18,7 @@ Nothing crashed. Each request did a correct thing by itself. The bug is in the g
 
 The gap is small, but the chance of hitting it is not. If a check-then-write takes 5 ms, any two requests for the same row within 5 ms of each other collide. For a normal row that is rare. For a hot row in a sale, it happens all the time. This is **contention**: many writers fight for the same item.
 
-Lesson [4.4](/learn/04-data/transactions/) gave the tools: row locks, version checks, and isolation levels. An isolation level is a setting that says how much one running transaction may see of the changes of others. This lesson shows when to pick each, and what to do when the fight spans more than one database.
+The [Transactions and Isolation](/learn/backend/04-data/transactions/) lesson gave the tools: row locks, version checks, and isolation levels. An isolation level is a setting that says how much one running transaction may see of the changes of others. This lesson shows when to pick each, and what to do when the fight spans more than one database.
 
 <PatternsBuildsOn
   pattern="Contention"
@@ -41,7 +41,7 @@ Try the cheapest fix first. Let the database do the check and the write as one s
 UPDATE seats SET left = left - 1 WHERE id = 7 AND left > 0;
 ```
 
-If one row changed, you got the seat. If zero rows changed, it is sold out. Lesson [4.4](/learn/04-data/transactions/) explains why this works at Read committed, the default isolation level in PostgreSQL. At this level a transaction sees only changes that other transactions have already finished. A second updater waits for the first one. Then it checks the `WHERE` clause against the new version of the row. For a single row and a single comparison, stop here. The strategies below are for cases where the decision needs more than one statement. They are also for cases with more than one resource, or a long wait for the user.
+If one row changed, you got the seat. If zero rows changed, it is sold out. The [Transactions and Isolation](/learn/backend/04-data/transactions/) lesson explains why this works at Read committed, the default isolation level in PostgreSQL. At this level a transaction sees only changes that other transactions have already finished. A second updater waits for the first one. Then it checks the `WHERE` clause against the new version of the row. For a single row and a single comparison, stop here. The strategies below are for cases where the decision needs more than one statement. They are also for cases with more than one resource, or a long wait for the user.
 
 ## The race, five ways
 
@@ -65,7 +65,7 @@ Reach for it when conflicts are frequent, the transaction is short, and everythi
 
 Do not lock. Read the row with its version. Write with `WHERE version = <the version you read>`. If zero rows change, someone else won: re-read and retry. This is cheap when conflicts are rare. The user can think for as long as they like between read and write. The reason is that nothing is held.
 
-When conflicts are frequent it wastes work. Say many buyers each try to take one unit from one stock row and each loser retries at once. Each round has exactly one winner, and every loser tries again. So the number of attempts grows far faster than the number of sales. That is the worst case when everyone retries in step. Add jitter (lesson [7.2](/learn/07-reliability/timeouts-retries/)) and a cap on retries. Jitter means each loser waits a small random time before it tries again, so the retries do not all land at the same moment.
+When conflicts are frequent it wastes work. Say many buyers each try to take one unit from one stock row and each loser retries at once. Each round has exactly one winner, and every loser tries again. So the number of attempts grows far faster than the number of sales. That is the worst case when everyone retries in step. Add jitter (the [Timeouts, Retries, Backoff](/learn/backend/07-reliability/timeouts-retries/) lesson) and a cap on retries. Jitter means each loser waits a small random time before it tries again, so the retries do not all land at the same moment.
 
 ### Reservation with a TTL
 
@@ -73,7 +73,7 @@ A checkout may take minutes: pick a seat, enter a card, pass a bank check. You c
 
 Three details make a hold safe:
 
-- **Take the hold atomically.** It is a write only one buyer can win, such as an `UPDATE ... WHERE hold IS NULL OR hold_expires < now()`. Or `SET key value NX PX 300000` in Redis (lesson [8.2](/learn/08-technologies/redis/)): set only if absent, with an expiry.
+- **Take the hold atomically.** It is a write only one buyer can win, such as an `UPDATE ... WHERE hold IS NULL OR hold_expires < now()`. Or `SET key value NX PX 300000` in Redis (the [Redis](/learn/backend/08-technologies/redis/) lesson): set only if absent, with an expiry.
 - **Free expired holds.** Check the expiry when reading, or run a sweeper, a small background job that deletes old holds. Otherwise abandoned holds hide seats.
 - **Confirm re-checks.** The hold may have expired and been taken by someone else. A unique constraint is a rule in the database that refuses a second row with the same values. On the final booking, such as one row per `(event, seat)`, it is the last line of defence. If the hold store is lost or wrong, the constraint still refuses the second booking.
 
@@ -81,13 +81,13 @@ You trade a little fairness (someone sits on a seat) for no waiting and no long 
 
 ### Serialize through a queue
 
-Send every request for the same key to a queue partition (lesson [6.1](/learn/06-async/queues/)). A partition is one separate line inside a queue. The key, here the seat id, decides which line a request joins. One worker handles that partition in order. There is no concurrent writer, so there is no race. The order of arrival decides who wins.
+Send every request for the same key to a queue partition (the [Queues](/learn/backend/06-async/queues/) lesson). A partition is one separate line inside a queue. The key, here the seat id, decides which line a request joins. One worker handles that partition in order. There is no concurrent writer, so there is no race. The order of arrival decides who wins.
 
-This turns a lock fight into a line. It scales across keys, since each seat has its own line. It does not scale within one key: a hot seat is handled at one worker's speed. And the user gets the answer later, through the queue. So the API needs to return a ticket and let the client poll or listen (lesson [9.3](/learn/09-patterns/real-time-updates/)).
+This turns a lock fight into a line. It scales across keys, since each seat has its own line. It does not scale within one key: a hot seat is handled at one worker's speed. And the user gets the answer later, through the queue. So the API needs to return a ticket and let the client poll or listen (the [Real-time Updates](/learn/backend/09-patterns/real-time-updates/) lesson).
 
 ## When one database is not enough: distributed locks
 
-Sometimes the contested thing is not one row. It is a cron job (a task that a timer starts, for example every night) that must run on one machine, a file in object storage, or a resource in another service. You then use a **distributed lock**. It is a lock held in a shared service such as ZooKeeper, etcd, or Redis (lesson [8.8](/learn/08-technologies/zookeeper/)).
+Sometimes the contested thing is not one row. It is a cron job (a task that a timer starts, for example every night) that must run on one machine, a file in object storage, or a resource in another service. You then use a **distributed lock**. It is a lock held in a shared service such as ZooKeeper, etcd, or Redis (the [ZooKeeper / etcd](/learn/backend/08-technologies/zookeeper/) lesson).
 
 Locks in such systems are **leases**: they expire on their own, so a crashed client cannot hold one forever. That solves crashes. It opens a worse problem: a client that is slow, not dead.
 
@@ -100,9 +100,9 @@ The fix is a **fencing token**: a number that goes up with every grant of the lo
 Two consequences:
 
 - The final check must be **in the resource**, not in the lock holder. If the resource cannot compare tokens, the lock cannot protect it.
-- The lock service must hand out increasing numbers. Kleppmann notes that ZooKeeper can supply one: it numbers every change it makes, and that number only goes up. He also argues that Redlock, an algorithm that takes a lock on several Redis servers at once, has no facility to generate fencing tokens. Lesson [8.2](/learn/08-technologies/redis/) records that Redis's own docs advise fencing tokens too.
+- The lock service must hand out increasing numbers. Kleppmann notes that ZooKeeper can supply one: it numbers every change it makes, and that number only goes up. He also argues that Redlock, an algorithm that takes a lock on several Redis servers at once, has no facility to generate fencing tokens. The [Redis](/learn/backend/08-technologies/redis/) lesson records that Redis's own docs advise fencing tokens too.
 
-Kleppmann's other test is the useful one. Ask what happens if the lock fails. If two clients doing the same work wastes some CPU, the lock is for **efficiency**, and a simple single-node lock is fine. If two clients doing the work corrupts data, the lock is for **correctness**, and you need a fencing token or a system that agrees (lesson [4.11](/learn/04-data/consensus/)).
+Kleppmann's other test is the useful one. Ask what happens if the lock fails. If two clients doing the same work wastes some CPU, the lock is for **efficiency**, and a simple single-node lock is fine. If two clients doing the work corrupts data, the lock is for **correctness**, and you need a fencing token or a system that agrees (the [Consensus](/learn/backend/04-data/consensus/) lesson).
 
 PostgreSQL has a lighter option inside one database: **advisory locks**. They are locks on a name or number that you pick, such as a job id. The database does not tie them to any row, so only code that asks for the lock obeys it. The manual says they avoid table bloat (wasted disk space from old row versions) and that a session lock is released when the session ends.
 
@@ -124,7 +124,7 @@ PostgreSQL has a lighter option inside one database: **advisory locks**. They ar
 | Throughput of one locked row | Falls as the hold time grows | Derived: transactions line up one behind another |
 | Lockstep retries on one version | Many failed attempts for each success | Derived: one winner per round |
 | Deadlock | The database aborts one transaction | PostgreSQL manual |
-| Redis hold | `SET key value NX PX <ms>` | Redis docs, via lesson 8.2 |
+| Redis hold | `SET key value NX PX <ms>` | Redis docs, via the [Redis](/learn/backend/08-technologies/redis/) lesson |
 
 ## Trade-offs
 
@@ -148,7 +148,7 @@ Do not say "use a Redis lock" for a correctness problem and stop there. A lease 
 </Callout>
 
 <Callout type="deep" title="Isolation levels do not replace this">
-At Repeatable read, a stricter isolation level where a transaction sees one frozen view of the data, PostgreSQL stops a lost update by failing the second writer with a serialization error, an error that means "retry this transaction". That is a version check done for you. You still must catch the error and retry. At Read committed the same bug passes silently. Write skew, where two transactions read the same rows and write different ones, needs Serializable (the strictest level, which makes transactions behave as if they ran one at a time) or a lock on the rows the decision depends on. Lesson 4.4 shows both.
+At Repeatable read, a stricter isolation level where a transaction sees one frozen view of the data, PostgreSQL stops a lost update by failing the second writer with a serialization error, an error that means "retry this transaction". That is a version check done for you. You still must catch the error and retry. At Read committed the same bug passes silently. Write skew, where two transactions read the same rows and write different ones, needs Serializable (the strictest level, which makes transactions behave as if they ran one at a time) or a lock on the rows the decision depends on. The [Transactions and Isolation](/learn/backend/04-data/transactions/) lesson shows both.
 </Callout>
 
 ## Check yourself

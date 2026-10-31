@@ -31,7 +31,7 @@ const steps: BuildStep[] = [
   {
     req: 'FR1: post a comment',
     caption:
-      'A viewer posts a comment with a plain HTTP request. The API checks it and saves it in a store partitioned by video, with a per-video sequence number. Posting is stateless, so any API server can take it (lesson 2.4).',
+      'A viewer posts a comment with a plain HTTP request. The API checks it and saves it in a store partitioned by video, with a per-video sequence number. Posting is stateless, so any API server can take it (the Load Balancing lesson).',
     packets: [{ from: 'poster', to: 'api' }, { from: 'api', to: 'store', delay: 0.9 }],
   },
   {

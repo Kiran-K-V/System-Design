@@ -32,7 +32,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: 5M points per second',
-    caption: 'Points flow through a buffer into a store built for time series (lesson 10.2). The buffer is a log (lesson 6.2). A burst piles up there instead of crushing the store, and the store drains at its own speed.',
+    caption: 'Points flow through a buffer into a store built for time series (the Time Series Databases lesson). The buffer is a log (the Pub/Sub and Logs lesson). A burst piles up there instead of crushing the store, and the store drains at its own speed.',
     packets: [{ from: 'col', to: 'buf' }, { from: 'buf', to: 'store', delay: 0.5 }],
   },
   {

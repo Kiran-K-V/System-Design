@@ -26,7 +26,7 @@ const steps: Step[] = [
     stat: `static: ${PCT(D.staticUtil)} used, ${USD(D.staticHours * PRICE)} a day`,
   },
   {
-    caption: `An API prices only the work. The same ${D.used.toFixed(1)} GPU-hours of work, billed at the cost of ${D.used.toFixed(1)} busy GPUs, would be ${USD(D.used * PRICE)} at the same hourly rate. The gap between the two numbers is the price of idle time. This is why utilization, not the hourly rate, decides the crossover (lesson A0.4).`,
+    caption: `An API prices only the work. The same ${D.used.toFixed(1)} GPU-hours of work, billed at the cost of ${D.used.toFixed(1)} busy GPUs, would be ${USD(D.used * PRICE)} at the same hourly rate. The gap between the two numbers is the price of idle time. This is why utilization, not the hourly rate, decides the crossover (the Build, Buy, or Fine-tune lesson).`,
     mode: 'work',
     stat: `work only: ${USD(D.used * PRICE)} a day`,
   },

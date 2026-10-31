@@ -47,7 +47,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'Quality: 1M checks per second',
-    caption: 'One Redis cannot take that load under our assumption. Split callers over shards (separate Redis servers, each holding some callers) by key (lesson 4.8). Each caller always lands on the same shard, so its bucket stays in one place.',
+    caption: 'One Redis cannot take that load under our assumption. Split callers over shards (separate Redis servers, each holding some callers) by key (the Consistent Hashing lesson). Each caller always lands on the same shard, so its bucket stays in one place.',
     packets: [{ from: 'gw1', to: 'shard2' }],
   },
   {

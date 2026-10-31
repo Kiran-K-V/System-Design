@@ -24,14 +24,14 @@ const NAIVE: { m: SeqMessage; caption: string }[] = [
 
 const DEDUPE: { m: SeqMessage; caption: string }[] = [
   { m: { from: 'Broker', to: 'Consumer', label: 'deliver M1: +$10' }, caption: 'The broker hands message M1 to the consumer. M1 has a unique id, set by the producer.' },
-  { m: { from: 'Consumer', to: 'Ledger DB', label: 'txn: id M1 + credit $10', tone: 'accent' }, caption: 'The consumer opens one database transaction. It saves the id M1 in a "processed" table and credits $10. Both changes commit together or not at all (lesson 4.4).' },
+  { m: { from: 'Consumer', to: 'Ledger DB', label: 'txn: id M1 + credit $10', tone: 'accent' }, caption: 'The consumer opens one database transaction. It saves the id M1 in a "processed" table and credits $10. Both changes commit together or not at all (the Transactions and Isolation lesson).' },
   { m: { from: 'Ledger DB', to: 'Consumer', label: 'committed', tone: 'ok' }, caption: 'The transaction commits. The credit and the id are now stored.' },
   { m: { from: 'Consumer', to: 'Broker', label: 'ack', lost: true, tone: 'bad' }, caption: 'The same network fault: the ack is lost.' },
   { m: { from: 'Broker', to: 'Broker', label: 'no ack in time: resend', note: true, tone: 'warn' }, caption: 'The broker resends M1, because it must not lose messages.' },
   { m: { from: 'Broker', to: 'Consumer', label: 'deliver M1: +$10', tone: 'warn' }, caption: 'M1 arrives again, with the same id.' },
   { m: { from: 'Consumer', to: 'Ledger DB', label: 'txn: id M1 + credit' }, caption: 'The consumer starts the same transaction. The insert of id M1 breaks the unique key, so the whole transaction rolls back.' },
   { m: { from: 'Ledger DB', to: 'Consumer', label: 'M1 exists: skip', tone: 'ok' }, caption: 'The consumer learns M1 was already done. It skips the credit. The balance is unchanged.' },
-  { m: { from: 'Consumer', to: 'Broker', label: 'ack', tone: 'ok' }, caption: 'The consumer acks. The broker deletes M1. Delivery happened twice. The effect happened once. This is idempotency from lesson 3.4, applied to a queue.' },
+  { m: { from: 'Consumer', to: 'Broker', label: 'ack', tone: 'ok' }, caption: 'The consumer acks. The broker deletes M1. Delivery happened twice. The effect happened once. This is idempotency from the Idempotency lesson, applied to a queue.' },
 ];
 
 function Strip({ credits, ids, bad }: { credits: number; ids: string | null; bad: boolean }) {

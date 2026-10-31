@@ -39,7 +39,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR2: request a ride',
-    caption: 'The rider accepts the fare. The ride service saves a Ride in state "requested" in a normal database (lesson 8.1). Rides are few compared with location pings, so a database is fine here.',
+    caption: 'The rider accepts the fare. The ride service saves a Ride in state "requested" in a normal database (the PostgreSQL lesson). Rides are few compared with location pings, so a database is fine here.',
     packets: [{ from: 'gw', to: 'ride', label: 'fareId' }, { from: 'ride', to: 'ridedb', label: 'save', delay: 0.9 }],
   },
   {
@@ -49,7 +49,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR3: find nearby drivers',
-    caption: 'The matching service takes a new Ride and asks the geo index for free drivers within a radius, nearest first. This is proximity search (lesson 10.1).',
+    caption: 'The matching service takes a new Ride and asks the geo index for free drivers within a radius, nearest first. This is proximity search (the Proximity Search lesson).',
     packets: [{ from: 'ride', to: 'match', label: 'ride' }, { from: 'match', to: 'geo', label: 'radius?', delay: 0.9 }],
   },
   {

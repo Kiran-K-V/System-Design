@@ -37,7 +37,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: no accepted bid is lost',
-    caption: 'Each accepted bid is also appended to a bid log, in the same transaction (lesson 4.4). The auction row keeps only the latest bid. The log keeps all of them, so the history is complete and a dispute can be settled.',
+    caption: 'Each accepted bid is also appended to a bid log, in the same transaction (the Transactions and Isolation lesson). The auction row keeps only the latest bid. The log keeps all of them, so the history is complete and a dispute can be settled.',
     packets: [{ from: 'svc', to: 'bidlog', label: 'append' }],
   },
   {
@@ -47,7 +47,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: new bid shown within ~1 s',
-    caption: 'After a bid is accepted, the service publishes it to a channel for that auction. Gateway servers hold the viewers WebSockets and push the new bid out (lesson 9.3). No viewer has to poll.',
+    caption: 'After a bid is accepted, the service publishes it to a channel for that auction. Gateway servers hold the viewers WebSockets and push the new bid out (the Real-time Updates lesson). No viewer has to poll.',
     packets: [{ from: 'svc', to: 'pubsub', label: 'new high' }, { from: 'pubsub', to: 'gw', label: 'push', delay: 0.9 }, { from: 'gw', to: 'viewer', label: '120', delay: 1.8 }],
   },
   {

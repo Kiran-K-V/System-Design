@@ -30,7 +30,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR2: many editors, one document',
-    caption: 'Each editor opens a WebSocket (lesson 2.5) to a collaboration server. All editors of one document are routed to the same server, chosen by hashing the document id (lesson 4.8). That server orders their edits.',
+    caption: 'Each editor opens a WebSocket (the Real-time Transport lesson) to a collaboration server. All editors of one document are routed to the same server, chosen by hashing the document id (the Consistent Hashing lesson). That server orders their edits.',
     packets: [{ from: 'a', to: 'collab', label: 'edit' }, { from: 'b', to: 'collab', label: 'edit', delay: 0.4 }],
   },
   {

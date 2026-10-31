@@ -32,12 +32,12 @@ const edges: BuildEdge[] = [
 const steps: BuildStep[] = [
   {
     req: 'FR1: record every view',
-    caption: 'The View API does one cheap thing: append the event to Kafka, a durable log that only grows at the end (lesson 8.6). It does not touch a counter. The log absorbs the burst.',
+    caption: 'The View API does one cheap thing: append the event to Kafka, a durable log that only grows at the end (the Kafka lesson). It does not touch a counter. The log absorbs the burst.',
     packets: [{ from: 'viewer', to: 'api', label: 'view' }, { from: 'api', to: 'kafka', label: 'view', delay: 0.9 }],
   },
   {
     req: 'FR1: count views per video',
-    caption: 'A Flink job (a program that processes a stream of events, lesson 8.7) reads the log and groups events by video id. It sums views for one minute, then writes one partial count per video. The store sees far fewer writes than there are views.',
+    caption: 'A Flink job (a program that processes a stream of events, the Flink lesson) reads the log and groups events by video id. It sums views for one minute, then writes one partial count per video. The store sees far fewer writes than there are views.',
     packets: [{ from: 'kafka', to: 'flink', label: '+1' }, { from: 'flink', to: 'counts', label: '+n', delay: 0.9 }],
   },
   {

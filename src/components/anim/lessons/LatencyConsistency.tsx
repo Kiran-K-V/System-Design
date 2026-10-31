@@ -3,7 +3,7 @@ import CacheWidgetFrame, { Seg } from './CacheWidgetFrame';
 
 type Mode = 'async' | 'semi' | 'sync';
 
-const LOCAL = 1; // ms to commit on the leader (~1 ms, see lesson 1.2)
+const LOCAL = 1; // ms to commit on the leader (~1 ms, see the Latency Numbers lesson)
 const NEAR_RTT = 1; // ms to a replica in another zone of the same region (~1 ms)
 
 const MODES: { id: Mode; label: string; blurb: string; tag: string }[] = [

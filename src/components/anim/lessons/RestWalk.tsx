@@ -71,7 +71,7 @@ const steps: WalkStep[] = [
   },
   {
     caption:
-      'Now the danger. A client sends POST /tweets, the response is lost, and the client retries. POST is not idempotent, so the server creates two tweets. Lesson 3.4 shows how to fix this.',
+      'Now the danger. A client sends POST /tweets, the response is lost, and the client retries. POST is not idempotent, so the server creates two tweets. The Idempotency lesson shows how to fix this.',
     req: { line: 'POST /tweets  (sent twice)', body: '{ "text": "hi" }' },
     res: { line: '201 Created  ×2', extra: 'Location: 982, Location: 983', ok: false },
     rows: [R980, { id: 982, text: 'hi' }, { id: 983, text: 'hi' }],

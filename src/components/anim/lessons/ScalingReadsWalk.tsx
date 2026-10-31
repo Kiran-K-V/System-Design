@@ -23,7 +23,7 @@ const lone: FlowNode = { id: 'db', x: 615, y: 150, w: 120, h: 80, label: 'Databa
 
 const steps: Step[] = [
   {
-    caption: 'One database serves every read and every write. Say it handles ~10,000 simple reads per second (lesson 1.5 gives 10K to 50K+ for one node). Demand is 25,000. The database is the ceiling, so requests queue.',
+    caption: 'One database serves every read and every write. Say it handles ~10,000 simple reads per second (the Numbers to Know lesson gives 10K to 50K+ for one node). Demand is 25,000. The database is the ceiling, so requests queue.',
     note: 'demand 25K/s, ceiling 10K/s',
     noteTone: 'bad',
     nodes: [users, app, { ...lone, tone: 'bad' }],
@@ -32,7 +32,7 @@ const steps: Step[] = [
     active: ['db'],
   },
   {
-    caption: 'Rung 1: read replicas (lesson 4.6). The primary keeps the writes. Three followers copy its log and answer reads. Capacity for reads is now about 3 x 10K. Writes still go to one machine.',
+    caption: 'Rung 1: read replicas (the Replication lesson). The primary keeps the writes. Three followers copy its log and answer reads. Capacity for reads is now about 3 x 10K. Writes still go to one machine.',
     note: 'reads spread over 3 replicas',
     nodes: [users, app, primary, { ...replicas, tone: 'ok' }],
     edges: [
@@ -45,7 +45,7 @@ const steps: Step[] = [
     active: ['replicas'],
   },
   {
-    caption: 'The price is replica lag. A user saves a post (it goes to the primary). The page reloads and the read hits a replica that has not replayed the log yet. The user sees the old data. This is the read-your-writes problem from lesson 4.10.',
+    caption: 'The price is replica lag. A user saves a post (it goes to the primary). The page reloads and the read hits a replica that has not replayed the log yet. The user sees the old data. This is the read-your-writes problem from the Consistency Models lesson.',
     note: 'write lands on primary, read hits a stale replica',
     noteTone: 'bad',
     nodes: [users, app, primary, { ...replicas, tone: 'bad', sub: 'x3, one behind' }],
@@ -62,7 +62,7 @@ const steps: Step[] = [
     active: ['replicas'],
   },
   {
-    caption: 'Fix: remember who wrote recently. For a short window after a write, send that user\'s reads to the primary. Everyone else keeps reading replicas. The primary carries only the few reads of recent writers. A position token (lesson 4.6) is the exact version of the same idea.',
+    caption: 'Fix: remember who wrote recently. For a short window after a write, send that user\'s reads to the primary. Everyone else keeps reading replicas. The primary carries only the few reads of recent writers. A position token (the Replication lesson) is the exact version of the same idea.',
     note: 'recent writers read the primary',
     noteTone: 'ok',
     nodes: [users, app, { ...primary, tone: 'ok' }, replicas],
@@ -76,7 +76,7 @@ const steps: Step[] = [
     active: ['primary'],
   },
   {
-    caption: 'Rung 2: a cache (lessons 5.1 to 5.4) in front of the replicas. At a 90% hit ratio only 1 read in 10 reaches the database, so the same replicas now carry about 10 times the demand. One cache node answers ~100K simple ops per second (lesson 5.1).',
+    caption: 'Rung 2: a cache (the lessons Why Cache through Eviction) in front of the replicas. At a 90% hit ratio only 1 read in 10 reaches the database, so the same replicas now carry about 10 times the demand. One cache node answers ~100K simple ops per second (the Why Cache lesson).',
     note: '90% hit: replicas see 10% of reads',
     nodes: [users, app, primary, replicas, { ...cache, tone: 'ok' }],
     edges: [
@@ -105,7 +105,7 @@ const steps: Step[] = [
     active: ['cache'],
   },
   {
-    caption: 'Rung 3: a CDN (lesson 2.7) for content that is the same for everyone: images, scripts, public pages. Those reads end at the edge and never reach your servers. If the CDN answers half of all reads, everything behind it sees half the demand. This only works for shared, cacheable responses.',
+    caption: 'Rung 3: a CDN (the CDN and Proxies lesson) for content that is the same for everyone: images, scripts, public pages. Those reads end at the edge and never reach your servers. If the CDN answers half of all reads, everything behind it sees half the demand. This only works for shared, cacheable responses.',
     note: 'CDN answers 50% at the edge',
     nodes: [users, { ...cdn, tone: 'ok' }, app, primary, replicas, cache],
     edges: [

@@ -63,7 +63,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'Reads go through a CDN. A CDN is a network of servers near users that keep copies of files. The first viewer in a region misses the cache, so the CDN fetches from the store (the origin) and keeps a copy. Later viewers nearby get it from the edge. The object store is the durable home. The CDN absorbs the read traffic (lesson 2.7).',
+      'Reads go through a CDN. A CDN is a network of servers near users that keep copies of files. The first viewer in a region misses the cache, so the CDN fetches from the store (the origin) and keeps a copy. Later viewers nearby get it from the edge. The object store is the durable home. The CDN absorbs the read traffic (the CDN and Proxies lesson).',
     active: 'cdn',
     edges: [
       { from: 'client', to: 'cdn', label: 'GET video', labelAt: [-40, 20] },

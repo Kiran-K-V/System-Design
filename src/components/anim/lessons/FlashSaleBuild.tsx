@@ -33,7 +33,7 @@ const edges: BuildEdge[] = [
 const steps: BuildStep[] = [
   {
     req: 'FR1: see item and stock',
-    caption: 'The sale page is the same for everyone, so a CDN serves it (lesson 2.7). A sold-out flag is cached for about a second. Millions of page views never reach our servers.',
+    caption: 'The sale page is the same for everyone, so a CDN serves it (the CDN and Proxies lesson). A sold-out flag is cached for about a second. Millions of page views never reach our servers.',
     packets: [{ from: 'users', to: 'cdn' }],
   },
   {

@@ -44,7 +44,7 @@ const LINES: Record<Strategy, Line[]> = {
     { caption: 'B pays inside the window and confirms. The hold becomes a booking. If B had paid after the hold expired, the confirm would fail unless it re-checks the seat.', arrow: 'confirm' },
   ],
   queue: [
-    { caption: 'A\'s request does not touch the seat. It is appended to a queue (lesson 6.1) that is keyed by seat, so every request for 12A lands in one place.', arrow: 'enqueue' },
+    { caption: 'A\'s request does not touch the seat. It is appended to a queue (the Queues lesson) that is keyed by seat, so every request for 12A lands in one place.', arrow: 'enqueue' },
     { caption: 'B\'s request is appended behind A\'s. The order is now fixed, and it was decided by one component, not by a race.', arrow: 'enqueue' },
     { caption: 'One worker takes the oldest request, A, checks the seat, and books it. Because only one worker handles this seat, there is no concurrent writer to collide with.', arrow: 'book' },
     { caption: 'The worker takes B\'s request. The seat is gone, so B gets "sold out". The price: the answer comes back through the queue, so the user waits, and one slow request delays those behind it.', arrow: 'book' },

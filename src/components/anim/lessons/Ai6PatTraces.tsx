@@ -49,7 +49,7 @@ const PATS: Pat[] = [
   },
   {
     title: 'Plan, execute, replan',
-    caption: 'Plan, execute, replan: write the steps first, run them one by one, and revise the remaining plan when a step fails. In this failing case step 3 hits a missing resource. The replanner changes steps 3 and 4 and the run goes on. Lesson A6.8 covers planning in depth.',
+    caption: 'Plan, execute, replan: write the steps first, run them one by one, and revise the remaining plan when a step fails. In this failing case step 3 hits a missing resource. The replanner changes steps 3 and 4 and the run goes on. The Planning lesson covers planning in depth.',
     nodes: [N('p', 120, 90, 'Plan', 'LLM'), N('x', 330, 90, 'Execute', 'one step'), N('c', 540, 90, 'Check', undefined, { tone: 'bad' }), N('r', 330, 200, 'Replan', 'LLM')],
     edges: [{ from: 'p', to: 'x' }, { from: 'x', to: 'c' }, { from: 'c', to: 'r', label: 'step failed', labelAt: [60, 6] }, { from: 'r', to: 'x', label: 'new steps', labelAt: [-48, 0] }],
     active: 'c',

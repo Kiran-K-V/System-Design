@@ -19,7 +19,7 @@ const ROWS: Row[] = [
   { m: { from: 'Host + model', to: 'MCP client', label: 'model chose get_weather', tone: 'warn' }, phase: 'Operation', caption: 'The host calls the model with these tools. The model writes a tool request. The spec says there SHOULD be a human in the loop who can deny the call, and that clients SHOULD show the inputs before the call.' },
   { m: { from: 'MCP client', to: 'MCP server', label: 'tools/call', tone: 'accent' }, phase: 'Operation', caption: 'After approval, the client sends tools/call with the tool name and arguments. This is a JSON-RPC request with an id.' },
   { m: { from: 'MCP server', to: 'MCP client', label: 'result, isError: false', tone: 'ok' }, phase: 'Operation', caption: 'The server runs the tool and returns content. A failed run still returns a result, with isError set to true. An unknown tool or bad arguments return a JSON-RPC error instead.' },
-  { m: { from: 'MCP client', to: 'Host + model', label: 'result to the model' }, phase: 'Operation', caption: 'The client passes the result to the host, and the host adds it to the model call. This is the tool loop from lesson A3.4, with MCP carrying the call to the server.' },
+  { m: { from: 'MCP client', to: 'Host + model', label: 'result to the model' }, phase: 'Operation', caption: 'The client passes the result to the host, and the host adds it to the model call. This is the tool loop from the Tool-calling Protocol lesson, with MCP carrying the call to the server.' },
 ];
 
 export default function Ai6McpSeq() {

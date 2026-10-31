@@ -29,7 +29,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR2: follow and unfollow',
-    caption: 'The follow graph is a table of (follower, followee) pairs, indexed both ways (lesson 4.3). We ask two questions of it: who does Ana follow, and who follows Ben.',
+    caption: 'The follow graph is a table of (follower, followee) pairs, indexed both ways (the Indexing lesson). We ask two questions of it: who does Ana follow, and who follows Ben.',
   },
   {
     req: 'FR3: view the home feed (pull)',
@@ -42,7 +42,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'NFR: write the feed ahead of time',
-    caption: 'When a post is published, a queue (lesson 6.1) hands it to workers. Each worker looks up the author\'s followers and adds the post id to each follower\'s feed. This is fan-out on write.',
+    caption: 'When a post is published, a queue (the Queues lesson) hands it to workers. Each worker looks up the author\'s followers and adds the post id to each follower\'s feed. This is fan-out on write.',
     packets: [{ from: 'api', to: 'queue' }, { from: 'workers', to: 'cache', delay: 0.8 }],
   },
   {

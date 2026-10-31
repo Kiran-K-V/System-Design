@@ -56,7 +56,7 @@ const PATS: Pat[] = [
   },
   {
     title: 'Autonomous agent',
-    caption: 'Autonomous agent. No fixed path. The model picks the next tool from what it sees, and it decides when it is done. This is the loop from lesson A6.1. Anthropic says agents suit open-ended problems where the number of steps is hard to predict, and that they bring higher cost and compounding errors. Budgets are required.',
+    caption: 'Autonomous agent. No fixed path. The model picks the next tool from what it sees, and it decides when it is done. This is the loop from the Agent Loop lesson. Anthropic says agents suit open-ended problems where the number of steps is hard to predict, and that they bring higher cost and compounding errors. Budgets are required.',
     nodes: [io('in', 60, 120, 'Goal'), { id: 'm', x: 230, y: 120, w: 140, h: 60, label: 'Model', sub: 'picks next step' }, { id: 't', x: 430, y: 120, w: 120, h: 60, label: 'Tools' }, io('out', 645, 120, 'Answer')],
     edges: [{ from: 'in', to: 'm' }, { from: 'm', to: 't', label: 'tool_use', labelAt: [0, -18] }, { from: 't', to: 'm', label: 'result', labelAt: [0, 20], bend: 50 }, { from: 't', to: 'out', label: 'model stops', labelAt: [-14, -24], dashed: true, tone: 'ok' }],
     active: 'm',

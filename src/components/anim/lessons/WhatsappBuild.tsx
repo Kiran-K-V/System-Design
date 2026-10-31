@@ -28,7 +28,7 @@ const steps: BuildStep[] = [
   {
     req: 'FR1: send and receive a message',
     caption:
-      'Start with one chat server. Alice and Bob each hold a WebSocket to it, which is one long-lived two-way connection (lesson 2.5). The server keeps a map from user to socket in memory. Alice sends a frame, the server looks up Bob, and it writes the frame to Bob’s socket. This works until one machine cannot hold every socket.',
+      'Start with one chat server. Alice and Bob each hold a WebSocket to it, which is one long-lived two-way connection (the Real-time Transport lesson). The server keeps a map from user to socket in memory. Alice sends a frame, the server looks up Bob, and it writes the frame to Bob’s socket. This works until one machine cannot hold every socket.',
     packets: [{ from: 'alice', to: 'gw1' }, { from: 'gw1', to: 'bob', delay: 0.9 }],
   },
   {

@@ -1,7 +1,7 @@
 /** Logic for E3.6. Illustrative models. Not measurements. */
 
-export const WEIGHT_BYTES = 140e9; // Llama 3 70B in BF16 (lesson A2.1)
-export const HBM_BYTES_PER_S = 3.35e12; // one H100 (lesson A2.1)
+export const WEIGHT_BYTES = 140e9; // Llama 3 70B in BF16 (the GPU Memory Math lesson)
+export const HBM_BYTES_PER_S = 3.35e12; // one H100 (the GPU Memory Math lesson)
 export const LAYERS = 80;
 export const SYNCS_PER_LAYER = 2; // two all-reduces per transformer layer in the forward pass (Megatron-LM)
 

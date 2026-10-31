@@ -57,7 +57,7 @@ const STRATEGIES: Strategy[] = [
       { m: m('Cache', 'App', 'hit: v1', 'ok'), caption: 'A hit.' },
       { m: m('App', 'Cache', 'GET user:9'), caption: 'Now a key that is not cached, while the database is down.' },
       { m: m('Cache', 'DB', 'load user:9', 'bad', { lost: true }), caption: 'The loader cannot reach the database.' },
-      { m: note('Cache', 'load failed: error', 'bad'), caption: 'Failure mode: every miss is an error, and many misses at once all hit the database together (lesson 5.5). Read-through hides complexity. It does not remove staleness: updates still need a write strategy.' },
+      { m: note('Cache', 'load failed: error', 'bad'), caption: 'Failure mode: every miss is an error, and many misses at once all hit the database together (the Invalidation and Stampede lesson). Read-through hides complexity. It does not remove staleness: updates still need a write strategy.' },
     ],
   },
   {

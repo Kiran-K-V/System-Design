@@ -15,7 +15,7 @@ const messages: SeqMessage[] = [
 
 const steps = [
   { caption: 'A client opens an HTTPS connection to a new server. Two handshakes must finish before the first byte of the page: TCP, then TLS 1.3. Watch the round trips add up.' },
-  { caption: 'TCP SYN leaves the client (lesson 2.1).' },
+  { caption: 'TCP SYN leaves the client (the IP, TCP, UDP lesson).' },
   { caption: 'SYN-ACK returns. The client now knows the server is up.' },
   { caption: '1 round trip is gone and no TLS has happened. Everything so far is plain TCP.' },
   { caption: 'The client sends the ACK and, right behind it, the TLS ClientHello. The hello lists the encryption methods the client supports and carries its half of the key exchange (the "key share"). TLS 1.3 sends the key share at once, which saves a round trip.' },

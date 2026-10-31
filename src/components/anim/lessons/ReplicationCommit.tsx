@@ -25,7 +25,7 @@ interface Step {
 
 const START: Step = {
   caption:
-    'One row, x, stored on three machines. The leader accepts writes. Two followers copy the leader’s log, the file where it records every change before applying it (lesson 4.2). All three hold x = 4 at log position 41.',
+    'One row, x, stored on three machines. The leader accepts writes. Two followers copy the leader’s log, the file where it records every change before applying it (the How a Database Stores Data lesson). All three hold x = 4 at log position 41.',
   leader: { sub: 'log 41 · x=4' },
   f1: { sub: 'log 41 · x=4' },
   f2: { sub: 'log 41 · x=4' },

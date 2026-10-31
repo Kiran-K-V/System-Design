@@ -29,7 +29,7 @@ const buffered: FlowEdge[] = [
 
 const steps: Step[] = [
   {
-    caption: 'A sale starts. Writes arrive at 30,000 per second for a short time. One primary takes ~10,000 simple writes per second (lesson 1.5 gives 5K to 20K). Writes queue up inside the database, latency climbs, and clients time out.',
+    caption: 'A sale starts. Writes arrive at 30,000 per second for a short time. One primary takes ~10,000 simple writes per second (the Numbers to Know lesson gives 5K to 20K). Writes queue up inside the database, latency climbs, and clients time out.',
     note: '30K/s burst, 10K/s ceiling',
     noteTone: 'bad',
     nodes: [clients, api, { ...lone, tone: 'bad' }],
@@ -38,7 +38,7 @@ const steps: Step[] = [
     active: ['db'],
   },
   {
-    caption: 'Write-behind through a queue (lesson 6.1). The API appends the write to a durable queue and answers at once. A worker drains the queue at the database\'s pace. The burst becomes a backlog, not an outage. The ack now means "accepted", not "stored".',
+    caption: 'Write-behind through a queue (the Queues lesson). The API appends the write to a durable queue and answers at once. A worker drains the queue at the database\'s pace. The burst becomes a backlog, not an outage. The ack now means "accepted", not "stored".',
     note: 'queue absorbs the burst',
     nodes: [clients, api, { ...queue, tone: 'warn', sub: 'backlog grows' }, worker, lone],
     edges: [...buffered, { from: 'worker', to: 'db' }],
@@ -62,7 +62,7 @@ const steps: Step[] = [
     active: ['db'],
   },
   {
-    caption: 'Sharding (lesson 4.7). One database cannot take sustained writes above its ceiling, so split the key space. The worker hashes the key and sends each row to one of 3 shards. With evenly spread keys the cluster takes about 3 times the writes. Writes to different shards never touch.',
+    caption: 'Sharding (the Sharding lesson). One database cannot take sustained writes above its ceiling, so split the key space. The worker hashes the key and sends each row to one of 3 shards. With evenly spread keys the cluster takes about 3 times the writes. Writes to different shards never touch.',
     note: 'hash(key) picks the shard',
     nodes: [clients, api, queue, worker, shard(0, 'ok'), shard(1, 'ok'), shard(2, 'ok')],
     edges: [...buffered, { from: 'worker', to: 's0' }, { from: 'worker', to: 's1' }, { from: 'worker', to: 's2' }],

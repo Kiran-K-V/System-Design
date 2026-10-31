@@ -35,7 +35,7 @@ const steps: Step[] = [
     tokens: 0, time: 0, burst: 'ok', burstRest: 'wait', later: 'none', active: 'burst',
   },
   {
-    caption: 'Requests 6 to 8 find no token. They are rejected with HTTP 429 (Too Many Requests). They are not queued here. A client that gets a 429 should wait and try again later (lesson 7.2).',
+    caption: 'Requests 6 to 8 find no token. They are rejected with HTTP 429 (Too Many Requests). They are not queued here. A client that gets a 429 should wait and try again later (the Timeouts, Retries, Backoff lesson).',
     tokens: 0, time: 0, burst: 'ok', burstRest: 'bad', later: 'none', active: 'burst',
   },
   {

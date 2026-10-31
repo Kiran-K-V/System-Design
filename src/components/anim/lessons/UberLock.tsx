@@ -53,7 +53,7 @@ const better: CompareVariant = {
   steps: [
     { caption: 'The same two matchers pick the same driver. Each now tries to create one key, only if it does not exist (the Redis command SET with the NX option and a 10 second expiry).', packets: [{ from: 'a', to: 'lock', label: 'lock if free' }, { from: 'b', to: 'lock', label: 'lock if free' }], active: ['lock'] },
     {
-      caption: 'Redis runs one command at a time (lesson 8.2). One SET wins. The other fails right away. There is no gap between check and write.',
+      caption: 'Redis runs one command at a time (the Redis lesson). One SET wins. The other fails right away. There is no gap between check and write.',
       tones: { a: 'ok', b: 'warn', lock: 'ok' },
       active: ['lock'],
     },

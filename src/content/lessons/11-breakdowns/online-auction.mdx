@@ -15,7 +15,7 @@ A seller lists a used Royal Enfield on a classifieds site. Ten minutes before th
 
 Two rules must hold. First, the highest bid wins, and no accepted bid may be silently lost. Second, everyone watching must see the new price quickly, or they bid against a price that is already gone.
 
-Most of the system is easy. One part is hard: many writers race to update **one value**, the highest bid of one auction. That is **contention**: many requests fighting for the same piece of data. Lesson [9.4](/learn/09-patterns/contention/) taught the general patterns. This case study applies them and adds two more problems: broadcasting the new price, and ending the auction on time.
+Most of the system is easy. One part is hard: many writers race to update **one value**, the highest bid of one auction. That is **contention**: many requests fighting for the same piece of data. The [Dealing with Contention](/learn/backend/09-patterns/contention/) lesson taught the general patterns. This case study applies them and adds two more problems: broadcasting the new price, and ending the auction on time.
 
 ## Requirements
 
@@ -50,7 +50,7 @@ Most of the system is easy. One part is hard: many writers race to update **one 
 | `GET /v1/auctions/{id}` | Status and current highest bid. |
 | `WS /v1/auctions/{id}/stream` | A WebSocket: one connection that stays open, so the server can push each new highest bid. |
 
-The bid call needs an idempotency key (lesson [3.4](/learn/03-api-design/idempotency/)). That is a unique token the client attaches to one bid, so the server can spot a repeat of the same request and ignore it. A phone that retries after a timeout must not place two bids.
+The bid call needs an idempotency key (the [Idempotency](/learn/backend/03-api-design/idempotency/) lesson). That is a unique token the client attaches to one bid, so the server can spot a repeat of the same request and ignore it. A phone that retries after a timeout must not place two bids.
 
 ## High-level design
 
@@ -63,7 +63,7 @@ Three details are worth saying aloud.
 - The **auction row** holds the current highest bid. It is the only value that bids compete for. The **bid log** is append-only: rows are only added, never changed, so all bids are kept.
 - A **pub/sub channel** (a named mailbox that many listeners can subscribe to) will carry each new price to viewers, and a **delay queue** (a queue that releases an item only at a set time) will end each auction. Both are explained in the deep dives below.
 - **Reads** and **writes** have different shapes. A viewer reads again and again. A bidder writes once in a while. Keep the two paths apart so viewers cannot slow bids down.
-- **Sharding** (lesson [4.7](/learn/04-data/sharding/)) is by auction id. All bids for one auction go to one shard. Different auctions spread over many shards.
+- **Sharding** (the [Sharding](/learn/backend/04-data/sharding/) lesson) is by auction id. All bids for one auction go to one shard. Different auctions spread over many shards.
 
 ## Numbers
 
@@ -77,7 +77,7 @@ The naive handler does three steps in code: read the row, compare, write. The pr
 
 <AuctionRace client:visible />
 
-The failure is called a **lost update**. B was told "accepted", then A overwrote B. This is the same anomaly lesson [4.4](/learn/04-data/transactions/) showed.
+The failure is called a **lost update**. B was told "accepted", then A overwrote B. This is the same anomaly the [Transactions and Isolation](/learn/backend/04-data/transactions/) lesson showed.
 
 The fix puts the check and the write in one statement. It is a **conditional write**, also called **compare-and-set**: change the value only if it still has the value you expect.
 
@@ -97,7 +97,7 @@ What are the other options?
 |---|---|---|
 | Row lock first | `SELECT ... FOR UPDATE`, then update | Holds a lock across two statements. Bids queue behind each other |
 | Single writer per auction | Route all bids of one auction to one partition and one thread | Needs routing, and failover for the owner. No lock fights at all |
-| Redis script | A Lua script (a small program that Redis runs as one uninterrupted step) does the compare and set in memory (lesson [8.2](/learn/08-technologies/redis/)) | Fast, but a failover can lose the latest bids. Say this out loud |
+| Redis script | A Lua script (a small program that Redis runs as one uninterrupted step) does the compare and set in memory (the [Redis](/learn/backend/08-technologies/redis/) lesson) | Fast, but a failover can lose the latest bids. Say this out loud |
 
 Do not lock the whole table. That makes every auction wait for every other auction.
 
@@ -105,17 +105,17 @@ Do not lock the whole table. That makes every auction wait for every other aucti
 
 Each viewer wants the new price. The first idea is to poll. With thousands of viewers polling once a second, one auction row takes thousands of reads a second. A viewer sees a new price up to a second late.
 
-Push is better. After a bid commits, the service publishes it to a **channel** for that auction, using pub/sub (lesson [6.2](/learn/06-async/pubsub-logs/)). **Gateway** servers hold the viewers' WebSocket connections (lesson [9.3](/learn/09-patterns/real-time-updates/)). Each gateway subscribes to the channels of the auctions its viewers watch, and pushes each message to those viewers.
+Push is better. After a bid commits, the service publishes it to a **channel** for that auction, using pub/sub (the [Pub/Sub and Logs](/learn/backend/06-async/pubsub-logs/) lesson). **Gateway** servers hold the viewers' WebSocket connections (the [Real-time Updates](/learn/backend/09-patterns/real-time-updates/) lesson). Each gateway subscribes to the channels of the auctions its viewers watch, and pushes each message to those viewers.
 
 Two details matter. A gateway that restarts loses its connections. Clients reconnect and fetch the current state with a plain `GET`, so a missed push is repaired. Second, send the highest bid and its version, not "a bid happened". A viewer drops any message older than what it already shows, so out-of-order delivery is harmless.
 
 ## Deep dive: when the auction ends
 
-A cron job (a task that runs on a fixed schedule) that scans all auctions every minute is late by up to a minute. It scans millions of rows. Use a timer per auction instead. When an auction is created, schedule a close event at its end time in a delay queue or scheduler. One example is in lesson [11.15](/learn/11-breakdowns/job-scheduler/).
+A cron job (a task that runs on a fixed schedule) that scans all auctions every minute is late by up to a minute. It scans millions of rows. Use a timer per auction instead. When an auction is created, schedule a close event at its end time in a delay queue or scheduler. One example is in the [Job Scheduler](/learn/backend/11-breakdowns/job-scheduler/) lesson.
 
 Two rules protect the end.
 
-1. **The server clock decides.** A bid is valid only if `end_at > now()` on the database. A phone clock can be wrong or changed. A bid that left the phone at 17:59:59.9 but arrives at 18:00:00.1 is late. Say so in the rules. Clocks across servers also differ slightly (lesson [10.5](/learn/10-advanced/ids-and-time/)), so judge time in one place, the shard that owns the auction.
+1. **The server clock decides.** A bid is valid only if `end_at > now()` on the database. A phone clock can be wrong or changed. A bid that left the phone at 17:59:59.9 but arrives at 18:00:00.1 is late. Say so in the rules. Clocks across servers also differ slightly (the [Distributed IDs and Time](/learn/backend/10-advanced/ids-and-time/) lesson), so judge time in one place, the shard that owns the auction.
 2. **Closing is conditional too.** Many auctions use **anti-sniping**: a bid in the last two minutes pushes the end time out by two minutes. Then the timer that fires at the old time is stale. The close statement is `UPDATE ... SET status = 'closed' WHERE id = :id AND status = 'open' AND end_at <= now()`. If it affects 0 rows, the auction was extended, so reschedule the timer for the new `end_at`.
 
 ## Trade-offs

@@ -47,7 +47,7 @@ const steps: Step[] = [
   },
   {
     caption:
-      'The Tensor Cores do the matrix math. NVIDIA lists 1,979 TFLOPS for BF16 on the H100 page, marked "with sparsity". Dense math, which is what normal models use, is half: about 989 TFLOPS. Each weight byte brings only a few FLOPs of work. So the cores wait for memory. Lesson A2.2 shows by how much.',
+      'The Tensor Cores do the matrix math. NVIDIA lists 1,979 TFLOPS for BF16 on the H100 page, marked "with sparsity". Dense math, which is what normal models use, is half: about 989 TFLOPS. Each weight byte brings only a few FLOPs of work. So the cores wait for memory. The Prefill vs Decode: TTFT and TPOT lesson shows by how much.',
     active: 3,
     readout: '989 TFLOPS dense (1,979 is the sparse figure)',
   },

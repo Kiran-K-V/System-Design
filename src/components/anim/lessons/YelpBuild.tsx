@@ -30,12 +30,12 @@ const edges: BuildEdge[] = [
 const steps: BuildStep[] = [
   {
     req: 'FR1: search by name, place, category',
-    caption: 'A search goes to a search index (lesson 8.5) that holds each business with a text field, a category, and a location. One query mixes all three filters. The database is not asked.',
+    caption: 'A search goes to a search index (the Elasticsearch lesson) that holds each business with a text field, a category, and a location. One query mixes all three filters. The database is not asked.',
     packets: [{ from: 'client', to: 'api', label: 'pizza near me' }, { from: 'api', to: 'search', delay: 0.9 }, { from: 'search', to: 'index', delay: 1.8 }],
   },
   {
     req: 'FR1: keep the index fed',
-    caption: 'The business database stays the source of truth. A change feed (lesson 6.5) copies each change into the index. The index may lag a little. Eventual consistency is acceptable here.',
+    caption: 'The business database stays the source of truth. A change feed (the Change Data Capture lesson) copies each change into the index. The index may lag a little. Eventual consistency is acceptable here.',
     packets: [{ from: 'bizdb', to: 'index', label: 'change' }],
   },
   {
