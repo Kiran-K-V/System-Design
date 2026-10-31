@@ -75,7 +75,18 @@ Length: set by the number of ideas, not a word limit. A lesson with about 10 ide
 
 ## 4. Visual contract
 
-Every lesson has at least **one step-through animation** (`AnimFrame` with `steps: {caption}[]`, rendering a pure function of the step index) and **one more visual**: a second animation, a live simulator with sliders or buttons, or a static infographic. Static infographics are React components with no hooks and no client directive.
+Every lesson has at least **one step-through animation** (`AnimFrame` with `steps: {caption}[]`, rendering a pure function of the step index). A second visual is optional: add one only if it passes the test below. Static infographics are React components with no hooks and no client directive.
+
+**Value test. Every animation or widget must pass it, or it is not built.** Ask: what does the reader see that one sentence cannot say? It must show a mechanism, a sequence in time, a data flow, a state change, or a failure. Then it earns its place.
+
+Do NOT build these (a past cleanup removed 195 of them):
+- A slider, dropdown or toggle whose only effect is that one number changes another number ("double X, Y doubles"; "raise the load, cost goes up").
+- A calculator, planner, cost estimator or break-even tool. Put the formula and one worked example in prose.
+- Bar charts or tables that restate numbers already in the text.
+- A stepper of boxes that only shows arithmetic or a formula.
+- A "simulator" with made-up numbers where the lesson is one sentence.
+
+A slider is fine only when moving it changes a picture of a mechanism (items move, a queue fills, a ring rebalances), and the idea is not obvious from text. Prose must never tell the reader to "move the slider" to learn a fact. If unsure, cut it. Fewer visuals that teach beat many that decorate.
 
 - Follow `design/DIAGRAMS.md`. Use `TEXT_SIZES` tokens, `STROKE`, tone colors that mean state (`accent` active, `ok`, `bad`, `warn`, `muted`), one active element per step. Hatch only on number badges.
 - Build with the primitives and kits. Do not draw raw SVG shapes or text when a primitive exists.
@@ -83,7 +94,7 @@ Every lesson has at least **one step-through animation** (`AnimFrame` with `step
 - Use CSS variables only (`var(--accent)`, `--ok`, `--bad`, `--warn`, `--muted`, `--fg`, `--bg`, `--surface`, `--border`, `--node`) so dark mode works.
 - Step captions explain what just happened and why, in plain English. One idea per step. No autoplay.
 - **Server-side render safety:** no `Math.random()`, `Date.now()`, or `window` or `localStorage` reads during render (hydration mismatch). Randomness and storage go in effects or handlers. Use `seedOf('key')` for sketch seeds.
-- Interactive logic (simulators, calculators) gets its logic in a separate `.ts` file and a quick node test of the numbers. State the model's assumptions in the lesson.
+- Interactive logic that passes the value test gets its logic in a separate `.ts` file and a quick node test of the numbers. State the model's assumptions in the lesson.
 - New components go in `src/components/anim/lessons/<UniqueName>.tsx`. Run `ls` first. Reuse and compose. Do not copy near-duplicates.
 
 ## 5. Process and model routing

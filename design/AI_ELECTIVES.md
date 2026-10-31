@@ -27,7 +27,7 @@ The plan was written before the Numbers policy (NEXT_LESSONS.md, 2026-10-20). Wh
 
 - No `Ballpark` anywhere in the electives. Where the plan says "Prove it: Ballpark", write a `Diagnose` or a concept quiz question instead (what happens, why, which choice).
 - No step-by-step arithmetic walks in prose and no quiz question that asks the reader to compute. A single sourced order-of-magnitude anchor that explains a design choice is fine ("~16 bytes per parameter, so one GPU cannot hold a 70B model's training state").
-- Interactive calculators and simulators are allowed: the widget does the arithmetic, the prose states the conclusion. Label assumptions in the widget "illustrative" when they are not sourced.
+- No calculators or slider-and-number simulators. Every visual must pass the value test in `design/NEXT_LESSONS.md` section 4: no slider-and-number simulators, no calculators. Label assumptions "illustrative" when they are not sourced.
 - Published figures from a source (a paper's speedup, a company's latency) are fine. Cite them, label vendor numbers "company claim" or "paper claim", and state what exactly they measure.
 
 ## 5. Facts

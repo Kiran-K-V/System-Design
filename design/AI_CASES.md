@@ -18,7 +18,7 @@ Read `design/NEXT_LESSONS.md` and `design/AI_LESSONS.md` first. Every rule there
 5. **Core entities and API.** Short.
 6. **A naive design and where it breaks.** Show the failure as a story.
 7. **High-level design.** Built step by step with `DesignBuild` (one box per requirement, each step names the requirement).
-8. **Three deep dives** (h2 each, named for the idea). Each has a worked example. At least one has a second interactive visual (`DesignCompare` or a simulator with sliders).
+8. **Three deep dives** (h2 each, named for the idea). Each has a worked example. A second visual is optional (`DesignCompare` or a mechanism picture). Every visual must pass the value test in `design/NEXT_LESSONS.md` section 4: no slider-and-number simulators, no calculators.
 9. **Failure modes and an incident drill.** A table of failure modes (what happens, how you detect it, what you do). Then one `Diagnose` with a unique id.
 10. **Drills** (only where the plan lists them). A "## Drill: <name>" h2 each, 10 to 15 minutes of work: bar, design in a few paragraphs, a failure, a `Diagnose`. Drills need their own sources.
 11. **Staff answer vs senior answer.** A two-column table or two short blocks. Concrete differences, not adjectives.

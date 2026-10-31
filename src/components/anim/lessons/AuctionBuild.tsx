@@ -42,7 +42,7 @@ const steps: BuildStep[] = [
   },
   {
     req: 'FR3: view an auction',
-    caption: 'A viewer asks for the auction and gets the current highest bid. Reads are far more common than bids, so this path can use a replica or a short cache (lessons 4.6 and 5.3) when a few seconds of lag is acceptable.',
+    caption: 'A viewer asks for the auction and gets the current highest bid. Reads are far more common than bids, so this path can use a replica or a short cache (lessons Replication and Cache Strategies) when a few seconds of lag is acceptable.',
     packets: [{ from: 'viewer', to: 'svc', label: 'GET' }],
   },
   {

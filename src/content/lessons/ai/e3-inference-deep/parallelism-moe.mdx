@@ -6,8 +6,6 @@ requires: ['ai/e2-training/model-parallelism', 'ai/a2-inference-cost/gpu-memory-
 import Callout from '../../../../components/lesson/Callout.astro';
 import Quiz from '../../../../components/lesson/Quiz.tsx';
 import Diagnose from '../../../../components/lesson/Diagnose.tsx';
-import AiE3ParSplit from '../../../../components/anim/lessons/AiE3ParSplit.tsx';
-import AiE3MoeRouter from '../../../../components/anim/lessons/AiE3MoeRouter.tsx';
 
 ## The problem
 
@@ -37,13 +35,11 @@ Think of a team of painters on one wall. Two painters double the speed. Eight pa
 
 The animation shows this with a simple model. Step through 2, 4, and 8 GPUs, then look at the layouts.
 
-<AiE3ParSplit client:visible />
-
 The numbers in the animation are illustrative. We chose the sync cost to show the shape. The shape matches what Databricks measured. Their guide says that, unlike in training, adding GPUs gives "significant diminishing returns" for inference latency. They name two reasons: communication overhead inside the node, and lower use of memory bandwidth (MBU, from the [Prefill vs Decode: TTFT and TPOT](/learn/ai/a2-inference-cost/prefill-decode/) lesson) when each GPU reads less. For Llama2-70B, going from 4 to 8 GPUs cut latency only to about 0.7 times at small batch sizes. That is a vendor measurement on their setup. It is one data point, not a law.
 
 Two more points about TP in serving.
 
-- **Keep it inside one server.** The E2.4 rule holds. TP talks a lot, so it needs NVLink [mid], the direct GPU-to-GPU link. Across servers, the network is far slower, and the sync would dominate.
+- **Keep it inside one server.** The [Tensor, Pipeline, Sequence, and Expert Parallelism](/learn/ai/e2-training/model-parallelism/) rule holds. TP talks a lot, so it needs NVLink [mid], the direct GPU-to-GPU link. Across servers, the network is far slower, and the sync would dominate.
 - **A split is also a memory tool.** A 70B model in 16-bit needs more than one H100 for the weights alone (the [GPU Memory Math](/learn/ai/a2-inference-cost/gpu-memory-math/) lesson). TP also makes room for the KV cache, because each GPU holds less weight. So the lowest TP degree that fits the weights and the cache is a sensible start. Go higher only for a latency target that you cannot meet otherwise.
 
 ## What pipeline parallelism buys in serving
@@ -75,7 +71,7 @@ The Mixtral paper gives the example. Each layer has 8 experts. The router picks 
 
 Memory is different. The router can send a token to any expert, so every expert must be in GPU memory. Memory follows the total, not the active count. A 47B model at 16 bits needs about 94 GB for weights alone.
 
-Now the effect on a decode step. A step reads weights, and decode is limited by memory reads (the [Prefill vs Decode: TTFT and TPOT](/learn/ai/a2-inference-cost/prefill-decode/) lesson). With a batch of one token, only 2 of the 8 experts are read. With a bigger batch, different tokens pick different experts, and soon nearly all experts are read. The widget below shows this under an even-routing assumption. The DeepSpeed-MoE paper states the cost side: inference is often limited by memory bandwidth, and an MoE model can be up to 10 times larger than a dense model of the same quality, so it could need much more bandwidth to match the dense model's latency. So an MoE saves compute but not memory, and at large batches it does not save memory reads either. It saves most when the batch is small, or when compute is what limits you.
+Now the effect on a decode step. A step reads weights, and decode is limited by memory reads (the [Prefill vs Decode: TTFT and TPOT](/learn/ai/a2-inference-cost/prefill-decode/) lesson). With a batch of one token, only 2 of the 8 experts are read. With a bigger batch, different tokens pick different experts, and soon nearly all experts are read. This effect assumes even routing. The DeepSpeed-MoE paper states the cost side: inference is often limited by memory bandwidth, and an MoE model can be up to 10 times larger than a dense model of the same quality, so it could need much more bandwidth to match the dense model's latency. So an MoE saves compute but not memory, and at large batches it does not save memory reads either. It saves most when the batch is small, or when compute is what limits you.
 
 ## Expert parallelism and the all-to-all
 
@@ -93,12 +89,6 @@ The router decides how many tokens each expert gets. Nothing forces it to spread
 
 Why? The all-to-all brings tokens to experts. Every GPU runs its experts, then the results go back. Nobody can go on until the slowest GPU is done. If one GPU holds a hot expert, it has the most work, and every other GPU waits for it. The step time follows the hot expert. Adding GPUs does not help, because one expert is still one expert.
 
-Try it. Raise the share of routing that goes to expert 4. Watch the step time. Then add copies of that expert on the lightest GPUs.
-
-<AiE3MoeRouter client:visible />
-
-What the widget shows:
-
 1. **At an even share, the load is even.** The step has no extra wait. Only the fixed all-to-all cost remains.
 2. **A hot expert makes one GPU the bottleneck.** The step time grows with the load of that GPU. Moving other experts around does not help much, because the hot expert alone is the load.
 3. **Copies of the hot expert spread its tokens.** With enough copies, the load evens out. The price is the memory of each copy, in every MoE layer that has a hot expert.
@@ -106,7 +96,7 @@ What the widget shows:
 
 What are the real fixes? These are our reading of the mechanism, not measured results from a source:
 
-- **Replicate the hot expert** onto lighter GPUs, as in the widget. It costs memory, and it needs a router that knows about the copies.
+- **Replicate the hot expert** onto lighter GPUs. It costs memory, and it needs a router that knows about the copies.
 - **Rebalance placement over time**, from the observed load. Experts that are hot together should not share a GPU.
 - **Watch expert load as a metric.** The first sign is a step time that rises with no change in batch size.
 - **Do not drop tokens at a cap unless the model was built for it.** Dropping a token changes the answer.

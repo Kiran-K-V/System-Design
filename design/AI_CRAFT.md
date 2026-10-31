@@ -31,7 +31,7 @@ Read `design/NEXT_LESSONS.md` and `design/AI_LESSONS.md` first. Every rule there
 
 ## 4. Visuals
 
-Two per lesson. Follow `design/DIAGRAMS.md` (hand-drawn look). One step-through with `AnimFrame` (see existing `Ai9Ver*.tsx` components for the pattern). One second visual: a compare, a simulator, or a checklist widget. Interactive maths goes in a separate `.ts` file with a node check; label assumptions "illustrative". SVG text at least 12px rendered.
+Two per lesson. Follow `design/DIAGRAMS.md` (hand-drawn look). One step-through with `AnimFrame` (see existing `Ai9Ver*.tsx` components for the pattern). A second visual is optional: a compare, a mechanism picture, or a checklist widget. Every visual must pass the value test in `design/NEXT_LESSONS.md` section 4: no slider-and-number simulators, no calculators. Interactive logic that passes the test goes in a separate `.ts` file with a node check; label assumptions "illustrative". SVG text at least 12px rendered.
 
 ## 5. Rules
 

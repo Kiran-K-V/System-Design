@@ -21,7 +21,7 @@ Read `design/NEXT_LESSONS.md`, `design/AI_LESSONS.md`, and `design/AI_CASES.md` 
 
 ## 3. Visuals
 
-Two: (1) a step-through of the before/after or the mechanism with `AnimFrame` or `DesignCompare` (see `src/components/anim/DesignBuild.tsx`, `src/components/anim/lessons/ShopifyCompare.tsx`); (2) the second visual the plan names (simulator, bar compare, timeline). Follow `design/DIAGRAMS.md`. Interactive maths goes in a separate `.ts` file with a node check; label simulator assumptions "illustrative".
+Two: (1) a step-through of the before/after or the mechanism with `AnimFrame` or `DesignCompare` (see `src/components/anim/DesignBuild.tsx`, `src/components/anim/lessons/ShopifyCompare.tsx`); (2) an optional second visual (compare, timeline, mechanism picture). Every visual must pass the value test in `design/NEXT_LESSONS.md` section 4: no slider-and-number simulators, no calculators. Follow `design/DIAGRAMS.md`. Interactive logic that passes the test goes in a separate `.ts` file with a node check; label simulator assumptions "illustrative".
 
 ## 4. Rules
 
