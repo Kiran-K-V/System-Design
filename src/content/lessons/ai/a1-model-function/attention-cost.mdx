@@ -20,7 +20,7 @@ It does not. Measure it and the long prompt is slower than 100 times. The 2N rul
 
 If each token costs the same, a prompt costs `n × 2N`. Latency grows in a straight line. You plan capacity on that. And for a short prompt it is nearly true.
 
-It fails because of what attention does. **Attention** [mid] lets a token pull information from the other tokens. Each token makes a **query** [mid] (what am I looking for). Each earlier token offers a **key** [mid] (what do I hold) and a **value** [mid] (what I pass on). The model compares the query with every key. It turns the scores into weights with softmax. Then it takes a weighted sum of the values.
+It fails because of what attention does. **Attention** lets a token pull information from the other tokens. Each token makes a **query** (what am I looking for). Each earlier token offers a **key** (what do I hold) and a **value** (what I pass on). The model compares the query with every key. It turns the scores into weights with softmax. Then it takes a weighted sum of the values.
 
 <Math block tex="\text{Attention}(Q,K,V) = \text{softmax}\!\left(\frac{Q K^{\top}}{\sqrt{d_k}}\right) V" />
 
@@ -28,7 +28,7 @@ The original Transformer paper states this formula. In words: score every query 
 
 ## The mechanism: the score matrix
 
-Picture the scores as an n × n grid. Row i holds token i's scores against every token it may read. A **causal mask** [mid] blocks the cells above the diagonal, because a text generator may not read the future. About half the grid stays.
+Picture the scores as an n × n grid. Row i holds token i's scores against every token it may read. A **causal mask** blocks the cells above the diagonal, because a text generator may not read the future. About half the grid stays.
 
 <Ai1AttnMatrix client:visible />
 
@@ -37,19 +37,19 @@ Per layer, the score step does work for every cell of the grid. The grid has n r
 Two things follow. For a short prompt, the weight work dominates and attention is a small extra. For a long prompt, the n² part takes over. For a 70B model the crossover sits at a prompt of tens of thousands of tokens (~54,000 with a full mask, our derived estimate). At 128K tokens, attention costs more than all the weights together.
 
 Make the prompt 16 times longer and the weight work grows 16 times. The attention work grows about 256 times. Kernels that skip the masked half do half the work, but the shape of the curve stays the same.
-All of this is the **prefill** [mid] phase: the model reads the whole prompt at once. During generation, each new token adds just one row of n scores. As a result, its attention work grows linearly with the context. The [Prefill vs Decode: TTFT and TPOT](/learn/ai/a2-inference-cost/prefill-decode/) lesson covers that phase.
+All of this is the **prefill** phase: the model reads the whole prompt at once. During generation, each new token adds just one row of n scores. As a result, its attention work grows linearly with the context. The [Prefill vs Decode: TTFT and TPOT](/learn/ai/a2-inference-cost/prefill-decode/) lesson covers that phase.
 
 ## Memory: the n × n matrix
 
 A naive implementation writes the whole score matrix to GPU memory, for every head. That matrix also grows with n². At 8K tokens it is already gigabytes. At 128K it is terabytes (~2 TB per layer, our estimate). No GPU has that, so the naive method does not work at long context, whatever the compute budget.
 
-**FlashAttention** [senior] fixes the memory problem without changing the answer. Its authors call it "an IO-aware exact attention algorithm that uses tiling". It computes the result in small tiles that fit in fast on-chip memory. The method fuses the steps into one GPU kernel. It also keeps only a running maximum and sum per row. The paper reports that it uses less memory, linear in sequence length, and is up to 7.6x faster on GPT-2 (their Figure 1).  The extra storage is just a few numbers per row, so it stays small even at 128K.
+**FlashAttention** fixes the memory problem without changing the answer. Its authors call it "an IO-aware exact attention algorithm that uses tiling". It computes the result in small tiles that fit in fast on-chip memory. The method fuses the steps into one GPU kernel. It also keeps only a running maximum and sum per row. The paper reports that it uses less memory, linear in sequence length, and is up to 7.6x faster on GPT-2 (their Figure 1).  The extra storage is just a few numbers per row, so it stays small even at 128K.
 
 Note what did **not** change. FlashAttention computes every cell, so FLOPs stay quadratic. It saves memory reads and writes, which is where the time goes in practice. But a 128K prefill still does the n² work.
 
 ## The KV cache: what you must keep
 
-When a model generates token n+1, it needs the keys and values of all n earlier tokens. They do not change, so the model computes them once and stores them. That store is the **KV cache** [mid]. It is a cache in the backend sense: compute once, read many times, memory in exchange for compute.
+When a model generates token n+1, it needs the keys and values of all n earlier tokens. They do not change, so the model computes them once and stores them. That store is the **KV cache**. It is a cache in the backend sense: compute once, read many times, memory in exchange for compute.
 
 <CrossTrackLink id="05-caching/why-cache">
 A cache trades memory for repeated work. The KV cache avoids repeated work for attention. It keeps each token's key and value. As a result, later tokens do not recompute them. As with any cache, size and eviction become design questions.
@@ -57,7 +57,7 @@ A cache trades memory for repeated work. The KV cache avoids repeated work for a
 
 The cache stores a key and a value for every token, in every layer, for every KV head. So its size per token is fixed for a given model. For Llama 3 70B it is ~320 KiB per token. A 128K sequence takes ~40 GiB. The cache grows in a straight line with n, but each user has their own.
 
-Why 8 KV heads and not 64? **Multi-query attention (MQA)** [senior] has all query heads share one key and value head. The shared head cuts memory traffic when generating, at a small quality loss. **Grouped-query attention (GQA)** [senior] sits between full multi-head and MQA. Its authors report that a multi-head checkpoint can be converted with about 5% of the original pretraining compute. The converted model has quality close to multi-head and speed close to MQA. Llama 3 uses 8 KV heads with 64 query heads at 70B. With a KV head for every query head the cache would be 8 times larger, far too big to hold many users on one GPU.
+Why 8 KV heads and not 64? **Multi-query attention (MQA)** has all query heads share one key and value head. The shared head cuts memory traffic when generating, at a small quality loss. **Grouped-query attention (GQA)** sits between full multi-head and MQA. Its authors report that a multi-head checkpoint can be converted with about 5% of the original pretraining compute. The converted model has quality close to multi-head and speed close to MQA. Llama 3 uses 8 KV heads with 64 query heads at 70B. With a KV head for every query head the cache would be 8 times larger, far too big to hold many users on one GPU.
 
 Llama 3 supports up to 128K tokens. Its paper says the model was pretrained at 8K and then extended. Several vendors list windows of about 1M tokens as of 2026-10-15 (the [Why Models Hallucinate, and the Context Window](/learn/ai/a1-model-function/hallucination-context/) lesson). A big window is a ceiling, not a recommendation: each token costs compute, memory, and latency.
 

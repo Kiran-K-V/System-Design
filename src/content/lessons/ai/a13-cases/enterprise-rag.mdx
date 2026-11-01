@@ -58,9 +58,9 @@ The eval comes before the design (the [AI Design Method](/learn/ai/a0-orientatio
 
 **2. Generation metrics.** The Ragas docs define **faithfulness** as "claims in the response supported by the retrieved context" divided by "total claims in the response". Their example: "Einstein was born in Germany on 20th March 1879" has two claims. The birthplace is supported. The date is not, because the context says 14 March. So only half the claims are supported, and faithfulness is low. **Context recall** is reference claims supported by the retrieved context, divided by all reference claims. **Answer relevancy** is the mean cosine similarity between the question and questions generated from the answer ([Ragas](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/faithfulness/)).
 
-**3. Leak tests with canary documents.** A **canary document** [mid] is a planted document with a unique made-up string, readable only by a probe group. Callers outside the group ask questions built to retrieve it: its title, its topic, the exact string. The string must never appear in a prompt, citation, answer, cache entry, or log line. Run this in CI on every retrieval or ACL change, and all day in production.
+**3. Leak tests with canary documents.** A **canary document** is a planted document with a unique made-up string, readable only by a probe group. Callers outside the group ask questions built to retrieve it: its title, its topic, the exact string. The string must never appear in a prompt, citation, answer, cache entry, or log line. Run this in CI on every retrieval or ACL change, and all day in production.
 
-Canary tests do not prove zero. If a thousand canary queries find no leak, the **rule of three** [senior] only says the true leak rate is small at 95% confidence, not that it is zero. So canaries find bugs. The zero comes from the design: a filter inside the search plus a final check.
+Canary tests do not prove zero. If a thousand canary queries find no leak, the **rule of three** only says the true leak rate is small at 95% confidence, not that it is zero. So canaries find bugs. The zero comes from the design: a filter inside the search plus a final check.
 
 **4. Freshness probes.** A probe edits, revokes, and deletes a test document in every source on a timer and times how long the index takes to agree (deep dive 2). Online, watch the share of answers with a valid citation and user reports of "this cites something I cannot open".
 
@@ -129,7 +129,7 @@ The [Permissions in Retrieval](/learn/ai/a5-rag/retrieval-permissions/) lesson n
 | Pre-filter | The ACL is a condition inside the search | Full lists if the store filters inside the graph | A list of group ids per query | [Azure AI Search](https://learn.microsoft.com/en-us/azure/search/search-security-trimming-for-azure-search) |
 | Index per tenant | One index or namespace per customer | Perfect isolation between customers | Overhead per index | [Qdrant](https://qdrant.tech/documentation/guides/multiple-partitions/), [Pinecone](https://docs.pinecone.io/guides/index-data/indexing-overview) |
 
-Post-filter rows shrink with selectivity (selectivity [mid] is the share of rows that pass the filter). The index scans a fixed number of candidates (`ef_search`), and only the passing share survives. A narrow-access employee gets under one row. Iterative scans keep going, but stop at `hnsw.max_scan_tuples`, 20,000 by default.
+Post-filter rows shrink with selectivity (selectivity is the share of rows that pass the filter). The index scans a fixed number of candidates (`ef_search`), and only the passing share survives. A narrow-access employee gets under one row. Iterative scans keep going, but stop at `hnsw.max_scan_tuples`, 20,000 by default.
 
 Pre-filtering has its own cost. Azure's security trimming is "a regular OData filter" over a string field of principals. An OR chain over hundreds of ids "slows down query response time by many seconds", while `search.in` gives "subsecond response times". Pinecone's `$in` takes at most 10,000 values. Azure also says the principal is "just a string": nothing verifies it, so one piece of code must build the filter. Elasticsearch enforces a role query inside the engine, but "Document level security doesn't apply to write APIs" ([Elastic](https://www.elastic.co/docs/deploy-manage/users-roles/cluster-or-deployment-auth/controlling-access-at-document-field-level)). An exact scan over the matches also costs a lot of memory traffic on every query. Use an index that filters inside the graph.
 
@@ -171,7 +171,7 @@ The answer cache is often the largest term. The final check replaces the whole c
 
 One leak can survive even a fresh index. Alice is in group G, which reads folder F. At 09:00 she is removed from G. At 09:05 Bob adds "layoff list" to F. At 09:10 Alice asks. If the permission check reads a cache made at 08:55, it still says she may read F, so she gets a document that did not exist while she had access.
 
-SpiceDB's docs, following Google's Zanzibar design, call this the **new-enemy problem** [staff]: "if a relationship has changed, and all the caches have not been updated or cleared". The fix is a **consistency token** [senior]. A ZedToken is "an opaque token representing a point-in-time of the SpiceDB datastore", and it "protects users from the New Enemy Problem". The mode `minimize_latency` is fastest but can leave a window. `at_least_as_fresh` guarantees data "at least as fresh as" a token. `fully_consistent` "explicitly bypasses caching, dramatically impacting latency" ([SpiceDB](https://authzed.com/docs/spicedb/concepts/consistency)).
+SpiceDB's docs, following Google's Zanzibar design, call this the **new-enemy problem**: "if a relationship has changed, and all the caches have not been updated or cleared". The fix is a **consistency token**. A ZedToken is "an opaque token representing a point-in-time of the SpiceDB datastore", and it "protects users from the New Enemy Problem". The mode `minimize_latency` is fastest but can leave a window. `at_least_as_fresh` guarantees data "at least as fresh as" a token. `fully_consistent` "explicitly bypasses caching, dramatically impacting latency" ([SpiceDB](https://authzed.com/docs/spicedb/concepts/consistency)).
 
 Our reading for RAG: when the pipeline writes a chunk, store the permission token of that moment on it. At query time, check the document with `at_least_as_fresh` and that token. The check may use a cache, but never one older than the content write. Also send ACL and content events for one document through one ordered queue.
 
@@ -195,7 +195,7 @@ A deleted document that still answers is a quiet, serious bug. There are four wa
 
 1. **A shrunken document.** Version 11 had 8 chunks, version 12 has 7. Chunk 8 stays unless the pipeline deletes by doc id and older version.
 2. **A missed delete event.** A reconciliation job lists document ids in the source and the index and deletes the difference. Alert when the count is not zero.
-3. **A late update.** An old `upsert` arrives after the `delete` and revives the document. A **tombstone** [mid] (doc id, deleted-at, last version) blocks any `upsert` that is not newer.
+3. **A late update.** An old `upsert` arrives after the `delete` and revives the document. A **tombstone** (doc id, deleted-at, last version) blocks any `upsert` that is not newer.
 4. **A cache.** Tag each cached answer with the doc ids it cites. Purge by tag on a delete or ACL change.
 
 Derived data also holds the text: context lines, summaries, eval sets, and logs. In our reading, a deletion policy must list each one.

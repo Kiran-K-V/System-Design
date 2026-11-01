@@ -2,7 +2,7 @@
 
 Format: fact, exact number, URL, page date. "Date not shown" means the page has no date. UNVERIFIED means the page could not be loaded or read.
 
-Terms [mid]: logprobs = log of the probability the model gave a token.
+Terms: logprobs = log of the probability the model gave a token.
 
 ## 1. Nondeterminism
 

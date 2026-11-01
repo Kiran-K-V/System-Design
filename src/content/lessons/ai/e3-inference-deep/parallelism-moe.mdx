@@ -25,9 +25,9 @@ The questions on the way are:
 
 ## Why more tensor parallelism gives less
 
-[The Prefill vs Decode: TTFT and TPOT lesson](/learn/ai/a2-inference-cost/prefill-decode/) gave the floor of a decode step: the weight bytes divided by the memory speed of the GPUs that hold them. A decode step is mostly reading weights. **Tensor parallelism** [senior] (TP) cuts each weight matrix into slices, one per GPU, so that each GPU reads only its slice. With twice the GPUs, each reads half as much, and the read time halves.
+[The Prefill vs Decode: TTFT and TPOT lesson](/learn/ai/a2-inference-cost/prefill-decode/) gave the floor of a decode step: the weight bytes divided by the memory speed of the GPUs that hold them. A decode step is mostly reading weights. **Tensor parallelism** (TP) cuts each weight matrix into slices, one per GPU, so that each GPU reads only its slice. With twice the GPUs, each reads half as much, and the read time halves.
 
-That is the gain. Now the cost. After each slice has done its share, the GPUs must add their partial results together. This is an **all-reduce** [mid]: every GPU adds in its part, and every GPU ends with the sum. The Megatron-LM design needs two of them per layer in the forward pass. A decode step runs the forward pass once, so the number of syncs is the same whatever the number of GPUs, and each sync now spans more GPUs. Also, each sync sits in the middle of the work. The next layer cannot start until it ends, so nothing hides it.
+That is the gain. Now the cost. After each slice has done its share, the GPUs must add their partial results together. This is an **all-reduce**: every GPU adds in its part, and every GPU ends with the sum. The Megatron-LM design needs two of them per layer in the forward pass. A decode step runs the forward pass once, so the number of syncs is the same whatever the number of GPUs, and each sync now spans more GPUs. Also, each sync sits in the middle of the work. The next layer cannot start until it ends, so nothing hides it.
 
 So the step time has two parts. The read part falls as you add GPUs. The sync part stays or grows. The read part is large at first, so the early doublings help. Later, the sync part is a large share, and more GPUs help little.
 
@@ -39,12 +39,12 @@ The numbers in the animation are illustrative. We chose the sync cost to show th
 
 Two more points about TP in serving.
 
-- **Keep it inside one server.** The [Tensor, Pipeline, Sequence, and Expert Parallelism](/learn/ai/e2-training/model-parallelism/) rule holds. TP talks a lot, so it needs NVLink [mid], the direct GPU-to-GPU link. Across servers, the network is far slower, and the sync would dominate.
+- **Keep it inside one server.** The [Tensor, Pipeline, Sequence, and Expert Parallelism](/learn/ai/e2-training/model-parallelism/) rule holds. TP talks a lot, so it needs NVLink, the direct GPU-to-GPU link. Across servers, the network is far slower, and the sync would dominate.
 - **A split is also a memory tool.** A 70B model in 16-bit needs more than one H100 for the weights alone (the [GPU Memory Math](/learn/ai/a2-inference-cost/gpu-memory-math/) lesson). TP also makes room for the KV cache, because each GPU holds less weight. So the lowest TP degree that fits the weights and the cache is a sensible start. Go higher only for a latency target that you cannot meet otherwise.
 
 ## What pipeline parallelism buys in serving
 
-**Pipeline parallelism** [senior] (PP) cuts the model by layers. GPU 1 holds the first group of layers, GPU 2 the next, and so on. A token's data passes from stage to stage.
+**Pipeline parallelism** (PP) cuts the model by layers. GPU 1 holds the first group of layers, GPU 2 the next, and so on. A token's data passes from stage to stage.
 
 Does it make one token faster? No. The token still has to pass through every layer, one after another. The time for one token does not fall. What PP gives is **throughput**: while stage 2 works on one batch, stage 1 can already start the next. It also sends less data than TP. The SARATHI paper notes that PP is popular for deployment across nodes because of its lower communication overhead than TP. Our reading: use TP inside a server for latency and PP across servers when the model is too big for one server.
 
@@ -52,7 +52,7 @@ PP has a known weakness, the **bubble**: a stage sits idle when no batch is read
 
 ## Shard or replicate?
 
-You have 8 GPUs. You can run one group of 8 with TP. Or two groups of 4. Or four groups of 2. Each group is a full copy of the model, and each copy serves its own users. A copy is a **replica** [junior].
+You have 8 GPUs. You can run one group of 8 with TP. Or two groups of 4. Or four groups of 2. Each group is a full copy of the model, and each copy serves its own users. A copy is a **replica**.
 
 This is the same question as scaling a stateless web service. One huge machine is the fastest for one request. Several smaller machines serve more requests in total. Here the choice moves two numbers in opposite directions:
 
@@ -65,7 +65,7 @@ Replicas also help with failure and with load. When one copy fails, the others s
 
 ## Mixture of experts: all the experts in memory
 
-[The GPU Memory Math lesson](/learn/ai/a2-inference-cost/gpu-memory-math/) introduced the **mixture of experts** [mid] (MoE) model. A normal layer has one feed-forward block. An MoE layer has many, called experts. A small network, the **router** [mid], picks a few experts for each token. Only those run.
+[The GPU Memory Math lesson](/learn/ai/a2-inference-cost/gpu-memory-math/) introduced the **mixture of experts** (MoE) model. A normal layer has one feed-forward block. An MoE layer has many, called experts. A small network, the **router**, picks a few experts for each token. Only those run.
 
 The Mixtral paper gives the example. Each layer has 8 experts. The router picks 2 per token. Each token can use 47B parameters in total, but only 13B are active during a step. So the compute per token is like a 13B model.
 
@@ -75,9 +75,9 @@ Now the effect on a decode step. A step reads weights, and decode is limited by 
 
 ## Expert parallelism and the all-to-all
 
-You cannot always fit all experts on one GPU. **Expert parallelism** [senior] (EP) puts different experts on different GPUs. It does not cut any matrix in pieces. Instead, each token goes to the GPU that holds its chosen expert.
+You cannot always fit all experts on one GPU. **Expert parallelism** (EP) puts different experts on different GPUs. It does not cut any matrix in pieces. Instead, each token goes to the GPU that holds its chosen expert.
 
-That needs an **all-to-all** [mid]. Every GPU sends a different bundle to every other GPU, and then every GPU sends the results back. Picture a sorting office where every worker has letters for every other worker. Everyone walks to everyone else, then walks back.
+That needs an **all-to-all**. Every GPU sends a different bundle to every other GPU, and then every GPU sends the results back. Picture a sorting office where every worker has letters for every other worker. Everyone walks to everyone else, then walks back.
 
 Is this claim sourced? Yes. The DeepSpeed-MoE paper states that expert parallelism needs all-to-all communication between all expert-parallel devices. It also reports two opposite effects when the number of GPUs grows for a fixed MoE model. Each GPU holds fewer experts and reads less data, which helps. But more communication between experts on different GPUs can hurt. In its tests on a 52B model with 128 experts, going from 8 to 64 GPUs, a tuned system gained more than it lost, and the paper reports higher throughput per GPU as GPUs were added. A plain PyTorch baseline did not. That is a paper claim from 2022, on its own setup. Our reading: the all-to-all is real, its size depends on your links and your software, and you must measure it.
 

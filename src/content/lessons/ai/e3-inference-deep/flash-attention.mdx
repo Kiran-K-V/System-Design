@@ -24,17 +24,17 @@ The questions are:
 
 ## Two memories on one GPU
 
-A GPU has a large, slow-ish memory and a small, very fast one. **HBM** [junior] (high bandwidth memory) is the large one on the card, where weights and the KV cache live ([the GPU Memory Math lesson](/learn/ai/a2-inference-cost/gpu-memory-math/)). **SRAM** [junior] (static RAM) is the small, fast memory inside the chip, next to the math units. Think of HBM as a warehouse across town and SRAM as the workbench in front of you. You do the work on the bench. A trip to the warehouse costs far more than a step of work.
+A GPU has a large, slow-ish memory and a small, very fast one. **HBM** (high bandwidth memory) is the large one on the card, where weights and the KV cache live ([the GPU Memory Math lesson](/learn/ai/a2-inference-cost/gpu-memory-math/)). **SRAM** (static RAM) is the small, fast memory inside the chip, next to the math units. Think of HBM as a warehouse across town and SRAM as the workbench in front of you. You do the work on the bench. A trip to the warehouse costs far more than a step of work.
 
 The FlashAttention paper gives figures for an A100: HBM is 40 GB at 1.5 TB/s, and SRAM is 20 MB at about 19 TB/s. So SRAM is roughly 10 times faster, and about 2,000 times smaller. The paper also states that on modern GPUs "compute speed has out-paced memory speed", so many operations wait on memory.
 
-How does a GPU program use these memories? A **kernel** [mid] is one function that runs on the GPU. The paper describes the execution model: each kernel loads its inputs from HBM, computes, and writes its outputs back to HBM. If a task has three steps and each step is its own kernel, the data makes three round trips to the warehouse.
+How does a GPU program use these memories? A **kernel** is one function that runs on the GPU. The paper describes the execution model: each kernel loads its inputs from HBM, computes, and writes its outputs back to HBM. If a task has three steps and each step is its own kernel, the data makes three round trips to the warehouse.
 
-[The Prefill vs Decode: TTFT and TPOT lesson](/learn/ai/a2-inference-cost/prefill-decode/) taught the test for what limits a step: **arithmetic intensity** [mid], the number of operations per byte moved. A step with high intensity waits for the math units (compute-bound). A step with low intensity waits for memory (memory-bound). The paper lists the kinds: a matrix multiply with a large inner size is compute-bound. Element-wise steps (activation, dropout) and reductions (sum, softmax) are memory-bound, because each number is used once or twice and then written back.
+[The Prefill vs Decode: TTFT and TPOT lesson](/learn/ai/a2-inference-cost/prefill-decode/) taught the test for what limits a step: **arithmetic intensity**, the number of operations per byte moved. A step with high intensity waits for the math units (compute-bound). A step with low intensity waits for memory (memory-bound). The paper lists the kinds: a matrix multiply with a large inner size is compute-bound. Element-wise steps (activation, dropout) and reductions (sum, softmax) are memory-bound, because each number is used once or twice and then written back.
 
 ## Naive solution: write the score matrix to HBM
 
-Recall attention from [the Attention and Its Cost lesson](/learn/ai/a1-model-function/attention-cost/). For a sequence of N tokens, each head has three matrices of N rows and d columns: queries Q, keys K, and values V. Here d is the **head width** [mid], 64 or 128 in common models. Attention is three steps:
+Recall attention from [the Attention and Its Cost lesson](/learn/ai/a1-model-function/attention-cost/). For a sequence of N tokens, each head has three matrices of N rows and d columns: queries Q, keys K, and values V. Here d is the **head width**, 64 or 128 in common models. Attention is three steps:
 
 1. Multiply Q by the transpose of K. The result is the score matrix S, with N rows and N columns. Every token scores every other token.
 2. Apply softmax to each row of S. The result is the probability matrix P, also N by N.
@@ -50,13 +50,13 @@ Why did the many "approximate attention" methods not fix this? The paper's answe
 
 ## Idea one: fuse the steps
 
-If three steps ran inside one kernel, S and P could stay on chip, and only Q, K, V in and O out would touch HBM. This is **kernel fusion** [mid]. Compilers already fuse simple element-wise operations. Why not attention?
+If three steps ran inside one kernel, S and P could stay on chip, and only Q, K, V in and O out would touch HBM. This is **kernel fusion**. Compilers already fuse simple element-wise operations. Why not attention?
 
 Two obstacles. First, S is N by N, and SRAM is small. For long sequences it cannot hold a whole matrix. Second, the softmax step needs a full row of S before it can finish. If a row is spread over many chunks of keys, you cannot finish the row until you have seen them all. The next section solves the second problem, and tiling solves the first.
 
 ## Idea two: tiles and a running softmax
 
-**Softmax** [mid] turns a row of scores into weights that sum to 1. Each score becomes its exponential, then every value is divided by the row's total. A safe version first subtracts the row's largest value, so the exponentials do not overflow. So a softmax needs two row-wide numbers: the maximum, and the sum of exponentials.
+**Softmax** turns a row of scores into weights that sum to 1. Each score becomes its exponential, then every value is divided by the row's total. A safe version first subtracts the row's largest value, so the exponentials do not overflow. So a softmax needs two row-wide numbers: the maximum, and the sum of exponentials.
 
 Now think of one row of S cut into blocks of columns. We see block 1 first, then block 2. After block 1 we can compute a maximum m and a sum l for what we have seen. Then block 2 arrives, with its own maximum. If the new maximum is larger, the old sum was measured against the wrong reference. The fix is a rescale: multiply the old sum by a factor that moves it to the new reference, then add the new block's sum. The paper states this decomposition exactly. If you keep two numbers per row, m and l, you can compute the softmax one block at a time.
 
@@ -64,7 +64,7 @@ An everyday picture: you keep a running tally of votes, but the unit changes whe
 
 The same rescale applies to the output. FlashAttention keeps a partial output for each row. When a new block changes the reference, it scales the partial output by the same factor and adds the new block's contribution. After the last block, the output is final.
 
-The paper calls this **tiling** [mid]: split the inputs Q, K, V into blocks, bring a block into SRAM, work on it, move on. In the paper's algorithm the outer loop goes over blocks of K and V, and the inner loop goes over blocks of Q. The block width is set by how much fits in SRAM: SRAM must hold a tile of K, V, Q and O at once, so the paper sets the key block width to the SRAM size divided by four times the head width.
+The paper calls this **tiling**: split the inputs Q, K, V into blocks, bring a block into SRAM, work on it, move on. In the paper's algorithm the outer loop goes over blocks of K and V, and the inner loop goes over blocks of Q. The block width is set by how much fits in SRAM: SRAM must hold a tile of K, V, Q and O at once, so the paper sets the key block width to the SRAM size divided by four times the head width.
 
 Step through a toy run. The sizes are made up: 8 tokens and a tile of 2 by 4. The counter shows the HBM traffic against standard attention.
 

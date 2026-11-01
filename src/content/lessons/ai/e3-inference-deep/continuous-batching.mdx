@@ -19,9 +19,9 @@ This lesson opens that loop. You will learn what the scheduler does between two 
 
 ## Naive solution: schedule whole requests
 
-The first design is **request-level scheduling** [mid]. The server collects some requests, hands them to the engine as one batch, and waits. The engine runs the model again and again, one token per request per run, until every request in the batch is done. Only then does it return anything.
+The first design is **request-level scheduling**. The server collects some requests, hands them to the engine as one batch, and waits. The engine runs the model again and again, one token per request per run, until every request in the batch is done. Only then does it return anything.
 
-First, a word for one run. An **iteration** [mid] is one pass through all the layers of the model. In that pass, every request in the batch gets one new token. The Orca paper uses this word, and so do we. A request that writes 500 tokens needs 500 iterations.
+First, a word for one run. An **iteration** is one pass through all the layers of the model. In that pass, every request in the batch gets one new token. The Orca paper uses this word, and so do we. A request that writes 500 tokens needs 500 iterations.
 
 The Orca paper names two faults of request-level scheduling.
 
@@ -34,13 +34,13 @@ A backend engineer has seen this problem before. Picture a job queue where each 
 
 ## The mechanism: a scheduler that runs between iterations
 
-The Orca paper calls the fix **iteration-level scheduling** [senior]. The scheduler runs a short loop, over and over:
+The Orca paper calls the fix **iteration-level scheduling**. The scheduler runs a short loop, over and over:
 
 1. **Select.** Pick the requests that will run in the next iteration.
 2. **Run.** Ask the engine to run exactly one iteration for them.
 3. **Collect.** Take the new token of each request. Send finished requests back to their clients at once. Remove them from the batch.
 
-The place where requests wait is the **request pool** [mid]. The endpoint puts each new request there. The scheduler reads the pool before every iteration. A new request has to wait for at most one iteration before it gets its chance.
+The place where requests wait is the **request pool**. The endpoint puts each new request there. The scheduler reads the pool before every iteration. A new request has to wait for at most one iteration before it gets its chance.
 
 A picture helps. Think of a city bus that stops at every block. A passenger who reaches the stop can board. A passenger who reaches their street gets off. The bus never waits at the depot for a full load. Each block is one iteration.
 
@@ -52,9 +52,9 @@ The animation shows three decisions that the scheduler makes before every iterat
 
 **Which requests go first?** Orca uses first-come-first-served at the iteration level. The paper states the rule: if request X arrived before request Y, then X has run at least as many iterations as Y. A late request can still return earlier if it is short. The rule keeps the loop fair and simple.
 
-**How many may run?** The scheduler has a **maximum batch size** [mid]: the most requests in one iteration. The paper says this knob trades throughput for latency. A larger batch gives more throughput with diminishing returns, and it makes each iteration longer. The operator sets the limit by the latency budget. The [Batching and Throughput](/learn/ai/a2-inference-cost/batching-throughput/) lesson showed the curve for this trade.
+**How many may run?** The scheduler has a **maximum batch size**: the most requests in one iteration. The paper says this knob trades throughput for latency. A larger batch gives more throughput with diminishing returns, and it makes each iteration longer. The operator sets the limit by the latency budget. The [Batching and Throughput](/learn/ai/a2-inference-cost/batching-throughput/) lesson showed the curve for this trade.
 
-**Is there memory?** This is the gate that stopped request C in the animation. Each request needs room for its **KV cache** [mid], the keys and values of every token it has seen (the [KV Cache](/learn/ai/a2-inference-cost/kv-cache/) lesson). That memory grows by one token at every iteration. Orca measures it in **slots**: one slot holds the keys and values of one token.
+**Is there memory?** This is the gate that stopped request C in the animation. Each request needs room for its **KV cache**, the keys and values of every token it has seen (the [KV Cache](/learn/ai/a2-inference-cost/kv-cache/) lesson). That memory grows by one token at every iteration. Orca measures it in **slots**: one slot holds the keys and values of one token.
 
 Why can the scheduler not just start a request and hope for room? Because it can deadlock. Imagine a batch full of requests that each need one more slot for their next token, and the free pool is empty. No request can run, and none can finish and give its slots back. Nothing moves.
 
@@ -78,9 +78,9 @@ The Orca paper lists three cases where two requests cannot share a normal batch:
 
 A normal batch is a block of shape [requests, tokens, hidden width]. All requests must have the same number of tokens. With the cases above, that rule would almost never be true. The paper says the chance that two requests fit together gets small very fast as the batch grows.
 
-Orca's answer is **selective batching** [senior]: batch only the steps that can be batched. Look at what a Transformer layer does. Most steps multiply each token's row by the same weight matrices. Those steps do not care which request a row belongs to. You can stack all rows from all requests into one flat block of shape [total tokens, hidden width] and run one big multiply.
+Orca's answer is **selective batching**: batch only the steps that can be batched. Look at what a Transformer layer does. Most steps multiply each token's row by the same weight matrices. Those steps do not care which request a row belongs to. You can stack all rows from all requests into one flat block of shape [total tokens, hidden width] and run one big multiply.
 
-One step does care. **Attention** [mid] compares a token with the earlier tokens of its own request. It needs a request's own keys and values. It cannot mix rows from two requests. So Orca does this: before attention, it splits the flat block by request. It runs attention once per request. Then it merges the rows back into one block.
+One step does care. **Attention** compares a token with the earlier tokens of its own request. It needs a request's own keys and values. It cannot mix rows from two requests. So Orca does this: before attention, it splits the flat block by request. It runs attention once per request. Then it merges the rows back into one block.
 
 Picture a highway with one exit per rider. All cars share the highway, which is the shared weights. At the end, each car turns into its own driveway, which is its own keys and values. After that the cars rejoin the highway.
 
@@ -96,7 +96,7 @@ Selective batching makes a joiner possible. It does not make a joiner free. When
 
 Recall from [the Prefill vs Decode: TTFT and TPOT lesson](/learn/ai/a2-inference-cost/prefill-decode/) that prefill is compute-bound and takes time in proportion to the prompt. So the iteration that holds a long new prompt is much longer than a normal decode iteration. Every other request in that batch waits for it. The users of those requests see their token stream freeze for a moment. The throughput stays high, but the smoothness of the stream breaks.
 
-The fix is **chunked prefill** [senior]: cut the prompt into chunks and run one chunk per iteration, next to the decode tokens. The vLLM docs describe the policy. The scheduler first adds every decode request to the iteration. Then it fills the rest of a per-iteration token budget with prefill chunks. A prompt that does not fit is cut. The budget has a name, `max_num_batched_tokens`. Per the docs, smaller values give a better gap between tokens, because fewer prefill tokens slow the decodes. Larger values give a better time to first token. In version 1 of vLLM, the docs say chunked prefill is on by default whenever it is possible.
+The fix is **chunked prefill**: cut the prompt into chunks and run one chunk per iteration, next to the decode tokens. The vLLM docs describe the policy. The scheduler first adds every decode request to the iteration. Then it fills the rest of a per-iteration token budget with prefill chunks. A prompt that does not fit is cut. The budget has a name, `max_num_batched_tokens`. Per the docs, smaller values give a better gap between tokens, because fewer prefill tokens slow the decodes. Larger values give a better time to first token. In version 1 of vLLM, the docs say chunked prefill is on by default whenever it is possible.
 
 The [Prefill and Decode Disaggregation](/learn/ai/e3-inference-deep/disaggregation/) lesson goes further: it covers chunked prefill and putting prefill and decode on separate machines.
 

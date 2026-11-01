@@ -34,8 +34,8 @@ A GPU cluster has the same tiers:
 
 | Tier | What it is | Figure, with source |
 |---|---|---|
-| Inside a node | A **node** [junior] is one server, usually with 8 GPUs. The GPUs talk over **NVLink** [mid], NVIDIA's direct GPU-to-GPU link | NVIDIA lists 900 GB/s for H100 (fourth generation) and says 1.8 TB/s per GPU for Blackwell (fifth generation, "bidirectional"), company claims |
-| Between nodes | A network card per GPU, over a fabric such as **InfiniBand** [mid] (a network built for clusters) or RoCE (a similar standard over Ethernet) | Llama 3 used 400 Gbps links between GPUs. 400 Gbps is 50 GB/s (derived: divide by 8) |
+| Inside a node | A **node** is one server, usually with 8 GPUs. The GPUs talk over **NVLink**, NVIDIA's direct GPU-to-GPU link | NVIDIA lists 900 GB/s for H100 (fourth generation) and says 1.8 TB/s per GPU for Blackwell (fifth generation, "bidirectional"), company claims |
+| Between nodes | A network card per GPU, over a fabric such as **InfiniBand** (a network built for clusters) or RoCE (a similar standard over Ethernet) | Llama 3 used 400 Gbps links between GPUs. 400 Gbps is 50 GB/s (derived: divide by 8) |
 
 Read the two columns together. NVLink on an H100 is about 18 times faster than a 400 Gbps network link (derived: 900 divided by 50). The units differ (bytes versus bits), so check them. The two numbers also measure slightly different things, so treat the ratio as an order of magnitude, not an exact figure. The practical rule is the same either way: **a transfer inside a node is much cheaper than one between nodes.**
 
@@ -47,9 +47,9 @@ Keep one rule in mind for the rest of the lesson. Each split sends a different a
 
 ### What tensor parallelism is
 
-A transformer layer is mostly big matrix multiplications. A **matrix multiply** [junior] turns an input vector into an output vector using a grid of learned numbers (the weight matrix). If the matrix is too big or too slow for one GPU, cut it.
+A transformer layer is mostly big matrix multiplications. A **matrix multiply** turns an input vector into an output vector using a grid of learned numbers (the weight matrix). If the matrix is too big or too slow for one GPU, cut it.
 
-**Tensor parallelism** [senior] splits each weight matrix across several GPUs. Each GPU holds one slice and does its share of the multiply. Then the GPUs combine their partial results.
+**Tensor parallelism** splits each weight matrix across several GPUs. Each GPU holds one slice and does its share of the multiply. Then the GPUs combine their partial results.
 
 Picture four cooks making one huge soup. Each adds the same ingredients but to a quarter of the pot. At certain points they must pour their pots together, mix, and pour back. The pouring is the communication.
 
@@ -59,7 +59,7 @@ It makes a model fit and it makes each layer faster. Each GPU holds a fraction o
 
 ### How the combine works
 
-The combine step is an **all-reduce** [mid]: every GPU contributes a partial result, and every GPU ends up holding the sum. It is a **collective** [mid], an operation in which a group of GPUs communicate together rather than one pair.
+The combine step is an **all-reduce**: every GPU contributes a partial result, and every GPU ends up holding the sum. It is a **collective**, an operation in which a group of GPUs communicate together rather than one pair.
 
 The Megatron-LM paper designs a transformer layer so that the forward pass needs two all-reduces and the backward pass needs two more. That is four combines per layer, in every step, for every layer. The Ultra-Scale Playbook (a Hugging Face guide) adds a second point: this all-reduce sits in the middle of the computation, so it cannot be overlapped with other work. The next layer cannot start until the combine ends.
 
@@ -79,7 +79,7 @@ Step 2 shows a tensor group as one node. Steps 3 and 4 add the two other kinds o
 
 ### Pipeline parallelism
 
-**Pipeline parallelism** [senior] cuts the model by depth. A transformer is a stack of layers. Give the first block of layers to stage 1, the next block to stage 2, and so on. Each **stage** [mid] runs on its own GPU (or its own group of GPUs). A batch enters stage 1, and its output goes to stage 2.
+**Pipeline parallelism** cuts the model by depth. A transformer is a stack of layers. Give the first block of layers to stage 1, the next block to stage 2, and so on. Each **stage** runs on its own GPU (or its own group of GPUs). A batch enters stage 1, and its output goes to stage 2.
 
 Picture an assembly line. One station fits the engine. The next fits the doors. A car passes through every station in turn.
 
@@ -89,9 +89,9 @@ Why use it? It needs very little communication. Only the activations at the cut 
 
 Send one batch through the line. While stage 1 works, stages 2 to 4 wait. While stage 4 works, stages 1 to 3 wait. At any moment only one station is busy. That is a waste of 3 out of 4 GPUs.
 
-The fix is the same as on a real assembly line: keep it full. Cut the batch into small **micro-batches** [mid]. Send micro-batch 1 into stage 1. When it moves to stage 2, send micro-batch 2 into stage 1. Now several stations work at once.
+The fix is the same as on a real assembly line: keep it full. Cut the batch into small **micro-batches**. Send micro-batch 1 into stage 1. When it moves to stage 2, send micro-batch 2 into stage 1. Now several stations work at once.
 
-But the line must still fill at the start and drain at the end. During those times, some stages sit idle. That idle time is the **pipeline bubble** [senior]. The Megatron-LM paper gives it as a fraction of the ideal time:
+But the line must still fill at the start and drain at the end. During those times, some stages sit idle. That idle time is the **pipeline bubble**. The Megatron-LM paper gives it as a fraction of the ideal time:
 
 <Math block tex="\text{bubble} = \frac{p - 1}{m}" />
 
@@ -123,17 +123,17 @@ Pipeline stages go on the slower link. Llama 3 405B uses 16 stages (Llama 3 pape
 
 Tensor and pipeline parallelism split the model. They do not help when the **input** is the problem. A sequence of 131,072 tokens has huge activations, and attention (the [Attention and Its Cost](/learn/ai/a1-model-function/attention-cost/) lesson) compares every token with every earlier token.
 
-**Context parallelism** [senior] splits the sequence across GPUs. Each GPU holds a chunk of the tokens. The catch is attention. A token in chunk 3 must still attend to tokens in chunks 1 and 2. So GPUs must send their Keys and Values (the saved vectors from the [Attention and Its Cost](/learn/ai/a1-model-function/attention-cost/) lesson) to each other. The Playbook describes a ring version in which each GPU starts sending its key and value pairs to the others while it computes, so the transfer overlaps with the arithmetic. It also notes that a naive version is unbalanced, because tokens late in a sequence attend to more tokens than early ones. A zig-zag assignment gives each GPU a mix of early and late chunks.
+**Context parallelism** splits the sequence across GPUs. Each GPU holds a chunk of the tokens. The catch is attention. A token in chunk 3 must still attend to tokens in chunks 1 and 2. So GPUs must send their Keys and Values (the saved vectors from the [Attention and Its Cost](/learn/ai/a1-model-function/attention-cost/) lesson) to each other. The Playbook describes a ring version in which each GPU starts sending its key and value pairs to the others while it computes, so the transfer overlaps with the arithmetic. It also notes that a naive version is unbalanced, because tokens late in a sequence attend to more tokens than early ones. A zig-zag assignment gives each GPU a mix of early and late chunks.
 
-Llama 3 uses it only for the long-context stage. Its table shows two layouts at 16,384 GPUs: with a context degree of 1 at 8,192 tokens and 41% MFU, and with a context degree of 16 at 131,072 tokens and 38% MFU. **MFU** [mid] means model FLOPs utilization: the share of the GPU's peak arithmetic rate that goes into useful model math. A drop from 41% to 38% buys a sequence 16 times longer.
+Llama 3 uses it only for the long-context stage. Its table shows two layouts at 16,384 GPUs: with a context degree of 1 at 8,192 tokens and 41% MFU, and with a context degree of 16 at 131,072 tokens and 38% MFU. **MFU** means model FLOPs utilization: the share of the GPU's peak arithmetic rate that goes into useful model math. A drop from 41% to 38% buys a sequence 16 times longer.
 
-A note on names. **Sequence parallelism** [senior], as the Playbook uses the word, is a companion to tensor parallelism. It splits along the sequence the parts of a layer that tensor parallelism leaves whole, so that activations take less memory. Context parallelism splits attention itself. The names are close. When you read a paper, check which one it means.
+A note on names. **Sequence parallelism**, as the Playbook uses the word, is a companion to tensor parallelism. It splits along the sequence the parts of a layer that tensor parallelism leaves whole, so that activations take less memory. Context parallelism splits attention itself. The names are close. When you read a paper, check which one it means.
 
 ### Expert parallelism
 
 The [GPU Memory Math](/learn/ai/a2-inference-cost/gpu-memory-math/) lesson introduced the mixture of experts (MoE) model: each layer holds many feed-forward blocks (experts), and a router sends each token to a few of them. Mixtral 8x7B has 8 experts per layer and uses 2 per token. It has 47B parameters in total and uses 13B per token (Mixtral paper).
 
-**Expert parallelism** [senior] puts different experts on different GPUs. As the Playbook says, it does not split any matrix multiply. It routes each token's hidden state to the GPU that holds the chosen expert. This needs an **all-to-all** [mid]: every GPU sends a different bundle to every other GPU, then gathers the results. The Playbook lists the all-to-all as the key communication of expert parallelism, and says it works with data parallelism, since it splits the experts and not the input tokens.
+**Expert parallelism** puts different experts on different GPUs. As the Playbook says, it does not split any matrix multiply. It routes each token's hidden state to the GPU that holds the chosen expert. This needs an **all-to-all**: every GPU sends a different bundle to every other GPU, then gathers the results. The Playbook lists the all-to-all as the key communication of expert parallelism, and says it works with data parallelism, since it splits the experts and not the input tokens.
 
 The all-to-all is heavy, and it depends on the router. Our reading: if the router favours one expert, that expert's GPU gets more tokens than the others, and everyone waits for it. Teams watch expert load for this reason. The [Parallelism and MoE for Inference](/learn/ai/e3-inference-deep/parallelism-moe/) lesson covers the serving side. For training, the Playbook suggests that with MoE it can help to place experts across nodes.
 

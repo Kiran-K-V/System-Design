@@ -54,6 +54,7 @@ Length: set by the number of ideas, not a word limit. A lesson with about 10 ide
 
 ### Writing style
 - Plain, direct English. One idea per sentence. Short sentences. Active voice. No filler, no hype.
+- **No level tags in lesson text.** Never write `[junior]`, `[mid]`, `[senior]` or `[staff]` after a term. Those tags belong to the maintainer's chat vocabulary rule, not to the site. Define a new term in one plain sentence at first use, with no tag.
 - **Audience: the reader can code and has shipped a web service, but knows nothing about networks, databases, or infrastructure.** Never write for someone who already knows the topic. A term that feels obvious to you is the term that loses the reader.
 - **Teach every term inside the text, before you use it, at the moment the reader needs it.** Never put a glossary or word list at the top of a lesson. Do not assume a reader has met a term in another lesson unless that lesson taught it. When you are unsure, define it again in one clause.
 - **Give every idea four parts:** what it is, an everyday picture (an analogy), why it exists, and one concrete example. Three short sentences is too little for an idea.
