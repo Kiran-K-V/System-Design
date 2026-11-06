@@ -27,7 +27,7 @@ const f = (v: number) => v.toFixed(3);
 
 const steps: Step[] = [
   {
-    caption: 'These 8 numbers stand in for weights of one layer. They are illustrative, not from a real model. In BF16 each takes 2 bytes and can hold one of about 65,000 values, so the stored number is almost the true one.',
+    caption: 'These 8 numbers stand in for a few of the weights in a model. They are made up, not from a real model. In BF16 (a 16-bit way to store a number) each takes 2 bytes and can be one of about 65,000 values. So the stored number is almost the true one.',
     ws: WS,
     q: null,
     range: 1,
@@ -36,7 +36,7 @@ const steps: Step[] = [
     tone: 'accent',
   },
   {
-    caption: `INT8 keeps one byte per weight: 256 codes. The scale is the largest magnitude, 0.90, divided by 127, so the codes sit ${f(q8.scale)} apart. Each weight snaps to the nearest code. The largest error here is ${f(e8.max)}. The model barely notices, but your eval is what says so.`,
+    caption: `INT8 (whole numbers in 8 bits) keeps one byte per weight: 256 allowed values, called codes. The scale is the biggest weight size, 0.90, divided by 127, so the codes sit ${f(q8.scale)} apart. Each weight snaps to the nearest code. The biggest error here is ${f(e8.max)}. The model barely notices, but only your own test can say so.`,
     ws: WS,
     q: q8.q,
     range: 1,
@@ -45,7 +45,7 @@ const steps: Step[] = [
     tone: 'ok',
   },
   {
-    caption: `INT4 keeps half a byte: 16 codes, spaced ${f(q4.scale)} apart (0.90 / 7). The bottom row shows the 16 codes. Every weight moves to the nearest tick. The largest error is ${f(e4.max)}, ${Math.round(e4.max / e8.max)} times the INT8 error. You saved 4x the bytes against BF16 and paid in precision.`,
+    caption: `INT4 (whole numbers in 4 bits) keeps half a byte: 16 codes, spaced ${f(q4.scale)} apart (0.90 / 7). The bottom row shows the 16 codes as small marks. Every weight moves to the nearest mark. The biggest error is ${f(e4.max)}, ${Math.round(e4.max / e8.max)} times the INT8 error. You saved 4x the bytes against BF16 and paid in precision.`,
     ws: WS,
     q: q4.q,
     range: 1,
@@ -54,7 +54,7 @@ const steps: Step[] = [
     tone: 'warn',
   },
   {
-    caption: `Add one large weight, 3.0 (illustrative outlier). The scale is set by the largest magnitude, so the 16 codes now spread over -3 to 3 and sit ${f(q4o.scale)} apart. The same 8 small weights now see a maximum error of ${f(e4o.max)}, up from ${f(e4.max)}. One big value coarsens the grid for all the others.`,
+    caption: `Add one large weight, 3.0 (a made-up outlier, a value far bigger than the rest). The scale is set by the biggest weight, so the 16 codes now spread over -3 to 3 and sit ${f(q4o.scale)} apart. The same 8 small weights now see a biggest error of ${f(e4o.max)}, up from ${f(e4.max)}. One big value spaces the marks further apart for all the others.`,
     ws: WS_OUT,
     q: q4o.q,
     range: 3,
@@ -63,12 +63,12 @@ const steps: Step[] = [
     tone: 'bad',
   },
   {
-    caption: 'This is why methods differ. AWQ reports that protecting about 1% of the weights, the ones that matter most, "can greatly reduce quantization error". GPTQ rounds weights to 3 or 4 bits after training, with no retraining, and quantized a 175B model in about 4 GPU hours. We do not quote accuracy numbers: they depend on the model and task. Run your eval.',
+    caption: 'This is why smarter methods exist. The authors of AWQ report that protecting about 1% of the weights, the ones that matter most, can greatly reduce the rounding error. The authors of GPTQ round weights to 3 or 4 bits after training, with no retraining. They rounded a 175B model (175 billion weights) in about 4 hours of GPU time. We do not quote accuracy numbers: they depend on the model and task. Run your own test.',
     ws: WS_OUT,
     q: q4o.q,
     range: 3,
     levels: 16,
-    stat: 'Quality loss: measure on your eval',
+    stat: 'Quality loss: measure with your own test',
     tone: 'accent',
   },
 ];

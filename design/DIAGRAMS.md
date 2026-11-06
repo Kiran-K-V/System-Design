@@ -47,3 +47,10 @@ Use the hand font for labels. Use mono (`mono`) only for code, keys, numbers, an
 - Use a `SketchSvg` viewBox about 720 wide. Text sizes assume that width.
 - Keep 24px of empty space inside the diagram edge.
 - Put the explanation in the step caption, not in the drawing.
+
+## 3D scenes (rare)
+Use 3D only when a third direction carries the idea (a score cube, a grid of GPUs). It must pass the value test in `design/NEXT_LESSONS.md` section 4.
+- Build with `src/components/anim/three/` (`Stage3D`, `Cube`, `CellField`, `usePalette`). Pattern: a small file `Name.tsx` that is only `export default lazy3D(() => import('./Name3D'))`, and the scene in `Name3D.tsx`. The 3D library must never load on the server (build fails) or on pages without a scene.
+- Wrap the scene in `AnimFrame`. The caption carries the teaching text, the legend names each axis, and the scene is a pure function of the step.
+- Never name a color in text (the accent differs by track). Use `usePalette` so dark mode works. Never put an apostrophe in a single-quoted string.
+- Check light, dark and 390px wide screenshots before you report done.

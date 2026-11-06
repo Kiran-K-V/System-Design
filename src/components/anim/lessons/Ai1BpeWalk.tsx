@@ -15,22 +15,22 @@ interface Step {
 const steps: Step[] = [
   {
     caption:
-      'We train a tiny tokenizer on one string: "hug pug pun bun hugs". Start with single characters. Real byte-level BPE (GPT-2, Llama 3) starts from the 256 raw bytes, so any input can be encoded and no "unknown" token is needed. Here: 16 symbols across 5 words.',
+      'We build a tiny tokenizer from one string: "hug pug pun bun hugs". We start with single characters. Real byte-level BPE (byte-pair encoding, used by GPT-2 and Llama 3) starts from the 256 raw bytes. So any input can be encoded and no "unknown" token is needed. Here we have 16 symbols across 5 words.',
     snap: 0,
     phase: 'start',
   },
   {
-    caption: 'Count every adjacent pair inside each word. The pair u+g occurs 3 times (hug, pug, hugs). No other pair beats 2. This is a frequency table, like a GROUP BY on neighbors.',
+    caption: 'Count every pair of neighbors inside each word. The pair u+g occurs 3 times (hug, pug, hugs). No other pair beats 2. This is a tally of how often each pair shows up.',
     snap: 0,
     phase: 'count',
   },
   {
-    caption: 'Merge the most frequent pair into one new symbol, "ug". It gets the next free id, 256, because ids 0 to 255 are the raw bytes (the minbpe rule). Now 3 symbols fewer: 13.',
+    caption: 'Merge the most frequent pair into one new symbol, "ug". It gets the next free id, 256, because ids 0 to 255 belong to the raw bytes. Now we have 3 symbols fewer: 13.',
     snap: 1,
     phase: 'merge',
   },
   {
-    caption: 'Count again on the merged words. h+ug and u+n tie at 2. Ties break by first occurrence in the text, so h+ug wins. The counts change after every merge, so BPE must recount each round.',
+    caption: 'Count again on the merged words. h+ug and u+n tie at 2. The tie goes to the pair that appears first in the text, so h+ug wins. The counts change after every merge, so BPE must recount each round.',
     snap: 1,
     phase: 'count',
   },
@@ -45,13 +45,13 @@ const steps: Step[] = [
     phase: 'count',
   },
   {
-    caption: 'Merge u+n into "un", id 258. 9 symbols left. Three merges give a vocabulary of 256 + 3 = 259 tokens. Real tokenizers stop at a target size: about 100K for GPT-4-era tokenizers and 128K for Llama 3.',
+    caption: 'Merge u+n into "un", id 258. 9 symbols left. Three merges give a vocabulary (the full list of pieces) of 256 + 3 = 259 tokens. Real tokenizers stop at a target size: about 100K (100 thousand) for GPT-4-era tokenizers and 128K for Llama 3.',
     snap: 3,
     phase: 'merge',
   },
   {
     caption:
-      'Result: 16 characters became 9 tokens, about 1.8 characters per token on this toy string. Common pieces became single tokens. Rare words stay split into many pieces. That is why rare words, numbers, and other scripts cost more tokens.',
+      'Result: 16 characters became 9 tokens, about 1.8 characters per token on this toy string. Common pieces became single tokens. Rare words stay split into many pieces. That is why rare words, numbers, and other writing systems cost more tokens.',
     snap: 3,
     phase: 'end',
   },

@@ -1,6 +1,6 @@
 # Writing AI track lessons: addendum
 
-Read `design/NEXT_LESSONS.md` first. Every rule there applies (lesson contract, quiz rules, visual contract, verification, gotchas). This file lists only what is different for the AI System Design track.
+Read `design/NEXT_LESSONS.md` first. Every rule there applies (lesson contract, quiz rules, visual contract, verification, gotchas), above all the **Kid test**, **Acronyms and names** and **No research trivia** rules in "Writing style". Run `node scripts/check-jargon.mjs` before you report a lesson done. This file lists only what is different for the AI System Design track.
 
 ## 1. Where things go
 
