@@ -1,0 +1,180 @@
+import { useEffect, useMemo, useRef } from 'react';
+import { useFrame, useThree } from '@react-three/fiber';
+import * as THREE from 'three';
+import type { Vec3 } from './blocks';
+import { useReducedMotion } from './theme';
+
+const SPHERE = new THREE.SphereGeometry(1, 20, 14);
+
+/**
+ * A text label that floats over a point in the scene. It is a plain HTML element, so it stays sharp and readable.
+ * `hideBehind` hides it when the point is on the far side of a globe centered at the origin.
+ */
+export function Tag({ position, text, color, show = true, hideBehind = false }: { position: Vec3; text: string; color?: string; show?: boolean; hideBehind?: boolean }) {
+  const obj = useRef<THREE.Object3D>(null);
+  const { camera, size, gl } = useThree();
+  const el = useMemo(() => document.createElement('div'), []);
+  const v = useMemo(() => new THREE.Vector3(), []);
+  const cam = useMemo(() => new THREE.Vector3(), []);
+
+  useEffect(() => {
+    const parent = gl.domElement.parentElement;
+    if (!parent) return;
+    Object.assign(el.style, {
+      position: 'absolute',
+      left: '0',
+      top: '0',
+      pointerEvents: 'none',
+      whiteSpace: 'nowrap',
+      fontSize: '12px',
+      fontWeight: '500',
+      lineHeight: '1.2',
+      padding: '2px 6px',
+      borderRadius: '6px',
+      background: 'color-mix(in srgb, var(--surface) 85%, transparent)',
+      transition: 'opacity 250ms',
+      opacity: '0',
+    });
+    parent.appendChild(el);
+    return () => el.remove();
+  }, [el, gl]);
+
+  useEffect(() => {
+    el.textContent = text;
+    el.style.color = color ?? 'var(--fg)';
+  }, [el, text, color]);
+
+  useFrame(() => {
+    const o = obj.current;
+    if (!o) return;
+    o.getWorldPosition(v);
+    let visible = show;
+    if (hideBehind) {
+      cam.copy(camera.position).normalize();
+      if (v.clone().normalize().dot(cam) < 0.15) visible = false;
+    }
+    const p = v.clone().project(camera);
+    if (p.z > 1) visible = false;
+    const x = (p.x * 0.5 + 0.5) * size.width;
+    const y = (-p.y * 0.5 + 0.5) * size.height;
+    el.style.transform = `translate(-50%, -50%) translate(${x}px, ${y}px)`;
+    el.style.opacity = visible ? '1' : '0';
+  });
+
+  return <object3D ref={obj} position={position} />;
+}
+
+/** A small ball. */
+export function Dot({ pos, color, r = 0.08, opacity = 1 }: { pos: Vec3; color: string; r?: number; opacity?: number }) {
+  return (
+    <mesh geometry={SPHERE} position={pos} scale={[r, r, r]} visible={opacity > 0.01}>
+      <meshBasicMaterial color={color} transparent opacity={opacity} />
+    </mesh>
+  );
+}
+
+/** Points on a curve that bows upward between a and b (lifted along +y by `lift` at the middle). */
+export function liftArc(a: Vec3, b: Vec3, lift: number, n = 40): Vec3[] {
+  const out: Vec3[] = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const h = Math.sin(Math.PI * t) * lift;
+    out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t + h, a[2] + (b[2] - a[2]) * t]);
+  }
+  return out;
+}
+
+/** Points on a great-circle path over a sphere of radius r, raised in the middle by `lift` times r. */
+export function globeArc(a: Vec3, b: Vec3, r: number, lift: number, n = 48): Vec3[] {
+  const va = new THREE.Vector3(...a).normalize();
+  const vb = new THREE.Vector3(...b).normalize();
+  const angle = va.angleTo(vb);
+  const out: Vec3[] = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const s = Math.sin(angle) || 1;
+    const p = va
+      .clone()
+      .multiplyScalar(Math.sin((1 - t) * angle) / s)
+      .add(vb.clone().multiplyScalar(Math.sin(t * angle) / s))
+      .normalize()
+      .multiplyScalar(r * (1 + lift * Math.sin(Math.PI * t) * Math.min(1, angle)));
+    out.push([p.x, p.y, p.z]);
+  }
+  return out;
+}
+
+/** Latitude and longitude in degrees to a point on a sphere of radius r. */
+export function latLon(lat: number, lon: number, r: number): Vec3 {
+  const phi = ((90 - lat) * Math.PI) / 180;
+  const theta = ((lon + 180) * Math.PI) / 180;
+  return [-r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta)];
+}
+
+/**
+ * A thick line along `points` that draws itself from start to end.
+ * `progress` 0 hides it, 1 shows all of it. It glides between values.
+ */
+export function Arc({ points, color, progress = 1, opacity = 1, width = 0.03 }: { points: Vec3[]; color: string; progress?: number; opacity?: number; width?: number }) {
+  const reduced = useReducedMotion();
+  const geom = useMemo(() => {
+    const curve = new THREE.CatmullRomCurve3(points.map((p) => new THREE.Vector3(...p)));
+    return new THREE.TubeGeometry(curve, Math.max(16, points.length), width, 6, false);
+  }, [points, width]);
+  useEffect(() => () => geom.dispose(), [geom]);
+  const mat = useRef<THREE.MeshBasicMaterial>(null);
+  const shown = useRef(0);
+  const total = geom.index ? geom.index.count : 0;
+  const ring = 6 * 6; // index entries per tube segment (6 radial sides x 6)
+
+  useFrame((_, dt) => {
+    const k = reduced ? 1 : 1 - Math.exp(-dt * 3.5);
+    shown.current += (progress - shown.current) * k;
+    const count = Math.floor((total * Math.max(0, Math.min(1, shown.current))) / ring) * ring;
+    geom.setDrawRange(0, count);
+    if (mat.current) mat.current.opacity += (opacity - mat.current.opacity) * k;
+  });
+
+  return (
+    <mesh geometry={geom}>
+      <meshBasicMaterial ref={mat} color={color} transparent opacity={0} />
+    </mesh>
+  );
+}
+
+/** A see-through globe with latitude and longitude lines. Its fill hides lines on the far side. */
+export function Globe({ r, line, fill }: { r: number; line: string; fill: string }) {
+  const grid = useMemo(() => {
+    const pts: number[] = [];
+    const seg = 64;
+    for (let lat = -60; lat <= 60; lat += 30) {
+      for (let i = 0; i < seg; i++) {
+        const a = latLon(lat, (i / seg) * 360 - 180, r * 1.003);
+        const b = latLon(lat, ((i + 1) / seg) * 360 - 180, r * 1.003);
+        pts.push(...a, ...b);
+      }
+    }
+    for (let lon = -180; lon < 180; lon += 30) {
+      for (let i = 0; i < seg; i++) {
+        const a = latLon((i / seg) * 180 - 90, lon, r * 1.003);
+        const b = latLon(((i + 1) / seg) * 180 - 90, lon, r * 1.003);
+        pts.push(...a, ...b);
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    return g;
+  }, [r]);
+  useEffect(() => () => grid.dispose(), [grid]);
+
+  return (
+    <group>
+      <mesh geometry={SPHERE} scale={[r, r, r]}>
+        <meshBasicMaterial color={fill} transparent opacity={0.92} />
+      </mesh>
+      <lineSegments geometry={grid}>
+        <lineBasicMaterial color={line} transparent opacity={0.28} />
+      </lineSegments>
+    </group>
+  );
+}
