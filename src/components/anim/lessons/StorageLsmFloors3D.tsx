@@ -85,8 +85,8 @@ function Scene({ step, p }: { step: Step; p: ReturnType<typeof usePalette> }) {
 
   // A hidden box keeps its place and fades out: face 0 and edge 0.
   const fade = (on: boolean, face: number): [number, number] => (on ? [face, EDGE] : [0, 0]);
-  const add = (key: string, pos: Vec3, size: Vec3, color: string, [face, edge]: [number, number]) =>
-    cubes.push({ key, t: { pos, size, color, face, edge, edgeColor: p.fg } });
+  const add = (key: string, pos: Vec3, size: Vec3, color: string, [face, edge]: [number, number], hint?: string) =>
+    cubes.push({ key, t: { pos, size, color, face, edge, edgeColor: p.fg, hint } });
 
   // Floor plates, always shown.
   add('plate-ram', [0, 2.6, 0], [2.4, 0.06, 1.4], p.fg, [0.08, 0.45]);
@@ -96,22 +96,22 @@ function Scene({ step, p }: { step: Step; p: ReturnType<typeof usePalette> }) {
 
   // Memtable keys in memory.
   for (let i = 0; i < 4; i++) {
-    add(`k${i + 1}`, [-0.75 + i * 0.5, 2.85, 0], [0.4, 0.4, 0.4], p.accent, fade(i < step.keys, 0.85));
+    add(`k${i + 1}`, [-0.75 + i * 0.5, 2.85, 0], [0.4, 0.4, 0.4], p.accent, fade(i < step.keys, 0.85), 'A key in the memtable, kept sorted in RAM.');
   }
 
   // Fresh files on floor 0. When merging, they glide down to floor 1 and vanish.
   ['f0a', 'f0b', 'f0c'].forEach((key, i) => {
     const home: Vec3 = [FLOOR0_X[i], 1.2, 0];
     const on = !step.merging && i < step.fresh;
-    add(key, step.merging ? MERGE_POS : home, [1.1, 0.35, 1.0], p.ok, fade(on, 0.6));
+    add(key, step.merging ? MERGE_POS : home, [1.1, 0.35, 1.0], p.ok, fade(on, 0.6), 'A sorted file flushed from memory. Never edited again.');
   });
 
   // Merged file on floor 1.
   const f1Size: Vec3 = step.bigF1 ? [5.2, 0.4, 1.4] : [4.2, 0.4, 1.3];
-  add('f1', MERGE_POS, f1Size, p.warn, fade(true, 0.6));
+  add('f1', MERGE_POS, f1Size, p.warn, fade(true, 0.6), 'Floor 1: files merged by compaction. Only the newest copy of each key is kept.');
 
   // Older data on floor 2.
-  add('f2', [0, -1.95, 0], [6.6, 0.45, 1.8], p.muted, fade(true, 0.45));
+  add('f2', [0, -1.95, 0], [6.6, 0.45, 1.8], p.muted, fade(true, 0.45), 'Floor 2: older data, about 10 times bigger than floor 1.');
 
   const legend = [
     { label: 'New writes in memory', color: p.accent },
@@ -126,6 +126,9 @@ function Scene({ step, p }: { step: Step; p: ReturnType<typeof usePalette> }) {
       distance={14}
       legend={legend}
       angle={[0.35, -0.55]}
+      ground={-2.5}
+      groundSize={16}
+      focus={[0, step.merging ? -0.2 : step.fresh ? 1.2 : 1.8, 0]}
     >
       {cubes.map((c) => (
         <Cube key={c.key} {...c.t} />

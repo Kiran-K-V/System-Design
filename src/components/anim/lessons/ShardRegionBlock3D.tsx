@@ -98,14 +98,14 @@ function Scene({ index, step, p }: { index: number; step: Step; p: ReturnType<ty
   const has = (tag: TagName) => step.tags.includes(tag);
 
   const cubes: { key: string; t: CubeTarget }[] = [
-    { key: 'whole', t: { pos: [0, 0, 1.8], size: WHOLE, color: p.muted, ...step.whole, edgeColor: p.fg } },
+    { key: 'whole', t: { pos: [0, 0, 1.8], size: WHOLE, color: p.muted, ...step.whole, edgeColor: p.fg, hint: 'One database holds every row. It is full, and every write lands here.' } },
   ];
   for (let s = 0; s < 3; s++) {
     for (let r = 0; r < 3; r++) {
       const look = step.server(s, r);
       cubes.push({
         key: `s${s}-${r}`,
-        t: { pos: [SHARD_X[s], 0, REGION_Z[r]], size: SERVER, color: shardColor[s], face: look.face, edge: look.edge, edgeColor: p.fg },
+        t: { pos: [SHARD_X[s], 0, REGION_Z[r]], size: SERVER, color: shardColor[s], face: look.face, edge: look.edge, edgeColor: p.fg, hint: `Shard ${s + 1} (${SHARD_ROWS[s]}), copy in ${REGION_NAME[r]}.` },
       });
     }
   }
@@ -120,7 +120,7 @@ function Scene({ index, step, p }: { index: number; step: Step; p: ReturnType<ty
   if (index >= 3) legend.push({ label: 'Change sent to copies', color: p.ok });
 
   return (
-    <Stage3D label="Nine servers: three shards side by side, each copied into three regions front to back." distance={13} legend={legend} angle={[0.45, -0.5]}>
+    <Stage3D label="Nine servers: three shards side by side, each copied into three regions front to back." distance={13} legend={legend} angle={[0.45, -0.5]} view={index === 0 ? [0.3, -0.2] : index === 1 ? [0.35, -0.15] : [0.5, -0.7]} ground={-0.75} groundSize={13}>
       {cubes.map((c) => (
         <Cube key={c.key} {...c.t} />
       ))}

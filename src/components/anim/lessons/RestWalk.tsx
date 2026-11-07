@@ -145,7 +145,7 @@ export default function RestWalk() {
             text
           </HandText>
           {s.rows.map((r, k) => (
-            <motion.g key={`${i}-${r.id}-${k}`} initial={s.hl === r.id ? { opacity: 0 } : false} animate={{ opacity: 1 }} transition={{ duration: 0.5 }}>
+            <motion.g key={`${i}-${r.id}-${k}`} initial={s.hl === r.id ? { opacity: 0 } : false} animate={{ opacity: 1 }} transition={{ duration: 0.25, ease: [0.23, 1, 0.32, 1] }}>
               {s.hl === r.id && <rect x={TX - 104} y={74 + k * ROW_H} width={208} height={ROW_H - 6} rx={6} fill="var(--accent-soft)" />}
               <HandText x={TX - 96} y={91 + k * ROW_H} size={14} anchor="start" mono>
                 {String(r.id)}

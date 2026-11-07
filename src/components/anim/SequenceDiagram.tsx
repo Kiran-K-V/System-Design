@@ -56,7 +56,7 @@ export default function SequenceDiagram({ actors, messages, visible, width = 640
             key={i}
             initial={isNew ? { opacity: 0, x: -dir * 24 } : false}
             animate={{ opacity: 1, x: 0 }}
-            transition={{ duration: 0.5, ease: 'easeOut' }}
+            transition={{ duration: 0.35, ease: [0.23, 1, 0.32, 1] }}
           >
             {m.note || m.from === m.to ? (
               <>

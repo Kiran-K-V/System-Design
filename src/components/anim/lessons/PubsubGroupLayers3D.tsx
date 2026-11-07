@@ -36,6 +36,13 @@ const steps: Step[] = [
 
 const DISTANCE = 14;
 const ANGLE: [number, number] = [0.5, -0.45];
+/** Per level: look down on the lanes first, then turn to see the group layers from the side. */
+const VIEWS: [number, number][] = [
+  [0.75, -0.3],
+  [0.45, -0.5],
+  [0.35, -0.75],
+  [0.4, -0.45],
+];
 const PARTS = [
   { name: 'P0', z: 1.8 },
   { name: 'P1', z: 0.6 },
@@ -83,7 +90,7 @@ function Scene({ step, p }: { step: Step; p: Palette }) {
     for (let i = 0; i < RECORDS; i++) {
       cubes.push({
         key: `r-${part.name}-${i}`,
-        t: box([X(i), 0, part.z], [0.38, 0.25, 0.7], p.muted, i < 8 || showNew, 0.6, 0.5, p.fg),
+        t: { ...box([X(i), 0, part.z], [0.38, 0.25, 0.7], p.muted, i < 8 || showNew, 0.6, 0.5, p.fg), hint: `${part.name}, offset ${i}. Records are never edited; new ones are added on the right.` },
       });
     }
     tags.push({ key: `lane-${part.name}`, position: [-3.7, 0, part.z], text: part.name, show: true });
@@ -101,7 +108,7 @@ function Scene({ step, p }: { step: Step; p: Palette }) {
   PARTS.forEach((part, pi) => {
     cubes.push({
       key: `bk-billing-${part.name}`,
-      t: box(
+      t: { ...box(
         [X(billingAt[pi]), (BILLING_Y + 0.15) / 2, part.z],
         [0.08, BILLING_Y - 0.15, 0.08],
         p.accent,
@@ -110,10 +117,11 @@ function Scene({ step, p }: { step: Step; p: Palette }) {
         0.9,
         p.accent,
       ),
+      hint: `Billing group's bookmark in ${part.name}: it has read up to offset ${billingAt[pi]}.` },
     });
     cubes.push({
       key: `bk-analytics-${part.name}`,
-      t: box(
+      t: { ...box(
         [X(analyticsAt[pi]), (ANALYTICS_Y + 0.15) / 2, part.z],
         [0.08, ANALYTICS_Y - 0.15, 0.08],
         p.ok,
@@ -122,6 +130,7 @@ function Scene({ step, p }: { step: Step; p: Palette }) {
         0.9,
         p.ok,
       ),
+      hint: `Analytics group's bookmark in ${part.name}: it has read up to offset ${analyticsAt[pi]}. Slower than billing, and that is fine.` },
     });
   });
 
@@ -143,6 +152,10 @@ function Scene({ step, p }: { step: Step; p: Palette }) {
       distance={DISTANCE}
       legend={legend}
       angle={ANGLE}
+      view={VIEWS[lvl - 1]}
+      focus={[0, lvl === 1 ? 0 : lvl === 2 ? 0.6 : 1.2, 0]}
+      ground={-0.35}
+      groundSize={14}
     >
       {cubes.map((c) => (
         <Cube key={c.key} {...c.t} />

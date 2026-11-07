@@ -56,22 +56,37 @@ function roundPath(d: string) {
   return d.replace(/-?\d+\.\d+(e-?\d+)?/g, (n) => String(Math.round(+n * 10) / 10));
 }
 
-function Drawn({ make, deps }: { make: () => ReturnType<typeof gen.path>; deps: unknown[] }) {
+/**
+ * Renders rough.js paths. A stroke that mounts draws itself in like a pen; a fill fades in. Shapes that only change
+ * between steps keep their element, so only new marks animate. Dashes are applied here, because rough.js drops
+ * `strokeLineDash` when it converts a shape to paths.
+ */
+function Drawn({ make, deps, dash, delay = 0 }: { make: () => ReturnType<typeof gen.path>; deps: unknown[]; dash?: number[]; delay?: number }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const paths = useMemo(() => gen.toPaths(make()).map((p) => ({ ...p, d: roundPath(p.d) })), deps);
+  const outline = (p: (typeof paths)[number]) => !p.fill || p.fill === 'none';
   return (
     <>
-      {paths.map((p, i) => (
-        <path
-          key={i}
-          d={p.d}
-          stroke={p.stroke}
-          strokeWidth={p.strokeWidth}
-          fill={p.fill ?? 'none'}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-      ))}
+      {paths.map((p, i) => {
+        const line = outline(p);
+        // A dashed stroke cannot use the dash trick that draws a line in, so it fades in instead.
+        const draw = line && !dash;
+        return (
+          <path
+            key={i}
+            d={p.d}
+            stroke={p.stroke}
+            strokeWidth={p.strokeWidth}
+            fill={p.fill ?? 'none'}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeDasharray={line && dash ? dash.join(' ') : undefined}
+            pathLength={draw ? 1 : undefined}
+            className={draw ? 'sk-draw' : 'sk-fade'}
+            style={delay ? { animationDelay: `${delay}ms` } : undefined}
+          />
+        );
+      })}
     </>
   );
 }
@@ -111,13 +126,13 @@ function opts(s: ShapeStyle): Options {
 /** Rounded rectangle centered on (cx, cy). */
 export function SketchBox({ cx, cy, w, h, r = 12, ...s }: { cx: number; cy: number; w: number; h: number; r?: number } & ShapeStyle) {
   const o = opts(s);
-  return <Drawn make={() => gen.path(roundedRect(cx - w / 2, cy - h / 2, w, h, r), o)} deps={[cx, cy, w, h, r, JSON.stringify(o)]} />;
+  return <Drawn make={() => gen.path(roundedRect(cx - w / 2, cy - h / 2, w, h, r), o)} deps={[cx, cy, w, h, r, JSON.stringify(o)]} dash={o.strokeLineDash} />;
 }
 
 /** Ellipse centered on (cx, cy). */
 export function SketchEllipse({ cx, cy, w, h, ...s }: { cx: number; cy: number; w: number; h: number } & ShapeStyle) {
   const o = opts(s);
-  return <Drawn make={() => gen.ellipse(cx, cy, w, h, o)} deps={[cx, cy, w, h, JSON.stringify(o)]} />;
+  return <Drawn make={() => gen.ellipse(cx, cy, w, h, o)} deps={[cx, cy, w, h, JSON.stringify(o)]} dash={o.strokeLineDash} />;
 }
 
 /** Database cylinder centered on (cx, cy). */
@@ -130,7 +145,7 @@ export function SketchCylinder({ cx, cy, w, h, ...s }: { cx: number; cy: number;
   const d =
     `M${cx - rx} ${top} A${rx} ${ry} 0 0 1 ${cx + rx} ${top} A${rx} ${ry} 0 0 1 ${cx - rx} ${top} ` +
     `L${cx - rx} ${bot} A${rx} ${ry} 0 0 0 ${cx + rx} ${bot} L${cx + rx} ${top}`;
-  return <Drawn make={() => gen.path(d, o)} deps={[cx, cy, w, h, JSON.stringify(o)]} />;
+  return <Drawn make={() => gen.path(d, o)} deps={[cx, cy, w, h, JSON.stringify(o)]} dash={o.strokeLineDash} />;
 }
 
 export interface ArrowProps extends ShapeStyle {
@@ -156,12 +171,14 @@ export function SketchArrow({ points, head = 'end', ...s }: ArrowProps) {
       <Drawn
         make={() => (n === 2 ? gen.line(points[0][0], points[0][1], points[1][0], points[1][1], o) : gen.curve(points, o))}
         deps={[JSON.stringify(points), JSON.stringify(o)]}
+        dash={o.strokeLineDash}
       />
+      {/* Heads land after the line has drawn in, like a pen finishing the stroke. */}
       {head !== 'none' && (
-        <Drawn make={() => gen.path(headLines(points[n - 1], points[n - 2]), headOpts)} deps={[JSON.stringify(points), JSON.stringify(o)]} />
+        <Drawn make={() => gen.path(headLines(points[n - 1], points[n - 2]), headOpts)} deps={[JSON.stringify(points), JSON.stringify(o)]} delay={o.strokeLineDash ? 0 : 300} />
       )}
       {head === 'both' && (
-        <Drawn make={() => gen.path(headLines(points[0], points[1]), headOpts)} deps={[JSON.stringify(points), JSON.stringify(o), 'start']} />
+        <Drawn make={() => gen.path(headLines(points[0], points[1]), headOpts)} deps={[JSON.stringify(points), JSON.stringify(o), 'start']} delay={o.strokeLineDash ? 0 : 300} />
       )}
     </>
   );
@@ -200,6 +217,7 @@ export function HandText({
   const first = y - ((lines.length - 1) * size * lineHeight) / 2;
   return (
     <text
+      className="sk-fade"
       x={x}
       textAnchor={anchor}
       fontSize={size}

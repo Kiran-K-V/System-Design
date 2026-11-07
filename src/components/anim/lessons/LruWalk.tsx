@@ -68,7 +68,7 @@ export default function LruWalk() {
                   key={e.key}
                   initial={{ x: slotX(wasAt >= 0 ? wasAt : 0), opacity: wasAt >= 0 ? 1 : 0 }}
                   animate={{ x: slotX(i), opacity: 1 }}
-                  transition={{ duration: 0.5, ease: 'easeInOut' }}
+                  transition={{ duration: 0.35, ease: 'easeInOut' }}
                 >
                   {(justHit || justIn) && <rect x={-(SLOT_W - 12) / 2} y={168 - 29} width={SLOT_W - 12} height={58} rx={8} fill={justHit ? 'var(--ok)' : 'var(--accent)'} opacity={0.2} />}
                   <SketchBox cx={0} cy={168} w={SLOT_W - 8} h={62} r={9} seed={seedOf(`k${e.key}`)} stroke={justHit ? 'var(--ok)' : justIn ? 'var(--accent)' : 'var(--fg)'} strokeWidth={justHit || justIn ? 2.4 : 1.4} />

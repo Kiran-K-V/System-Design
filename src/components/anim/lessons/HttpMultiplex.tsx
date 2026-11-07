@@ -157,7 +157,7 @@ export default function HttpMultiplex() {
                 </g>
               ))}
               {sc && (
-                <motion.g key={i} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.5 }}>
+                <motion.g key={i} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.25, ease: [0.23, 1, 0.32, 1] }}>
                   {sc.segs.map((s, k) => (
                     <Bar key={k} seg={s} rowY={s.row === 'all' ? 0 : ROW_Y[s.row]} />
                   ))}

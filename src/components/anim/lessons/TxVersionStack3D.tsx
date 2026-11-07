@@ -124,6 +124,8 @@ function Scene({ step, p }: { step: Step; p: Palette }) {
       face: l.face,
       edge: l.edge,
       edgeColor: p.fg,
+      hint: tone === 'bad' ? `Row ${v.row}, time ${v.time}: no snapshot can see this version, so cleanup may delete it.` : `Row ${v.row}, version written at time ${v.time}.`,
+      pop: tone === 'accent' || tone === 'ok',
     };
     return <Cube key={v.key} {...t} />;
   });
@@ -141,7 +143,7 @@ function Scene({ step, p }: { step: Step; p: Palette }) {
   });
 
   return (
-    <Stage3D label="Three rows, each a stack of versions over time, with flat sheets marking what each transaction can read." distance={13} legend={legend} angle={[0.35, -0.5]}>
+    <Stage3D label="Three rows, each a stack of versions over time, with flat sheets marking what each transaction can read." distance={13} legend={legend} angle={[0.35, -0.5]} ground={yOf(0)} groundSize={13} focus={[0, step.t2 ? 0.6 : step.t1 ? 0.2 : 0, 0]} view={step.t1 || step.t2 ? [0.2, -0.45] : [0.4, -0.55]}>
       {cubes}
       {versionTags}
       <Cube key="t1-sheet" {...sheet(T1_TIME, p.accent, step.t1)} />

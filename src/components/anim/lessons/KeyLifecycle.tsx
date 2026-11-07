@@ -134,7 +134,7 @@ export default function KeyLifecycle() {
           ))}
           <SketchArrow points={[[TX + 12, 100], [TX + 360, 100]]} head="none" stroke="var(--border)" strokeWidth={1} seed={seedOf('kline')} />
           {s.rows.map((r, k) => (
-            <motion.g key={`${i}-${k}`} initial={s.hl ? { opacity: 0 } : false} animate={{ opacity: 1 }} transition={{ duration: 0.5 }}>
+            <motion.g key={`${i}-${k}`} initial={s.hl ? { opacity: 0 } : false} animate={{ opacity: 1 }} transition={{ duration: 0.25, ease: [0.23, 1, 0.32, 1] }}>
               {s.hl && <rect x={TX + 10} y={110 + k * 34} width={352} height={28} rx={6} fill="var(--accent-soft)" />}
               <HandText x={TX + 16} y={125 + k * 34} size={14} anchor="start" mono>
                 {r.key}

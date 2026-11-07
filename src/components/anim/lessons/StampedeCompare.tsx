@@ -108,7 +108,7 @@ export default function StampedeCompare() {
                 </HandText>
 
                 {c.toDb && (
-                  <motion.g key={`db${i}`} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.5 }}>
+                  <motion.g key={`db${i}`} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.25, ease: [0.23, 1, 0.32, 1] }}>
                     <SketchArrow points={[[cx, 198], [cx, 252]]} seed={seedOf(`b${k}${i}`)} stroke={miss && c.db > 100 ? 'var(--bad)' : 'var(--accent)'} strokeWidth={c.db > 100 ? 3.2 : 1.6} />
                     <HandText x={cx + 10} y={226} size={15} anchor="start" color={c.db > 100 ? 'var(--bad)' : 'var(--ok)'}>
                       {c.toDb}

@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
 import type { Vec3 } from './blocks';
-import { useReducedMotion } from './theme';
+import { MAX_DT, springStep, useReducedMotion } from './theme';
+import { TOON_GRADIENT, inkStrokes, makeInk, useHint, useWake } from './ink';
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
 
 const SPHERE = new THREE.SphereGeometry(1, 20, 14);
 
@@ -64,12 +66,135 @@ export function Tag({ position, text, color, show = true, hideBehind = false }: 
   return <object3D ref={obj} position={position} />;
 }
 
-/** A small ball. */
-export function Dot({ pos, color, r = 0.08, opacity = 1 }: { pos: Vec3; color: string; r?: number; opacity?: number }) {
+/**
+ * A small ball, toon-shaded. It moves to new positions on a spring and fades in and out, so it can be a graph node
+ * that travels between steps. `hint` shows a note on hover or tap. `pop` grows it and adds a ring to draw the eye.
+ */
+export function Dot({ pos, color, r = 0.08, opacity = 1, hint, pop = false }: { pos: Vec3; color: string; r?: number; opacity?: number; hint?: string; pop?: boolean }) {
+  const reduced = useReducedMotion();
+  const wake = useWake();
+  const group = useRef<THREE.Group>(null);
+  const mat = useRef<THREE.MeshToonMaterial>(null);
+  const ring = useRef<THREE.MeshBasicMaterial>(null);
+  const init = useRef({ pos, opacity, r }).current;
+  const st = useRef({ p: pos.map((x) => ({ x, v: 0 })), r: { x: r, v: 0 }, ring: 0 }).current;
+  const tint = useMemo(() => new THREE.Color(color), [color]);
+  const want = useRef({ pos, opacity, r, pop });
+  want.current = { pos, opacity, r, pop };
+  useEffect(wake, [pos[0], pos[1], pos[2], opacity, r, color, pop, wake]);
+  const active = useCallback(() => (mat.current?.opacity ?? 0) > 0.1, []);
+  const handlers = useHint(hint, active);
+
+  useFrame((_, rawDt) => {
+    const g = group.current;
+    const m = mat.current;
+    if (!g || !m) return;
+    const dt = Math.min(rawDt, MAX_DT);
+    const w = want.current;
+    const size = w.r * (w.pop ? 1.5 : 1);
+    if (reduced) {
+      st.p.forEach((s, i) => (s.x = w.pos[i]));
+      st.r.x = size;
+    } else {
+      st.p.forEach((s, i) => springStep(s, w.pos[i], dt));
+      springStep(st.r, size, dt, 140, 12);
+    }
+    g.position.set(st.p[0].x, st.p[1].x, st.p[2].x);
+    g.scale.setScalar(Math.max(0.0001, st.r.x));
+    const k = reduced ? 1 : 1 - Math.exp(-dt * 7);
+    m.opacity += (w.opacity - m.opacity) * k;
+    m.color.lerp(tint, k);
+    st.ring += ((w.pop ? 1 : 0) - st.ring) * k;
+    if (ring.current) {
+      ring.current.opacity = st.ring * m.opacity * 0.45;
+      ring.current.color.copy(m.color);
+    }
+    g.visible = m.opacity > 0.01;
+  });
+
   return (
-    <mesh geometry={SPHERE} position={pos} scale={[r, r, r]} visible={opacity > 0.01}>
-      <meshBasicMaterial color={color} transparent opacity={opacity} />
-    </mesh>
+    <group ref={group} position={init.pos} scale={init.r}>
+      <mesh geometry={SPHERE} {...handlers}>
+        <meshToonMaterial ref={mat} color={color} gradientMap={TOON_GRADIENT} transparent opacity={init.opacity} />
+      </mesh>
+      {/* Halo that faces the camera, shown when the dot is popped. */}
+      <sprite scale={[3.4, 3.4, 1]}>
+        <spriteMaterial ref={ring} map={HALO} transparent opacity={0} depthWrite={false} />
+      </sprite>
+    </group>
+  );
+}
+
+/** Soft round glow used behind a popped dot. */
+const HALO = (() => {
+  if (typeof document === 'undefined') return null;
+  const n = 64;
+  const c = document.createElement('canvas');
+  c.width = c.height = n;
+  const g = c.getContext('2d')!;
+  const grad = g.createRadialGradient(n / 2, n / 2, n * 0.18, n / 2, n / 2, n / 2);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, n, n);
+  return new THREE.CanvasTexture(c);
+})();
+
+/**
+ * Many straight ink lines drawn in one call: the edges of a graph, or the links between floors.
+ * All lines share one color and opacity, which glide when they change. Use several Links for several styles.
+ * `sketch` adds the faint off-line second stroke of the hand-drawn look.
+ */
+export function Links({ segments, color, opacity = 1, width = 1.4, sketch = false }: { segments: [Vec3, Vec3][]; color: string; opacity?: number; width?: number; sketch?: boolean }) {
+  const reduced = useReducedMotion();
+  const wake = useWake();
+  const key = JSON.stringify(segments);
+  const geoms = useMemo(() => {
+    const flat = segments.flatMap(([a, b]) => [...a, ...b]);
+    const raw = new THREE.BufferGeometry();
+    raw.setAttribute('position', new THREE.Float32BufferAttribute(flat, 3));
+    const main = new LineSegmentsGeometry().setPositions(flat);
+    const extra = sketch ? inkStrokes(raw, 0.03, 0.02, 5) : null;
+    raw.dispose();
+    return { main, extra };
+    // The key holds the segment list by value.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, sketch]);
+  const inks = useMemo(() => {
+    const main = makeInk(geoms.main, color, width, 0);
+    const extra = geoms.extra ? makeInk(geoms.extra, color, 1, 0) : null;
+    return { main, extra };
+    // Color changes glide in the frame loop instead of rebuilding.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [geoms, width]);
+  useEffect(
+    () => () => {
+      inks.main.dispose();
+      inks.extra?.dispose();
+      geoms.main.dispose();
+      geoms.extra?.dispose();
+    },
+    [inks, geoms],
+  );
+  const tint = useMemo(() => new THREE.Color(color), [color]);
+  useEffect(wake, [key, color, opacity, wake]);
+
+  useFrame((_, rawDt) => {
+    const k = reduced ? 1 : 1 - Math.exp(-Math.min(rawDt, MAX_DT) * 6);
+    for (const [ink, share] of [[inks.main, 1], [inks.extra, 0.35]] as const) {
+      if (!ink) continue;
+      ink.material.opacity += (opacity * share - ink.material.opacity) * k;
+      ink.material.color.lerp(tint, k);
+      ink.line.visible = ink.material.opacity > 0.01;
+    }
+  });
+
+  if (!segments.length) return null;
+  return (
+    <>
+      <primitive object={inks.main.line} />
+      {inks.extra && <primitive object={inks.extra.line} />}
+    </>
   );
 }
 
@@ -124,11 +249,13 @@ export function Arc({ points, color, progress = 1, opacity = 1, width = 0.03 }: 
   useEffect(() => () => geom.dispose(), [geom]);
   const mat = useRef<THREE.MeshBasicMaterial>(null);
   const shown = useRef(0);
+  const wake = useWake();
+  useEffect(wake, [progress, opacity, geom, wake]);
   const total = geom.index ? geom.index.count : 0;
   const ring = 6 * 6; // index entries per tube segment (6 radial sides x 6)
 
   useFrame((_, dt) => {
-    const k = reduced ? 1 : 1 - Math.exp(-dt * 3.5);
+    const k = reduced ? 1 : 1 - Math.exp(-Math.min(dt, MAX_DT) * 3.5);
     shown.current += (progress - shown.current) * k;
     const count = Math.floor((total * Math.max(0, Math.min(1, shown.current))) / ring) * ring;
     geom.setDrawRange(0, count);

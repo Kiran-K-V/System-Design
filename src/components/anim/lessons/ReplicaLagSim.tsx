@@ -71,13 +71,13 @@ export default function ReplicaLagSim() {
                 <div key={r.name} className="flex items-center gap-2">
                   <span className="w-20 shrink-0 text-xs text-muted">{r.name}</span>
                   <div className="relative h-5 flex-1 overflow-hidden rounded bg-bg">
-                    <div className="absolute inset-y-0 left-0 transition-[width] duration-200" style={{ width: x(r.lag), background: 'var(--bad)', opacity: 0.28 }} />
-                    <div className="absolute inset-y-0 right-0 transition-[left] duration-200" style={{ left: x(r.lag), background: 'var(--ok)', opacity: 0.35 }} />
+                    <div className="absolute inset-y-0 left-0 transition-[width] duration-200 motion-reduce:transition-none" style={{ width: x(r.lag), background: 'var(--bad)', opacity: 0.28 }} />
+                    <div className="absolute inset-y-0 right-0 transition-[left] duration-200 motion-reduce:transition-none" style={{ left: x(r.lag), background: 'var(--ok)', opacity: 0.35 }} />
                   </div>
                 </div>
               ))}
               <div className="pointer-events-none absolute inset-y-0 left-[5.5rem] right-0">
-                <div className="absolute inset-y-0 w-0.5 bg-accent transition-[left] duration-200" style={{ left: x(delay) }} />
+                <div className="absolute inset-y-0 w-0.5 bg-accent transition-[left] duration-200 motion-reduce:transition-none" style={{ left: x(delay) }} />
               </div>
             </div>
             <div className="ml-[5.5rem] mt-1 flex justify-between text-[11px] tabular-nums text-muted">

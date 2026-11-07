@@ -110,15 +110,15 @@ function Scene({ step, p }: { step: Step; p: ReturnType<typeof usePalette> }) {
       angle={[0.44, -1.05]}
     >
       <Globe r={R} line={p.fg} fill={p.bg} />
-      <Dot pos={geo.origin} color={p.warn} r={0.1} />
+      <Dot pos={geo.origin} color={p.warn} r={0.1} hint="Origin server in New York. It holds the master copy of every file." />
       <Tag position={latLon(ORIGIN.lat, ORIGIN.lon, LABEL_HEIGHT)} text="New York (origin)" hideBehind />
       {USERS.map((u, i) => {
         const g = geo.users[i];
         return (
           <group key={u.name}>
-            <Dot pos={g.user} color={p.accent} r={0.07} />
+            <Dot pos={g.user} color={p.accent} r={0.07} hint={`A user in ${u.name}.`} />
             <Tag position={latLon(u.lat, u.lon, LABEL_HEIGHT)} text={u.name} hideBehind />
-            <Dot pos={g.edge} color={p.ok} r={0.08} opacity={step.edges ? 1 : 0} />
+            <Dot pos={g.edge} color={p.ok} r={0.08} opacity={step.edges ? 1 : 0} hint={`Edge server near ${u.name}. Keeps copies of popular files.`} pop={step.fill.progress > 0 && u.name === 'Lagos'} />
             <Arc points={g.toOrigin} color={p.accent} progress={step.toOrigin.progress} opacity={step.toOrigin.opacity} width={0.025} />
             <Arc points={g.toEdge} color={p.ok} progress={step.toEdge.progress} opacity={step.toEdge.opacity} width={0.025} />
           </group>

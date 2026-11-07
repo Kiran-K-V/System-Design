@@ -101,7 +101,7 @@ function Lane({ i, step }: { i: 0 | 1 | 2; step: number }) {
             key={b.label}
             initial={isNew ? { opacity: 0, x: -10 } : false}
             animate={{ opacity: 1, x: 0 }}
-            transition={{ duration: 0.5 }}
+            transition={{ duration: 0.3, ease: [0.23, 1, 0.32, 1] }}
           >
             {Array.from({ length: n }, (_, k) => {
               const cy = y + (k - (n - 1) / 2) * (h + 3);
@@ -131,7 +131,7 @@ function Lane({ i, step }: { i: 0 | 1 | 2; step: number }) {
         </motion.g>
       )}
       {stat && (
-        <motion.g initial={stat.at === step ? { opacity: 0 } : false} animate={{ opacity: 1 }} transition={{ delay: 0.4, duration: 0.5 }}>
+        <motion.g initial={stat.at === step ? { opacity: 0 } : false} animate={{ opacity: 1 }} transition={{ delay: 0.2, duration: 0.3 }}>
           <HandText x={594} y={y} size={14} color={stat.color} weight={700}>
             {stat.lines}
           </HandText>

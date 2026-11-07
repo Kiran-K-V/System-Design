@@ -80,7 +80,7 @@ export default function AnimFrame<S extends Step>({ title, steps, children, inte
                   onClick={() => go(i)}
                   aria-label={`Go to step ${i + 1}`}
                   aria-current={i === index ? 'step' : undefined}
-                  className={`h-2 rounded-full transition-all ${i === index ? 'w-5 bg-accent' : i < index ? 'w-2 bg-accent/60' : 'w-2 bg-line hover:bg-muted'}`}
+                  className={`h-2 rounded-full transition-[width,background-color] duration-200 ease-out motion-reduce:transition-none ${i === index ? 'w-5 bg-accent' : i < index ? 'w-2 bg-accent/60' : 'w-2 bg-line hover:bg-muted'}`}
                 />
               ))}
             </div>
