@@ -171,3 +171,20 @@ export function useHint(text: string | undefined, active: () => boolean = () => 
 /** Call it when something starts to move, so the scene keeps drawing for a few seconds. */
 export const WakeContext = createContext<() => void>(() => {});
 export const useWake = () => useContext(WakeContext);
+
+/* ---------- Floating labels ---------- */
+
+/** One floating label as the label layer sees it. Tags write the wanted spot; the layer decides what shows. */
+export interface LabelEntry {
+  el: HTMLDivElement;
+  x: number;
+  y: number;
+  want: boolean;
+  w: number;
+  h: number;
+}
+export interface LabelApi {
+  add: (e: LabelEntry) => void;
+  remove: (e: LabelEntry) => void;
+}
+export const LabelContext = createContext<LabelApi | null>(null);

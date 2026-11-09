@@ -2,7 +2,7 @@ import { Component, useCallback, useEffect, useMemo, useRef, useState, type Reac
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
 import { MAX_DT, isCoarse, springStep, usePalette, useReducedMotion } from './theme';
-import { HintContext, WakeContext, useWake, type HintApi } from './ink';
+import { HintContext, LabelContext, WakeContext, useWake, type HintApi, type LabelApi, type LabelEntry } from './ink';
 import type { Vec3 } from './blocks';
 
 export interface LegendItem {
@@ -241,6 +241,37 @@ function Ground({ y, size, ink }: { y: number; size: number; ink: string }) {
 }
 
 /**
+ * Places every floating label once per frame, after the tags have computed where they want to be.
+ * A label is pushed inside the frame edges, and a label that would overlap one placed earlier is hidden.
+ * Earlier tags win, so scenes list their most important labels first.
+ */
+function LabelLayer({ entries }: { entries: LabelEntry[] }) {
+  const size = useThree((s) => s.size);
+  useFrame(() => {
+    const placed: { l: number; t: number; r: number; b: number }[] = [];
+    const pad = 3;
+    for (const e of entries) {
+      if (!e.want || !e.w) {
+        e.el.style.opacity = '0';
+        continue;
+      }
+      const l = Math.max(4, Math.min(size.width - e.w - 4, e.x - e.w / 2));
+      const t = Math.max(4, Math.min(size.height - e.h - 4, e.y - e.h / 2));
+      const box = { l: l - pad, t: t - pad, r: l + e.w + pad, b: t + e.h + pad };
+      const clash = placed.some((q) => box.l < q.r && box.r > q.l && box.t < q.b && box.b > q.t);
+      if (clash) {
+        e.el.style.opacity = '0';
+        continue;
+      }
+      placed.push(box);
+      e.el.style.transform = `translate(${l}px, ${t}px)`;
+      e.el.style.opacity = '1';
+    }
+  });
+  return null;
+}
+
+/**
  * Draws a frame only when one is needed: for a few seconds after anything changes, while the reader drags,
  * and during the first slow sway. Then the scene rests and costs no battery. Phones draw at 30 frames a second.
  */
@@ -280,6 +311,17 @@ export default function Stage3D({ label, distance, legend, angle = [0.45, -0.55]
   useEffect(wake);
   const swayUntil = useMemo(() => (typeof performance === 'undefined' ? 0 : performance.now() + SWAY_MS), []);
 
+  const labels = useMemo<LabelEntry[]>(() => [], []);
+  const labelApi = useMemo<LabelApi>(
+    () => ({
+      add: (e) => labels.push(e),
+      remove: (e) => {
+        const i = labels.indexOf(e);
+        if (i >= 0) labels.splice(i, 1);
+      },
+    }),
+    [labels],
+  );
   const tip = useRef<HTMLDivElement>(null);
   const hint = useMemo<HintApi>(
     () => ({
@@ -347,6 +389,7 @@ export default function Stage3D({ label, distance, legend, angle = [0.45, -0.55]
             >
               <WakeContext.Provider value={wake}>
                 <HintContext.Provider value={hint}>
+                <LabelContext.Provider value={labelApi}>
                   <Ticker wakeAt={wakeAt} swayUntil={reduced ? 0 : swayUntil} />
                   <Lights />
                   <CameraRig distance={distance} />
@@ -354,6 +397,8 @@ export default function Stage3D({ label, distance, legend, angle = [0.45, -0.55]
                     {ground !== undefined && <Ground y={ground} size={groundSize} ink={p.fg} />}
                     {children}
                   </Rig>
+                  <LabelLayer entries={labels} />
+                </LabelContext.Provider>
                 </HintContext.Provider>
               </WakeContext.Provider>
             </Canvas>

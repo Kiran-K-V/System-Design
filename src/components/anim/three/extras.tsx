@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useRef } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
 import type { Vec3 } from './blocks';
 import { MAX_DT, springStep, useReducedMotion } from './theme';
-import { TOON_GRADIENT, inkStrokes, makeInk, useHint, useWake } from './ink';
+import { LabelContext, TOON_GRADIENT, inkStrokes, makeInk, useHint, useWake, type LabelEntry } from './ink';
 import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
 
 const SPHERE = new THREE.SphereGeometry(1, 20, 14);
@@ -15,10 +15,13 @@ const SPHERE = new THREE.SphereGeometry(1, 20, 14);
 export function Tag({ position, text, color, show = true, hideBehind = false }: { position: Vec3; text: string; color?: string; show?: boolean; hideBehind?: boolean }) {
   const obj = useRef<THREE.Object3D>(null);
   const { camera, size, gl } = useThree();
+  const layer = useContext(LabelContext);
   const el = useMemo(() => document.createElement('div'), []);
+  const entry = useMemo<LabelEntry>(() => ({ el, x: 0, y: 0, want: false, w: 0, h: 0 }), [el]);
   const v = useMemo(() => new THREE.Vector3(), []);
   const cam = useMemo(() => new THREE.Vector3(), []);
   const center = useMemo(() => new THREE.Vector3(), []);
+  const narrow = size.width < 480;
 
   useEffect(() => {
     const parent = gl.domElement.parentElement;
@@ -29,7 +32,6 @@ export function Tag({ position, text, color, show = true, hideBehind = false }: 
       top: '0',
       pointerEvents: 'none',
       whiteSpace: 'nowrap',
-      fontSize: '12px',
       fontWeight: '500',
       lineHeight: '1.2',
       padding: '2px 6px',
@@ -39,13 +41,21 @@ export function Tag({ position, text, color, show = true, hideBehind = false }: 
       opacity: '0',
     });
     parent.appendChild(el);
-    return () => el.remove();
-  }, [el, gl]);
+    layer?.add(entry);
+    return () => {
+      layer?.remove(entry);
+      el.remove();
+    };
+  }, [el, gl, layer, entry]);
 
   useEffect(() => {
     el.textContent = text;
     el.style.color = color ?? 'var(--fg)';
-  }, [el, text, color]);
+    el.style.fontSize = narrow ? '11px' : '12px';
+    // Measured once per text change; the label layer needs the size to keep labels apart.
+    entry.w = el.offsetWidth;
+    entry.h = el.offsetHeight;
+  }, [el, text, color, narrow, entry]);
 
   useFrame(() => {
     const o = obj.current;
@@ -60,10 +70,13 @@ export function Tag({ position, text, color, show = true, hideBehind = false }: 
     }
     const p = v.clone().project(camera);
     if (p.z > 1) visible = false;
-    const x = (p.x * 0.5 + 0.5) * size.width;
-    const y = (-p.y * 0.5 + 0.5) * size.height;
-    el.style.transform = `translate(-50%, -50%) translate(${x}px, ${y}px)`;
-    el.style.opacity = visible ? '1' : '0';
+    entry.x = (p.x * 0.5 + 0.5) * size.width;
+    entry.y = (-p.y * 0.5 + 0.5) * size.height;
+    entry.want = visible;
+    if (!layer) {
+      el.style.transform = `translate(-50%, -50%) translate(${entry.x}px, ${entry.y}px)`;
+      el.style.opacity = visible ? '1' : '0';
+    }
   });
 
   return <object3D ref={obj} position={position} />;
