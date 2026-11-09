@@ -110,7 +110,7 @@ export default function AsyncFlowLab({ policies = false, initial = {}, title = '
             if (t >= SECONDS - 1) setT(0);
             setPlaying((x) => !x);
           }}
-          className="h-8 rounded-md bg-accent px-3 font-medium text-white hover:opacity-90"
+          className="h-8 rounded-md bg-accent px-3 font-medium text-on-accent hover:opacity-90"
         >
           {playing ? 'Pause' : 'Play'}
         </button>

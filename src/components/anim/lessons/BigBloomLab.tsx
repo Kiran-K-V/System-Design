@@ -66,7 +66,7 @@ export default function BigBloomLab() {
             <input id="bf-word" value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && add()} className="w-full rounded-md border border-line bg-bg px-2 py-1.5" placeholder="e.g. pear" />
           </div>
           <div className="flex flex-wrap gap-2">
-            <button type="button" onClick={add} className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white">Add</button>
+            <button type="button" onClick={add} className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-on-accent">Add</button>
             <button type="button" onClick={ask} className="rounded-md border border-line px-3 py-1.5 text-xs">Is it in?</button>
             <button type="button" onClick={addMany} className="rounded-md border border-line px-3 py-1.5 text-xs">Add 10 more</button>
             <button type="button" onClick={() => setProbe(observedFp(b))} className="rounded-md border border-line px-3 py-1.5 text-xs">Test 200 unseen</button>

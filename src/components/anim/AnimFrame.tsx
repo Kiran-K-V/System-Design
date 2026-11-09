@@ -80,7 +80,7 @@ export default function AnimFrame<S extends Step>({ title, steps, children, inte
                   onClick={() => go(i)}
                   aria-label={`Go to step ${i + 1}`}
                   aria-current={i === index ? 'step' : undefined}
-                  className={`h-2 rounded-full transition-[width,background-color] duration-200 ease-out motion-reduce:transition-none ${i === index ? 'w-5 bg-accent' : i < index ? 'w-2 bg-accent/60' : 'w-2 bg-line hover:bg-muted'}`}
+                  className={`relative h-2 rounded-full before:absolute before:-inset-x-1 before:-inset-y-3 before:content-[''] transition-[width,background-color] duration-200 ease-out motion-reduce:transition-none ${i === index ? 'w-5 bg-accent' : i < index ? 'w-2 bg-accent/60' : 'w-2 bg-line hover:bg-muted'}`}
                 />
               ))}
             </div>
@@ -93,10 +93,10 @@ export default function AnimFrame<S extends Step>({ title, steps, children, inte
         <div className="bg-bg px-2 py-4 sm:px-4">{children(index, steps[index])}</div>
 
         <figcaption
-          aria-live="polite"
+          aria-live={playing ? 'off' : 'polite'}
           className="m-3 flex min-h-[4.5rem] items-start gap-3.5 rounded-xl border border-line bg-surface px-4 py-3.5 text-[0.95rem] leading-relaxed"
         >
-          <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-full bg-accent text-[13px] font-semibold tabular-nums text-white">
+          <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-full bg-accent text-[13px] font-semibold tabular-nums text-on-accent">
             {index + 1}
           </span>
           <span className="min-w-0 flex-1">{steps[index].caption}</span>
@@ -106,7 +106,7 @@ export default function AnimFrame<S extends Step>({ title, steps, children, inte
           <button
             type="button"
             onClick={togglePlay}
-            className="flex h-9 items-center gap-2 rounded-lg bg-accent px-3.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
+            className="flex h-11 items-center gap-2 rounded-lg bg-accent px-3.5 sm:h-9 text-sm font-medium text-on-accent transition-opacity hover:opacity-90"
           >
             <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
               {playing ? <path d="M3 2h2v8H3zM7 2h2v8H7z" /> : <path d="M3.2 1.8v8.4L10 6z" />}
@@ -159,7 +159,7 @@ function CtrlButton(props: { label: string; onClick: () => void; disabled: boole
       title={props.label}
       onClick={props.onClick}
       disabled={props.disabled}
-      className="flex h-9 w-9 items-center justify-center rounded-lg border border-line text-muted transition-colors hover:border-accent/50 hover:text-fg disabled:opacity-30"
+      className="flex h-11 w-11 items-center justify-center rounded-lg border border-line text-muted sm:h-9 sm:w-9 transition-colors hover:border-accent/50 hover:text-fg disabled:opacity-30"
     >
       <svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
         {props.children}

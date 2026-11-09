@@ -54,7 +54,7 @@ export default function QuestionCard({ question, index, attempt = 0, onResult }:
             disabled={choice !== null}
             aria-pressed={confidence === l.key}
             onClick={() => setConfidence(l.key)}
-            className={`rounded-full border px-3 py-1 transition-colors ${
+            className={`min-h-11 rounded-full border px-3 py-1 transition-colors ${
               confidence === l.key ? 'border-accent bg-accent-soft text-fg' : 'border-line hover:bg-surface'
             } disabled:cursor-default`}
           >
@@ -72,7 +72,7 @@ export default function QuestionCard({ question, index, attempt = 0, onResult }:
                 type="button"
                 disabled={choice !== null || !confidence}
                 onClick={() => answer(orig)}
-                className={`w-full rounded-md border px-3 py-2 text-left text-sm transition-colors ${
+                className={`min-h-11 w-full rounded-md border px-3 py-2 text-left text-sm transition-colors ${
                   state === 'idle'
                     ? 'border-line enabled:hover:bg-surface disabled:opacity-60'
                     : state === 'right'
@@ -117,6 +117,8 @@ export default function QuestionCard({ question, index, attempt = 0, onResult }:
                 <div className="mt-2 flex gap-2">
                   <input
                     id={`why-${id}`}
+                    name="reason"
+                    autoComplete="off"
                     value={why}
                     onChange={(e) => setWhy(e.target.value)}
                     maxLength={200}

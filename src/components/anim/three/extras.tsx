@@ -10,7 +10,7 @@ const SPHERE = new THREE.SphereGeometry(1, 20, 14);
 
 /**
  * A text label that floats over a point in the scene. It is a plain HTML element, so it stays sharp and readable.
- * `hideBehind` hides it when the point is on the far side of a globe centered at the origin.
+ * `hideBehind` hides it when the point is on the far side of a globe centered at the origin of its parent group.
  */
 export function Tag({ position, text, color, show = true, hideBehind = false }: { position: Vec3; text: string; color?: string; show?: boolean; hideBehind?: boolean }) {
   const obj = useRef<THREE.Object3D>(null);
@@ -18,6 +18,7 @@ export function Tag({ position, text, color, show = true, hideBehind = false }: 
   const el = useMemo(() => document.createElement('div'), []);
   const v = useMemo(() => new THREE.Vector3(), []);
   const cam = useMemo(() => new THREE.Vector3(), []);
+  const center = useMemo(() => new THREE.Vector3(), []);
 
   useEffect(() => {
     const parent = gl.domElement.parentElement;
@@ -52,8 +53,10 @@ export function Tag({ position, text, color, show = true, hideBehind = false }: 
     o.getWorldPosition(v);
     let visible = show;
     if (hideBehind) {
-      cam.copy(camera.position).normalize();
-      if (v.clone().normalize().dot(cam) < 0.15) visible = false;
+      // The globe sits at the origin of the label's parent group; the stage may have shifted it for focus.
+      o.parent?.getWorldPosition(center);
+      cam.copy(camera.position).sub(center).normalize();
+      if (v.clone().sub(center).normalize().dot(cam) < 0.15) visible = false;
     }
     const p = v.clone().project(camera);
     if (p.z > 1) visible = false;

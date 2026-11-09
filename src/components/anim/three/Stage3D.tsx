@@ -167,7 +167,7 @@ function Rig({ angle, view, focus = [0, 0, 0], onTouched, children }: { angle: [
   });
 
   return (
-    <group ref={group}>
+    <group ref={group} rotation={[angle[0], angle[1], 0]}>
       <group ref={shift}>{children}</group>
     </group>
   );
@@ -366,7 +366,7 @@ export default function Stage3D({ label, distance, legend, angle = [0.45, -0.55]
               aria-hidden="true"
               className={`pointer-events-none absolute right-3 top-2 rounded-full border border-line bg-surface/80 px-2.5 py-1 text-[12px] text-muted transition-opacity duration-500 ${touched ? 'opacity-0' : 'opacity-100'}`}
             >
-              Drag to turn · hover for notes
+              {isCoarse() ? 'Drag to turn · tap for notes' : 'Drag to turn · hover for notes'}
             </span>
           </Guard>
         )}

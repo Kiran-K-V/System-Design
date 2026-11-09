@@ -83,7 +83,7 @@ export default function EvictionLab() {
             onClick={() => setK(i + 1)}
             title={`Run up to access ${i + 1}`}
             className={`min-w-8 rounded border px-1.5 py-0.5 font-mono text-sm ${
-              i === kk - 1 ? 'border-accent bg-accent text-white' : i < kk ? 'border-line bg-surface' : 'border-line text-muted'
+              i === kk - 1 ? 'border-accent bg-accent text-on-accent' : i < kk ? 'border-line bg-surface' : 'border-line text-muted'
             }`}
           >
             {key}
@@ -95,7 +95,7 @@ export default function EvictionLab() {
         <button type="button" onClick={() => setK(Math.max(0, kk - 1))} disabled={kk === 0} className="h-8 rounded-md border border-line px-3 text-sm hover:bg-surface disabled:opacity-40">
           Back
         </button>
-        <button type="button" onClick={() => setK(Math.min(trace.length, kk + 1))} disabled={kk >= trace.length} className="h-8 rounded-md bg-accent px-3 text-sm font-medium text-white hover:opacity-90 disabled:opacity-40">
+        <button type="button" onClick={() => setK(Math.min(trace.length, kk + 1))} disabled={kk >= trace.length} className="h-8 rounded-md bg-accent px-3 text-sm font-medium text-on-accent hover:opacity-90 disabled:opacity-40">
           Next access
         </button>
         <button type="button" onClick={() => setK(trace.length)} className="h-8 rounded-md border border-line px-3 text-sm hover:bg-surface">

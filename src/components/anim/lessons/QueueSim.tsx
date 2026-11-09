@@ -180,7 +180,7 @@ export default function QueueSim() {
                 <button
                   type="button"
                   onClick={() => setRunning((r) => !r)}
-                  className="h-8 rounded-md bg-accent px-3 text-sm font-medium text-white hover:opacity-90"
+                  className="h-8 rounded-md bg-accent px-3 text-sm font-medium text-on-accent hover:opacity-90"
                 >
                   {running ? 'Pause' : 'Run'}
                 </button>

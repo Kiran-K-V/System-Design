@@ -234,7 +234,7 @@ export default function TxAnomalyLab() {
             role="tab"
             aria-selected={s.id === id}
             onClick={() => setId(s.id)}
-            className={`rounded-md border px-3 py-1.5 text-sm ${s.id === id ? 'border-accent bg-accent text-white' : 'border-line hover:bg-surface'}`}
+            className={`rounded-md border px-3 py-1.5 text-sm ${s.id === id ? 'border-accent bg-accent text-on-accent' : 'border-line hover:bg-surface'}`}
           >
             {s.tab}
           </button>

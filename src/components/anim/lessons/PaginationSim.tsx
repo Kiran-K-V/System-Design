@@ -143,7 +143,7 @@ export default function PaginationSim() {
       </div>
       <div className="space-y-4 px-4 py-4">
         <div className="flex flex-wrap items-center gap-2">
-          <button type="button" onClick={fetchNext} className="h-8 rounded-md bg-accent px-3 text-sm font-medium text-white hover:opacity-90">
+          <button type="button" onClick={fetchNext} className="h-8 rounded-md bg-accent px-3 text-sm font-medium text-on-accent hover:opacity-90">
             Fetch next page
           </button>
           <button type="button" onClick={addPost} className={btn}>

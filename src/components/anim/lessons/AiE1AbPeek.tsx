@@ -32,7 +32,7 @@ export default function AiE1AbPeek() {
     <CacheWidgetFrame title="A two-arm test, one batch at a time" hint="5% base rate, 1,000 users per arm per batch">
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <Seg label="True lift" value={lift} options={[{ id: 0, label: 'No real change (A/A)' }, { id: 10, label: '+10% real' }, { id: 20, label: '+20% real' }]} onChange={(v) => { setLift(v); setLooks(1); }} />
-        <button type="button" onClick={() => setLooks((k) => Math.min(LOOKS, k + 1))} disabled={looks >= LOOKS} className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
+        <button type="button" onClick={() => setLooks((k) => Math.min(LOOKS, k + 1))} disabled={looks >= LOOKS} className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-on-accent disabled:opacity-40">
           Add 1,000 users per arm
         </button>
         <button type="button" onClick={() => { setSeed((s) => s + 7); setLooks(1); }} className="rounded-md border border-line px-3 py-1.5 text-xs">

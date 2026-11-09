@@ -38,7 +38,7 @@ export default function Ai10ThreatOwasp() {
             type="button"
             aria-pressed={c.id === sel}
             onClick={() => setSel(c.id === sel ? null : c.id)}
-            className={`rounded-md border px-2 py-1 text-xs ${c.id === sel ? 'border-accent bg-accent font-semibold text-white' : 'border-line text-muted hover:bg-surface'}`}
+            className={`rounded-md border px-2 py-1 text-xs ${c.id === sel ? 'border-accent bg-accent font-semibold text-on-accent' : 'border-line text-muted hover:bg-surface'}`}
           >
             {c.title}
           </button>

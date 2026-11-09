@@ -32,7 +32,7 @@ export default function Quiz({ questions }: { questions: Question[] }) {
         />
       ))}
       {answered === questions.length && (
-        <div className="flex items-center justify-between rounded-lg bg-surface px-4 py-3 text-sm">
+        <div role="status" className="flex items-center justify-between rounded-lg bg-surface px-4 py-3 text-sm">
           <span>
             <strong>{correct}</strong> / {questions.length} right · <strong>{points}</strong> of {max} points
           </span>

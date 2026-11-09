@@ -43,7 +43,7 @@ export function Seg<T extends string | number>({
           type="button"
           aria-pressed={o.id === value}
           onClick={() => onChange(o.id)}
-          className={`px-2.5 py-1.5 ${o.id === value ? 'bg-accent font-semibold text-white' : 'text-muted hover:bg-surface'}`}
+          className={`px-2.5 py-1.5 ${o.id === value ? 'bg-accent font-semibold text-on-accent' : 'text-muted hover:bg-surface'}`}
         >
           {o.label}
         </button>

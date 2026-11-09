@@ -170,7 +170,7 @@ export default function BTreeSim() {
             aria-label="Key to insert"
           />
         </label>
-        <button type="submit" disabled={locked || text === ''} className="rounded-md bg-accent px-3 py-1.5 font-medium text-white hover:opacity-90 disabled:opacity-40">
+        <button type="submit" disabled={locked || text === ''} className="rounded-md bg-accent px-3 py-1.5 font-medium text-on-accent hover:opacity-90 disabled:opacity-40">
           Insert
         </button>
         <button

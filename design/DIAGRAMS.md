@@ -54,3 +54,16 @@ Use 3D only when a third direction carries the idea (a score cube, a grid of GPU
 - Wrap the scene in `AnimFrame`. The caption carries the teaching text, the legend names each axis, and the scene is a pure function of the step.
 - Never name a color in text (the accent differs by track). Use `usePalette` so dark mode works. Never put an apostrophe in a single-quoted string.
 - Check light, dark and 390px wide screenshots before you report done.
+
+### 3D house style
+The 3D look matches the hand-drawn 2D diagrams. The shared parts already draw it; do not build your own materials.
+- **Fill and ink.** `Cube` and `Dot` use a three-band toon fill and pen outlines with small corner ticks. Do not use lit or glossy materials. For graph edges and pointers use `Links` (one call for many lines; `sketch` adds the faint second stroke).
+- **Floor.** Give box scenes a `ground` (its height) and `groundSize`. Globes get no floor.
+- **One idea per step, camera included.** Set `view` (tilt, turn) and `focus` (a point) per step to show the part the caption talks about. The scene turns around `focus`, so zooming to one tower works after any drag. Pull back on the last step to show the whole picture.
+- **Hover notes.** Give every object a reader might wonder about a `hint` (one or two short sentences). The stage shows it on hover or tap.
+- **Draw the eye with `pop`, sparingly.** `pop` lifts a box a little and bolds its outline. Never `pop` boxes that are stacked or touching: the lift breaks the stack. Use color for those.
+- **Real data, not decoration.** Compute paths and counts from the lesson's own data (as `VecHnsw3D` does with `vecMath.ts`) so the 3D scene and the 2D animation agree. Label any toy number as an example in the caption.
+- **Labels.** `Tag` labels stay sharp but can collide. Hide labels that are not about the current step (`show`). Keep labels off the frame edge at 390px.
+- **Cost.** The stage draws only while something moves. Use `CellField` (one draw call) for more than about 60 equal boxes, with `h` for bars of different heights.
+- **Globe turn.** Longitude L faces the camera at turn = −(L + 90)° in radians. Tilt about 0.65 centers the northern mid-latitudes.
+

@@ -226,7 +226,7 @@ export default function LoadBalancerSim() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <button type="button" onClick={() => setRunning((r) => !r)} className="h-8 rounded-md bg-accent px-3 text-sm font-medium text-white hover:opacity-90">
+          <button type="button" onClick={() => setRunning((r) => !r)} className="h-8 rounded-md bg-accent px-3 text-sm font-medium text-on-accent hover:opacity-90">
             {running ? 'Pause' : 'Run'}
           </button>
           <button type="button" onClick={manualStep} disabled={running} className="h-8 rounded-md border border-line px-3 text-sm hover:bg-surface disabled:opacity-40">

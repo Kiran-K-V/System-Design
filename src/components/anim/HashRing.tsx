@@ -262,7 +262,7 @@ export default function HashRing({ initialServers = 4, initialKeys = 120, initia
 
         <div className="space-y-4 text-sm">
           <div className="flex flex-wrap items-center gap-2">
-            <button type="button" onClick={add} disabled={servers.length >= ALL_NODES.length} className="rounded-md bg-accent px-3 py-1.5 font-medium text-white hover:opacity-90 disabled:opacity-40">
+            <button type="button" onClick={add} disabled={servers.length >= ALL_NODES.length} className="rounded-md bg-accent px-3 py-1.5 font-medium text-on-accent hover:opacity-90 disabled:opacity-40">
               Add server
             </button>
             <button type="button" onClick={addKeys} className="rounded-md border border-line px-3 py-1.5 hover:bg-surface">
